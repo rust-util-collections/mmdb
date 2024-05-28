@@ -1,10 +1,10 @@
+use mmdb::{basic_multi_key::mapx_triple_key::MapxTk, mmdb_set_base_dir};
 use ruc::*;
-use vsdb::{basic_multi_key::mapx_triple_key::MapxTk, vsdb_set_base_dir};
 
 #[test]
 fn basic_cases() {
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 

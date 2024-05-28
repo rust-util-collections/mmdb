@@ -1,13 +1,13 @@
 [package]
-name = "vsdb_trie_db"
+name = "mmdb_trie_db"
 version = "0.21.0"
 edition = "2021"
 keywords = ["mpt", "trie", "database", "blockchain"]
 license = "MIT"
 authors = ["hui.fan@mail.ru"]
 description = "An out-of-box wraper of the `trie_db` crate"
-homepage = "https://github.com/rust-util-collections/vsdb"
-repository = "https://github.com/rust-util-collections/vsdb"
+homepage = "https://github.com/rust-util-collections/mmdb"
+repository = "https://github.com/rust-util-collections/mmdb"
 
 [dependencies]
 serde = { workspace = true }
@@ -15,15 +15,15 @@ trie-db-fun = { workspace = true }
 reference-trie-fun = { workspace = true }
 
 ruc = { workspace = true }
-vsdb = { workspace = true }
-vsdb_hash_db = { workspace = true }
+mmdb = { workspace = true }
+mmdb_hash_db = { workspace = true }
 
 [features]
 default = ["rocks_backend"]
 
-rocks_backend = ["vsdb/rocks_backend"]
-parity_backend = ["vsdb/parity_backend"]
+rocks_backend = ["mmdb/rocks_backend"]
+parity_backend = ["mmdb/parity_backend"]
 
-bcs_codec = ["vsdb/bcs_codec"]
-json_codec = ["vsdb/json_codec"]
-msgpack_codec = ["vsdb/msgpack_codec"]
+bcs_codec = ["mmdb/bcs_codec"]
+json_codec = ["mmdb/json_codec"]
+msgpack_codec = ["mmdb/msgpack_codec"]

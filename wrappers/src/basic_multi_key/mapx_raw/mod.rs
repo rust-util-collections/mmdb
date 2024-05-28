@@ -402,6 +402,6 @@ impl<'a> Entry<'a> {
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl vsdb_core::VsMgmt for MapxRawMk {
-    vsdb_core::impl_vs_methods_nope! {}
+impl mmdb_core::VsMgmt for MapxRawMk {
+    mmdb_core::impl_vs_methods_nope! {}
 }

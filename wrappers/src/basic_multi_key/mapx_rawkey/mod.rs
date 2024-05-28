@@ -200,6 +200,6 @@ impl<'a, V: ValueEnDe> Entry<'a, V> {
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl<V> vsdb_core::VsMgmt for MapxRawKeyMk<V> {
-    vsdb_core::impl_vs_methods_nope! {}
+impl<V> mmdb_core::VsMgmt for MapxRawKeyMk<V> {
+    mmdb_core::impl_vs_methods_nope! {}
 }

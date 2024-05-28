@@ -1,5 +1,5 @@
+use mmdb::{basic::vecx_raw::VecxRaw, mmdb_set_base_dir, RawBytes, ValueEnDe};
 use ruc::*;
-use vsdb::{basic::vecx_raw::VecxRaw, vsdb_set_base_dir, RawBytes, ValueEnDe};
 
 fn gen_sample(idx: usize) -> RawBytes {
     idx.to_be_bytes().to_vec()
@@ -8,8 +8,8 @@ fn gen_sample(idx: usize) -> RawBytes {
 #[test]
 fn basic_cases() {
     let cnt = 200;
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 
@@ -55,8 +55,8 @@ fn basic_cases() {
 
 #[test]
 fn write() {
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 

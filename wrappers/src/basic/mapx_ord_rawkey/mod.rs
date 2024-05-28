@@ -9,10 +9,10 @@
 //! # Examples
 //!
 //! ```
-//! use vsdb::basic::mapx_ord_rawkey::MapxOrdRawKey;
+//! use mmdb::basic::mapx_ord_rawkey::MapxOrdRawKey;
 //!
-//! let dir = format!("/tmp/vsdb_testing/{}", rand::random::<u128>());
-//! vsdb::vsdb_set_base_dir(&dir);
+//! let dir = format!("/tmp/mmdb_testing/{}", rand::random::<u128>());
+//! mmdb::mmdb_set_base_dir(&dir);
 //!
 //! let mut l = MapxOrdRawKey::new();
 //!
@@ -36,13 +36,13 @@
 mod test;
 
 use crate::common::{ende::ValueEnDe, RawKey};
+use mmdb_core::basic::mapx_raw::{self, MapxRaw, MapxRawIter};
 use serde::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
     marker::PhantomData,
     ops::{Deref, DerefMut, RangeBounds},
 };
-use vsdb_core::basic::mapx_raw::{self, MapxRaw, MapxRawIter};
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound = "")]
@@ -443,8 +443,8 @@ where
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl<V> vsdb_core::VsMgmt for MapxOrdRawKey<V> {
-    vsdb_core::impl_vs_methods_nope! {}
+impl<V> mmdb_core::VsMgmt for MapxOrdRawKey<V> {
+    mmdb_core::impl_vs_methods_nope! {}
 }
 
 /////////////////////////////////////////////////////////////////////////////

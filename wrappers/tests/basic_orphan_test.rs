@@ -1,11 +1,11 @@
+use mmdb::{basic::orphan::Orphan, mmdb_set_base_dir};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use vsdb::{basic::orphan::Orphan, vsdb_set_base_dir};
 
 #[test]
 fn basic_cases() {
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 

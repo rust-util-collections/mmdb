@@ -27,7 +27,7 @@ type EngineIter = parity_backend::ParityIter;
 
 use crate::common::{
     BranchIDBase as BranchID, Pre, PreBytes, RawKey, RawValue,
-    VersionIDBase as VersionID, PREFIX_SIZE, VSDB,
+    VersionIDBase as VersionID, MMDB, PREFIX_SIZE,
 };
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -42,7 +42,7 @@ use std::{
 };
 
 static LEN_LK: Lazy<Vec<Mutex<()>>> =
-    Lazy::new(|| (0..VSDB.db.area_count()).map(|_| Mutex::new(())).collect());
+    Lazy::new(|| (0..MMDB.db.area_count()).map(|_| Mutex::new(())).collect());
 
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////
@@ -127,13 +127,13 @@ impl Mapx {
 
     #[inline(always)]
     pub(crate) fn new() -> Self {
-        let prefix = VSDB.db.alloc_prefix();
+        let prefix = MMDB.db.alloc_prefix();
 
         let prefix_bytes = prefix.to_be_bytes();
 
-        assert!(VSDB.db.iter(prefix_bytes).next().is_none());
+        assert!(MMDB.db.iter(prefix_bytes).next().is_none());
 
-        VSDB.db.set_instance_len(prefix_bytes, 0);
+        MMDB.db.set_instance_len(prefix_bytes, 0);
 
         Mapx {
             prefix: prefix_bytes,
@@ -142,12 +142,12 @@ impl Mapx {
 
     #[inline(always)]
     pub(crate) fn get(&self, key: &[u8]) -> Option<RawValue> {
-        VSDB.db.get(self.prefix, key)
+        MMDB.db.get(self.prefix, key)
     }
 
     #[inline(always)]
     pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<ValueMut> {
-        let v = VSDB.db.get(self.prefix, key)?;
+        let v = MMDB.db.get(self.prefix, key)?;
 
         Some(ValueMut {
             key: key.to_vec(),
@@ -167,7 +167,7 @@ impl Mapx {
 
     #[inline(always)]
     pub(crate) fn len(&self) -> usize {
-        VSDB.db.get_instance_len(self.prefix) as usize
+        MMDB.db.get_instance_len(self.prefix) as usize
     }
 
     #[inline(always)]
@@ -178,7 +178,7 @@ impl Mapx {
     #[inline(always)]
     pub(crate) fn iter(&self) -> MapxIter {
         MapxIter {
-            db_iter: VSDB.db.iter(self.prefix),
+            db_iter: MMDB.db.iter(self.prefix),
             _hdr: self,
         }
     }
@@ -186,7 +186,7 @@ impl Mapx {
     #[inline(always)]
     pub(crate) fn iter_mut(&mut self) -> MapxIterMut {
         MapxIterMut {
-            db_iter: VSDB.db.iter(self.prefix),
+            db_iter: MMDB.db.iter(self.prefix),
             hdr: self,
         }
     }
@@ -197,7 +197,7 @@ impl Mapx {
         bounds: R,
     ) -> MapxIter<'a> {
         MapxIter {
-            db_iter: VSDB.db.range(self.prefix, bounds),
+            db_iter: MMDB.db.range(self.prefix, bounds),
             _hdr: self,
         }
     }
@@ -208,35 +208,35 @@ impl Mapx {
         bounds: R,
     ) -> MapxIterMut<'a> {
         MapxIterMut {
-            db_iter: VSDB.db.range(self.prefix, bounds),
+            db_iter: MMDB.db.range(self.prefix, bounds),
             hdr: self,
         }
     }
 
     #[inline(always)]
     pub(crate) fn insert(&mut self, key: &[u8], value: &[u8]) -> Option<RawValue> {
-        let ret = VSDB.db.insert(self.prefix, key, value);
+        let ret = MMDB.db.insert(self.prefix, key, value);
         if ret.is_none() {
-            VSDB.db.increase_instance_len(self.prefix);
+            MMDB.db.increase_instance_len(self.prefix);
         }
         ret
     }
 
     #[inline(always)]
     pub(crate) fn remove(&mut self, key: &[u8]) -> Option<RawValue> {
-        let ret = VSDB.db.remove(self.prefix, key);
+        let ret = MMDB.db.remove(self.prefix, key);
         if ret.is_some() {
-            VSDB.db.decrease_instance_len(self.prefix);
+            MMDB.db.decrease_instance_len(self.prefix);
         }
         ret
     }
 
     #[inline(always)]
     pub(crate) fn clear(&mut self) {
-        VSDB.db.iter(self.prefix).for_each(|(k, _)| {
-            VSDB.db.remove(self.prefix, &k);
+        MMDB.db.iter(self.prefix).for_each(|(k, _)| {
+            MMDB.db.remove(self.prefix, &k);
         });
-        VSDB.db.set_instance_len(self.prefix, 0);
+        MMDB.db.set_instance_len(self.prefix, 0);
     }
 
     #[inline(always)]

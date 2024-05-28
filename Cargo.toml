@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "core",
-    "derive",
     "wrappers",
     "utils/hash_db",
     "utils/trie_db",
@@ -35,9 +34,8 @@ hash-db = "0.16.0"
 trie-db-fun = { version = "100.28.0" }
 reference-trie-fun = { version = "100.29.1" }
 
-vsdb = { path = "wrappers", version = "0.62.0", default-features = false }
-vsdb_core = { path = "core", version = "0.62.0", default-features = false }
-vsdb_derive = { path = "derive", version = "0.53.0" }
+mmdb = { path = "wrappers", version = "0.62.0", default-features = false }
+mmdb_core = { path = "core", version = "0.62.0", default-features = false }
 
-vsdb_trie_db = { path = "utils/trie_db", version = "0.21.0", default-features = false }
-vsdb_hash_db = { path = "utils/hash_db", version = "0.21.0", default-features = false }
+mmdb_trie_db = { path = "utils/trie_db", version = "0.21.0", default-features = false }
+mmdb_hash_db = { path = "utils/hash_db", version = "0.21.0", default-features = false }

@@ -7,10 +7,10 @@
 //! # Examples
 //!
 //! ```
-//! use vsdb_core::basic::mapx_raw::MapxRaw;
+//! use mmdb_core::basic::mapx_raw::MapxRaw;
 //!
-//! let dir = format!("/tmp/vsdb_testing/{}", rand::random::<u128>());
-//! vsdb_core::vsdb_set_base_dir(&dir);
+//! let dir = format!("/tmp/mmdb_testing/{}", rand::random::<u128>());
+//! mmdb_core::mmdb_set_base_dir(&dir);
 //!
 //! let mut l = MapxRaw::new();
 //!

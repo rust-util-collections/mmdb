@@ -1,12 +1,12 @@
+use mmdb_core::{mmdb_set_base_dir, MapxRaw};
 use ruc::*;
 use std::borrow::Cow;
-use vsdb_core::{vsdb_set_base_dir, MapxRaw};
 
 #[test]
 fn basic_cases() {
     let cnt = 200;
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 

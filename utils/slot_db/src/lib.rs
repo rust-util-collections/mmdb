@@ -2,15 +2,15 @@
 #![deny(warnings)]
 #![cfg_attr(test, warn(warnings))]
 
+use mmdb::{
+    basic::mapx_ord::MapxOrdIter as LargeIter, KeyEnDeOrdered, MapxOrd,
+};
 use ruc::*;
 use serde::{de, Deserialize, Serialize};
 use std::{
     collections::{btree_set::Iter as SmallIter, BTreeSet},
     mem,
     ops::Bound,
-};
-use vsdb::{
-    basic::mapx_ord::MapxOrdIter as LargeIter, KeyEnDeOrdered, MapxOrd,
 };
 
 type Slot = u64;

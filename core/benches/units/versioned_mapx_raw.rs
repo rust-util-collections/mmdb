@@ -1,13 +1,13 @@
 use criterion::{criterion_group, Criterion};
+use mmdb_core::{versioned::mapx_raw::MapxRawVs, BranchName, VersionName, VsMgmt};
 use rand::Rng;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-use vsdb_core::{versioned::mapx_raw::MapxRawVs, BranchName, VersionName, VsMgmt};
 
 fn read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::versioned::mapx_raw::MapxRawVs **");
+    let mut group = c.benchmark_group("** mmdb::versioned::mapx_raw::MapxRawVs **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -33,7 +33,7 @@ fn read_write(c: &mut Criterion) {
 }
 
 fn random_read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::versioned::mapx_raw::MapxRawVs **");
+    let mut group = c.benchmark_group("** mmdb::versioned::mapx_raw::MapxRawVs **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -62,7 +62,7 @@ fn random_read_write(c: &mut Criterion) {
 }
 
 fn version_read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::versioned::mapx_raw::MapxRawVs **");
+    let mut group = c.benchmark_group("** mmdb::versioned::mapx_raw::MapxRawVs **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -92,7 +92,7 @@ fn version_read_write(c: &mut Criterion) {
 }
 
 fn version_random_read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::versioned::mapx_raw::MapxRawVs **");
+    let mut group = c.benchmark_group("** mmdb::versioned::mapx_raw::MapxRawVs **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -127,7 +127,7 @@ fn version_random_read_write(c: &mut Criterion) {
 }
 
 fn branch_version_read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::versioned::mapx_raw::MapxRawVs **");
+    let mut group = c.benchmark_group("** mmdb::versioned::mapx_raw::MapxRawVs **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -157,7 +157,7 @@ fn branch_version_read_write(c: &mut Criterion) {
 }
 
 fn branch_version_random_read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::versioned::mapx_raw::MapxRawVs **");
+    let mut group = c.benchmark_group("** mmdb::versioned::mapx_raw::MapxRawVs **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);

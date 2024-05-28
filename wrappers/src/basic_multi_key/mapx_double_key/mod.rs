@@ -238,6 +238,6 @@ where
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl<K1, K2, V> vsdb_core::VsMgmt for MapxDk<K1, K2, V> {
-    vsdb_core::impl_vs_methods_nope! {}
+impl<K1, K2, V> mmdb_core::VsMgmt for MapxDk<K1, K2, V> {
+    mmdb_core::impl_vs_methods_nope! {}
 }

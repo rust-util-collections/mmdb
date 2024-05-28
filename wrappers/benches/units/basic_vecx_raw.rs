@@ -1,13 +1,13 @@
 use criterion::{criterion_group, Criterion};
+use mmdb::{basic::vecx_raw::VecxRaw, ValueEnDe};
 use rand::Rng;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-use vsdb::{basic::vecx_raw::VecxRaw, ValueEnDe};
 
 fn read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::basic::vecx_raw::VecxRaw **");
+    let mut group = c.benchmark_group("** mmdb::basic::vecx_raw::VecxRaw **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -33,7 +33,7 @@ fn read_write(c: &mut Criterion) {
 }
 
 fn random_read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::basic::vecx_raw::VecxRaw **");
+    let mut group = c.benchmark_group("** mmdb::basic::vecx_raw::VecxRaw **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);

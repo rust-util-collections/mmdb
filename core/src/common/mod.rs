@@ -74,23 +74,23 @@ pub const RESERVED_VERSION_NUM_DEFAULT: usize = 10;
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////
 
-const BASE_DIR_VAR: &str = "VSDB_BASE_DIR";
+const BASE_DIR_VAR: &str = "MMDB_BASE_DIR";
 
-static VSDB_BASE_DIR: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(gen_data_dir()));
+static MMDB_BASE_DIR: Lazy<Mutex<PathBuf>> = Lazy::new(|| Mutex::new(gen_data_dir()));
 
-static VSDB_CUSTOM_DIR: Lazy<PathBuf> = Lazy::new(|| {
-    let mut d = VSDB_BASE_DIR.lock().clone();
+static MMDB_CUSTOM_DIR: Lazy<PathBuf> = Lazy::new(|| {
+    let mut d = MMDB_BASE_DIR.lock().clone();
     d.push("__CUSTOM__");
     pnk!(fs::create_dir_all(&d));
-    env::set_var("VSDB_CUSTOM_DIR", d.as_os_str());
+    env::set_var("MMDB_CUSTOM_DIR", d.as_os_str());
     d
 });
 
 #[cfg(feature = "rocks_backend")]
-pub static VSDB: Lazy<VsDB<engines::RocksDB>> = Lazy::new(|| pnk!(VsDB::new()));
+pub static MMDB: Lazy<MmDB<engines::RocksDB>> = Lazy::new(|| pnk!(MmDB::new()));
 
 #[cfg(feature = "parity_backend")]
-pub static VSDB: Lazy<VsDB<engines::ParityDB>> = Lazy::new(|| pnk!(VsDB::new()));
+pub static MMDB: Lazy<MmDB<engines::ParityDB>> = Lazy::new(|| pnk!(MmDB::new()));
 
 /// Clean orphan instances in background.
 pub static TRASH_CLEANER: Lazy<Mutex<ThreadPool>> =
@@ -119,11 +119,11 @@ macro_rules! parse_prefix {
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////
 
-pub struct VsDB<T: Engine> {
+pub struct MmDB<T: Engine> {
     db: T,
 }
 
-impl<T: Engine> VsDB<T> {
+impl<T: Engine> MmDB<T> {
     #[inline(always)]
     fn new() -> Result<Self> {
         Ok(Self {
@@ -154,42 +154,42 @@ impl<T: Engine> VsDB<T> {
 fn gen_data_dir() -> PathBuf {
     // Compatible with Windows OS?
     let d = env::var(BASE_DIR_VAR)
-        .or_else(|_| env::var("HOME").map(|h| format!("{}/.vsdb", h)))
-        .unwrap_or_else(|_| "/tmp/.vsdb".to_owned());
+        .or_else(|_| env::var("HOME").map(|h| format!("{}/.mmdb", h)))
+        .unwrap_or_else(|_| "/tmp/.mmdb".to_owned());
     pnk!(fs::create_dir_all(&d));
     PathBuf::from(d)
 }
 
-/// ${VSDB_CUSTOM_DIR}
+/// ${MMDB_CUSTOM_DIR}
 #[inline(always)]
-pub fn vsdb_get_custom_dir() -> &'static Path {
-    VSDB_CUSTOM_DIR.as_path()
+pub fn mmdb_get_custom_dir() -> &'static Path {
+    MMDB_CUSTOM_DIR.as_path()
 }
 
-/// ${VSDB_BASE_DIR}
+/// ${MMDB_BASE_DIR}
 #[inline(always)]
-pub fn vsdb_get_base_dir() -> PathBuf {
-    VSDB_BASE_DIR.lock().clone()
+pub fn mmdb_get_base_dir() -> PathBuf {
+    MMDB_BASE_DIR.lock().clone()
 }
 
-/// Set ${VSDB_BASE_DIR} manually.
+/// Set ${MMDB_BASE_DIR} manually.
 #[inline(always)]
-pub fn vsdb_set_base_dir(dir: impl AsRef<Path>) -> Result<()> {
+pub fn mmdb_set_base_dir(dir: impl AsRef<Path>) -> Result<()> {
     static HAS_INITED: AtomicBool = AtomicBool::new(false);
 
     if HAS_INITED.swap(true, Ordering::Relaxed) {
-        Err(eg!("VSDB has been initialized !!"))
+        Err(eg!("MMDB has been initialized !!"))
     } else {
         env::set_var(BASE_DIR_VAR, dir.as_ref().as_os_str());
-        *VSDB_BASE_DIR.lock() = dir.as_ref().to_path_buf();
+        *MMDB_BASE_DIR.lock() = dir.as_ref().to_path_buf();
         Ok(())
     }
 }
 
 /// Flush data to disk, may take a long time.
 #[inline(always)]
-pub fn vsdb_flush() {
-    VSDB.flush();
+pub fn mmdb_flush() {
+    MMDB.flush();
 }
 
 macro_rules! impl_from_for_name {

@@ -1,5 +1,5 @@
 use crate::common::{
-    vsdb_get_base_dir, vsdb_set_base_dir, BranchIDBase as BranchID, Engine, Pre,
+    mmdb_get_base_dir, mmdb_set_base_dir, BranchIDBase as BranchID, Engine, Pre,
     PreBytes, RawBytes, RawKey, RawValue, VersionIDBase as VersionID, GB,
     INITIAL_BRANCH_ID, MB, PREFIX_SIZE, RESERVED_ID_CNT,
 };
@@ -369,10 +369,10 @@ impl PreAllocator {
 }
 
 fn rocksdb_open() -> Result<(DB, Vec<String>)> {
-    let dir = vsdb_get_base_dir();
+    let dir = mmdb_get_base_dir();
 
     // avoid setting again on an opened DB
-    omit!(vsdb_set_base_dir(&dir));
+    omit!(mmdb_set_base_dir(&dir));
 
     let mut cfg = Options::default();
 
@@ -406,7 +406,7 @@ fn rocksdb_open() -> Result<(DB, Vec<String>)> {
     };
 
     // println!(
-    //     "[vsdb]: The `write_buffer_size` of rocksdb is {}MB, per column family",
+    //     "[mmdb]: The `write_buffer_size` of rocksdb is {}MB, per column family",
     //     wr_buffer_size / MB as usize
     // );
 

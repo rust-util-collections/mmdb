@@ -15,7 +15,7 @@ musl_lint:
 	fi
 
 test:
-	rm -rf ~/.vsdb
+	rm -rf ~/.mmdb
 	cargo test --workspace -- --nocapture
 
 update:

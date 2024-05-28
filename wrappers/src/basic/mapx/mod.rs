@@ -9,10 +9,10 @@
 //! # Examples
 //!
 //! ```
-//! use vsdb::Mapx;
+//! use mmdb::Mapx;
 //!
-//! let dir = format!("/tmp/vsdb_testing/{}", rand::random::<u128>());
-//! vsdb::vsdb_set_base_dir(&dir);
+//! let dir = format!("/tmp/mmdb_testing/{}", rand::random::<u128>());
+//! mmdb::mmdb_set_base_dir(&dir);
 //!
 //! let mut l = Mapx::new();
 //!
@@ -323,8 +323,8 @@ where
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl<K, V> vsdb_core::VsMgmt for Mapx<K, V> {
-    vsdb_core::impl_vs_methods_nope! {}
+impl<K, V> mmdb_core::VsMgmt for Mapx<K, V> {
+    mmdb_core::impl_vs_methods_nope! {}
 }
 
 /////////////////////////////////////////////////////////////////////////////

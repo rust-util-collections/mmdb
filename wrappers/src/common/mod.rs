@@ -4,4 +4,4 @@
 
 pub mod ende;
 
-pub use vsdb_core::common::*;
+pub use mmdb_core::common::*;

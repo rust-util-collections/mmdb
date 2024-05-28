@@ -1,23 +1,23 @@
 [package]
-name = "vsdb_trie_map"
+name = "mmdb_trie_map"
 version = "0.21.0"
 edition = "2021"
 keywords = ["mpt", "trie", "database", "blockchain"]
 license = "MIT"
 authors = ["hui.fan@mail.ru"]
-description = "Various easy-to-use KV-map structures based of the `vsdb_trie_db` crate"
-homepage = "https://github.com/rust-util-collections/vsdb"
-repository = "https://github.com/rust-util-collections/vsdb"
+description = "Various easy-to-use KV-map structures based of the `mmdb_trie_db` crate"
+homepage = "https://github.com/rust-util-collections/mmdb"
+repository = "https://github.com/rust-util-collections/mmdb"
 
 [dependencies]
-vsdb_trie_db = { workspace = true }
+mmdb_trie_db = { workspace = true }
 
 [features]
 default = ["rocks_backend"]
 
-rocks_backend = ["vsdb_trie_db/rocks_backend"]
-parity_backend = ["vsdb_trie_db/parity_backend"]
+rocks_backend = ["mmdb_trie_db/rocks_backend"]
+parity_backend = ["mmdb_trie_db/parity_backend"]
 
-bcs_codec = ["vsdb_trie_db/bcs_codec"]
-json_codec = ["vsdb_trie_db/json_codec"]
-msgpack_codec = ["vsdb_trie_db/msgpack_codec"]
+bcs_codec = ["mmdb_trie_db/bcs_codec"]
+json_codec = ["mmdb_trie_db/json_codec"]
+msgpack_codec = ["mmdb_trie_db/msgpack_codec"]

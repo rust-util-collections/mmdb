@@ -7,10 +7,10 @@
 //! # Examples
 //!
 //! ```
-//! use vsdb::basic::orphan::Orphan;
+//! use mmdb::basic::orphan::Orphan;
 //!
-//! let dir = format!("/tmp/vsdb_testing/{}", rand::random::<u128>());
-//! vsdb::vsdb_set_base_dir(&dir);
+//! let dir = format!("/tmp/mmdb_testing/{}", rand::random::<u128>());
+//! mmdb::mmdb_set_base_dir(&dir);
 //!
 //! assert_eq!(Orphan::new(0), 0);
 //! assert!(Orphan::new(1) > 0);
@@ -362,6 +362,6 @@ where
 ////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl<T> vsdb_core::VsMgmt for Orphan<T> {
-    vsdb_core::impl_vs_methods_nope! {}
+impl<T> mmdb_core::VsMgmt for Orphan<T> {
+    mmdb_core::impl_vs_methods_nope! {}
 }

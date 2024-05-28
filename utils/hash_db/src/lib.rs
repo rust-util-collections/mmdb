@@ -1,10 +1,10 @@
 pub use hash_db as sp_hash_db;
-pub use vsdb;
+pub use mmdb;
 
 use hash_db::{AsHashDB, HashDB, HashDBRef, Hasher as KeyHasher, Prefix};
+use mmdb::{basic::mapx_ord_rawkey::MapxOrdRawKey as Map, RawBytes, ValueEnDe};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use vsdb::{basic::mapx_ord_rawkey::MapxOrdRawKey as Map, RawBytes, ValueEnDe};
 
 pub use keccak_hasher::KeccakHasher;
 

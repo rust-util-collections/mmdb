@@ -1,13 +1,13 @@
 use criterion::{criterion_group, Criterion};
+use mmdb::{basic::mapx_ord::MapxOrd, ValueEnDe};
 use rand::Rng;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-use vsdb::{basic::mapx_ord::MapxOrd, ValueEnDe};
 
 fn read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::basic::mapx_ord::MapxOrd **");
+    let mut group = c.benchmark_group("** mmdb::basic::mapx_ord::MapxOrd **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -34,7 +34,7 @@ fn read_write(c: &mut Criterion) {
 }
 
 fn random_read_write(c: &mut Criterion) {
-    let mut group = c.benchmark_group("** vsdb::basic::mapx_ord::MapxOrd **");
+    let mut group = c.benchmark_group("** mmdb::basic::mapx_ord::MapxOrd **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);

@@ -9,10 +9,10 @@
 //! # Examples
 //!
 //! ```
-//! use vsdb::basic::mapx_ord_rawvalue::MapxOrdRawValue;
+//! use mmdb::basic::mapx_ord_rawvalue::MapxOrdRawValue;
 //!
-//! let dir = format!("/tmp/vsdb_testing/{}", rand::random::<u128>());
-//! vsdb::vsdb_set_base_dir(&dir);
+//! let dir = format!("/tmp/mmdb_testing/{}", rand::random::<u128>());
+//! mmdb::mmdb_set_base_dir(&dir);
 //!
 //! let mut l = MapxOrdRawValue::new();
 //!
@@ -37,6 +37,7 @@
 mod test;
 
 use crate::common::{ende::KeyEnDeOrdered, RawValue};
+use mmdb_core::basic::mapx_raw::{MapxRaw, MapxRawIter, MapxRawIterMut, ValueIterMut};
 use ruc::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,7 +45,6 @@ use std::{
     marker::PhantomData,
     ops::{Bound, Deref, DerefMut, RangeBounds},
 };
-use vsdb_core::basic::mapx_raw::{MapxRaw, MapxRawIter, MapxRawIterMut, ValueIterMut};
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound = "")]
@@ -473,8 +473,8 @@ impl<'a> DoubleEndedIterator for MapxOrdRawValueValuesMut<'a> {
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl<K> vsdb_core::VsMgmt for MapxOrdRawValue<K> {
-    vsdb_core::impl_vs_methods_nope! {}
+impl<K> mmdb_core::VsMgmt for MapxOrdRawValue<K> {
+    mmdb_core::impl_vs_methods_nope! {}
 }
 
 /////////////////////////////////////////////////////////////////////////////

@@ -1,5 +1,5 @@
 use crate::common::{
-    vsdb_get_base_dir, vsdb_set_base_dir, BranchIDBase as BranchID, Engine, Pre,
+    mmdb_get_base_dir, mmdb_set_base_dir, BranchIDBase as BranchID, Engine, Pre,
     PreBytes, RawBytes, RawKey, RawValue, VersionIDBase as VersionID, INITIAL_BRANCH_ID,
     PREFIX_SIZE, RESERVED_ID_CNT,
 };
@@ -451,10 +451,10 @@ impl PreAllocator {
 }
 
 fn paritydb_open() -> Result<DB> {
-    let dir = vsdb_get_base_dir();
+    let dir = mmdb_get_base_dir();
 
     // avoid setting again on an opened DB
-    omit!(vsdb_set_base_dir(&dir));
+    omit!(mmdb_set_base_dir(&dir));
 
     let mut cfg = Options::with_columns(&dir, 1 + DATA_SET_NUM);
     cfg.columns.iter_mut().for_each(|c| {

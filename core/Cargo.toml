@@ -1,11 +1,11 @@
 [package]
-name = "vsdb_core"
+name = "mmdb_core"
 version = "0.62.2"
 authors = ["hui.fan@mail.ru"]
 edition = "2021"
-description = "A stuctured DB with some 'Git-like' features, mainly used in blockchain projects."
-homepage = "https://github.com/rust-util-collections/vsdb"
-repository = "https://github.com/rust-util-collections/vsdb/tree/master/core"
+description = ""
+homepage = "https://github.com/rust-util-collections/mmdb"
+repository = "https://github.com/rust-util-collections/mmdb/tree/master/core"
 keywords = ["git", "leveldb", "rocksdb", "version", "vcs"]
 categories = ["database-implementations", "data-structures", "algorithms", "caching"]
 license = "GPL-3.0"
@@ -23,8 +23,6 @@ primitive-types-0-12 = {  workspace = true, optional = true }
 primitive-types-0-11 = { workspace = true, optional = true }
 primitive-types-0-10 = { workspace = true, optional = true }
 
-vsdb_derive = { workspace = true, optional = true }
-
 rocksdb = { workspace = true, optional = true }
 parity-db = { workspace = true, optional = true }
 
@@ -41,7 +39,6 @@ parity_backend = ["parity-db"]
 
 compress = ["rocksdb?/zstd"]
 
-vs = ["vsdb_derive"] # the switch of all versioned APIs
 extra_types = ["primitive-types-0-12", "primitive-types-0-11", "primitive-types-0-10"]
 
 # [[bench]]

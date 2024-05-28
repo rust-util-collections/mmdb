@@ -11,10 +11,10 @@
 //! # Examples
 //!
 //! ```
-//! use vsdb::basic::mapx_ord::MapxOrd;
+//! use mmdb::basic::mapx_ord::MapxOrd;
 //!
-//! let dir = format!("/tmp/vsdb_testing/{}", rand::random::<u128>());
-//! vsdb::vsdb_set_base_dir(&dir);
+//! let dir = format!("/tmp/mmdb_testing/{}", rand::random::<u128>());
+//! mmdb::mmdb_set_base_dir(&dir);
 //!
 //! let mut l = MapxOrd::new();
 //!
@@ -45,6 +45,7 @@ use crate::{
         RawKey,
     },
 };
+use mmdb_core::basic::mapx_raw;
 use ruc::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -52,7 +53,6 @@ use std::{
     marker::PhantomData,
     ops::{Bound, RangeBounds},
 };
-use vsdb_core::basic::mapx_raw;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound = "")]
@@ -469,8 +469,8 @@ where
 /////////////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl<K, V> vsdb_core::VsMgmt for MapxOrd<K, V> {
-    vsdb_core::impl_vs_methods_nope! {}
+impl<K, V> mmdb_core::VsMgmt for MapxOrd<K, V> {
+    mmdb_core::impl_vs_methods_nope! {}
 }
 
 /////////////////////////////////////////////////////////////////////////////

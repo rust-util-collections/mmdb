@@ -1,14 +1,14 @@
 use criterion::{criterion_group, Criterion};
+use mmdb::basic_multi_key::mapx_rawkey::MapxRawKeyMk;
 use rand::Rng;
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-use vsdb::basic_multi_key::mapx_rawkey::MapxRawKeyMk;
 
 fn read_write(c: &mut Criterion) {
     let mut group =
-        c.benchmark_group("** vsdb::basic_multi_key::mapx_rawkey::MapxRawKeyMk **");
+        c.benchmark_group("** mmdb::basic_multi_key::mapx_rawkey::MapxRawKeyMk **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);
@@ -36,7 +36,7 @@ fn read_write(c: &mut Criterion) {
 
 fn random_read_write(c: &mut Criterion) {
     let mut group =
-        c.benchmark_group("** vsdb::basic_multi_key::mapx_rawkey::MapxRawKeyMk **");
+        c.benchmark_group("** mmdb::basic_multi_key::mapx_rawkey::MapxRawKeyMk **");
     group
         .measurement_time(Duration::from_secs(9))
         .sample_size(100);

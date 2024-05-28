@@ -1,6 +1,6 @@
+use mmdb::{basic::mapx_ord_rawkey::MapxOrdRawKey, mmdb_set_base_dir, ValueEnDe};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use vsdb::{basic::mapx_ord_rawkey::MapxOrdRawKey, vsdb_set_base_dir, ValueEnDe};
 
 #[derive(Serialize, Deserialize, Default, Debug, Eq, PartialEq, Clone)]
 struct SampleBlock {
@@ -16,8 +16,8 @@ fn gen_sample(bytes: &[u8]) -> SampleBlock {
 #[test]
 fn basic_cases() {
     let cnt = 200;
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 

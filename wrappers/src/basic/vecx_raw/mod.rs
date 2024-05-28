@@ -7,10 +7,10 @@
 //! # Examples
 //!
 //! ```
-//! use vsdb::basic::vecx_raw::VecxRaw;
+//! use mmdb::basic::vecx_raw::VecxRaw;
 //!
-//! let dir = format!("/tmp/vsdb_testing/{}", rand::random::<u128>());
-//! vsdb::vsdb_set_base_dir(&dir);
+//! let dir = format!("/tmp/mmdb_testing/{}", rand::random::<u128>());
+//! mmdb::mmdb_set_base_dir(&dir);
 //!
 //! let mut l = VecxRaw::new();
 //!
@@ -36,10 +36,10 @@ use crate::{
     basic::mapx_ord_rawvalue::{MapxOrdRawValue, MapxOrdRawValueIterMut, ValueMut},
     common::RawValue,
 };
+use mmdb_core::basic::mapx_raw::MapxRawIter;
 use ruc::*;
 use serde::{Deserialize, Serialize};
 use std::{cmp::Ordering, marker::PhantomData};
-use vsdb_core::basic::mapx_raw::MapxRawIter;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(bound = "")]
@@ -234,8 +234,8 @@ type VecxRawIterMut<'a> = MapxOrdRawValueIterMut<'a, usize>;
 ////////////////////////////////////////////////////////////////////
 
 #[cfg(feature = "vs")]
-impl vsdb_core::VsMgmt for VecxRaw {
-    vsdb_core::impl_vs_methods_nope! {}
+impl mmdb_core::VsMgmt for VecxRaw {
+    mmdb_core::impl_vs_methods_nope! {}
 }
 
 /////////////////////////////////////////////////////////////////////////////

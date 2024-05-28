@@ -1,12 +1,12 @@
+use mmdb::{basic_multi_key::mapx_raw::MapxRawMk, mmdb_set_base_dir};
 use ruc::*;
-use vsdb::{basic_multi_key::mapx_raw::MapxRawMk, vsdb_set_base_dir};
 
 const NIL: &[u8] = &[];
 
 #[test]
 fn basic_cases() {
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 

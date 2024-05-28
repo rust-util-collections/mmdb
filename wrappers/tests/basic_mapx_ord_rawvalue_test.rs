@@ -1,12 +1,12 @@
+use mmdb::{basic::mapx_ord_rawvalue::MapxOrdRawValue, mmdb_set_base_dir, ValueEnDe};
 use ruc::*;
 use std::ops::Bound;
-use vsdb::{basic::mapx_ord_rawvalue::MapxOrdRawValue, vsdb_set_base_dir, ValueEnDe};
 
 #[test]
 fn basic_cases() {
     let cnt = 200;
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 

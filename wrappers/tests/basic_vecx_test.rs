@@ -1,6 +1,6 @@
+use mmdb::{mmdb_set_base_dir, ValueEnDe, Vecx};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use vsdb::{vsdb_set_base_dir, ValueEnDe, Vecx};
 
 #[derive(Default, Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct SampleBlock {
@@ -18,8 +18,8 @@ fn gen_sample(idx: usize) -> SampleBlock {
 #[test]
 fn basic_cases() {
     let cnt = 200;
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
     let hdr = {
@@ -64,8 +64,8 @@ fn basic_cases() {
 
 #[test]
 fn write() {
-    info_omit!(vsdb_set_base_dir(&format!(
-        "/tmp/vsdb_testing/{}",
+    info_omit!(mmdb_set_base_dir(&format!(
+        "/tmp/mmdb_testing/{}",
         rand::random::<u64>()
     )));
 
