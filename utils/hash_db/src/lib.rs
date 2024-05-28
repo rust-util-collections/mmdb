@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 
 pub use keccak_hasher::KeccakHasher;
 
-pub type TrieBackend = VsBackend<KeccakHasher, Vec<u8>>;
+pub type TrieBackend = MmBackend<KeccakHasher, Vec<u8>>;
 
 pub trait TrieVar: AsRef<[u8]> + for<'a> From<&'a [u8]> {}
 
 impl<T> TrieVar for T where T: AsRef<[u8]> + for<'a> From<&'a [u8]> {}
 
 // NOTE: make it `!Clone`
-pub struct VsBackend<H, T>
+pub struct MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar,
@@ -25,14 +25,14 @@ where
     null_node_data: T,
 }
 
-impl<H, T> VsBackend<H, T>
+impl<H, T> MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar,
 {
-    /// Create a new `VsBackend` from the default null key/data
+    /// Create a new `MmBackend` from the default null key/data
     pub fn new() -> Self {
-        VsBackend {
+        MmBackend {
             data: Map::new(),
             hashed_null_key: Self::hashed_null_node(),
             null_node_data: [0u8].as_slice().into(),
@@ -45,7 +45,7 @@ where
     }
 }
 
-impl<H, T> Default for VsBackend<H, T>
+impl<H, T> Default for MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar,
@@ -55,7 +55,7 @@ where
     }
 }
 
-impl<H, T> HashDB<H, T> for VsBackend<H, T>
+impl<H, T> HashDB<H, T> for MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar + Clone + Sync + Send + PartialEq + Default,
@@ -124,7 +124,7 @@ where
     }
 }
 
-impl<H, T> HashDBRef<H, T> for VsBackend<H, T>
+impl<H, T> HashDBRef<H, T> for MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar + Clone + Sync + Send + Default + PartialEq,
@@ -137,7 +137,7 @@ where
     }
 }
 
-impl<H, T> AsHashDB<H, T> for VsBackend<H, T>
+impl<H, T> AsHashDB<H, T> for MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar + Clone + Sync + Send + Default + PartialEq,
@@ -198,7 +198,7 @@ where
 
 #[derive(Serialize, Deserialize)]
 #[serde(bound = "")]
-struct VsBackendSerde<T>
+struct MmBackendSerde<T>
 where
     T: TrieVar,
 {
@@ -206,12 +206,12 @@ where
     null_node_data: Vec<u8>,
 }
 
-impl<H, T> From<VsBackendSerde<T>> for VsBackend<H, T>
+impl<H, T> From<MmBackendSerde<T>> for MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar,
 {
-    fn from(vbs: VsBackendSerde<T>) -> Self {
+    fn from(vbs: MmBackendSerde<T>) -> Self {
         Self {
             data: vbs.data,
             hashed_null_key: Self::hashed_null_node(),
@@ -220,12 +220,12 @@ where
     }
 }
 
-impl<H, T> From<&VsBackend<H, T>> for VsBackendSerde<T>
+impl<H, T> From<&MmBackend<H, T>> for MmBackendSerde<T>
 where
     H: KeyHasher,
     T: TrieVar,
 {
-    fn from(vb: &VsBackend<H, T>) -> Self {
+    fn from(vb: &MmBackend<H, T>) -> Self {
         Self {
             data: unsafe { vb.data.shadow() },
             null_node_data: vb.null_node_data.as_ref().to_vec(),
@@ -233,13 +233,13 @@ where
     }
 }
 
-impl<H, T> ValueEnDe for VsBackend<H, T>
+impl<H, T> ValueEnDe for MmBackend<H, T>
 where
     H: KeyHasher,
     T: TrieVar,
 {
     fn try_encode(&self) -> Result<RawBytes> {
-        bcs::to_bytes(&VsBackendSerde::from(self)).c(d!())
+        bcs::to_bytes(&MmBackendSerde::from(self)).c(d!())
     }
 
     fn encode(&self) -> RawBytes {
@@ -247,7 +247,7 @@ where
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
-        bcs::from_bytes::<VsBackendSerde<T>>(bytes)
+        bcs::from_bytes::<MmBackendSerde<T>>(bytes)
             .c(d!())
             .map(Self::from)
     }

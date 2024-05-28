@@ -4,9 +4,8 @@ export CARGO_NET_GIT_FETCH_WITH_CLI = true
 
 lint:
 	cargo clippy --workspace
-	cargo clippy --workspace --features "extra_types"
-	cargo check --workspace --tests --features "extra_types"
-	cargo check --workspace --benches --features "extra_types"
+	cargo check --workspace --tests
+	cargo check --workspace --benches
 
 lintall: lint
 	cargo clippy --workspace --no-default-features --features "parity_backend,msgpack_codec"
@@ -16,7 +15,7 @@ lintall: lint
 lintmusl:
 	cargo clippy --workspace --target x86_64-unknown-linux-musl \
 		--no-default-features \
-		--features "parity_backend,msgpack_codec,extra_types"
+		--features "parity_backend,msgpack_codec"
 
 test:
 	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)

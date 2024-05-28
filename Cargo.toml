@@ -22,10 +22,6 @@ serde = { version = "1.0.136", features = ["derive"] }
 
 threadpool = "1.8.1" # used in a background cleaner
 
-primitive-types-0-12 = { package = "primitive-types", version = "0.12", default-features = false }
-primitive-types-0-11 = { package = "primitive-types", version = "0.11", default-features = false }
-primitive-types-0-10 = { package = "primitive-types", version = "0.10", default-features = false }
-
 parity-db = "0.4.13"
 rocksdb = { version = "0.22.0", default-features = false }
 
@@ -34,8 +30,8 @@ hash-db = "0.16.0"
 trie-db-fun = { version = "100.28.0" }
 reference-trie-fun = { version = "100.29.1" }
 
-mmdb = { path = "wrappers", version = "0.62.0", default-features = false }
-mmdb_core = { path = "core", version = "0.62.0", default-features = false }
+mmdb = { path = "wrappers", version = "1.0.0", default-features = false }
+mmdb_core = { path = "core", version = "1.0.0", default-features = false }
 
-mmdb_trie_db = { path = "utils/trie_db", version = "0.21.0", default-features = false }
-mmdb_hash_db = { path = "utils/hash_db", version = "0.21.0", default-features = false }
+mmdb_trie_db = { path = "utils/trie_db", version = "0.1.0", default-features = false }
+mmdb_hash_db = { path = "utils/hash_db", version = "0.1.0", default-features = false }

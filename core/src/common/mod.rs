@@ -4,9 +4,6 @@
 
 pub(crate) mod engines;
 
-#[cfg(feature = "vs")]
-pub use ruc::crypto::trie_root;
-
 use engines::Engine;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;

@@ -6,6 +6,8 @@
 
 mmdb is a 'std-collection-like' database.
 
+This is a simplified version of [**vsdb**](https://crates.io/crates/vsdb), retaining only the most practical and stable parts.
+
 Check [**here**](wrappers/README.md) for a detailed description.
 
 ### Crate List

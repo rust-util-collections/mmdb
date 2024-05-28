@@ -8,6 +8,8 @@
 
 mmdb is a 'std-collection-like' database.
 
+This is a simplified version of [**vsdb**](https://crates.io/crates/vsdb), retaining only the most practical and stable parts.
+
 [**To view the change log check here**](https://github.com/rust-util-collections/mmdb/blob/master/CHANGELOG.md).
 
 ### Highlights
@@ -35,9 +37,6 @@ mmdb is a 'std-collection-like' database.
 - `json_codec`, use `serde_json` as the codec
     - Better generality and compatibility
 - `compress`, enable compression in the backend database
-- `extra_types`, implement `VsMgmt` for some common extra types
-  - For example: `H256` and `H160` of the `primitive-types` crate
-- `vs`, enable all versioned APIs and the `Vs` procedural macro
 
 ### NOTE
 

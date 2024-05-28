@@ -1,12 +1,12 @@
 [package]
 name = "mmdb_core"
-version = "0.62.2"
+version = "1.0.0"
 authors = ["hui.fan@mail.ru"]
 edition = "2021"
-description = ""
+description = "A std-collection-like database"
 homepage = "https://github.com/rust-util-collections/mmdb"
 repository = "https://github.com/rust-util-collections/mmdb/tree/master/core"
-keywords = ["git", "leveldb", "rocksdb", "version", "vcs"]
+keywords = ["kv", "leveldb", "rocksdb", "std"]
 categories = ["database-implementations", "data-structures", "algorithms", "caching"]
 license = "GPL-3.0"
 
@@ -18,10 +18,6 @@ once_cell = { workspace = true }
 parking_lot = { workspace = true }
 
 threadpool = { workspace = true } # used in a background cleaner
-
-primitive-types-0-12 = {  workspace = true, optional = true }
-primitive-types-0-11 = { workspace = true, optional = true }
-primitive-types-0-10 = { workspace = true, optional = true }
 
 rocksdb = { workspace = true, optional = true }
 parity-db = { workspace = true, optional = true }
@@ -39,12 +35,6 @@ parity_backend = ["parity-db"]
 
 compress = ["rocksdb?/zstd"]
 
-extra_types = ["primitive-types-0-12", "primitive-types-0-11", "primitive-types-0-10"]
-
 # [[bench]]
 # name = "basic"
-# harness = false
-
-# [[bench]]
-# name = "versioned"
 # harness = false
