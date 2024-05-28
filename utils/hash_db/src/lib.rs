@@ -239,7 +239,7 @@ where
     T: TrieVar,
 {
     fn try_encode(&self) -> Result<RawBytes> {
-        bcs::to_bytes(&MmBackendSerde::from(self)).c(d!())
+        msgpack::to_vec(&MmBackendSerde::from(self)).c(d!())
     }
 
     fn encode(&self) -> RawBytes {
@@ -247,7 +247,7 @@ where
     }
 
     fn decode(bytes: &[u8]) -> Result<Self> {
-        bcs::from_bytes::<MmBackendSerde<T>>(bytes)
+        msgpack::from_slice::<MmBackendSerde<T>>(bytes)
             .c(d!())
             .map(Self::from)
     }

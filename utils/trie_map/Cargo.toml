@@ -18,6 +18,5 @@ default = ["rocks_backend"]
 rocks_backend = ["mmdb_trie_db/rocks_backend"]
 parity_backend = ["mmdb_trie_db/parity_backend"]
 
-bcs_codec = ["mmdb_trie_db/bcs_codec"]
 json_codec = ["mmdb_trie_db/json_codec"]
 msgpack_codec = ["mmdb_trie_db/msgpack_codec"]

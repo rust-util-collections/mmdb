@@ -18,8 +18,7 @@ serde = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 
-bcs = { workspace = true, optional = true }
-rmp-serde = { workspace = true, optional = true }
+msgpack = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 ruc = { workspace = true }
@@ -39,9 +38,8 @@ parity_backend = ["mmdb_core/parity_backend"]
 compress = ["mmdb_core/compress"]
 
 serde_ende = []
-msgpack_codec = ["serde_ende", "rmp-serde"]
+msgpack_codec = ["serde_ende", "msgpack"]
 json_codec = ["serde_ende", "serde_json"]
-bcs_codec = ["serde_ende", "bcs"]
 
 # [[bench]]
 # name = "basic"

@@ -1,20 +1,24 @@
 #![deny(warnings)]
 #![allow(clippy::new_without_default)]
 
+mod substrate_trie;
+
 pub use mmdb::{RawBytes, RawKey, RawValue, ValueEnDe};
 
 use mmdb::basic::mapx_ord_rawkey::MapxOrdRawKey;
 use mmdb_hash_db::{sp_hash_db::EMPTY_PREFIX, KeccakHasher as H, TrieBackend};
-use reference_trie_fun::{
-    ExtensionLayout as L, RefTrieDB as TrieDB, RefTrieDBBuilder as TrieDBBuilder,
-    RefTrieDBMut as TrieDBMut, RefTrieDBMutBuilder as TrieDBMutBuilder,
-};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use trie_db_fun::{
+use trie_db::{
     CError, DBValue, HashDB, Hasher as _, Trie, TrieHash, TrieItem, TrieIterator, TrieKeyItem,
     TrieMut,
 };
+
+type L = substrate_trie::LayoutV1<H>;
+type TrieDB<'a, 'cache> = trie_db::TrieDB<'a, 'cache, L>;
+type TrieDBBuilder<'a, 'cache> = trie_db::TrieDBBuilder<'a, 'cache, L>;
+type TrieDBMut<'a> = trie_db::TrieDBMut<'a, L>;
+type TrieDBMutBuilder<'a> = trie_db::TrieDBMutBuilder<'a, L>;
 
 pub type TrieRoot = TrieHash<L>;
 

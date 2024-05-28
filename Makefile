@@ -8,8 +8,7 @@ lint:
 	cargo check --workspace --benches
 
 lintall: lint
-	cargo clippy --workspace --no-default-features --features "parity_backend,msgpack_codec"
-	cargo clippy --workspace --no-default-features --features "parity_backend,compress,bcs_codec"
+	cargo clippy --workspace --no-default-features --features "parity_backend,compress,msgpack_codec"
 	cargo check --workspace --tests --no-default-features --features "parity_backend,json_codec"
 
 lintmusl:
@@ -39,10 +38,10 @@ testmusl:
 
 bench:
 	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)
-	cargo bench --workspace --no-default-features --features "parity_backend,bcs_codec"
+	cargo bench --workspace --no-default-features --features "parity_backend,msgpack_codec"
 	du -sh ~/.mmdb
 	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)
-	cargo bench --workspace --no-default-features --features "parity_backend,compress,bcs_codec"
+	cargo bench --workspace --no-default-features --features "parity_backend,compress,msgpack_codec"
 	du -sh ~/.mmdb
 	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)
 	cargo bench --workspace
@@ -54,7 +53,7 @@ bench:
 benchmusl:
 	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)
 	cargo bench --workspace --target x86_64-unknown-linux-musl \
-		--no-default-features --features "parity_backend,bcs_codec"
+		--no-default-features --features "parity_backend,msgpack_codec"
 	du -sh ~/.mmdb
 
 fmt:

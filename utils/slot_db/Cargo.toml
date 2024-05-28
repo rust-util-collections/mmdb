@@ -26,7 +26,6 @@ parity_backend = ["mmdb/parity_backend"]
 
 compress = ["mmdb/compress"]
 
-bcs_codec = ["mmdb/bcs_codec"]
 json_codec = ["mmdb/json_codec"]
 msgpack_codec = ["mmdb/msgpack_codec"]
 
