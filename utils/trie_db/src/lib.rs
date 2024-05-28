@@ -320,7 +320,7 @@ impl<'a> MptRo<'a> {
         pnk!(self.trie.key_iter())
     }
 
-    pub fn root(&mut self) -> TrieRoot {
+    pub fn root(&self) -> TrieRoot {
         *self.trie.root()
     }
 }
@@ -353,7 +353,7 @@ mod test {
     use std::collections::BTreeMap;
 
     #[test]
-    fn trie_db_encode_decode() {
+    fn trie_db_restore() {
         let mut hdr = pnk!(MptOnce::create());
 
         pnk!(hdr.insert(b"key", b"value"));
@@ -365,8 +365,20 @@ mod test {
         let hdr_encoded = hdr.encode();
         drop(hdr);
 
-        let hdr = pnk!(MptOnce::decode(&hdr_encoded));
+        let mut hdr = pnk!(MptOnce::decode(&hdr_encoded));
         assert_eq!(b"value", pnk!(hdr.get(b"key")).unwrap().as_slice());
+        assert_eq!(root, hdr.root());
+
+        pnk!(hdr.insert(b"key1", b"value1"));
+        assert_eq!(b"value1", pnk!(hdr.get(b"key1")).unwrap().as_slice());
+
+        let old_hdr_ro = pnk!(hdr.ro_handle(root));
+        assert_eq!(root, old_hdr_ro.root());
+        assert_eq!(b"value", pnk!(old_hdr_ro.get(b"key")).unwrap().as_slice());
+        assert!(pnk!(old_hdr_ro.get(b"key1")).is_none());
+
+        let new_root = hdr.commit();
+        assert_eq!(new_root, hdr.root());
     }
 
     #[test]
