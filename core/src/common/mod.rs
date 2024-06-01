@@ -90,8 +90,13 @@ pub static MMDB: Lazy<MmDB<engines::RocksDB>> = Lazy::new(|| pnk!(MmDB::new()));
 pub static MMDB: Lazy<MmDB<engines::ParityDB>> = Lazy::new(|| pnk!(MmDB::new()));
 
 /// Clean orphan instances in background.
-pub static TRASH_CLEANER: Lazy<Mutex<ThreadPool>> =
-    Lazy::new(|| Mutex::new(ThreadPool::new(1)));
+pub static TRASH_CLEANER: Lazy<Mutex<ThreadPool>> = Lazy::new(|| {
+    let pool = threadpool::Builder::new()
+        .num_threads(1)
+        .thread_stack_size(512 * MB as usize) // use large stack size
+        .build();
+    Mutex::new(pool)
+});
 
 /////////////////////////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////////////////////////

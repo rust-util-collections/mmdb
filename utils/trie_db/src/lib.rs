@@ -47,9 +47,9 @@ impl MptStore {
         self.remove_backend(backend_key);
     }
 
-    pub fn trie_create(&self, backend_key: &[u8], reset: bool) -> Result<MptOnce> {
+    pub fn trie_create(&self, backend_key: &[u8], force: bool) -> Result<MptOnce> {
         let backend = MptStore::new_backend();
-        self.put_backend(backend_key, &backend, reset).c(d!())?;
+        self.put_backend(backend_key, &backend, force).c(d!())?;
 
         MptOnce::create_with_backend(backend).c(d!())
     }
@@ -64,10 +64,10 @@ impl MptStore {
         self.meta.get(backend_key)
     }
 
-    fn put_backend(&self, backend_key: &[u8], backend: &TrieBackend, reset: bool) -> Result<()> {
+    fn put_backend(&self, backend_key: &[u8], backend: &TrieBackend, force: bool) -> Result<()> {
         let mut hdr = unsafe { self.meta.shadow() };
 
-        if reset {
+        if force {
             hdr.remove(backend_key);
         } else if hdr.contains_key(backend_key) {
             return Err(eg!("backend key already exists"));
