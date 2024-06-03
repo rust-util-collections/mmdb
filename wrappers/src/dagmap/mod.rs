@@ -2,7 +2,7 @@ use crate::{MapxOrdRawKey, MapxRaw, Orphan};
 use mmdb_core::common::{RawBytes, TRASH_CLEANER};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub type ChildId = [u8];
 pub type DagHead = DagMap;
@@ -10,8 +10,14 @@ pub type DagHead = DagMap;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DagMap {
     id: RawBytes,
+
     data: MapxRaw,
+
+    #[serde(skip)]
+    cache: HashMap<RawBytes, RawBytes>,
+
     parent: Option<Orphan<DagMap>>,
+
     // child id --> child instance
     children: MapxOrdRawKey<DagMap>,
 }
@@ -43,10 +49,18 @@ impl DagMap {
     }
 
     pub fn get(&self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
+        let key = key.as_ref();
+
         let mut hdr = self;
         let mut hdr_owned;
+
         loop {
-            if let Some(v) = hdr.data.get(&key) {
+            if let Some(v) = hdr
+                .cache
+                .get(key)
+                .map(|v| v.to_owned())
+                .or_else(|| hdr.data.get(key))
+            {
                 return alt!(v.is_empty(), None, Some(v));
             }
             if let Some(p) = hdr.parent.as_ref() {
@@ -64,25 +78,50 @@ impl DagMap {
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Option<RawBytes> {
-        self.data.insert(key, value)
+        if let Some(v) = self
+            .cache
+            .insert(key.as_ref().to_owned(), value.as_ref().to_owned())
+        {
+            Some(v)
+        } else {
+            self.data.get(key)
+        }
     }
 
     #[inline(always)]
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
-        self.data.remove(key)
+        if let Some(v) = self.cache.insert(key.as_ref().to_owned(), vec![]) {
+            Some(v)
+        } else {
+            self.data.get(key)
+        }
     }
 
     #[inline(always)]
-    pub fn prune(self) -> DagHead {
-        self.prune_mainline()
+    pub fn commit(&mut self) {
+        for (k, v) in self.cache.drain() {
+            self.data.insert(k, v);
+        }
     }
 
-    // Return the new head of mainline
-    fn prune_mainline(mut self) -> DagHead {
+    /// Return the new head of mainline,
+    /// all instances should have been committed!
+    #[inline(always)]
+    pub fn prune(self) -> Result<DagHead> {
+        self.prune_mainline().c(d!())
+    }
+
+    // Return the new head of mainline,
+    // all instances should have been committed!
+    fn prune_mainline(mut self) -> Result<DagHead> {
+        if !self.cache.is_empty() {
+            return Err(eg!("cache is dirty"));
+        }
+
         let p = if let Some(p) = self.parent.as_ref() {
             p
         } else {
-            return self;
+            return Ok(self);
         };
 
         let mut linebuf = vec![p.get_value()];
@@ -92,6 +131,7 @@ impl DagMap {
 
         let mid = linebuf.len() - 1;
         let (others, genesis) = linebuf.split_at_mut(mid);
+
         for i in others.iter().rev() {
             for (k, v) in i.data.iter() {
                 genesis[0].data.insert(k, v);
@@ -102,28 +142,46 @@ impl DagMap {
             genesis[0].data.insert(k, v);
         }
 
-        let mut keep_only = vec![];
+        let mut exclude_targets = vec![];
         for (id, child) in self.children.iter() {
             genesis[0].children.insert(&id, &child);
-            keep_only.push(id);
+            exclude_targets.push(id);
         }
 
         // disconnect from nodes of the mainline
         self.children.clear();
 
-        genesis[0].prune_children(&keep_only);
+        genesis[0].prune_children_exclude(&exclude_targets);
 
-        linebuf.pop().unwrap()
+        Ok(linebuf.pop().unwrap())
     }
 
-    /// Drop children that are not in the `keep_only` list
-    pub fn prune_children(&mut self, keep_only: &[impl AsRef<ChildId>]) {
-        let keep_only = keep_only.iter().map(|i| i.as_ref()).collect::<HashSet<_>>();
-        let dropped_children = self
-            .children
-            .iter()
-            .filter(|(id, _)| !keep_only.contains(&id.as_slice()))
-            .collect::<Vec<_>>();
+    /// Drop children that are in the `targets` list
+    #[inline(always)]
+    pub fn prune_children_include(&mut self, include_targets: &[impl AsRef<ChildId>]) {
+        self.prune_children(include_targets, false);
+    }
+
+    /// Drop children that are not in the `exclude_targets` list
+    #[inline(always)]
+    pub fn prune_children_exclude(&mut self, exclude_targets: &[impl AsRef<ChildId>]) {
+        self.prune_children(exclude_targets, true);
+    }
+
+    fn prune_children(&mut self, targets: &[impl AsRef<ChildId>], exclude_mode: bool) {
+        let targets = targets.iter().map(|i| i.as_ref()).collect::<HashSet<_>>();
+
+        let dropped_children = if exclude_mode {
+            self.children
+                .iter()
+                .filter(|(id, _)| !targets.contains(&id.as_slice()))
+                .collect::<Vec<_>>()
+        } else {
+            self.children
+                .iter()
+                .filter(|(id, _)| targets.contains(&id.as_slice()))
+                .collect::<Vec<_>>()
+        };
 
         for (id, child) in dropped_children.iter() {
             debug_assert_eq!(id, &child.id);
@@ -133,6 +191,7 @@ impl DagMap {
         TRASH_CLEANER.lock().execute(|| {
             for (_, mut child) in dropped_children.into_iter() {
                 child.data.clear();
+                child.cache.clear();
                 for (_, mut c) in child.children.iter_mut() {
                     c.drop_children();
                 }
@@ -144,6 +203,7 @@ impl DagMap {
         for (id, mut child) in self.children.iter_mut() {
             debug_assert_eq!(id, child.id);
             child.data.clear();
+            child.cache.clear();
             for (_, mut c) in child.children.iter_mut() {
                 c.drop_children();
             }
@@ -162,12 +222,14 @@ mod test {
         i0.insert("k0", "v0");
         assert_eq!(i0.get("k0").unwrap().as_slice(), "v0".as_bytes());
         assert!(i0.get("k1").is_none());
+        i0.commit();
         let mut i0 = Orphan::new(i0);
 
         let mut i1 = DagMap::new(vec![1], Some(&mut i0)).unwrap();
         i1.insert("k1", "v1");
         assert_eq!(i1.get("k1").unwrap().as_slice(), "v1".as_bytes());
         assert_eq!(i1.get("k0").unwrap().as_slice(), "v0".as_bytes());
+        i1.commit();
         let mut i1 = Orphan::new(i1);
 
         // Child ID exist
@@ -207,8 +269,9 @@ mod test {
             i0.get_value().get("k0").unwrap().as_slice(),
             "v0".as_bytes()
         );
+        i2.commit();
 
-        let mut head = i2.prune();
+        let mut head = pnk!(i2.prune());
 
         sleep_ms!(1000); // give some time to the async cleaner
 
@@ -245,10 +308,11 @@ mod test {
         // prune with deep stack
         for i in 10u8..=255 {
             head.insert(i.to_be_bytes(), i.to_be_bytes());
+            head.commit();
             head = DagMap::new(vec![i], Some(&mut Orphan::new(head))).unwrap();
         }
 
-        let head = head.prune();
+        let head = pnk!(head.prune());
         assert!(head.parent.is_none());
         assert!(head.children.is_empty());
 
