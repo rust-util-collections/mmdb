@@ -208,13 +208,13 @@ mod test {
             "v0".as_bytes()
         );
 
-        let new_head = i2.prune();
+        let mut head = i2.prune();
 
         sleep_ms!(1000); // give some time to the async cleaner
 
-        assert_eq!(new_head.get("k2").unwrap().as_slice(), "v2x".as_bytes());
-        assert_eq!(new_head.get("k1").unwrap().as_slice(), "v1x".as_bytes());
-        assert_eq!(new_head.get("k0").unwrap().as_slice(), "v0x".as_bytes());
+        assert_eq!(head.get("k2").unwrap().as_slice(), "v2x".as_bytes());
+        assert_eq!(head.get("k1").unwrap().as_slice(), "v1x".as_bytes());
+        assert_eq!(head.get("k0").unwrap().as_slice(), "v0x".as_bytes());
 
         assert_eq!(
             i1.get_value().get("k2").unwrap().as_slice(),
@@ -241,5 +241,22 @@ mod test {
             i0.get_value().get("k0").unwrap().as_slice(),
             "v0x".as_bytes()
         );
+
+        // prune with deep stack
+        for i in 10u8..=255 {
+            head.insert(i.to_be_bytes(), i.to_be_bytes());
+            head = DagMap::new(vec![i], Some(&mut Orphan::new(head))).unwrap();
+        }
+
+        let head = head.prune();
+        assert!(head.parent.is_none());
+        assert!(head.children.is_empty());
+
+        for i in 10u8..=255 {
+            assert_eq!(
+                head.get(i.to_be_bytes()).unwrap().as_slice(),
+                i.to_be_bytes()
+            );
+        }
     }
 }
