@@ -72,6 +72,26 @@ impl DagMap {
         }
     }
 
+    /// Get data from the backend DB directly
+    pub fn get_direct(&self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
+        let key = key.as_ref();
+
+        let mut hdr = self;
+        let mut hdr_owned;
+
+        loop {
+            if let Some(v) = hdr.data.get(key) {
+                return alt!(v.is_empty(), None, Some(v));
+            }
+            if let Some(p) = hdr.parent.as_ref() {
+                hdr_owned = p.get_value();
+                hdr = &hdr_owned;
+            } else {
+                return None;
+            }
+        }
+    }
+
     #[inline(always)]
     pub fn insert(
         &mut self,
@@ -84,16 +104,43 @@ impl DagMap {
         {
             Some(v)
         } else {
-            self.data.get(key)
+            self.get_direct(key)
         }
     }
 
     #[inline(always)]
+    pub fn insert_direct(
+        &mut self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+    ) -> Option<RawBytes> {
+        let k = key.as_ref();
+        self.cache.remove(k);
+        self.data.insert(key, value)
+    }
+
+    #[inline(always)]
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
-        if let Some(v) = self.cache.insert(key.as_ref().to_owned(), vec![]) {
+        let k = key.as_ref();
+
+        if let Some(v) = self.get(k) {
+            self.cache.insert(k.to_owned(), vec![]);
             Some(v)
         } else {
-            self.data.get(key)
+            None // did not exist already, insert nothing
+        }
+    }
+
+    #[inline(always)]
+    pub fn remove_direct(&mut self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
+        let k = key.as_ref();
+
+        if let Some(v) = self.get(k) {
+            self.cache.remove(k);
+            self.data.insert(k, []);
+            Some(v)
+        } else {
+            None // did not exist already, insert nothing
         }
     }
 
@@ -226,10 +273,10 @@ mod test {
         let mut i0 = Orphan::new(i0);
 
         let mut i1 = DagMap::new(vec![1], Some(&mut i0)).unwrap();
-        i1.insert("k1", "v1");
+        i1.insert_direct("k1", "v1");
         assert_eq!(i1.get("k1").unwrap().as_slice(), "v1".as_bytes());
         assert_eq!(i1.get("k0").unwrap().as_slice(), "v0".as_bytes());
-        i1.commit();
+        // i1.commit(); // need NOT `commit` when using `insert_direct`
         let mut i1 = Orphan::new(i1);
 
         // Child ID exist
@@ -312,7 +359,7 @@ mod test {
             head = DagMap::new(vec![i], Some(&mut Orphan::new(head))).unwrap();
         }
 
-        let head = pnk!(head.prune());
+        let mut head = pnk!(head.prune());
         assert!(head.parent.is_none());
         assert!(head.children.is_empty());
 
@@ -321,6 +368,11 @@ mod test {
                 head.get(i.to_be_bytes()).unwrap().as_slice(),
                 i.to_be_bytes()
             );
+        }
+
+        for i in 0u8..=255 {
+            head.remove(i.to_be_bytes());
+            assert!(head.get(i.to_be_bytes()).is_none());
         }
     }
 }
