@@ -108,6 +108,7 @@ impl DagMap {
         }
     }
 
+    /// Insert data bypassing the cache layer
     #[inline(always)]
     pub fn insert_direct(
         &mut self,
@@ -131,6 +132,7 @@ impl DagMap {
         }
     }
 
+    /// Remove data bypassing the cache layer
     #[inline(always)]
     pub fn remove_direct(&mut self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
         let k = key.as_ref();
@@ -144,6 +146,7 @@ impl DagMap {
         }
     }
 
+    /// Flush all cached data into DB
     #[inline(always)]
     pub fn commit(&mut self) {
         for (k, v) in self.cache.drain() {
