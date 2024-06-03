@@ -72,8 +72,8 @@ impl DagMap {
         }
     }
 
-    /// Get data from the backend DB directly
-    pub fn get_direct(&self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
+    // Get data from the backend DB directly
+    fn get_from_db(&self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
         let key = key.as_ref();
 
         let mut hdr = self;
@@ -104,7 +104,7 @@ impl DagMap {
         {
             Some(v)
         } else {
-            self.get_direct(key)
+            self.get_from_db(key)
         }
     }
 
