@@ -4,8 +4,8 @@ use ruc::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-type ChildId = [u8];
-type DagHead = DagMap;
+pub type ChildId = [u8];
+pub type DagHead = DagMap;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DagMap {
@@ -157,7 +157,7 @@ mod test {
     use super::*;
 
     #[test]
-    fn basic() {
+    fn dagmap_functions() {
         let mut i0 = DagMap::new(vec![0], None).unwrap();
         i0.insert("k0", "v0");
         assert_eq!(i0.get("k0").unwrap().as_slice(), "v0".as_bytes());
