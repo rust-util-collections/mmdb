@@ -13,7 +13,7 @@ pub use basic::{
     mapx_ord_rawvalue::MapxOrdRawValue, orphan::Orphan, vecx::Vecx, vecx_raw::VecxRaw,
 };
 
-pub use dagmap::{raw::DagMapRaw, rawkey::DagMapRawKey};
+pub use dagmap::{raw::DagMapRaw, rawkey::DagMapRawKey, DagMapId};
 
 pub use common::{
     ende::{KeyDe, KeyEn, KeyEnDe, KeyEnDeOrdered, ValueDe, ValueEn, ValueEnDe},

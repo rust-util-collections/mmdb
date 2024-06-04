@@ -1,67 +1,65 @@
 #[cfg(test)]
 mod test;
 
-use crate::{MapxOrdRawKey, MapxRaw, Orphan};
-use mmdb_core::common::{RawBytes, TRASH_CLEANER};
+use crate::{DagMapId, MapxOrdRawKey, MapxRaw, Orphan};
+use mmdb_core::{
+    basic::mapx_raw,
+    common::{RawBytes, TRASH_CLEANER},
+};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::HashSet,
+    ops::{Deref, DerefMut},
+};
 
-pub type ChildId = [u8];
-pub type DagHead = DagMapRaw;
+type DagHead = DagMapRaw;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DagMapRaw {
-    id: RawBytes,
-
     data: MapxRaw,
 
-    #[serde(skip)]
-    cache: HashMap<RawBytes, RawBytes>,
-
-    parent: Option<Orphan<DagMapRaw>>,
+    parent: Orphan<Option<DagMapRaw>>,
 
     // child id --> child instance
     children: MapxOrdRawKey<DagMapRaw>,
 }
 
 impl DagMapRaw {
-    pub fn new(id: RawBytes, parent: Option<&mut Orphan<Self>>) -> Result<Self> {
-        let pshadow = parent.as_ref().map(|p| unsafe { p.shadow() });
+    pub fn new(id: &DagMapId, parent: &mut Orphan<Option<Self>>) -> Result<Self> {
+        let r = Self {
+            parent: unsafe { parent.shadow() },
+            ..Default::default()
+        };
 
-        if let Some(p) = parent {
-            let mut hdr = p.get_mut();
-            if hdr.children.contains_key(&id) {
-                Err(eg!("Child ID exist!"))
-            } else {
-                let i = Self {
-                    id,
-                    parent: pshadow,
-                    ..Default::default()
-                };
-                hdr.children.insert(&i.id, &i);
-                Ok(i)
+        if let Some(p) = parent.get_mut().as_mut() {
+            if p.children.contains_key(id) {
+                return Err(eg!("Child ID exist!"));
             }
-        } else {
-            Ok(Self {
-                id,
-                parent: None,
-                ..Default::default()
-            })
+            p.children.insert(id, &r);
+        }
+
+        Ok(r)
+    }
+
+    /// # Safety
+    ///
+    /// This API breaks the semantic safety guarantees,
+    /// but it is safe to use in a race-free environment.
+    #[inline(always)]
+    pub unsafe fn shadow(&self) -> Self {
+        Self {
+            data: self.data.shadow(),
+            parent: self.parent.shadow(),
+            children: self.children.shadow(),
         }
     }
 
-    ///
-    /// # Safety
-    ///
-    pub unsafe fn shadow(&self) -> Self {
-        Self {
-            id: self.id.clone(),
-            data: self.data.shadow(),
-            cache: HashMap::new(),
-            parent: self.parent.as_ref().map(|p| p.shadow()),
-            children: self.children.shadow(),
-        }
+    #[inline(always)]
+    pub fn is_dead(&self) -> bool {
+        self.data.is_empty()
+            && self.parent.get_value().is_none()
+            && self.children.is_empty()
     }
 
     pub fn get(&self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
@@ -71,16 +69,11 @@ impl DagMapRaw {
         let mut hdr_owned;
 
         loop {
-            if let Some(v) = hdr
-                .cache
-                .get(key)
-                .map(|v| v.to_owned())
-                .or_else(|| hdr.data.get(key))
-            {
+            if let Some(v) = hdr.data.get(key) {
                 return alt!(v.is_empty(), None, Some(v));
             }
-            if let Some(p) = hdr.parent.as_ref() {
-                hdr_owned = p.get_value();
+            if let Some(p) = hdr.parent.get_value() {
+                hdr_owned = p;
                 hdr = &hdr_owned;
             } else {
                 return None;
@@ -88,24 +81,12 @@ impl DagMapRaw {
         }
     }
 
-    // Get data from the backend DB directly
-    fn get_from_db(&self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
-        let key = key.as_ref();
-
-        let mut hdr = self;
-        let mut hdr_owned;
-
-        loop {
-            if let Some(v) = hdr.data.get(key) {
-                return alt!(v.is_empty(), None, Some(v));
-            }
-            if let Some(p) = hdr.parent.as_ref() {
-                hdr_owned = p.get_value();
-                hdr = &hdr_owned;
-            } else {
-                return None;
-            }
-        }
+    #[inline(always)]
+    pub fn get_mut(&mut self, key: impl AsRef<[u8]>) -> Option<ValueMut<'_>> {
+        self.data.get_mut(key.as_ref()).map(|inner| ValueMut {
+            value: inner.clone(),
+            inner,
+        })
     }
 
     #[inline(always)]
@@ -114,60 +95,12 @@ impl DagMapRaw {
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Option<RawBytes> {
-        if let Some(v) = self
-            .cache
-            .insert(key.as_ref().to_owned(), value.as_ref().to_owned())
-        {
-            Some(v)
-        } else {
-            self.get_from_db(key)
-        }
-    }
-
-    /// Insert data bypassing the cache layer
-    #[inline(always)]
-    pub fn insert_direct(
-        &mut self,
-        key: impl AsRef<[u8]>,
-        value: impl AsRef<[u8]>,
-    ) -> Option<RawBytes> {
-        let k = key.as_ref();
-        self.cache.remove(k);
-        self.data.insert(key, value)
+        self.data.insert(key.as_ref(), value)
     }
 
     #[inline(always)]
     pub fn remove(&mut self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
-        let k = key.as_ref();
-
-        if let Some(v) = self.get(k) {
-            self.cache.insert(k.to_owned(), vec![]);
-            Some(v)
-        } else {
-            None // did not exist already, insert nothing
-        }
-    }
-
-    /// Remove data bypassing the cache layer
-    #[inline(always)]
-    pub fn remove_direct(&mut self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
-        let k = key.as_ref();
-
-        if let Some(v) = self.get(k) {
-            self.cache.remove(k);
-            self.data.insert(k, []);
-            Some(v)
-        } else {
-            None // did not exist already, insert nothing
-        }
-    }
-
-    /// Flush all cached data into DB
-    #[inline(always)]
-    pub fn commit(&mut self) {
-        for (k, v) in self.cache.drain() {
-            self.data.insert(k, v);
-        }
+        self.data.insert(key.as_ref(), [])
     }
 
     /// Return the new head of mainline,
@@ -177,22 +110,17 @@ impl DagMapRaw {
         self.prune_mainline().c(d!())
     }
 
-    // Return the new head of mainline,
-    // all instances should have been committed!
+    // Return the new head of mainline
     fn prune_mainline(mut self) -> Result<DagHead> {
-        if !self.cache.is_empty() {
-            return Err(eg!("cache is dirty"));
-        }
-
-        let p = if let Some(p) = self.parent.as_ref() {
+        let p = if let Some(p) = self.parent.get_value() {
             p
         } else {
             return Ok(self);
         };
 
-        let mut linebuf = vec![p.get_value()];
-        while let Some(p) = linebuf.last().unwrap().parent.as_ref() {
-            linebuf.push(p.get_value());
+        let mut linebuf = vec![p];
+        while let Some(p) = linebuf.last().unwrap().parent.get_value() {
+            linebuf.push(p);
         }
 
         let mid = linebuf.len() - 1;
@@ -214,27 +142,32 @@ impl DagMapRaw {
             exclude_targets.push(id);
         }
 
-        // disconnect from nodes of the mainline
+        // disconnect from the mainline
         self.children.clear();
+
+        // clean up
+        *self.parent.get_mut() = None;
+        self.data.clear();
 
         genesis[0].prune_children_exclude(&exclude_targets);
 
+        // genesis[0]
         Ok(linebuf.pop().unwrap())
     }
 
     /// Drop children that are in the `targets` list
     #[inline(always)]
-    pub fn prune_children_include(&mut self, include_targets: &[impl AsRef<ChildId>]) {
+    pub fn prune_children_include(&mut self, include_targets: &[impl AsRef<DagMapId>]) {
         self.prune_children(include_targets, false);
     }
 
     /// Drop children that are not in the `exclude_targets` list
     #[inline(always)]
-    pub fn prune_children_exclude(&mut self, exclude_targets: &[impl AsRef<ChildId>]) {
+    pub fn prune_children_exclude(&mut self, exclude_targets: &[impl AsRef<DagMapId>]) {
         self.prune_children(exclude_targets, true);
     }
 
-    fn prune_children(&mut self, targets: &[impl AsRef<ChildId>], exclude_mode: bool) {
+    fn prune_children(&mut self, targets: &[impl AsRef<DagMapId>], exclude_mode: bool) {
         let targets = targets.iter().map(|i| i.as_ref()).collect::<HashSet<_>>();
 
         let dropped_children = if exclude_mode {
@@ -249,31 +182,58 @@ impl DagMapRaw {
                 .collect::<Vec<_>>()
         };
 
-        for (id, child) in dropped_children.iter() {
-            debug_assert_eq!(id, &child.id);
+        for (id, _) in dropped_children.iter() {
             self.children.remove(id);
         }
 
         TRASH_CLEANER.lock().execute(|| {
             for (_, mut child) in dropped_children.into_iter() {
                 child.data.clear();
-                child.cache.clear();
+                *child.parent.get_mut() = None;
                 for (_, mut c) in child.children.iter_mut() {
                     c.drop_children();
                 }
+                child.children.clear();
             }
         });
     }
 
     fn drop_children(&mut self) {
-        for (id, mut child) in self.children.iter_mut() {
-            debug_assert_eq!(id, child.id);
+        for (_, mut child) in self.children.iter_mut() {
             child.data.clear();
-            child.cache.clear();
+            *child.parent.get_mut() = None;
             for (_, mut c) in child.children.iter_mut() {
                 c.drop_children();
             }
         }
         self.children.clear();
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////
+
+#[derive(Debug)]
+pub struct ValueMut<'a> {
+    value: RawBytes,
+    inner: mapx_raw::ValueMut<'a>,
+}
+
+impl<'a> Drop for ValueMut<'a> {
+    fn drop(&mut self) {
+        self.inner.clone_from(&self.value);
+    }
+}
+
+impl<'a> Deref for ValueMut<'a> {
+    type Target = RawBytes;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<'a> DerefMut for ValueMut<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
     }
 }

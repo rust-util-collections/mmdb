@@ -18,9 +18,9 @@ lintmusl:
 
 test:
 	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)
-	cargo test --workspace --tests -- --test-threads=1
-	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)
 	cargo test --workspace --release --tests -- --test-threads=1
+	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)
+	cargo test --workspace --tests -- --test-threads=1
 
 testall: test
 	- rm -rf ~/.mmdb /tmp/.mmdb /tmp/mmdb_testing $(MMDB_BASE_DIR)

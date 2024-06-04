@@ -2,7 +2,7 @@ pub use hash_db as sp_hash_db;
 pub use mmdb;
 
 use hash_db::{AsHashDB, HashDB, HashDBRef, Hasher as KeyHasher, Prefix};
-use mmdb::{basic::mapx_ord_rawkey::MapxOrdRawKey as Map, RawBytes, ValueEnDe};
+use mmdb::{DagMapId, DagMapRaw, DagMapRawKey as Map, Orphan, RawBytes, ValueEnDe};
 use ruc::*;
 use serde::{Deserialize, Serialize};
 
@@ -10,9 +10,9 @@ pub use keccak_hasher::KeccakHasher;
 
 pub type TrieBackend = MmBackend<KeccakHasher, Vec<u8>>;
 
-pub trait TrieVar: AsRef<[u8]> + for<'a> From<&'a [u8]> {}
+pub trait TrieVar: Clone + AsRef<[u8]> + for<'a> From<&'a [u8]> {}
 
-impl<T> TrieVar for T where T: AsRef<[u8]> + for<'a> From<&'a [u8]> {}
+impl<T> TrieVar for T where T: Clone + AsRef<[u8]> + for<'a> From<&'a [u8]> {}
 
 // NOTE: make it `!Clone`
 pub struct MmBackend<H, T>
@@ -31,27 +31,44 @@ where
     T: TrieVar,
 {
     /// Create a new `MmBackend` from the default null key/data
-    pub fn new() -> Self {
-        MmBackend {
-            data: Map::new(),
+    pub fn new(id: &DagMapId, raw_parent: &mut Orphan<Option<DagMapRaw>>) -> Result<Self> {
+        Ok(MmBackend {
+            data: Map::new(id, raw_parent).c(d!())?,
             hashed_null_key: Self::hashed_null_node(),
             null_node_data: [0u8].as_slice().into(),
-        }
+        })
     }
 
     // The initial root node
     fn hashed_null_node() -> H::Out {
         H::hash(&[0])
     }
-}
 
-impl<H, T> Default for MmBackend<H, T>
-where
-    H: KeyHasher,
-    T: TrieVar,
-{
-    fn default() -> Self {
-        Self::new()
+    /// # Safety
+    ///
+    /// This API breaks the semantic safety guarantees,
+    /// but it is safe to use in a race-free environment.
+    #[inline(always)]
+    pub unsafe fn shadow(&self) -> Self {
+        Self {
+            data: self.data.shadow(),
+            hashed_null_key: self.hashed_null_key,
+            null_node_data: self.null_node_data.clone(),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// This API breaks the semantic safety guarantees,
+    /// but it is safe to use in a race-free environment.
+    #[inline(always)]
+    pub unsafe fn shadow_backend(&self) -> Map<Value<T>> {
+        self.shadow().data
+    }
+
+    #[inline(always)]
+    pub fn is_dead(&self) -> bool {
+        self.data.is_dead()
     }
 }
 
@@ -161,7 +178,7 @@ fn prefixed_key<H: KeyHasher>(key: &H::Out, prefix: Prefix) -> Vec<u8> {
     prefixed_key
 }
 
-struct Value<T> {
+pub struct Value<T> {
     v: T,
     rc: i32,
 }
