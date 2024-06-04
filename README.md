@@ -14,7 +14,7 @@ Check [**here**](wrappers/README.md) for a detailed description.
 
 |Name|Version|Doc|Path|Description|
 |:-|:-|:-|:-|:-|
-|[**mmdb**](wrappers)|[![](https://img.shields.io/crates/v/mmdb.svg)](https://crates.io/crates/mmdb)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb)|`./wrappers`|High-level APIs|
-|[**mmdb_core**](core)|[![](https://img.shields.io/crates/v/mmdb_core.svg)](https://crates.io/crates/mmdb_core)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb_core)|`./core`|Low-level implementations|
-|[**mmdb_slot_db**](utils/slot_db)|[![](https://img.shields.io/crates/v/mmdb_slot_db.svg)](https://crates.io/crates/mmdb_slot_db)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb_slot_db)|`./utils/slot_db`|A skip-list like timestamp DB|
-|[**mmdb_trie_map**](utils/trie_map)|[![](https://img.shields.io/crates/v/mmdb_trie_map.svg)](https://crates.io/crates/mmdb_trie_map)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb_trie_map)|`./utils/trie_map`|trie based structures with </br> limited version capabilities|
+|[**mmdb**](wrappers)|[![](https://img.shields.io/crates/v/mmdb.svg)](https://crates.io/crates/mmdb)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb)|`wrappers`|High-level APIs|
+|[**mmdb_core**](core)|[![](https://img.shields.io/crates/v/mmdb_core.svg)](https://crates.io/crates/mmdb_core)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb_core)|`core`|Low-level implementations|
+|[**mmdb_slot_db**](utils/slot_db)|[![](https://img.shields.io/crates/v/mmdb_slot_db.svg)](https://crates.io/crates/mmdb_slot_db)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb_slot_db)|`utils/slot_db`|A skip-list like timestamp DB|
+|[**mmdb_trie_db**](utils/trie_db)|[![](https://img.shields.io/crates/v/mmdb_trie_db.svg)](https://crates.io/crates/mmdb_trie_db)|[![](https://img.shields.io/badge/api-rustdoc-blue.svg)](https://docs.rs/mmdb_trie_db)|`utils/trie_db`|MPT(trie) implementations|

@@ -6,9 +6,9 @@ mod substrate_trie;
 #[cfg(test)]
 mod test;
 
-pub use mmdb::{DagMapId, DagMapRaw, Orphan, RawBytes, RawKey, RawValue, ValueEnDe};
+pub use mmdb::{RawBytes, RawKey, RawValue, ValueEnDe};
 
-use mmdb::basic::mapx_ord_rawkey::MapxOrdRawKey;
+use mmdb::{DagMapId, DagMapRaw, MapxOrdRawKey, Orphan};
 use mmdb_hash_db::{sp_hash_db::EMPTY_PREFIX, KeccakHasher as H, TrieBackend};
 use ruc::*;
 use serde::{Deserialize, Serialize};
