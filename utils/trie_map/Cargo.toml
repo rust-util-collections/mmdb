@@ -13,7 +13,7 @@ repository = "https://github.com/rust-util-collections/mmdb"
 mmdb_trie_db = { workspace = true }
 
 [features]
-default = ["rocks_backend"]
+default = ["rocks_backend","msgpack_codec"]
 
 rocks_backend = ["mmdb_trie_db/rocks_backend"]
 parity_backend = ["mmdb_trie_db/parity_backend"]

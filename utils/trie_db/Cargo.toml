@@ -22,7 +22,7 @@ mmdb = { workspace = true }
 mmdb_hash_db = { workspace = true }
 
 [features]
-default = ["rocks_backend"]
+default = ["rocks_backend","msgpack_codec"]
 
 rocks_backend = ["mmdb/rocks_backend"]
 parity_backend = ["mmdb/parity_backend"]
