@@ -142,12 +142,10 @@ impl DagMapRaw {
             exclude_targets.push(id);
         }
 
-        // disconnect from the mainline
-        self.children.clear();
-
         // clean up
         *self.parent.get_mut() = None;
         self.data.clear();
+        self.children.clear(); // disconnect from the mainline
 
         genesis[0].prune_children_exclude(&exclude_targets);
 
@@ -188,8 +186,8 @@ impl DagMapRaw {
 
         TRASH_CLEANER.lock().execute(|| {
             for (_, mut child) in dropped_children.into_iter() {
-                child.data.clear();
                 *child.parent.get_mut() = None;
+                child.data.clear();
                 for (_, mut c) in child.children.iter_mut() {
                     c.drop_children();
                 }
@@ -199,14 +197,23 @@ impl DagMapRaw {
     }
 
     fn drop_children(&mut self) {
-        for (_, mut child) in self.children.iter_mut() {
-            child.data.clear();
+        let mut children = self.children.iter().map(|(_, c)| c).collect::<Vec<_>>();
+        self.children.clear();
+
+        for child in children.iter_mut() {
             *child.parent.get_mut() = None;
+            child.data.clear();
             for (_, mut c) in child.children.iter_mut() {
                 c.drop_children();
             }
         }
-        self.children.clear();
+    }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        *self.parent.get_mut() = None;
+        self.data.clear();
+        self.drop_children();
     }
 }
 

@@ -104,8 +104,10 @@ impl MptStore {
     }
 
     #[inline(always)]
-    pub fn trie_remove(&mut self, backend_key: &[u8]) {
-        self.remove_backend(backend_key);
+    pub fn trie_destroy(&mut self, backend_key: &[u8]) {
+        if let Some(mut b) = self.remove_backend(backend_key) {
+            b.clear();
+        }
     }
 
     /// Can be used to set the new blockchain mainline
@@ -127,9 +129,7 @@ impl MptStore {
         backend: &TrieBackend,
         force: bool,
     ) -> Result<()> {
-        if force {
-            self.meta.remove(backend_key);
-        } else if self.meta.contains_key(backend_key) {
+        if !force && self.meta.contains_key(backend_key) {
             return Err(eg!("backend key already exists"));
         }
 
@@ -139,8 +139,8 @@ impl MptStore {
     }
 
     #[inline(always)]
-    fn remove_backend(&mut self, backend_key: &[u8]) {
-        self.meta.remove(backend_key);
+    fn remove_backend(&mut self, backend_key: &[u8]) -> Option<TrieBackend> {
+        self.meta.remove(backend_key)
     }
 }
 

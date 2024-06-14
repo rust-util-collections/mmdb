@@ -70,6 +70,11 @@ where
     pub fn is_dead(&self) -> bool {
         self.data.is_dead()
     }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
 }
 
 impl<H, T> HashDB<H, T> for MmBackend<H, T>

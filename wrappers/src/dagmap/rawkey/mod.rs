@@ -110,6 +110,11 @@ where
     pub fn prune_children_exclude(&mut self, exclude_targets: &[impl AsRef<DagMapId>]) {
         self.inner.prune_children_exclude(exclude_targets);
     }
+
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////
