@@ -103,10 +103,49 @@ impl MptStore {
         }
     }
 
+    pub fn trie_prune(
+        &mut self,
+        backend_key: &[u8],
+        root: TrieRoot,
+        search_history: bool,
+    ) -> Result<()> {
+        let hdr = self
+            .trie_restore(backend_key, root, search_history)
+            .c(d!())?;
+        let new_backend = hdr.backend.prune().c(d!())?;
+
+        let hdr_ro = unsafe { self.header_set.shadow() };
+        for k in hdr_ro
+            .iter()
+            .filter(|(_, i)| i.is_dead() || i.is_the_same_instance(&new_backend))
+            .map(|(key, _)| key)
+        {
+            self.header_set.remove(k);
+        }
+
+        self.meta.insert(backend_key, &new_backend);
+        self.header_set.insert(root, &new_backend); // set me after the cleanup ops!
+
+        Ok(())
+    }
+
+    /// Destroy itself and its descendants
     #[inline(always)]
     pub fn trie_destroy(&mut self, backend_key: &[u8]) {
         if let Some(mut b) = self.remove_backend(backend_key) {
             b.clear();
+            self.headers_clean_up();
+        }
+    }
+
+    fn headers_clean_up(&mut self) {
+        let hdr_ro = unsafe { self.header_set.shadow() };
+        for k in hdr_ro
+            .iter()
+            .filter(|(_, i)| i.is_dead())
+            .map(|(key, _)| key)
+        {
+            self.header_set.remove(k);
         }
     }
 

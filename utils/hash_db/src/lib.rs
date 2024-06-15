@@ -75,6 +75,22 @@ where
     pub fn clear(&mut self) {
         self.data.clear();
     }
+
+    #[inline(always)]
+    pub fn is_the_same_instance(&self, other_hdr: &Self) -> bool {
+        self.data.is_the_same_instance(&other_hdr.data)
+    }
+
+    /// Return a new backend instance
+    #[inline(always)]
+    pub fn prune(self) -> Result<Self> {
+        let data = self.data.prune().c(d!())?;
+        Ok(Self {
+            data,
+            hashed_null_key: Self::hashed_null_node(),
+            null_node_data: [0u8].as_slice().into(),
+        })
+    }
 }
 
 impl<H, T> HashDB<H, T> for MmBackend<H, T>

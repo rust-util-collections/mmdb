@@ -2,10 +2,7 @@
 mod test;
 
 use crate::{DagMapId, MapxOrdRawKey, MapxRaw, Orphan};
-use mmdb_core::{
-    basic::mapx_raw,
-    common::{RawBytes, TRASH_CLEANER},
-};
+use mmdb_core::{basic::mapx_raw, common::RawBytes};
 use ruc::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -184,16 +181,14 @@ impl DagMapRaw {
             self.children.remove(id);
         }
 
-        TRASH_CLEANER.lock().execute(|| {
-            for (_, mut child) in dropped_children.into_iter() {
-                *child.parent.get_mut() = None;
-                child.data.clear();
-                for (_, mut c) in child.children.iter_mut() {
-                    c.drop_children();
-                }
-                child.children.clear();
+        for (_, mut child) in dropped_children.into_iter() {
+            *child.parent.get_mut() = None;
+            child.data.clear();
+            for (_, mut c) in child.children.iter_mut() {
+                c.drop_children();
             }
-        });
+            child.children.clear();
+        }
     }
 
     fn drop_children(&mut self) {
@@ -209,11 +204,19 @@ impl DagMapRaw {
         }
     }
 
+    /// Drop all data
+    ///
+    /// NOTE: this is different from the prune operation.
     #[inline(always)]
     pub fn clear(&mut self) {
         *self.parent.get_mut() = None;
         self.data.clear();
         self.drop_children();
+    }
+
+    #[inline(always)]
+    pub fn is_the_same_instance(&self, other_hdr: &Self) -> bool {
+        self.data.is_the_same_instance(&other_hdr.data)
     }
 }
 
