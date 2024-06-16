@@ -182,36 +182,22 @@ impl DagMapRaw {
         }
 
         for (_, mut child) in dropped_children.into_iter() {
-            *child.parent.get_mut() = None;
-            child.data.clear();
-            for (_, mut c) in child.children.iter_mut() {
-                c.drop_children();
-            }
-            child.children.clear();
-        }
-    }
-
-    fn drop_children(&mut self) {
-        let mut children = self.children.iter().map(|(_, c)| c).collect::<Vec<_>>();
-        self.children.clear();
-
-        for child in children.iter_mut() {
-            *child.parent.get_mut() = None;
-            child.data.clear();
-            for (_, mut c) in child.children.iter_mut() {
-                c.drop_children();
-            }
+            child.destroy();
         }
     }
 
     /// Drop all data
-    ///
-    /// NOTE: this is different from the prune operation.
     #[inline(always)]
-    pub fn clear(&mut self) {
+    pub fn destroy(&mut self) {
         *self.parent.get_mut() = None;
         self.data.clear();
-        self.drop_children();
+
+        let mut children = self.children.iter().map(|(_, c)| c).collect::<Vec<_>>();
+        self.children.clear(); // optimize for recursive ops
+
+        for c in children.iter_mut() {
+            c.destroy();
+        }
     }
 
     #[inline(always)]

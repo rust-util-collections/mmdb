@@ -73,7 +73,7 @@ where
 
     #[inline(always)]
     pub fn clear(&mut self) {
-        self.data.clear();
+        self.data.destroy();
     }
 
     #[inline(always)]

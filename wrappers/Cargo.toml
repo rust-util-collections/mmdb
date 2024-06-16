@@ -1,6 +1,6 @@
 [package]
 name = "mmdb"
-version = "1.0.7"
+version = "1.0.8"
 authors = ["hui.fan@mail.ru"]
 edition = "2021"
 description = "A std-collection-like database"

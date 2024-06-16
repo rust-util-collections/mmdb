@@ -112,8 +112,8 @@ where
     }
 
     #[inline(always)]
-    pub fn clear(&mut self) {
-        self.inner.clear();
+    pub fn destroy(&mut self) {
+        self.inner.destroy();
     }
 
     #[inline(always)]

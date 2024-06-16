@@ -43,7 +43,7 @@ pub struct MptStore {
     // - for the storage MPT, it is the bytes of a H160 address
     meta: MapxOrdRawKey<TrieBackend>,
 
-    // BackendId(DagMapId) ==> backend instance
+    // BackendId(DagMapId, a root hash?) ==> backend instance
     // All nodes, aka headers
     header_set: HeaderSet,
 }
@@ -124,7 +124,7 @@ impl MptStore {
         }
 
         self.meta.insert(backend_key, &new_backend);
-        self.header_set.insert(root, &new_backend); // set me after the cleanup ops!
+        self.header_set.insert(root, &new_backend); // set it after the cleanup ops!
 
         Ok(())
     }
