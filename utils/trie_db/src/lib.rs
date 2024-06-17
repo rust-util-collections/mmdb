@@ -8,11 +8,10 @@ mod test;
 
 pub use mmdb::{RawBytes, RawKey, RawValue, ValueEnDe};
 
-use mmdb::{DagMapId, DagMapRaw, MapxOrdRawKey, Orphan};
+use mmdb::{DagMapRaw, MapxOrdRawKey, Orphan};
 use mmdb_hash_db::{sp_hash_db::EMPTY_PREFIX, KeccakHasher as H, TrieBackend};
 use ruc::*;
 use serde::{Deserialize, Serialize};
-use std::mem;
 use trie_db::{
     CError, DBValue, HashDB, Hasher as _, Trie, TrieHash, TrieItem, TrieIterator, TrieKeyItem,
     TrieMut,
@@ -30,8 +29,7 @@ pub type TrieIter<'a> = Box<dyn TrieIterator<L, Item = TrieItem<TrieHash<L>, CEr
 pub type TrieKeyIter<'a> =
     Box<dyn TrieIterator<L, Item = TrieKeyItem<TrieHash<L>, CError<L>>> + 'a>;
 
-// A root hash ?
-type BackendId = DagMapId;
+// root hash ==> backend instance
 type HeaderSet = MapxOrdRawKey<TrieBackend>;
 
 #[derive(Deserialize, Serialize)]
@@ -41,11 +39,7 @@ pub struct MptStore {
     // the backend key
     // - for the world state MPT, it is `[0]`(just an example)
     // - for the storage MPT, it is the bytes of a H160 address
-    meta: MapxOrdRawKey<TrieBackend>,
-
-    // BackendId(DagMapId, a root hash?) ==> backend instance
-    // All nodes, aka headers
-    header_set: HeaderSet,
+    meta: MapxOrdRawKey<HeaderSet>,
 }
 
 impl MptStore {
@@ -53,16 +47,12 @@ impl MptStore {
     pub fn new() -> Self {
         Self {
             meta: MapxOrdRawKey::new(),
-            header_set: MapxOrdRawKey::new(),
         }
     }
 
     #[inline(always)]
-    pub fn new_backend(
-        id: &BackendId, // A root hash ?
-        parent: &mut Orphan<Option<DagMapRaw>>,
-    ) -> Result<TrieBackend> {
-        TrieBackend::new(id, parent).c(d!())
+    pub fn new_backend(parent: &mut Orphan<Option<DagMapRaw>>) -> Result<TrieBackend> {
+        TrieBackend::new(parent).c(d!())
     }
 
     /// # Safety
@@ -73,116 +63,53 @@ impl MptStore {
     pub unsafe fn shadow(&self) -> Self {
         Self {
             meta: self.meta.shadow(),
-            header_set: self.header_set.shadow(),
         }
     }
 
     #[inline(always)]
     pub fn trie_create(&mut self, backend_key: &[u8], backend: TrieBackend) -> Result<MptOnce> {
-        self.put_backend(backend_key, &backend, false).c(d!())?;
-        MptOnce::create_with_backend(backend, &self.header_set).c(d!())
+        let hdr = self.meta.entry(backend_key).or_insert(HeaderSet::new());
+        MptOnce::create_with_backend(backend, &hdr).c(d!())
     }
 
-    /// @search_dag:
-    /// If we need to search for dag paths that have no direct logical relationship,
-    /// such as non-mainline paths or descendants of the target node?
     #[inline(always)]
-    pub fn trie_restore(
-        &self,
-        backend_key: &[u8],
-        root: TrieRoot,
-        search_dag: bool,
-    ) -> Result<MptOnce> {
-        let r = self
-            .get_backend(backend_key)
-            .c(d!("backend not found"))
-            .and_then(|backend| MptOnce::restore(backend, root, &self.header_set).c(d!()));
-
-        if search_dag && r.is_err() {
-            let b = self.header_set.get(root).c(d!())?;
-            MptOnce::restore(b, root, &self.header_set).c(d!())
-        } else {
-            r
-        }
+    pub fn trie_rederive(&self, backend_key: &[u8], root: TrieRoot) -> Result<MptOnce> {
+        self.meta.get(backend_key).c(d!()).and_then(|hs| {
+            hs.get(root)
+                .c(d!())
+                .and_then(|b| MptOnce::rederive(&b, root, &hs).c(d!()))
+        })
     }
 
-    pub fn trie_prune(
-        &mut self,
-        backend_key: &[u8],
-        root: TrieRoot,
-        search_dag: bool,
-    ) -> Result<()> {
-        let hdr = self.trie_restore(backend_key, root, search_dag).c(d!())?;
-        let new_backend = hdr.backend.prune().c(d!())?;
+    pub fn trie_prune(&mut self, backend_key: &[u8], root: TrieRoot) -> Result<()> {
+        let mut hs = self.meta.get(backend_key).c(d!())?;
+        let backend = hs.get(root).c(d!())?;
 
-        let hdr_ro = unsafe { self.header_set.shadow() };
-        for k in hdr_ro
+        let new_backend = backend.prune().c(d!())?;
+
+        let hs_ro = unsafe { hs.shadow() };
+        for k in hs_ro
             .iter()
             .filter(|(_, i)| i.is_dead() || i.is_the_same_instance(&new_backend))
             .map(|(key, _)| key)
         {
-            self.header_set.remove(k);
+            hs.remove(k);
         }
 
-        // !! DO NOT DO THIS !!
-        // self.meta.insert(backend_key, &new_backend);
-
-        self.header_set.insert(root, &new_backend); // set it after the cleanup ops!
+        hs.insert(root, &new_backend);
 
         Ok(())
     }
 
-    /// Destroy itself and its descendants
+    /// Destroy itself and all descendants
     #[inline(always)]
     pub fn trie_destroy(&mut self, backend_key: &[u8]) {
-        if let Some(mut b) = self.remove_backend(backend_key) {
-            b.clear();
-            self.headers_clean_up();
+        if let Some(mut hs) = self.meta.remove(backend_key) {
+            for (_root, mut b) in hs.iter() {
+                b.clear();
+            }
+            hs.clear();
         }
-    }
-
-    fn headers_clean_up(&mut self) {
-        let hdr_ro = unsafe { self.header_set.shadow() };
-        for k in hdr_ro
-            .iter()
-            .filter(|(_, i)| i.is_dead())
-            .map(|(key, _)| key)
-        {
-            self.header_set.remove(k);
-        }
-    }
-
-    /// Can be used to set the new blockchain mainline
-    #[inline(always)]
-    pub fn trie_swap_head(&mut self, backend_key: &[u8], root: TrieRoot) -> Result<()> {
-        let b = self.header_set.get(root).c(d!())?;
-        self.put_backend(backend_key, &b, true).c(d!())
-    }
-
-    #[inline(always)]
-    fn get_backend(&self, backend_key: &[u8]) -> Option<TrieBackend> {
-        self.meta.get(backend_key)
-    }
-
-    #[inline(always)]
-    fn put_backend(
-        &mut self,
-        backend_key: &[u8],
-        backend: &TrieBackend,
-        force: bool,
-    ) -> Result<()> {
-        if !force && self.meta.contains_key(backend_key) {
-            return Err(eg!("backend key already exists"));
-        }
-
-        self.meta.insert(backend_key, backend);
-
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn remove_backend(&mut self, backend_key: &[u8]) -> Option<TrieBackend> {
-        self.meta.remove(backend_key)
     }
 }
 
@@ -219,13 +146,23 @@ impl MptOnce {
         })
     }
 
-    fn restore(backend: TrieBackend, root: TrieRoot, header_set: &HeaderSet) -> Result<Self> {
-        let backend = Box::into_raw(Box::new(backend));
-        let mpt = MptMut::from_existing(unsafe { &mut *backend }, root).c(d!())?;
+    fn rederive(
+        parent_backend: &TrieBackend,
+        root: TrieRoot,
+        header_set: &HeaderSet,
+    ) -> Result<Self> {
+        let b = TrieBackend::new(&mut Orphan::new(Some(
+            unsafe { parent_backend.shadow_backend() }.into_inner(),
+        )))
+        .c(d!())
+        .map(|b| Box::into_raw(Box::new(b)))?;
+
+        let mpt = MptMut::from_existing(unsafe { &mut *b }, root).c(d!())?;
+
         Ok(Self {
             mpt,
             root,
-            backend: unsafe { Box::from_raw(backend) },
+            backend: unsafe { Box::from_raw(b) },
             header_set: unsafe { header_set.shadow() },
         })
     }
@@ -254,22 +191,17 @@ impl MptOnce {
         self.mpt.is_empty()
     }
 
-    pub fn commit(&mut self) -> Result<TrieRoot> {
+    pub fn commit(mut self) -> Result<Self> {
         let root = self.mpt.commit();
 
-        if self.header_set.contains_key(root) {
-            return Err(eg!("the root value exists!"));
-        }
+        // if self.header_set.contains_key(root) {
+        //     return Err(eg!("the root value exists!"));
+        // }
+
         // root ==> its data version
         self.header_set.insert(root, &self.backend);
 
-        let parent = unsafe { self.backend.shadow_backend() }.into_inner();
-        // use the parent root as the `uuid` for the new DagMap
-        let b = TrieBackend::new(&root, &mut Orphan::new(Some(parent))).c(d!())?;
-        let mut new_hdr = Self::restore(b, root, &self.header_set).c(d!())?;
-
-        mem::swap(self, &mut new_hdr);
-        Ok(self.root)
+        Self::rederive(&self.backend, root, &self.header_set).c(d!())
     }
 
     pub fn root(&self) -> TrieRoot {
@@ -305,7 +237,7 @@ impl ValueEnDe for MptOnce {
         let backend = TrieBackend::decode(&b).c(d!())?;
         let header_set = HeaderSet::decode(&h).c(d!())?;
 
-        Self::restore(backend, root, &header_set).c(d!())
+        Self::rederive(&backend, root, &header_set).c(d!())
     }
 }
 

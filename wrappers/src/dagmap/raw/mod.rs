@@ -23,17 +23,17 @@ pub struct DagMapRaw {
 }
 
 impl DagMapRaw {
-    pub fn new(id: &DagMapId, parent: &mut Orphan<Option<Self>>) -> Result<Self> {
+    pub fn new(parent: &mut Orphan<Option<Self>>) -> Result<Self> {
         let r = Self {
             parent: unsafe { parent.shadow() },
             ..Default::default()
         };
 
         if let Some(p) = parent.get_mut().as_mut() {
-            if p.children.contains_key(id) {
-                return Err(eg!("Child ID exist!"));
+            let child_id = super::gen_dag_map_id_num().to_be_bytes();
+            if p.children.insert(child_id, &r).is_some() {
+                return Err(eg!("The fucking world is over! Child ID exist!"));
             }
-            p.children.insert(id, &r);
         }
 
         Ok(r)
@@ -54,9 +54,12 @@ impl DagMapRaw {
 
     #[inline(always)]
     pub fn is_dead(&self) -> bool {
-        self.data.is_empty()
-            && self.parent.get_value().is_none()
-            && self.children.is_empty()
+        self.data.is_empty() && self.parent.get_value().is_none() && self.no_children()
+    }
+
+    #[inline(always)]
+    pub fn no_children(&self) -> bool {
+        self.children.is_empty()
     }
 
     pub fn get(&self, key: impl AsRef<[u8]>) -> Option<RawBytes> {
@@ -134,7 +137,8 @@ impl DagMapRaw {
         }
 
         let mut exclude_targets = vec![];
-        for (id, child) in self.children.iter() {
+        for (id, mut child) in self.children.iter_mut() {
+            *child.parent.get_mut() = Some(unsafe { genesis[0].shadow() });
             genesis[0].children.insert(&id, &child);
             exclude_targets.push(id);
         }

@@ -23,11 +23,8 @@ where
     V: ValueEnDe,
 {
     #[inline(always)]
-    pub fn new(
-        id: &DagMapId,
-        raw_parent: &mut Orphan<Option<DagMapRaw>>,
-    ) -> Result<Self> {
-        DagMapRaw::new(id, raw_parent).c(d!()).map(|inner| Self {
+    pub fn new(raw_parent: &mut Orphan<Option<DagMapRaw>>) -> Result<Self> {
+        DagMapRaw::new(raw_parent).c(d!()).map(|inner| Self {
             inner,
             _p: PhantomData,
         })
@@ -62,6 +59,11 @@ where
     #[inline(always)]
     pub fn is_dead(&self) -> bool {
         self.inner.is_dead()
+    }
+
+    #[inline(always)]
+    pub fn no_children(&self) -> bool {
+        self.inner.no_children()
     }
 
     #[inline(always)]

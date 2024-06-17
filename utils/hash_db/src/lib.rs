@@ -2,7 +2,7 @@ pub use hash_db as sp_hash_db;
 pub use mmdb;
 
 use hash_db::{AsHashDB, HashDB, HashDBRef, Hasher as KeyHasher, Prefix};
-use mmdb::{DagMapId, DagMapRaw, DagMapRawKey as Map, Orphan, RawBytes, ValueEnDe};
+use mmdb::{DagMapRaw, DagMapRawKey as Map, Orphan, RawBytes, ValueEnDe};
 use ruc::*;
 use serde::{Deserialize, Serialize};
 
@@ -31,9 +31,9 @@ where
     T: TrieVar,
 {
     /// Create a new `MmBackend` from the default null key/data
-    pub fn new(id: &DagMapId, raw_parent: &mut Orphan<Option<DagMapRaw>>) -> Result<Self> {
+    pub fn new(raw_parent: &mut Orphan<Option<DagMapRaw>>) -> Result<Self> {
         Ok(MmBackend {
-            data: Map::new(id, raw_parent).c(d!())?,
+            data: Map::new(raw_parent).c(d!())?,
             hashed_null_key: Self::hashed_null_node(),
             null_node_data: [0u8].as_slice().into(),
         })
@@ -69,6 +69,11 @@ where
     #[inline(always)]
     pub fn is_dead(&self) -> bool {
         self.data.is_dead()
+    }
+
+    #[inline(always)]
+    pub fn no_children(&self) -> bool {
+        self.data.no_children()
     }
 
     #[inline(always)]

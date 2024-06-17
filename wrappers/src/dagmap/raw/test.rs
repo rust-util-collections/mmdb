@@ -2,22 +2,19 @@ use super::*;
 
 #[test]
 fn dagmapraw_functions() {
-    let mut i0 = DagMapRaw::new(&[0], &mut Orphan::new(None)).unwrap();
+    let mut i0 = DagMapRaw::new(&mut Orphan::new(None)).unwrap();
     i0.insert("k0", "v0");
     assert_eq!(i0.get("k0").unwrap().as_slice(), "v0".as_bytes());
     assert!(i0.get("k1").is_none());
     let mut i0 = Orphan::new(Some(i0));
 
-    let mut i1 = DagMapRaw::new(&[1], &mut i0).unwrap();
+    let mut i1 = DagMapRaw::new(&mut i0).unwrap();
     i1.insert("k1", "v1");
     assert_eq!(i1.get("k1").unwrap().as_slice(), "v1".as_bytes());
     assert_eq!(i1.get("k0").unwrap().as_slice(), "v0".as_bytes());
     let mut i1 = Orphan::new(Some(i1));
 
-    // Child ID exist
-    assert!(DagMapRaw::new(&[1], &mut i0).is_err());
-
-    let mut i2 = DagMapRaw::new(&[2], &mut i1).unwrap();
+    let mut i2 = DagMapRaw::new(&mut i1).unwrap();
     i2.insert("k2", "v2");
     assert_eq!(i2.get("k2").unwrap().as_slice(), "v2".as_bytes());
     assert_eq!(i2.get("k1").unwrap().as_slice(), "v1".as_bytes());
@@ -70,7 +67,7 @@ fn dagmapraw_functions() {
     // prune with deep stack
     for i in 10u8..=255 {
         head.insert(i.to_be_bytes(), i.to_be_bytes());
-        head = DagMapRaw::new(&[i], &mut Orphan::new(Some(head))).unwrap();
+        head = DagMapRaw::new(&mut Orphan::new(Some(head))).unwrap();
     }
 
     let mut head = pnk!(head.prune());

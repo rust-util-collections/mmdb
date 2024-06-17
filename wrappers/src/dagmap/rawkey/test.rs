@@ -6,22 +6,19 @@ macro_rules! s {
 
 #[test]
 fn dagmaprawkey_functions() {
-    let mut i0 = DagMapRawKey::new(&[0], &mut Orphan::new(None)).unwrap();
+    let mut i0 = DagMapRawKey::new(&mut Orphan::new(None)).unwrap();
     i0.insert("k0", &s!("v0"));
     assert_eq!(i0.get("k0").unwrap(), s!("v0"));
     assert!(i0.get("k1").is_none());
     let mut i0_raw = Orphan::new(Some(i0.into_inner()));
 
-    let mut i1 = DagMapRawKey::new(&[1], &mut i0_raw).unwrap();
+    let mut i1 = DagMapRawKey::new(&mut i0_raw).unwrap();
     i1.insert("k1", &s!("v1"));
     assert_eq!(i1.get("k1").unwrap(), s!("v1"));
     assert_eq!(i1.get("k0").unwrap(), s!("v0"));
     let mut i1_raw = Orphan::new(Some(i1.into_inner()));
 
-    // Child ID exist
-    assert!(DagMapRawKey::<String>::new(&[1], &mut i0_raw).is_err());
-
-    let mut i2 = DagMapRawKey::new(&[2], &mut i1_raw).unwrap();
+    let mut i2 = DagMapRawKey::new(&mut i1_raw).unwrap();
     i2.insert("k2", &s!("v2"));
     assert_eq!(i2.get("k2").unwrap(), s!("v2"));
     assert_eq!(i2.get("k1").unwrap(), s!("v1"));
@@ -74,8 +71,7 @@ fn dagmaprawkey_functions() {
     // prune with deep stack
     for i in 10u8..=255 {
         head.insert(i.to_be_bytes(), &i.to_be_bytes().to_vec());
-        head =
-            DagMapRawKey::new(&[i], &mut Orphan::new(Some(head.into_inner()))).unwrap();
+        head = DagMapRawKey::new(&mut Orphan::new(Some(head.into_inner()))).unwrap();
     }
 
     let mut head = pnk!(head.prune());
