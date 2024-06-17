@@ -63,7 +63,7 @@ fmtall:
 	bash scripts/fmt.sh
 
 update:
-	cargo update
+	cargo update --verbose
 
 clean:
 	cargo clean
