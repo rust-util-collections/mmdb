@@ -83,19 +83,22 @@ impl MptStore {
         MptOnce::create_with_backend(backend, &self.header_set).c(d!())
     }
 
+    /// @search_dag:
+    /// If we need to search for dag paths that have no direct logical relationship,
+    /// such as non-mainline paths or descendants of the target node?
     #[inline(always)]
     pub fn trie_restore(
         &self,
         backend_key: &[u8],
         root: TrieRoot,
-        search_history: bool,
+        search_dag: bool,
     ) -> Result<MptOnce> {
         let r = self
             .get_backend(backend_key)
             .c(d!("backend not found"))
             .and_then(|backend| MptOnce::restore(backend, root, &self.header_set).c(d!()));
 
-        if search_history && r.is_err() {
+        if search_dag && r.is_err() {
             let b = self.header_set.get(root).c(d!())?;
             MptOnce::restore(b, root, &self.header_set).c(d!())
         } else {
@@ -107,11 +110,9 @@ impl MptStore {
         &mut self,
         backend_key: &[u8],
         root: TrieRoot,
-        search_history: bool,
+        search_dag: bool,
     ) -> Result<()> {
-        let hdr = self
-            .trie_restore(backend_key, root, search_history)
-            .c(d!())?;
+        let hdr = self.trie_restore(backend_key, root, search_dag).c(d!())?;
         let new_backend = hdr.backend.prune().c(d!())?;
 
         let hdr_ro = unsafe { self.header_set.shadow() };
@@ -123,7 +124,9 @@ impl MptStore {
             self.header_set.remove(k);
         }
 
-        self.meta.insert(backend_key, &new_backend);
+        // !! DO NOT DO THIS !!
+        // self.meta.insert(backend_key, &new_backend);
+
         self.header_set.insert(root, &new_backend); // set it after the cleanup ops!
 
         Ok(())
