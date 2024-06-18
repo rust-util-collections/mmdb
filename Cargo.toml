@@ -30,8 +30,8 @@ hash-db = "0.16.0"
 trie-db = "0.29.1"
 trie-root = "0.18.0"
 
-mmdb = { path = "wrappers", version = "1.0.0", default-features = false }
+mmdb = { path = "wrappers", version = "1.1.0", default-features = false }
 mmdb_core = { path = "core", version = "1.0.0", default-features = false }
 
-mmdb_trie_db = { path = "utils/trie_db", version = "0.2.0", default-features = false }
-mmdb_hash_db = { path = "utils/hash_db", version = "0.2.0", default-features = false }
+mmdb_trie_db = { path = "utils/trie_db", version = "0.3.0", default-features = false }
+mmdb_hash_db = { path = "utils/hash_db", version = "0.3.0", default-features = false }
