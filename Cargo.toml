@@ -4,7 +4,6 @@ members = [
     "wrappers",
     "utils/hash_db",
     "utils/trie_db",
-    "utils/trie_map",
     "utils/slot_db",
 ]
 resolver = "2"
