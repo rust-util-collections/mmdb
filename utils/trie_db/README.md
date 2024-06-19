@@ -6,3 +6,5 @@
 # mmdb_trie_db
 
 An out-of-box wrapper of [the `trie_db` crate](https://crates.io/crates/trie-db) crate, based on [`the powerful crate of mmdb`](https://crates.io/crates/mmdb).
+
+Check [**the test cases**](src/test.rs) for some usage examples.

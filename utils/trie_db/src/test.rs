@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 #[test]
 fn trie_db_destroy_and_prune() {
     let mut s = MptStore::new();
-    let b = MptStore::new_backend(&mut Orphan::new(None)).unwrap();
-    let mut hdr = pnk!(s.trie_create(&[0], b));
+    let mut hdr = pnk!(s.trie_init(&[0]));
 
     pnk!(hdr.insert(b"k", b"v0"));
     assert_eq!(b"v0", pnk!(hdr.get(b"k")).unwrap().as_slice());
@@ -129,8 +128,7 @@ fn trie_db_destroy_and_prune() {
 #[test]
 fn trie_db_rederive() {
     let mut s = MptStore::new();
-    let b = MptStore::new_backend(&mut Orphan::new(None)).unwrap();
-    let mut hdr = pnk!(s.trie_create(b"", b));
+    let mut hdr = pnk!(s.trie_init(b""));
 
     pnk!(hdr.insert(b"key", b"value"));
     assert_eq!(b"value", pnk!(hdr.get(b"key")).unwrap().as_slice());
@@ -162,8 +160,7 @@ fn trie_db_rederive() {
 #[test]
 fn trie_db_iter() {
     let mut s = MptStore::new();
-    let b = MptStore::new_backend(&mut Orphan::new(None)).unwrap();
-    let mut hdr = pnk!(s.trie_create(b"backend_key", b));
+    let mut hdr = pnk!(s.trie_init(b"backend_key"));
     assert!(hdr.is_empty());
 
     /////////////////////////////////////////////

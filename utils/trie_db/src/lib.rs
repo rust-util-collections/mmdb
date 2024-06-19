@@ -1,3 +1,4 @@
+#![doc = include_str!("../README.md")]
 #![deny(warnings)]
 #![allow(clippy::new_without_default)]
 
@@ -8,7 +9,7 @@ mod test;
 
 pub use mmdb::{RawBytes, RawKey, RawValue, ValueEnDe};
 
-use mmdb::{DagMapRaw, MapxOrdRawKey, Orphan};
+use mmdb::{MapxOrdRawKey, Orphan};
 use mmdb_hash_db::{sp_hash_db::EMPTY_PREFIX, KeccakHasher as H, TrieBackend};
 use ruc::*;
 use serde::{Deserialize, Serialize};
@@ -43,16 +44,12 @@ pub struct MptStore {
 }
 
 impl MptStore {
+    /// Create a new mpt DB.
     #[inline(always)]
     pub fn new() -> Self {
         Self {
             meta: MapxOrdRawKey::new(),
         }
-    }
-
-    #[inline(always)]
-    pub fn new_backend(parent: &mut Orphan<Option<DagMapRaw>>) -> Result<TrieBackend> {
-        TrieBackend::new(parent).c(d!())
     }
 
     /// # Safety
@@ -66,12 +63,24 @@ impl MptStore {
         }
     }
 
+    /// Create a new trie from scratch(no parent).
+    #[inline(always)]
+    pub fn trie_init(&mut self, backend_key: &[u8]) -> Result<MptOnce> {
+        let b = TrieBackend::new(&mut Orphan::new(None)).unwrap();
+        self.trie_create(backend_key, b).c(d!())
+    }
+
+    /// Create a new trie from a specified backend.
     #[inline(always)]
     pub fn trie_create(&mut self, backend_key: &[u8], backend: TrieBackend) -> Result<MptOnce> {
         let hdr = self.meta.entry(backend_key).or_insert(HeaderSet::new());
         MptOnce::create_with_backend(backend, &hdr).c(d!())
     }
 
+    /// Re-derive a trie handler from a specified trie root.
+    ///
+    /// NOTE:
+    /// The returned handler is actually a new created child of the target trie node.
     #[inline(always)]
     pub fn trie_rederive(&self, backend_key: &[u8], root: TrieRoot) -> Result<MptOnce> {
         self.meta.get(backend_key).c(d!()).and_then(|hs| {
@@ -81,6 +90,7 @@ impl MptStore {
         })
     }
 
+    /// Merge all nodes into the genesis node(include the target node itself).
     pub fn trie_prune(&mut self, backend_key: &[u8], root: TrieRoot) -> Result<()> {
         let mut hs = self.meta.get(backend_key).c(d!())?;
         let backend = hs.get(root).c(d!())?;
@@ -101,7 +111,7 @@ impl MptStore {
         Ok(())
     }
 
-    /// Destroy itself and all descendants
+    /// Destroy the entire trie related to the target `backend_key`.
     #[inline(always)]
     pub fn trie_destroy(&mut self, backend_key: &[u8]) {
         if let Some(mut hs) = self.meta.remove(backend_key) {
@@ -114,7 +124,7 @@ impl MptStore {
 }
 
 ///
-/// An owned MPT instance
+/// An owned MPT instance.
 ///
 /// # NOTE
 ///
@@ -183,6 +193,7 @@ impl MptOnce {
         self.mpt.remove(key).c(d!()).map(|_| ())
     }
 
+    /// Remove all `key-value`s in the current snapshot(version).
     pub fn clear(&mut self) -> Result<()> {
         self.mpt.clear().c(d!())
     }
@@ -191,6 +202,9 @@ impl MptOnce {
         self.mpt.is_empty()
     }
 
+    /// Commit all changes into the trie,
+    /// consume the trie handler, and derive a new trie handler
+    /// as a child of the current handler.
     pub fn commit(mut self) -> Result<Self> {
         let root = self.mpt.commit();
 
@@ -204,10 +218,13 @@ impl MptOnce {
         Self::rederive(&self.backend, root, &self.header_set).c(d!())
     }
 
+    /// Get the cached trie root,
+    /// no `commit` operations will be triggered.
     pub fn root(&self) -> TrieRoot {
         self.root
     }
 
+    /// Derive a readonly handler of the trie.
     pub fn ro_handle(&self, root: TrieRoot) -> Result<MptRo> {
         MptRo::from_existing(&self.backend, root).c(d!())
     }

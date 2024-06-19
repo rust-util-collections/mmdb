@@ -1,3 +1,7 @@
+#![doc = include_str!("../README.md")]
+#![deny(warnings)]
+#![cfg_attr(test, warn(warnings))]
+
 pub use hash_db as sp_hash_db;
 pub use mmdb;
 
