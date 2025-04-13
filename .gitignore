@@ -1,0 +1,6 @@
+/target
+*.swp
+*.swo
+**/*.proptest-regressions
+
+Cargo.lock

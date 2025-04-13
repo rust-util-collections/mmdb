@@ -1,0 +1,258 @@
+//! MemTable: in-memory sorted key-value store backed by a lock-free skiplist.
+
+mod skiplist;
+
+pub use skiplist::SkipListMemTable;
+
+use crate::types::{InternalKey, SequenceNumber, ValueType};
+
+/// A MemTable stores recent writes in memory before they are flushed to SST.
+///
+/// Keys are InternalKey-encoded (user_key + seq + type), values are raw bytes.
+/// The skiplist sorts by `compare_internal_key` ordering.
+pub struct MemTable {
+    inner: SkipListMemTable,
+    /// Approximate memory usage in bytes.
+    approximate_size: std::sync::atomic::AtomicUsize,
+}
+
+impl MemTable {
+    pub fn new() -> Self {
+        Self {
+            inner: SkipListMemTable::new(),
+            approximate_size: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Insert an entry. `key` is the user key; it will be encoded as an InternalKey.
+    pub fn put(&self, key: &[u8], value: &[u8], sequence: SequenceNumber, value_type: ValueType) {
+        let ikey = InternalKey::new(key, sequence, value_type);
+        let val = match value_type {
+            ValueType::Value => value.to_vec(),
+            ValueType::Deletion => Vec::new(),
+            ValueType::RangeDeletion => value.to_vec(), // value = end key of range
+        };
+        let entry_size = ikey.encoded_len() + val.len() + 16; // overhead estimate
+        self.inner.insert(ikey.into_bytes(), val);
+        self.approximate_size
+            .fetch_add(entry_size, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Look up a user key at or below the given sequence number.
+    /// Returns `Some(Some(value))` for a found value, `Some(None)` for a deletion tombstone,
+    /// or `None` if the key is not in this MemTable.
+    pub fn get(&self, key: &[u8], sequence: SequenceNumber) -> Option<Option<Vec<u8>>> {
+        // We need to find the entry with the highest sequence number <= `sequence`
+        // for the given user key.
+        //
+        // We create a search key with the given sequence and Value type (highest type),
+        // which will land us at or just before the newest relevant entry.
+        let search_key = InternalKey::new(key, sequence, ValueType::Value);
+        self.inner.get(search_key.as_bytes(), key)
+    }
+
+    /// Approximate memory usage in bytes.
+    pub fn approximate_size(&self) -> usize {
+        self.approximate_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Return an iterator over all entries in order.
+    /// Each item is (encoded_internal_key, value).
+    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
+        self.inner.iter()
+    }
+
+    /// Return true if empty.
+    pub fn is_empty(&self) -> bool {
+        self.approximate_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+    }
+}
+
+impl Default for MemTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memtable_put_get() {
+        let mt = MemTable::new();
+        mt.put(b"key1", b"value1", 1, ValueType::Value);
+        mt.put(b"key2", b"value2", 2, ValueType::Value);
+
+        // Should find key1 at seq >= 1
+        assert_eq!(mt.get(b"key1", 1), Some(Some(b"value1".to_vec())));
+        assert_eq!(mt.get(b"key2", 2), Some(Some(b"value2".to_vec())));
+
+        // key1 not visible at seq 0
+        assert_eq!(mt.get(b"key1", 0), None);
+    }
+
+    #[test]
+    fn test_memtable_delete() {
+        let mt = MemTable::new();
+        mt.put(b"key1", b"value1", 1, ValueType::Value);
+        mt.put(b"key1", b"", 2, ValueType::Deletion);
+
+        // At seq 2, should see tombstone
+        assert_eq!(mt.get(b"key1", 2), Some(None));
+        // At seq 1, should see the value
+        assert_eq!(mt.get(b"key1", 1), Some(Some(b"value1".to_vec())));
+    }
+
+    #[test]
+    fn test_memtable_overwrite() {
+        let mt = MemTable::new();
+        mt.put(b"key1", b"v1", 1, ValueType::Value);
+        mt.put(b"key1", b"v2", 2, ValueType::Value);
+
+        assert_eq!(mt.get(b"key1", 2), Some(Some(b"v2".to_vec())));
+        assert_eq!(mt.get(b"key1", 1), Some(Some(b"v1".to_vec())));
+        assert_eq!(mt.get(b"key1", 10), Some(Some(b"v2".to_vec())));
+    }
+
+    #[test]
+    fn test_memtable_iterator() {
+        let mt = MemTable::new();
+        mt.put(b"b", b"2", 1, ValueType::Value);
+        mt.put(b"a", b"1", 2, ValueType::Value);
+        mt.put(b"c", b"3", 3, ValueType::Value);
+
+        let entries: Vec<_> = mt.iter().collect();
+        // Should be sorted by internal key ordering: a, b, c
+        assert_eq!(entries.len(), 3);
+        let keys: Vec<&[u8]> = entries
+            .iter()
+            .map(|(k, _)| InternalKey::from_encoded(k.clone()).user_key().to_vec())
+            .map(|_| &[] as &[u8])
+            .collect();
+        // Better test: check user key ordering
+        let user_keys: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(k, _)| {
+                let ik = InternalKey::from_encoded(k.clone());
+                ik.user_key().to_vec()
+            })
+            .collect();
+        let _ = keys;
+        assert_eq!(user_keys[0], b"a");
+        assert_eq!(user_keys[1], b"b");
+        assert_eq!(user_keys[2], b"c");
+    }
+
+    #[test]
+    fn test_memtable_approximate_size() {
+        let mt = MemTable::new();
+        assert_eq!(mt.approximate_size(), 0);
+        mt.put(b"key", b"value", 1, ValueType::Value);
+        assert!(mt.approximate_size() > 0);
+    }
+
+    #[test]
+    fn test_memtable_concurrent_put_get() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mt = Arc::new(MemTable::new());
+        let num_threads = 8;
+        let entries_per_thread = 100;
+
+        // Spawn writers: each thread writes distinct keys
+        let mut handles = Vec::new();
+        for t in 0..num_threads {
+            let mt = Arc::clone(&mt);
+            handles.push(thread::spawn(move || {
+                for i in 0..entries_per_thread {
+                    let key = format!("t{}_k{:04}", t, i);
+                    let val = format!("t{}_v{}", t, i);
+                    let seq = (t * entries_per_thread + i + 1) as u64;
+                    mt.put(key.as_bytes(), val.as_bytes(), seq, ValueType::Value);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Verify all entries are readable
+        for t in 0..num_threads {
+            for i in 0..entries_per_thread {
+                let key = format!("t{}_k{:04}", t, i);
+                let val = format!("t{}_v{}", t, i);
+                let seq = (t * entries_per_thread + i + 1) as u64;
+                let result = mt.get(key.as_bytes(), seq);
+                assert_eq!(
+                    result,
+                    Some(Some(val.into_bytes())),
+                    "missing key {} at seq {}",
+                    key,
+                    seq
+                );
+            }
+        }
+
+        // Verify total count via iterator
+        let total: usize = mt.iter().count();
+        assert_eq!(total, num_threads * entries_per_thread);
+    }
+
+    #[test]
+    fn test_memtable_prefix_similar_keys() {
+        let mt = MemTable::new();
+        mt.put(b"a", b"val_a", 1, ValueType::Value);
+        mt.put(b"ab", b"val_ab", 2, ValueType::Value);
+        mt.put(b"abc", b"val_abc", 3, ValueType::Value);
+
+        // Each key should be independently retrievable
+        assert_eq!(mt.get(b"a", 10), Some(Some(b"val_a".to_vec())));
+        assert_eq!(mt.get(b"ab", 10), Some(Some(b"val_ab".to_vec())));
+        assert_eq!(mt.get(b"abc", 10), Some(Some(b"val_abc".to_vec())));
+
+        // Non-existent prefix-similar keys should not be found
+        assert_eq!(mt.get(b"abcd", 10), None);
+        assert_eq!(mt.get(b"b", 10), None);
+
+        // Visibility by sequence: "abc" at seq 3 should not be visible at seq 2
+        assert_eq!(mt.get(b"abc", 2), None);
+        assert_eq!(mt.get(b"abc", 3), Some(Some(b"val_abc".to_vec())));
+
+        // Iterator should yield keys in sorted order: a, ab, abc
+        let entries: Vec<_> = mt.iter().collect();
+        assert_eq!(entries.len(), 3);
+        let user_keys: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(k, _)| InternalKey::from_encoded(k.clone()).user_key().to_vec())
+            .collect();
+        assert_eq!(user_keys[0], b"a");
+        assert_eq!(user_keys[1], b"ab");
+        assert_eq!(user_keys[2], b"abc");
+    }
+
+    #[test]
+    fn test_memtable_is_empty_states() {
+        let mt = MemTable::new();
+
+        // Brand new memtable should be empty
+        assert!(mt.is_empty());
+        assert_eq!(mt.approximate_size(), 0);
+
+        // After a single put, no longer empty
+        mt.put(b"k", b"v", 1, ValueType::Value);
+        assert!(!mt.is_empty());
+        assert!(mt.approximate_size() > 0);
+
+        // After a deletion, still not empty (tombstone is an entry)
+        let mt2 = MemTable::new();
+        assert!(mt2.is_empty());
+        mt2.put(b"k", b"", 1, ValueType::Deletion);
+        assert!(!mt2.is_empty());
+    }
+}

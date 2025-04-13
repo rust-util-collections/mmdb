@@ -1,0 +1,134 @@
+//! SST file format constants and encoding helpers.
+//!
+//! Footer layout (48 bytes):
+//! ```text
+//! ┌───────────────────────────────┐
+//! │ metaindex_handle (BlockHandle)│  (varint encoded, up to 20 bytes)
+//! │ index_handle (BlockHandle)    │  (varint encoded, up to 20 bytes)
+//! │ padding (to 40 bytes)         │
+//! │ magic number (8 bytes)        │
+//! └───────────────────────────────┘
+//! ```
+
+/// Magic number identifying MMDB SST files.
+pub const TABLE_MAGIC: u64 = 0x4D4D_4442_5353_5400; // "MMDBSST\0"
+
+/// Fixed footer size.
+pub const FOOTER_SIZE: usize = 48;
+
+/// A handle pointing to a block within an SST file.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockHandle {
+    /// Offset of the block in the file.
+    pub offset: u64,
+    /// Size of the block data (not including the trailing checksum + type byte).
+    pub size: u64,
+}
+
+impl BlockHandle {
+    pub fn new(offset: u64, size: u64) -> Self {
+        Self { offset, size }
+    }
+
+    /// Encode to bytes (fixed 16 bytes: offset u64 LE + size u64 LE).
+    pub fn encode(&self) -> [u8; 16] {
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&self.offset.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.size.to_le_bytes());
+        buf
+    }
+
+    /// Decode from bytes.
+    pub fn decode(buf: &[u8]) -> Self {
+        let offset = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let size = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        Self { offset, size }
+    }
+}
+
+/// Block trailer appended after each block's data.
+/// ```text
+/// ┌──────────────┬──────────────┐
+/// │ type: u8     │ crc32: u32   │
+/// └──────────────┴──────────────┘
+/// ```
+pub const BLOCK_TRAILER_SIZE: usize = 5; // type(1) + crc32(4)
+
+/// Compression type for a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CompressionType {
+    None = 0,
+    Lz4 = 2,
+    Zstd = 3,
+}
+
+impl CompressionType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::None),
+            2 => Some(Self::Lz4),
+            3 => Some(Self::Zstd),
+            _ => None,
+        }
+    }
+}
+
+/// Encode an SST footer.
+pub fn encode_footer(
+    metaindex_handle: &BlockHandle,
+    index_handle: &BlockHandle,
+) -> [u8; FOOTER_SIZE] {
+    let mut footer = [0u8; FOOTER_SIZE];
+    let meta_enc = metaindex_handle.encode();
+    let idx_enc = index_handle.encode();
+    footer[0..16].copy_from_slice(&meta_enc);
+    footer[16..32].copy_from_slice(&idx_enc);
+    // bytes 32..40 are padding (zeros)
+    footer[40..48].copy_from_slice(&TABLE_MAGIC.to_le_bytes());
+    footer
+}
+
+/// Decode an SST footer. Returns (metaindex_handle, index_handle).
+pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> crate::error::Result<(BlockHandle, BlockHandle)> {
+    let magic = u64::from_le_bytes(data[40..48].try_into().unwrap());
+    if magic != TABLE_MAGIC {
+        return Err(crate::error::Error::Corruption(format!(
+            "invalid SST magic: {:#x}",
+            magic
+        )));
+    }
+    let metaindex_handle = BlockHandle::decode(&data[0..16]);
+    let index_handle = BlockHandle::decode(&data[16..32]);
+    Ok((metaindex_handle, index_handle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_block_handle_encode_decode() {
+        let bh = BlockHandle::new(12345, 6789);
+        let encoded = bh.encode();
+        let decoded = BlockHandle::decode(&encoded);
+        assert_eq!(bh, decoded);
+    }
+
+    #[test]
+    fn test_footer_encode_decode() {
+        let meta = BlockHandle::new(100, 200);
+        let idx = BlockHandle::new(300, 400);
+        let footer = encode_footer(&meta, &idx);
+        let (m2, i2) = decode_footer(&footer).unwrap();
+        assert_eq!(meta, m2);
+        assert_eq!(idx, i2);
+    }
+
+    #[test]
+    fn test_footer_bad_magic() {
+        let mut footer = [0u8; FOOTER_SIZE];
+        footer[40..48].copy_from_slice(&0xDEADBEEF_u64.to_le_bytes());
+        assert!(decode_footer(&footer).is_err());
+    }
+}
