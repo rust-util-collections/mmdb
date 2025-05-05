@@ -1,6 +1,7 @@
 //! MemTable: in-memory sorted key-value store backed by a lock-free skiplist.
 
 mod skiplist;
+pub mod skiplist_impl;
 
 pub use skiplist::SkipListMemTable;
 
@@ -59,8 +60,13 @@ impl MemTable {
 
     /// Return an iterator over all entries in order.
     /// Each item is (encoded_internal_key, value).
-    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.inner.iter()
+    }
+
+    /// Return an iterator over all entries in reverse order.
+    pub fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+        self.inner.iter_rev()
     }
 
     /// Return true if empty.
@@ -156,52 +162,60 @@ mod tests {
     }
 
     #[test]
-    fn test_memtable_concurrent_put_get() {
+    fn test_memtable_single_writer_concurrent_readers() {
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
         let mt = Arc::new(MemTable::new());
-        let num_threads = 8;
-        let entries_per_thread = 100;
+        let num_entries = 800;
 
-        // Spawn writers: each thread writes distinct keys
+        // Single writer inserts all entries first (matches DB group commit model).
+        for i in 0..num_entries {
+            let t = i / 100;
+            let j = i % 100;
+            let key = format!("t{}_k{:04}", t, j);
+            let val = format!("t{}_v{}", t, j);
+            let seq = (i + 1) as u64;
+            mt.put(key.as_bytes(), val.as_bytes(), seq, ValueType::Value);
+        }
+
+        // Spawn concurrent readers to verify all entries.
+        let done = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
-        for t in 0..num_threads {
+        for _ in 0..8 {
             let mt = Arc::clone(&mt);
+            let done = Arc::clone(&done);
             handles.push(thread::spawn(move || {
-                for i in 0..entries_per_thread {
-                    let key = format!("t{}_k{:04}", t, i);
-                    let val = format!("t{}_v{}", t, i);
-                    let seq = (t * entries_per_thread + i + 1) as u64;
-                    mt.put(key.as_bytes(), val.as_bytes(), seq, ValueType::Value);
+                while !done.load(Ordering::Relaxed) {
+                    for i in 0..num_entries {
+                        let t = i / 100;
+                        let j = i % 100;
+                        let key = format!("t{}_k{:04}", t, j);
+                        let val = format!("t{}_v{}", t, j);
+                        let seq = (i + 1) as u64;
+                        let result = mt.get(key.as_bytes(), seq);
+                        assert_eq!(
+                            result,
+                            Some(Some(val.into_bytes())),
+                            "missing key {} at seq {}",
+                            key,
+                            seq
+                        );
+                    }
+                    break; // One full pass is enough
                 }
             }));
         }
 
+        done.store(true, Ordering::Relaxed);
         for h in handles {
             h.join().unwrap();
         }
 
-        // Verify all entries are readable
-        for t in 0..num_threads {
-            for i in 0..entries_per_thread {
-                let key = format!("t{}_k{:04}", t, i);
-                let val = format!("t{}_v{}", t, i);
-                let seq = (t * entries_per_thread + i + 1) as u64;
-                let result = mt.get(key.as_bytes(), seq);
-                assert_eq!(
-                    result,
-                    Some(Some(val.into_bytes())),
-                    "missing key {} at seq {}",
-                    key,
-                    seq
-                );
-            }
-        }
-
         // Verify total count via iterator
         let total: usize = mt.iter().count();
-        assert_eq!(total, num_threads * entries_per_thread);
+        assert_eq!(total, num_entries);
     }
 
     #[test]

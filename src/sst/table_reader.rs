@@ -333,6 +333,124 @@ impl TableIterator {
         }
     }
 
+    /// Seek to the last entry <= target using compare_internal_key ordering.
+    /// After this call, the iterator is positioned on the found entry (or exhausted
+    /// if no entry <= target exists).
+    pub fn seek_for_prev(&mut self, target: &[u8]) {
+        use crate::types::compare_internal_key;
+
+        // Binary search index entries to find the last block that may contain an entry <= target.
+        // Each index entry's key is the largest key in that block.
+        // We want the last block whose smallest key <= target, which means we need
+        // the first block whose index_key >= target (same block as forward seek),
+        // but if the first entry in that block > target, we fall back to the previous block.
+        let idx = self.index_entries.partition_point(|(idx_key, _)| {
+            compare_internal_key(idx_key, target) == std::cmp::Ordering::Less
+        });
+
+        // Try the block at `idx` first, then fall back to previous blocks.
+        let mut found = false;
+        let mut try_idx = idx;
+
+        loop {
+            if try_idx >= self.index_entries.len() {
+                if try_idx == 0 {
+                    break;
+                }
+                try_idx -= 1;
+                continue;
+            }
+
+            let (_, ref handle_bytes) = self.index_entries[try_idx];
+            let handle = BlockHandle::decode(handle_bytes);
+
+            if let Ok(data) = self.reader.read_block_cached(&handle)
+                && let Ok(block) = Block::new(data)
+            {
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = block.iter().collect();
+                // Find the last entry <= target in this block
+                let pos = entries.partition_point(|(k, _)| {
+                    compare_internal_key(k, target) != std::cmp::Ordering::Greater
+                });
+
+                if pos > 0 {
+                    // Found an entry <= target in this block
+                    self.index_pos = try_idx + 1; // next block to load on forward iteration
+                    self.current_block_entries = entries;
+                    self.block_pos = pos - 1;
+                    found = true;
+                    break;
+                }
+            }
+
+            // No entry <= target in this block; try the previous block
+            if try_idx == 0 {
+                break;
+            }
+            try_idx -= 1;
+        }
+
+        if !found {
+            // No entry <= target in the entire table
+            self.index_pos = self.index_entries.len();
+            self.current_block_entries.clear();
+            self.block_pos = 0;
+        }
+    }
+
+    /// Move to the previous entry. Returns the entry at the new position,
+    /// or None if we've moved before the first entry.
+    pub fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        // If we have a previous entry in the current block, just decrement
+        if self.block_pos > 0 {
+            self.block_pos -= 1;
+            return Some(self.current_block_entries[self.block_pos].clone());
+        }
+
+        // Need to load the previous block.
+        // index_pos points to the *next* block to load for forward iteration.
+        // The current block is at index_pos - 1. The previous block is index_pos - 2.
+        // But we need to be careful: after seek_for_prev, index_pos = try_idx + 1,
+        // so the current block index is index_pos - 1.
+        // We want the block *before* the current one.
+        let current_block_index = if self.index_pos > 0 {
+            self.index_pos - 1
+        } else {
+            return None; // Already at or before the first block
+        };
+
+        if current_block_index == 0 {
+            return None; // Current block is the first block, no previous
+        }
+
+        let prev_block_index = current_block_index - 1;
+        let (_, ref handle_bytes) = self.index_entries[prev_block_index];
+        let handle = BlockHandle::decode(handle_bytes);
+
+        if let Ok(data) = self.reader.read_block_cached(&handle)
+            && let Ok(block) = Block::new(data)
+        {
+            self.current_block_entries = block.iter().collect();
+            if self.current_block_entries.is_empty() {
+                return None;
+            }
+            self.block_pos = self.current_block_entries.len() - 1;
+            self.index_pos = prev_block_index + 1;
+            return Some(self.current_block_entries[self.block_pos].clone());
+        }
+
+        None
+    }
+
+    /// Return the current entry without advancing, or None if not positioned.
+    pub fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.block_pos < self.current_block_entries.len() {
+            Some(self.current_block_entries[self.block_pos].clone())
+        } else {
+            None
+        }
+    }
+
     fn load_next_block(&mut self) -> bool {
         while self.index_pos < self.index_entries.len() {
             let (_, ref handle_bytes) = self.index_entries[self.index_pos];
@@ -371,6 +489,12 @@ impl Iterator for TableIterator {
                 return None;
             }
         }
+    }
+}
+
+impl crate::iterator::merge::SeekableIterator for TableIterator {
+    fn seek_to(&mut self, target: &[u8]) {
+        self.seek(target);
     }
 }
 
@@ -552,5 +676,147 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 500);
+    }
+
+    /// Build a test table with internal keys for seek_for_prev/prev tests.
+    fn build_internal_key_table(dir: &Path, count: usize) -> PathBuf {
+        use crate::types::InternalKey;
+
+        let path = dir.join("internal_iter.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Build sorted internal keys: each user key at seq=count-i (descending seq
+        // doesn't matter here since each user_key is unique)
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = (0..count)
+            .map(|i| {
+                let uk = format!("key_{:06}", i);
+                let ik = InternalKey::new(uk.as_bytes(), (count - i) as u64, ValueType::Value);
+                let val = format!("value_{}", i);
+                (ik.into_bytes(), val.into_bytes())
+            })
+            .collect();
+        // Internal keys with distinct user_keys are already in correct order since
+        // user_key ASC is the primary sort. But let's sort to be safe.
+        entries.sort_by(|(a, _), (b, _)| crate::types::compare_internal_key(a, b));
+
+        for (k, v) in &entries {
+            builder.add(k, v).unwrap();
+        }
+        builder.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn test_table_iterator_seek_for_prev() {
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_internal_key_table(dir.path(), 100);
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+
+        // For seek_for_prev, we want to find the last entry for a given user key.
+        // Use seq=0, Deletion type to create a key that sorts AFTER all entries
+        // for that user key (since lower seq sorts later in internal key order).
+        let seek_key =
+            |uk: &[u8]| -> Vec<u8> { InternalKey::new(uk, 0, ValueType::Deletion).into_bytes() };
+        let extract_uk = |ikey: &[u8]| -> Vec<u8> {
+            crate::types::InternalKeyRef::new(ikey).user_key().to_vec()
+        };
+
+        // seek_for_prev to exact user key
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"key_000050"));
+        let entry = iter.current().unwrap();
+        assert_eq!(extract_uk(&entry.0), b"key_000050");
+        assert_eq!(entry.1, b"value_50");
+
+        // seek_for_prev to key between entries (key_000050 < target < key_000051)
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"key_000050x"));
+        let entry = iter.current().unwrap();
+        assert_eq!(extract_uk(&entry.0), b"key_000050");
+
+        // seek_for_prev past all keys
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"zzz"));
+        let entry = iter.current().unwrap();
+        assert_eq!(extract_uk(&entry.0), b"key_000099");
+
+        // seek_for_prev before all keys
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"aaa"));
+        assert!(iter.current().is_none());
+
+        // seek_for_prev to first key
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"key_000000"));
+        let entry = iter.current().unwrap();
+        assert_eq!(extract_uk(&entry.0), b"key_000000");
+
+        // After seek_for_prev, forward iteration should work
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"key_000050"));
+        // Advance block_pos to consume the current entry
+        iter.block_pos += 1;
+        let next = iter.next();
+        assert!(next.is_some());
+        assert_eq!(extract_uk(&next.unwrap().0), b"key_000051");
+    }
+
+    #[test]
+    fn test_table_iterator_prev() {
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = build_internal_key_table(dir.path(), 100);
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+
+        let seek_key =
+            |uk: &[u8]| -> Vec<u8> { InternalKey::new(uk, 0, ValueType::Deletion).into_bytes() };
+        let extract_uk = |ikey: &[u8]| -> Vec<u8> {
+            crate::types::InternalKeyRef::new(ikey).user_key().to_vec()
+        };
+
+        // Seek to middle, then prev
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"key_000050"));
+        assert_eq!(extract_uk(&iter.current().unwrap().0), b"key_000050");
+
+        let prev = iter.prev().unwrap();
+        assert_eq!(extract_uk(&prev.0), b"key_000049");
+
+        let prev = iter.prev().unwrap();
+        assert_eq!(extract_uk(&prev.0), b"key_000048");
+
+        // Seek to end, prev through several entries
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"zzz"));
+        assert_eq!(extract_uk(&iter.current().unwrap().0), b"key_000099");
+
+        let prev = iter.prev().unwrap();
+        assert_eq!(extract_uk(&prev.0), b"key_000098");
+
+        // Seek to first key, prev should return None
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"key_000000"));
+        assert_eq!(extract_uk(&iter.current().unwrap().0), b"key_000000");
+        assert!(iter.prev().is_none());
+
+        // Prev across block boundaries (with 100 entries, there are multiple blocks)
+        let mut iter = TableIterator::new(reader.clone());
+        iter.seek_for_prev(&seek_key(b"key_000099"));
+        // Walk backwards through all entries
+        let mut count = 1; // start at 1 for the current entry
+        while iter.prev().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 100, "should be able to prev through all 100 entries");
     }
 }

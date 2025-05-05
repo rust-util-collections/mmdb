@@ -1,6 +1,6 @@
 # MMDB — A Modern LSM-Tree Storage Engine
 
-[![CI](https://github.com/user/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/user/mmdb/actions/workflows/ci.yml)
+[![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-159_passing-brightgreen.svg)]()

@@ -1,6 +1,7 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
 use std::collections::VecDeque;
+use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,6 +12,7 @@ use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
 use crate::compaction::LeveledCompaction;
 use crate::error::{Error, Result};
+use crate::iterator::BidiIterator;
 use crate::iterator::db_iter::DBIterator;
 use crate::iterator::merge::IterSource;
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
@@ -376,14 +378,42 @@ impl DB {
         }
 
         // SST files — use streaming TableIterator (O(1 block) memory each)
+        // Use from_seekable so DBIterator can re-seek for prev() support.
         for level in 0..version.num_levels {
             for tf in version.level_files(level) {
                 let iter = TableIterator::new(tf.reader.clone());
-                sources.push(IterSource::from_boxed(Box::new(iter)));
+                sources.push(IterSource::from_seekable(Box::new(iter)));
             }
         }
 
         Ok(DBIterator::from_sources(sources, seq))
+    }
+
+    /// Create a bidirectional iterator over all visible entries.
+    ///
+    /// Materializes entries at creation time. Supports `DoubleEndedIterator`
+    /// for both forward and reverse traversal.
+    pub fn iter_bidi(&self) -> Result<BidiIterator> {
+        let entries: Vec<_> = self.iter()?.collect();
+        Ok(BidiIterator::new(entries))
+    }
+
+    /// Create a bidirectional iterator over entries whose keys start with `prefix`.
+    pub fn prefix_iterator(&self, prefix: &[u8]) -> Result<BidiIterator> {
+        let prefix = prefix.to_vec();
+        let entries: Vec<_> = self
+            .iter()?
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .collect();
+        Ok(BidiIterator::new(entries))
+    }
+
+    /// Create a bidirectional iterator over entries within the given key range.
+    ///
+    /// Supports `Included`, `Excluded`, and `Unbounded` bounds.
+    pub fn range<R: RangeBounds<Vec<u8>>>(&self, bounds: R) -> Result<BidiIterator> {
+        let entries: Vec<_> = self.iter()?.filter(|(k, _)| bounds.contains(k)).collect();
+        Ok(BidiIterator::new(entries))
     }
 
     pub fn snapshot_seq(&self) -> SequenceNumber {

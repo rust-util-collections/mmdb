@@ -156,6 +156,99 @@ impl Block {
         None
     }
 
+    /// Seek to the last entry where compare(key, target) <= Equal.
+    /// Uses binary search on restart points, then forward scan to find the last entry <= target.
+    pub fn seek_for_prev_by<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+        &self,
+        target: &[u8],
+        compare: F,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        // Binary search on restart points to find the last restart point whose
+        // key is <= target.
+        let mut left = 0u32;
+        let mut right = self.num_restarts;
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let rp = self.restart_point(mid) as usize;
+
+            match decode_entry_at(&self.data, rp, &[]) {
+                Some((key, _, _)) => {
+                    if compare(&key, target) != std::cmp::Ordering::Greater {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                None => {
+                    right = mid;
+                }
+            }
+        }
+
+        // `left` is now the first restart point whose key > target.
+        // We need to scan from restart point `left - 1` (or 0 if left == 0),
+        // but we might also need to check from `left - 2` in case entries
+        // between restart points span the boundary.
+        // To be safe, start from one restart point before the one that's > target.
+        let start_restart = if left > 0 { left - 1 } else { 0 };
+        let start = self.restart_point(start_restart) as usize;
+
+        let mut offset = start;
+        let mut current_key = Vec::new();
+        let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
+
+        while offset < self.restart_offset {
+            match decode_entry_at(&self.data, offset, &current_key) {
+                Some((key, value, next_off)) => {
+                    if compare(&key, target) != std::cmp::Ordering::Greater {
+                        best = Some((key.clone(), value));
+                    } else {
+                        // All subsequent entries will be > target, we're done
+                        break;
+                    }
+                    current_key = key;
+                    offset = next_off;
+                }
+                None => break,
+            }
+        }
+
+        best
+    }
+
+    /// Decode all entries from the given restart point index through the end of
+    /// the data region. Returns a Vec of (key, value) pairs.
+    /// This is used by TableIterator::prev() to re-decode a block from a restart point.
+    pub fn iter_from_restart(&self, restart_index: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if restart_index >= self.num_restarts {
+            return Vec::new();
+        }
+
+        let start = self.restart_point(restart_index) as usize;
+        let mut offset = start;
+        let mut current_key = Vec::new();
+        let mut entries = Vec::new();
+
+        while offset < self.restart_offset {
+            match decode_entry_at(&self.data, offset, &current_key) {
+                Some((key, value, next_off)) => {
+                    entries.push((key.clone(), value));
+                    current_key = key;
+                    offset = next_off;
+                }
+                None => break,
+            }
+        }
+
+        entries
+    }
+
+    /// Return the number of restart points in this block.
+    pub fn num_restarts(&self) -> u32 {
+        self.num_restarts
+    }
+
     /// Binary search for a key using restart points, then linear scan.
     /// Returns Some((key, value)) for exact user key match at the latest sequence,
     /// or None if not found.
@@ -443,5 +536,77 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0.len(), 128);
         assert_eq!(entries[0].1.len(), 16384);
+    }
+
+    #[test]
+    fn test_seek_for_prev_by() {
+        let mut builder = BlockBuilder::new(4); // restart every 4 entries
+
+        for i in 0..20 {
+            let key = format!("key_{:04}", i * 2); // even keys: 0,2,4,...,38
+            let val = format!("val_{}", i);
+            builder.add(key.as_bytes(), val.as_bytes());
+        }
+
+        let data = builder.finish();
+        let block = Block::new(data).unwrap();
+        let compare = |a: &[u8], b: &[u8]| a.cmp(b);
+
+        // Exact match: seek_for_prev to key_0010 (exists)
+        let (k, v) = block.seek_for_prev_by(b"key_0010", compare).unwrap();
+        assert_eq!(k, b"key_0010");
+        assert_eq!(v, b"val_5");
+
+        // Between entries: seek_for_prev to key_0011 (between key_0010 and key_0012)
+        let (k, _) = block.seek_for_prev_by(b"key_0011", compare).unwrap();
+        assert_eq!(k, b"key_0010");
+
+        // After last: seek_for_prev to "zzz" should return last entry
+        let (k, _) = block.seek_for_prev_by(b"zzz", compare).unwrap();
+        assert_eq!(k, b"key_0038");
+
+        // Before first: seek_for_prev to "aaa" should return None
+        assert!(block.seek_for_prev_by(b"aaa", compare).is_none());
+
+        // Exactly first key
+        let (k, v) = block.seek_for_prev_by(b"key_0000", compare).unwrap();
+        assert_eq!(k, b"key_0000");
+        assert_eq!(v, b"val_0");
+
+        // Just before first key
+        assert!(block.seek_for_prev_by(b"key_", compare).is_none());
+    }
+
+    #[test]
+    fn test_iter_from_restart() {
+        let mut builder = BlockBuilder::new(4); // restart every 4 entries
+
+        for i in 0..12 {
+            let key = format!("key_{:04}", i);
+            let val = format!("val_{}", i);
+            builder.add(key.as_bytes(), val.as_bytes());
+        }
+
+        let data = builder.finish();
+        let block = Block::new(data).unwrap();
+
+        // Restart 0: entries 0..4 and beyond
+        let entries = block.iter_from_restart(0);
+        assert_eq!(entries.len(), 12);
+        assert_eq!(entries[0].0, b"key_0000");
+
+        // Restart 1: entries 4..8 and beyond
+        let entries = block.iter_from_restart(1);
+        assert_eq!(entries.len(), 8); // entries 4 through 11
+        assert_eq!(entries[0].0, b"key_0004");
+
+        // Restart 2: entries 8..12
+        let entries = block.iter_from_restart(2);
+        assert_eq!(entries.len(), 4); // entries 8 through 11
+        assert_eq!(entries[0].0, b"key_0008");
+
+        // Out of bounds
+        let entries = block.iter_from_restart(100);
+        assert!(entries.is_empty());
     }
 }

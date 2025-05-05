@@ -1091,3 +1091,193 @@ fn test_delete_range_basic() {
     );
     assert_eq!(db.get(b"h").unwrap(), Some(b"new".to_vec()));
 }
+
+// ---------------------------------------------------------------------------
+// Bidirectional / Range / Prefix iterator tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_prefix_iterator() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    // Write keys with two different 3-byte prefixes
+    for i in 0..10u8 {
+        let mut key_a = b"AAA".to_vec();
+        key_a.push(i);
+        db.put(&key_a, &[i]).unwrap();
+
+        let mut key_b = b"BBB".to_vec();
+        key_b.push(i);
+        db.put(&key_b, &[i + 100]).unwrap();
+    }
+
+    // Prefix iterator for "AAA" should only see AAA* keys
+    let entries: Vec<_> = db.prefix_iterator(b"AAA").unwrap().collect();
+    assert_eq!(entries.len(), 10, "expected 10 AAA-prefixed keys");
+    for (k, v) in &entries {
+        assert!(k.starts_with(b"AAA"), "key should start with AAA");
+        assert!(v[0] < 10, "value should be 0..9");
+    }
+
+    // Prefix iterator for "BBB" should only see BBB* keys
+    let entries: Vec<_> = db.prefix_iterator(b"BBB").unwrap().collect();
+    assert_eq!(entries.len(), 10, "expected 10 BBB-prefixed keys");
+    for (k, _) in &entries {
+        assert!(k.starts_with(b"BBB"), "key should start with BBB");
+    }
+
+    // Non-existent prefix should yield empty iterator
+    let entries: Vec<_> = db.prefix_iterator(b"CCC").unwrap().collect();
+    assert_eq!(entries.len(), 0);
+}
+
+#[test]
+fn test_range_iterator_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0..20 {
+        let key = format!("key_{:04}", i);
+        let val = format!("val_{:04}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    // Included..Excluded: [key_0005, key_0010)
+    let entries: Vec<_> = db
+        .range(b"key_0005".to_vec()..b"key_0010".to_vec())
+        .unwrap()
+        .collect();
+    assert_eq!(entries.len(), 5, "range [5,10) should have 5 entries");
+    assert_eq!(entries[0].0, b"key_0005");
+    assert_eq!(entries[4].0, b"key_0009");
+
+    // Included..=Included: [key_0005, key_0010]
+    let entries: Vec<_> = db
+        .range(b"key_0005".to_vec()..=b"key_0010".to_vec())
+        .unwrap()
+        .collect();
+    assert_eq!(entries.len(), 6, "range [5,10] should have 6 entries");
+
+    // Unbounded..Excluded: [.., key_0003)
+    let entries: Vec<_> = db.range(..b"key_0003".to_vec()).unwrap().collect();
+    assert_eq!(entries.len(), 3, "range [..,3) should have 3 entries");
+
+    // Included..Unbounded: [key_0018, ..]
+    let entries: Vec<_> = db.range(b"key_0018".to_vec()..).unwrap().collect();
+    assert_eq!(entries.len(), 2, "range [18,..] should have 2 entries");
+
+    // Full range
+    let entries: Vec<_> = db.range::<std::ops::RangeFull>(..).unwrap().collect();
+    assert_eq!(entries.len(), 20, "full range should have 20 entries");
+}
+
+#[test]
+fn test_bidi_iterator_forward_reverse() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0..10 {
+        let key = format!("key_{:04}", i);
+        let val = format!("val_{:04}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    // Full forward traversal
+    let forward: Vec<_> = db.iter_bidi().unwrap().collect();
+    assert_eq!(forward.len(), 10);
+    assert_eq!(forward[0].0, b"key_0000");
+    assert_eq!(forward[9].0, b"key_0009");
+
+    // Full reverse traversal
+    let reverse: Vec<_> = db.iter_bidi().unwrap().rev().collect();
+    assert_eq!(reverse.len(), 10);
+    assert_eq!(reverse[0].0, b"key_0009");
+    assert_eq!(reverse[9].0, b"key_0000");
+
+    // Forward and reverse should be mirror images
+    for (f, r) in forward.iter().zip(reverse.iter().rev()) {
+        assert_eq!(f.0, r.0);
+        assert_eq!(f.1, r.1);
+    }
+}
+
+#[test]
+fn test_bidi_iterator_interleaved() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for ch in b'a'..=b'f' {
+        db.put(&[ch], &[ch]).unwrap();
+    }
+
+    let mut it = db.iter_bidi().unwrap();
+    assert_eq!(it.next().unwrap().0, vec![b'a']); // front
+    assert_eq!(it.next_back().unwrap().0, vec![b'f']); // back
+    assert_eq!(it.next().unwrap().0, vec![b'b']); // front
+    assert_eq!(it.next_back().unwrap().0, vec![b'e']); // back
+    assert_eq!(it.next().unwrap().0, vec![b'c']); // front
+    assert_eq!(it.next_back().unwrap().0, vec![b'd']); // back
+    // Cursors crossed — both directions exhausted
+    assert!(it.next().is_none());
+    assert!(it.next_back().is_none());
+}
+
+#[test]
+fn test_bidi_range_reverse() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0..20 {
+        let key = format!("r_{:04}", i);
+        db.put(key.as_bytes(), b"v").unwrap();
+    }
+
+    // Range [r_0005, r_0015) reversed
+    let reverse: Vec<_> = db
+        .range(b"r_0005".to_vec()..b"r_0015".to_vec())
+        .unwrap()
+        .rev()
+        .collect();
+    assert_eq!(reverse.len(), 10);
+    assert_eq!(reverse[0].0, b"r_0014");
+    assert_eq!(reverse[9].0, b"r_0005");
+}
+
+#[test]
+fn test_iter_rev_after_flush_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 1024,
+        l0_compaction_trigger: 3,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    // Write data across multiple flushes to spread across SST levels
+    for round in 0..4 {
+        for i in 0..15 {
+            let key = format!("rev_{:04}", round * 15 + i);
+            let val = format!("v_{}", round * 15 + i);
+            db.put(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.compact().unwrap();
+
+    // Forward
+    let forward: Vec<_> = db.iter_bidi().unwrap().collect();
+    assert_eq!(forward.len(), 60);
+
+    // Reverse should be exact mirror
+    let reverse: Vec<_> = db.iter_bidi().unwrap().rev().collect();
+    assert_eq!(reverse.len(), 60);
+    assert_eq!(reverse[0].0, forward[59].0);
+    assert_eq!(reverse[59].0, forward[0].0);
+
+    // Verify sorted order of forward
+    for i in 1..forward.len() {
+        assert!(forward[i].0 > forward[i - 1].0, "not sorted at {}", i);
+    }
+}

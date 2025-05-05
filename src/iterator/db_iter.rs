@@ -197,25 +197,212 @@ impl DBIterator {
     }
 
     pub fn seek_to_first(&mut self) {
-        // Reset by seeking to empty key (sorts before everything)
-        self.merger.seek(b"\x00");
+        use crate::types::InternalKey;
+        // Seek to the smallest possible internal key (empty user key, max sequence).
+        let seek_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+        self.merger.seek(seek_key.as_bytes());
         self.last_user_key = None;
         self.needs_advance = true;
         self.current = None;
     }
 
-    /// Seek to the last key <= target, then position on it.
+    /// Seek to the last visible user key <= target.
+    ///
+    /// Strategy: seek to >= target. If exact match, done.
+    /// If the found key > target or no key >= target exists, use seek_to_last
+    /// and prev-scan approach to find the last key <= target.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.seek(target);
-        // If positioned exactly on target, done.
-        // If positioned past target, we need prev() which requires materialization.
-        // For now, this seeks to >= target — a full prev() implementation would need
-        // reverse iteration support in the heap.
-        if self.valid() && self.key() > target {
-            // We overshot. For the simplified version, we collected forward only.
-            // Mark as invalid — full reverse iteration requires more infrastructure.
-            self.current = None;
-            self.needs_advance = false;
+        if self.valid() && self.key() <= target {
+            return; // Exact match or equal
+        }
+        // Either no entry >= target (iterator exhausted), or the found entry > target.
+        // Need to find the last visible entry <= target by scanning from the beginning.
+        self.seek_for_prev_scan(target);
+    }
+
+    /// Internal: scan from the beginning to find the last visible entry <= target.
+    fn seek_for_prev_scan(&mut self, target: &[u8]) {
+        use crate::types::InternalKey;
+
+        let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+        self.merger.seek_to(first_key.as_bytes());
+        self.last_user_key = None;
+        self.range_tombstones.clear();
+
+        let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
+
+        loop {
+            let visible = self.next_visible();
+            match visible {
+                Some((uk, val)) => {
+                    if uk.as_slice() > target {
+                        break; // Past target, stop
+                    }
+                    best = Some((uk, val));
+                }
+                None => break,
+            }
+        }
+
+        match best {
+            Some((uk, val)) => {
+                // Re-position the merger on this key for future next()/prev() calls.
+                let reseek_key =
+                    InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+                self.merger.seek_to(reseek_key.as_bytes());
+                self.last_user_key = None;
+                self.range_tombstones.clear();
+
+                // Consume through to our key
+                loop {
+                    let visible = self.next_visible();
+                    match visible {
+                        Some((found_uk, _)) if found_uk == uk => break,
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+
+                self.current = Some((uk, val));
+                self.needs_advance = false;
+            }
+            None => {
+                self.current = None;
+                self.needs_advance = false;
+            }
+        }
+    }
+
+    /// Move to the previous visible user key.
+    ///
+    /// Uses the re-seek approach: saves the current user key, seeks to just before it,
+    /// then scans forward collecting visible entries to find the last one before the
+    /// saved key. This is O(log N) per call (same as RocksDB's approach for prev).
+    pub fn prev(&mut self) {
+        use crate::types::InternalKey;
+
+        // Ensure we have a current entry to move backwards from
+        self.ensure_current();
+        let saved_key = match &self.current {
+            Some((k, _)) => k.clone(),
+            None => {
+                // No current entry; nothing to go back from
+                return;
+            }
+        };
+
+        // Re-seek the merger to the very beginning and scan forward to find
+        // the last visible entry before saved_key.
+        let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+        self.merger.seek_to(first_key.as_bytes());
+        self.last_user_key = None;
+        self.range_tombstones.clear();
+
+        // Scan forward, collecting the last visible entry before saved_key
+        let mut prev_entry: Option<(Vec<u8>, Vec<u8>)> = None;
+
+        loop {
+            let visible = self.next_visible();
+            match visible {
+                Some((uk, val)) => {
+                    if uk >= saved_key {
+                        // We've reached or passed the saved key; stop
+                        break;
+                    }
+                    prev_entry = Some((uk, val));
+                }
+                None => break,
+            }
+        }
+
+        // Now we need to re-position the iterator.
+        // If we found a previous entry, position on it.
+        // We also need to ensure the merger is positioned correctly for future calls.
+        match prev_entry {
+            Some((uk, val)) => {
+                // Re-seek the merger to the found key so future next()/prev() work correctly.
+                let reseek_key =
+                    InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+                self.merger.seek_to(reseek_key.as_bytes());
+                self.last_user_key = None;
+                self.range_tombstones.clear();
+
+                // Advance the merger past this key so next() gives the right entry
+                // by consuming the current key's entries.
+                loop {
+                    let visible = self.next_visible();
+                    match visible {
+                        Some((found_uk, _)) if found_uk == uk => {
+                            // Found our key, stop
+                            break;
+                        }
+                        Some(_) => {
+                            // Different key before ours, keep going
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+
+                self.current = Some((uk, val));
+                self.needs_advance = false;
+            }
+            None => {
+                // No previous entry exists
+                self.current = None;
+                self.needs_advance = false;
+            }
+        }
+    }
+
+    /// Seek to the last visible key. Positions the iterator on the very last entry.
+    pub fn seek_to_last(&mut self) {
+        use crate::types::InternalKey;
+        // Seek to the beginning and scan to find the last visible entry
+        let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+        self.merger.seek_to(first_key.as_bytes());
+        self.last_user_key = None;
+        self.range_tombstones.clear();
+
+        let mut last_entry: Option<(Vec<u8>, Vec<u8>)> = None;
+        loop {
+            let visible = self.next_visible();
+            match visible {
+                Some(entry) => {
+                    last_entry = Some(entry);
+                }
+                None => break,
+            }
+        }
+
+        match last_entry {
+            Some((uk, val)) => {
+                // Re-seek so future prev() calls work
+                use crate::types::InternalKey;
+                let reseek_key =
+                    InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+                self.merger.seek_to(reseek_key.as_bytes());
+                self.last_user_key = None;
+                self.range_tombstones.clear();
+
+                // Consume through to our key
+                loop {
+                    let visible = self.next_visible();
+                    match visible {
+                        Some((found_uk, _)) if found_uk == uk => break,
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+
+                self.current = Some((uk, val));
+                self.needs_advance = false;
+            }
+            None => {
+                self.current = None;
+                self.needs_advance = false;
+            }
         }
     }
 
@@ -378,6 +565,186 @@ mod tests {
         assert_eq!(iter.value(), b"3");
 
         iter.advance();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_db_iterator_prev() {
+        let source = sort_lex(vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+            make_entry(b"d", 4, ValueType::Value, b"4"),
+            make_entry(b"e", 5, ValueType::Value, b"5"),
+        ]);
+
+        // Seek to middle, then prev
+        let mut iter = DBIterator::new(vec![source.clone()], 10);
+        iter.seek(b"c");
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"c");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"b");
+        assert_eq!(iter.value(), b"2");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"a");
+        assert_eq!(iter.value(), b"1");
+
+        // prev at beginning should invalidate
+        iter.prev();
+        assert!(!iter.valid());
+
+        // Seek to last, prev through all
+        let mut iter = DBIterator::new(vec![source.clone()], 10);
+        iter.seek(b"e");
+        assert_eq!(iter.key(), b"e");
+
+        iter.prev();
+        assert_eq!(iter.key(), b"d");
+        iter.prev();
+        assert_eq!(iter.key(), b"c");
+        iter.prev();
+        assert_eq!(iter.key(), b"b");
+        iter.prev();
+        assert_eq!(iter.key(), b"a");
+        iter.prev();
+        assert!(!iter.valid());
+
+        // prev then next should work
+        let mut iter = DBIterator::new(vec![source], 10);
+        iter.seek(b"c");
+        assert_eq!(iter.key(), b"c");
+        iter.prev();
+        assert_eq!(iter.key(), b"b");
+        // After prev, advance should move to next entry
+        iter.advance();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"c");
+    }
+
+    #[test]
+    fn test_db_iterator_seek_for_prev() {
+        let source = sort_lex(vec![
+            make_entry(b"apple", 1, ValueType::Value, b"1"),
+            make_entry(b"banana", 2, ValueType::Value, b"2"),
+            make_entry(b"cherry", 3, ValueType::Value, b"3"),
+            make_entry(b"date", 4, ValueType::Value, b"4"),
+        ]);
+
+        // Exact match
+        let mut iter = DBIterator::new(vec![source.clone()], 10);
+        iter.seek_for_prev(b"banana");
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"banana");
+
+        // Between entries: blueberry is between banana and cherry
+        let mut iter = DBIterator::new(vec![source.clone()], 10);
+        iter.seek_for_prev(b"blueberry");
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"banana"); // last key <= "blueberry"
+
+        // Before first key
+        let mut iter = DBIterator::new(vec![source.clone()], 10);
+        iter.seek_for_prev(b"aaa");
+        assert!(!iter.valid()); // nothing <= "aaa"
+
+        // After last key
+        let mut iter = DBIterator::new(vec![source.clone()], 10);
+        iter.seek_for_prev(b"zzz");
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"date"); // last key in dataset
+
+        // seek_for_prev to first key
+        let mut iter = DBIterator::new(vec![source], 10);
+        iter.seek_for_prev(b"apple");
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"apple");
+    }
+
+    #[test]
+    fn test_db_iterator_prev_with_tombstones() {
+        let source = sort_lex(vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 5, ValueType::Deletion, b""),
+            make_entry(b"b", 3, ValueType::Value, b"old_b"),
+            make_entry(b"c", 4, ValueType::Value, b"3"),
+            make_entry(b"d", 6, ValueType::Value, b"4"),
+        ]);
+
+        // Forward: should see a, c, d (b is deleted)
+        let mut iter = DBIterator::new(vec![source.clone()], 10);
+        iter.seek(b"d");
+        assert_eq!(iter.key(), b"d");
+
+        // prev should skip deleted "b" and land on "c"
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"c");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"a");
+    }
+
+    #[test]
+    fn test_db_iterator_prev_multiple_sources() {
+        let s1 = sort_lex(vec![
+            make_entry(b"a", 10, ValueType::Value, b"mem_a"),
+            make_entry(b"c", 8, ValueType::Value, b"mem_c"),
+        ]);
+        let s2 = sort_lex(vec![
+            make_entry(b"b", 6, ValueType::Value, b"sst_b"),
+            make_entry(b"d", 4, ValueType::Value, b"sst_d"),
+        ]);
+
+        // Forward: a, b, c, d
+        let mut iter = DBIterator::new(vec![s1, s2], 20);
+        iter.seek(b"d");
+        assert_eq!(iter.key(), b"d");
+
+        iter.prev();
+        assert_eq!(iter.key(), b"c");
+        assert_eq!(iter.value(), b"mem_c");
+
+        iter.prev();
+        assert_eq!(iter.key(), b"b");
+        assert_eq!(iter.value(), b"sst_b");
+
+        iter.prev();
+        assert_eq!(iter.key(), b"a");
+        assert_eq!(iter.value(), b"mem_a");
+
+        iter.prev();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_db_iterator_seek_to_last() {
+        let source = sort_lex(vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+        ]);
+
+        let mut iter = DBIterator::new(vec![source], 10);
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"c");
+        assert_eq!(iter.value(), b"3");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"b");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"a");
+
+        iter.prev();
         assert!(!iter.valid());
     }
 }

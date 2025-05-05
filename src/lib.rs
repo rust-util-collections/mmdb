@@ -20,6 +20,7 @@ pub mod stats;
 // Re-export primary API types
 pub use db::DB;
 pub use error::{Error, Result};
+pub use iterator::BidiIterator;
 pub use iterator::DBIterator;
 pub use options::{
     CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,

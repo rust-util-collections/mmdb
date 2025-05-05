@@ -17,6 +17,16 @@ enum IterSourceInner {
         pos: usize,
     },
     Boxed(Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>>),
+    /// A seekable boxed source (e.g., backed by a TableIterator that supports seek).
+    SeekableBoxed {
+        iter: Box<dyn SeekableIterator>,
+    },
+}
+
+/// Trait for iterators that support seeking (e.g., TableIterator).
+pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
+    /// Seek to the first entry >= target.
+    fn seek_to(&mut self, target: &[u8]);
 }
 
 impl IterSource {
@@ -30,6 +40,13 @@ impl IterSource {
     pub fn from_boxed(iter: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>>) -> Self {
         Self {
             inner: IterSourceInner::Boxed(iter),
+            peeked: None,
+        }
+    }
+
+    pub fn from_seekable(iter: Box<dyn SeekableIterator>) -> Self {
+        Self {
+            inner: IterSourceInner::SeekableBoxed { iter },
             peeked: None,
         }
     }
@@ -62,11 +79,41 @@ impl IterSource {
                 }
             }
             IterSourceInner::Boxed(iter) => iter.next(),
+            IterSourceInner::SeekableBoxed { iter } => iter.next(),
         }
     }
 
     pub fn is_exhausted(&mut self) -> bool {
         self.peek().is_none()
+    }
+
+    /// Seek to the first key >= target, supporting backward movement.
+    /// For Vec sources, resets position and re-scans from the appropriate point.
+    /// For SeekableBoxed sources, delegates to the underlying iterator's seek.
+    /// For plain Boxed sources, can only seek forward (same as `seek`).
+    pub fn seek_to<F: Fn(&[u8], &[u8]) -> Ordering>(&mut self, target: &[u8], compare: &F) {
+        self.peeked = None;
+        match &mut self.inner {
+            IterSourceInner::Vec { entries, pos } => {
+                // Binary search for the first entry >= target
+                let idx = entries.partition_point(|(k, _)| compare(k, target) == Ordering::Less);
+                *pos = idx;
+                // Pre-load peeked
+                if *pos < entries.len() {
+                    self.peeked = Some(entries[*pos].clone());
+                    *pos += 1;
+                }
+            }
+            IterSourceInner::SeekableBoxed { iter } => {
+                iter.seek_to(target);
+                // Pre-load peeked
+                self.peeked = iter.next();
+            }
+            IterSourceInner::Boxed(_) => {
+                // Fall back to forward-only seek
+                self.seek(target, compare);
+            }
+        }
     }
 
     /// Seek forward until the current key >= target according to `compare`.
@@ -220,6 +267,17 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     pub fn seek(&mut self, target: &[u8]) {
         for source in self.sources.iter_mut() {
             source.seek(target, &self.compare);
+        }
+        // Rebuild heap
+        self.initialized = false;
+        self.init_heap();
+    }
+
+    /// Seek all sources to a target key with backward support, then rebuild the heap.
+    /// Unlike `seek()`, this can move sources backward (for Vec and SeekableBoxed sources).
+    pub fn seek_to(&mut self, target: &[u8]) {
+        for source in self.sources.iter_mut() {
+            source.seek_to(target, &self.compare);
         }
         // Rebuild heap
         self.initialized = false;

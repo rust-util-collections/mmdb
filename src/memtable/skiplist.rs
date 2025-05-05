@@ -1,11 +1,10 @@
-//! SkipList-based MemTable implementation using crossbeam-skiplist.
+//! SkipList-based MemTable implementation using a custom concurrent skiplist.
 
-use crossbeam_skiplist::SkipMap;
-
+use super::skiplist_impl::ConcurrentSkipList;
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
 
 /// Newtype wrapper for internal keys that implements `Ord` using `compare_internal_key`.
-/// This ensures the SkipMap maintains logical internal key order directly,
+/// This ensures the skip list maintains logical internal key order directly,
 /// eliminating the need for O(N log N) re-sorting on iteration.
 #[derive(Clone, Debug)]
 pub struct OrdInternalKey(Vec<u8>);
@@ -41,7 +40,7 @@ impl Ord for OrdInternalKey {
 /// Keys are encoded InternalKeys (user_key + 8-byte trailer).
 /// The skiplist is ordered by `compare_internal_key` via the `OrdInternalKey` newtype.
 pub struct SkipListMemTable {
-    map: SkipMap<OrdInternalKey, Vec<u8>>,
+    map: ConcurrentSkipList<OrdInternalKey, Vec<u8>>,
 }
 
 impl Default for SkipListMemTable {
@@ -53,7 +52,7 @@ impl Default for SkipListMemTable {
 impl SkipListMemTable {
     pub fn new() -> Self {
         Self {
-            map: SkipMap::new(),
+            map: ConcurrentSkipList::new(),
         }
     }
 
@@ -70,12 +69,12 @@ impl SkipListMemTable {
     /// - `Some(None)` if a Deletion entry is found
     /// - `None` if no entry for this user key exists at or below the search sequence
     pub fn get(&self, search_key: &[u8], user_key: &[u8]) -> Option<Option<Vec<u8>>> {
-        // With OrdInternalKey, the SkipMap is sorted by (user_key ASC, seq DESC).
+        // With OrdInternalKey, the skip list is sorted by (user_key ASC, seq DESC).
         // Range from search_key finds the first entry >= search_key in logical order.
         // For the same user_key, higher seq entries come first.
         let search = OrdInternalKey(search_key.to_vec());
-        for entry in self.map.range(search..) {
-            let k = entry.key().as_bytes();
+        for (k, v) in self.map.range(search..) {
+            let k = k.as_bytes();
             if k.len() < 8 {
                 continue;
             }
@@ -84,7 +83,7 @@ impl SkipListMemTable {
                 // First matching user_key entry is the best (highest seq <= target_seq).
                 let entry_ref = InternalKeyRef::new(k);
                 return Some(match entry_ref.value_type() {
-                    ValueType::Value => Some(entry.value().clone()),
+                    ValueType::Value => Some(v),
                     ValueType::Deletion | ValueType::RangeDeletion => None,
                 });
             }
@@ -100,12 +99,23 @@ impl SkipListMemTable {
     }
 
     /// Iterate over all entries in internal key order (user_key ASC, seq DESC).
-    /// With `OrdInternalKey`, the SkipMap is already in the correct order —
+    /// With `OrdInternalKey`, the skip list is already in the correct order —
     /// no sorting needed.
-    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> + '_ {
-        self.map
-            .iter()
-            .map(|entry| (entry.key().0.clone(), entry.value().clone()))
+    pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+        self.map.iter().map(|(k, v)| (k.0, v))
+    }
+
+    /// Iterate over all entries in reverse internal key order.
+    pub fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+        self.map.iter().rev().map(|(k, v)| (k.0, v))
+    }
+
+    /// Iterate over a range of entries by OrdInternalKey bounds.
+    pub fn range(
+        &self,
+        bounds: impl std::ops::RangeBounds<OrdInternalKey>,
+    ) -> impl DoubleEndedIterator<Item = (Vec<u8>, Vec<u8>)> {
+        self.map.range(bounds).map(|(k, v)| (k.0, v))
     }
 }
 
@@ -196,5 +206,26 @@ mod tests {
             .map(|(k, _)| InternalKeyRef::new(k).sequence())
             .collect();
         assert_eq!(seqs, vec![5, 3, 1]);
+    }
+
+    #[test]
+    fn test_skiplist_iter_rev() {
+        let sl = SkipListMemTable::new();
+
+        let ik1 = InternalKey::new(b"a", 1, ValueType::Value);
+        sl.insert(ik1.into_bytes(), b"1".to_vec());
+        let ik2 = InternalKey::new(b"b", 2, ValueType::Value);
+        sl.insert(ik2.into_bytes(), b"2".to_vec());
+        let ik3 = InternalKey::new(b"c", 3, ValueType::Value);
+        sl.insert(ik3.into_bytes(), b"3".to_vec());
+
+        let entries: Vec<_> = sl.iter_rev().collect();
+        assert_eq!(entries.len(), 3);
+
+        // Reverse order: c, b, a
+        let user_keys: Vec<&[u8]> = entries.iter().map(|(k, _)| &k[..k.len() - 8]).collect();
+        assert_eq!(user_keys[0], b"c");
+        assert_eq!(user_keys[1], b"b");
+        assert_eq!(user_keys[2], b"a");
     }
 }
