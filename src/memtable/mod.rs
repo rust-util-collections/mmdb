@@ -15,6 +15,9 @@ pub struct MemTable {
     inner: SkipListMemTable,
     /// Approximate memory usage in bytes.
     approximate_size: std::sync::atomic::AtomicUsize,
+    /// Whether this memtable contains any RangeDeletion entries.
+    /// Used to skip the expensive O(N) range tombstone scan in get().
+    has_range_deletions: std::sync::atomic::AtomicBool,
 }
 
 impl MemTable {
@@ -22,6 +25,7 @@ impl MemTable {
         Self {
             inner: SkipListMemTable::new(),
             approximate_size: std::sync::atomic::AtomicUsize::new(0),
+            has_range_deletions: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -31,7 +35,11 @@ impl MemTable {
         let val = match value_type {
             ValueType::Value => value.to_vec(),
             ValueType::Deletion => Vec::new(),
-            ValueType::RangeDeletion => value.to_vec(), // value = end key of range
+            ValueType::RangeDeletion => {
+                self.has_range_deletions
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                value.to_vec()
+            }
         };
         let entry_size = ikey.encoded_len() + val.len() + 16; // overhead estimate
         self.inner.insert(ikey.into_bytes(), val);
@@ -67,6 +75,12 @@ impl MemTable {
     /// Return an iterator over all entries in reverse order.
     pub fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.inner.iter_rev()
+    }
+
+    /// Whether this memtable contains any range deletion entries.
+    pub fn has_range_deletions(&self) -> bool {
+        self.has_range_deletions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Return true if empty.

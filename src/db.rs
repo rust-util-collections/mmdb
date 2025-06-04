@@ -568,7 +568,8 @@ impl DB {
     }
 
     /// Check if a key is covered by any range tombstone visible at the given sequence.
-    /// Scans memtables for RangeDeletion entries where begin <= key < end.
+    /// Only scans memtables that actually contain RangeDeletion entries (O(1) skip
+    /// for the common case where delete_range() was never called).
     fn is_key_range_deleted(
         &self,
         key: &[u8],
@@ -579,6 +580,9 @@ impl DB {
         use crate::types::InternalKeyRef;
 
         let check_memtable = |mem: &MemTable| -> bool {
+            if !mem.has_range_deletions() {
+                return false;
+            }
             for (ikey, value) in mem.iter() {
                 if ikey.len() < 8 {
                     continue;

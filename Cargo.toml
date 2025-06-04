@@ -24,5 +24,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "benchmarks"
 harness = false
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
 [features]
 default = []

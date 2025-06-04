@@ -70,31 +70,27 @@ impl SkipListMemTable {
     /// - `None` if no entry for this user key exists at or below the search sequence
     pub fn get(&self, search_key: &[u8], user_key: &[u8]) -> Option<Option<Vec<u8>>> {
         // With OrdInternalKey, the skip list is sorted by (user_key ASC, seq DESC).
-        // Range from search_key finds the first entry >= search_key in logical order.
-        // For the same user_key, higher seq entries come first.
+        // Use O(log N) lower_bound to find the first entry >= search_key,
+        // then check a few entries at level 0 for the matching user_key.
         let search = OrdInternalKey(search_key.to_vec());
-        for (k, v) in self.map.range(search..) {
-            let k = k.as_bytes();
-            if k.len() < 8 {
-                continue;
-            }
-            let entry_uk = &k[..k.len() - 8];
-            if entry_uk == user_key {
-                // First matching user_key entry is the best (highest seq <= target_seq).
-                let entry_ref = InternalKeyRef::new(k);
-                return Some(match entry_ref.value_type() {
-                    ValueType::Value => Some(v),
-                    ValueType::Deletion | ValueType::RangeDeletion => None,
-                });
-            }
-            // Since keys are sorted by user_key ASC, if we see a different user_key
-            // that's lexicographically greater, we've passed all matches.
-            if entry_uk > user_key {
-                return None;
-            }
-            // entry_uk < user_key shouldn't happen with range(search..) in logical order,
-            // but skip just in case.
+
+        // lower_bound gives us the first entry >= search_key.
+        // For the same user_key, higher seq comes first, so the first match
+        // is the best (newest version <= target seq).
+        let (k, v) = self.map.lower_bound(&search)?;
+        let kb = k.as_bytes();
+        if kb.len() < 8 {
+            return None;
         }
+        let entry_uk = &kb[..kb.len() - 8];
+        if entry_uk == user_key {
+            let entry_ref = InternalKeyRef::new(kb);
+            return Some(match entry_ref.value_type() {
+                ValueType::Value => Some(v),
+                ValueType::Deletion | ValueType::RangeDeletion => None,
+            });
+        }
+        // The first entry >= search has a different user_key → not found.
         None
     }
 

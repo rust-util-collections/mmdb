@@ -187,6 +187,104 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         None
     }
 
+    /// Find the first entry with key >= `target` using O(log N) skiplist
+    /// traversal. Returns `(key, value)` or None if no such entry exists.
+    pub fn lower_bound(&self, target: &K) -> Option<(K, V)> {
+        let max_h = self.max_height.load(Ordering::Acquire);
+        let mut current: *const Node<K, V> = ptr::null();
+        let mut candidate: *const Node<K, V> = ptr::null();
+
+        for level in (0..max_h).rev() {
+            let mut next = if current.is_null() {
+                self.head[level].load(Ordering::Acquire)
+            } else {
+                unsafe { &*current }.next[level].load(Ordering::Acquire)
+            };
+
+            while !next.is_null() {
+                let n = unsafe { &*next };
+                if n.key < *target {
+                    current = next;
+                    next = n.next[level].load(Ordering::Acquire);
+                } else {
+                    // n.key >= target — this is a candidate
+                    candidate = next;
+                    break;
+                }
+            }
+        }
+
+        // After the level traversal, we need to check level 0 from `current`
+        // to find the exact first node >= target.
+        let start = if current.is_null() {
+            self.head[0].load(Ordering::Acquire)
+        } else {
+            unsafe { &*current }.next[0].load(Ordering::Acquire)
+        };
+
+        let mut ptr = start;
+        while !ptr.is_null() {
+            let n = unsafe { &*ptr };
+            if n.key >= *target {
+                return Some((n.key.clone(), n.value.clone()));
+            }
+            ptr = n.next[0].load(Ordering::Acquire);
+        }
+
+        // Fall back to candidate if the level-0 walk didn't find anything
+        if !candidate.is_null() {
+            let n = unsafe { &*candidate };
+            return Some((n.key.clone(), n.value.clone()));
+        }
+
+        None
+    }
+
+    /// Iterate forward from the first entry with key >= `target`.
+    /// Uses O(log N) seek then O(1) per-entry level-0 traversal.
+    /// Collects entries starting from the seek point (not the entire list).
+    pub fn range_from(&self, target: &K) -> Vec<(K, V)> {
+        let max_h = self.max_height.load(Ordering::Acquire);
+        let mut current: *const Node<K, V> = ptr::null();
+
+        // Seek using skip list levels
+        for level in (0..max_h).rev() {
+            let mut next = if current.is_null() {
+                self.head[level].load(Ordering::Acquire)
+            } else {
+                unsafe { &*current }.next[level].load(Ordering::Acquire)
+            };
+
+            while !next.is_null() {
+                let n = unsafe { &*next };
+                if n.key < *target {
+                    current = next;
+                    next = n.next[level].load(Ordering::Acquire);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Walk level 0 from the found position
+        let start = if current.is_null() {
+            self.head[0].load(Ordering::Acquire)
+        } else {
+            unsafe { &*current }.next[0].load(Ordering::Acquire)
+        };
+
+        let mut result = Vec::new();
+        let mut ptr = start;
+        while !ptr.is_null() {
+            let n = unsafe { &*ptr };
+            if n.key >= *target {
+                result.push((n.key.clone(), n.value.clone()));
+            }
+            ptr = n.next[0].load(Ordering::Acquire);
+        }
+        result
+    }
+
     /// Return a snapshot iterator over all entries, sorted by key.
     /// Entries are collected at creation time (safe for concurrent modification).
     pub fn iter(&self) -> SkipListIter<K, V> {
