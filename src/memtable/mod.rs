@@ -36,8 +36,10 @@ impl MemTable {
             ValueType::Value => value.to_vec(),
             ValueType::Deletion => Vec::new(),
             ValueType::RangeDeletion => {
+                // Release: ensures this flag is visible to any reader that
+                // subsequently Acquires skiplist entries via atomic pointers.
                 self.has_range_deletions
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                    .store(true, std::sync::atomic::Ordering::Release);
                 value.to_vec()
             }
         };
@@ -79,8 +81,10 @@ impl MemTable {
 
     /// Whether this memtable contains any range deletion entries.
     pub fn has_range_deletions(&self) -> bool {
+        // Acquire: pairs with the Release store in put() to ensure
+        // visibility across cores on weakly-ordered architectures (ARM/RISC-V).
         self.has_range_deletions
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Return true if empty.
