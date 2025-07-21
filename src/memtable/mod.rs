@@ -1,6 +1,6 @@
 //! MemTable: in-memory sorted key-value store backed by a lock-free skiplist.
 
-mod skiplist;
+pub mod skiplist;
 pub mod skiplist_impl;
 
 pub use skiplist::SkipListMemTable;
@@ -77,6 +77,14 @@ impl MemTable {
     /// Return an iterator over all entries in reverse order.
     pub fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.inner.iter_rev()
+    }
+
+    /// Get a raw pointer to the underlying skiplist for cursor-based iteration.
+    /// The pointer is valid as long as this MemTable is alive.
+    pub fn skiplist_ref(
+        &self,
+    ) -> *const skiplist_impl::ConcurrentSkipList<skiplist::OrdInternalKey, Vec<u8>> {
+        self.inner.skiplist_ptr()
     }
 
     /// Whether this memtable contains any range deletion entries.

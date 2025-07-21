@@ -312,6 +312,74 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         }
     }
 
+    /// Access key and value of a node by opaque pointer. Zero-copy.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid non-null node pointer from this skiplist.
+    pub unsafe fn node_kv(&self, ptr: *const ()) -> (&K, &V) {
+        unsafe {
+            let node = &*(ptr as *const Node<K, V>);
+            (&node.key, &node.value)
+        }
+    }
+
+    /// Get the next level-0 pointer from a node. Returns null if end.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid non-null node pointer from this skiplist.
+    pub unsafe fn node_next0(&self, ptr: *const ()) -> *const () {
+        unsafe {
+            let node = &*(ptr as *const Node<K, V>);
+            node.next[0].load(Ordering::Acquire) as *const ()
+        }
+    }
+
+    /// Return a raw pointer to the first level-0 node (for cursor iteration).
+    pub fn head_ptr(&self) -> *const () {
+        self.head[0].load(Ordering::Acquire) as *const ()
+    }
+
+    /// Seek to first entry >= target, returning raw node pointer. O(log N).
+    pub fn seek_ge_raw(&self, target: &K) -> *const () {
+        let max_h = self.max_height.load(Ordering::Acquire);
+        let mut current: *const Node<K, V> = ptr::null();
+
+        for level in (0..max_h).rev() {
+            let mut next = if current.is_null() {
+                self.head[level].load(Ordering::Acquire)
+            } else {
+                unsafe { &*current }.next[level].load(Ordering::Acquire)
+            };
+
+            while !next.is_null() {
+                let n = unsafe { &*next };
+                if n.key < *target {
+                    current = next;
+                    next = n.next[level].load(Ordering::Acquire);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let start = if current.is_null() {
+            self.head[0].load(Ordering::Acquire)
+        } else {
+            unsafe { &*current }.next[0].load(Ordering::Acquire)
+        };
+
+        // Walk level-0 to find exact first >= target
+        let mut ptr = start;
+        while !ptr.is_null() {
+            let n = unsafe { &*ptr };
+            if n.key >= *target {
+                return ptr as *const ();
+            }
+            ptr = n.next[0].load(Ordering::Acquire);
+        }
+        ptr::null()
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)

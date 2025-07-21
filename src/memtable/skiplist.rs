@@ -1,7 +1,9 @@
 //! SkipList-based MemTable implementation using a custom concurrent skiplist.
 
 use super::skiplist_impl::ConcurrentSkipList;
+use crate::iterator::merge::SeekableIterator;
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
+use std::sync::Arc;
 
 /// Newtype wrapper for internal keys that implements `Ord` using `compare_internal_key`.
 /// This ensures the skip list maintains logical internal key order directly,
@@ -54,6 +56,11 @@ impl SkipListMemTable {
         Self {
             map: ConcurrentSkipList::new(),
         }
+    }
+
+    /// Get a raw pointer to the underlying skiplist for cursor-based iteration.
+    pub fn skiplist_ptr(&self) -> *const ConcurrentSkipList<OrdInternalKey, Vec<u8>> {
+        &self.map as *const _
     }
 
     /// Insert an encoded internal key and value.
@@ -112,6 +119,68 @@ impl SkipListMemTable {
         bounds: impl std::ops::RangeBounds<OrdInternalKey>,
     ) -> impl DoubleEndedIterator<Item = (Vec<u8>, Vec<u8>)> {
         self.map.range(bounds).map(|(k, v)| (k.0, v))
+    }
+}
+
+/// Cursor-based streaming iterator over a SkipListMemTable.
+/// Does NOT collect/clone the entire skiplist upfront — walks the level-0
+/// pointer chain on demand, cloning each entry only when `next()` is called.
+///
+/// Implements `SeekableIterator` so it can be used as a seekable source
+/// in `MergingIterator`, eliminating the O(N) iterator creation cost.
+pub struct MemTableCursorIter {
+    /// Arc to keep the underlying memtable (and its skiplist) alive.
+    _memtable: Arc<crate::memtable::MemTable>,
+    /// Current node pointer in the level-0 chain. null = exhausted.
+    cursor: *const (),
+    /// Reference to the skiplist for node_kv/node_next0 access.
+    skiplist: *const ConcurrentSkipList<OrdInternalKey, Vec<u8>>,
+}
+
+// SAFETY: The skiplist nodes are heap-allocated with stable pointers.
+// The Arc<MemTable> keeps the skiplist alive for the iterator's lifetime.
+// Reads are lock-free (Acquire ordering on atomic next pointers).
+unsafe impl Send for MemTableCursorIter {}
+
+impl MemTableCursorIter {
+    pub fn new(memtable: Arc<crate::memtable::MemTable>) -> Self {
+        let skiplist = memtable.skiplist_ref();
+        let head = unsafe { &*skiplist }.head_ptr();
+        Self {
+            _memtable: memtable,
+            cursor: head,
+            skiplist,
+        }
+    }
+
+    #[inline]
+    fn sl(&self) -> &ConcurrentSkipList<OrdInternalKey, Vec<u8>> {
+        unsafe { &*self.skiplist }
+    }
+
+    fn seek_internal(&mut self, target: &[u8]) {
+        let search = OrdInternalKey(target.to_vec());
+        self.cursor = self.sl().seek_ge_raw(&search);
+    }
+}
+
+impl Iterator for MemTableCursorIter {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor.is_null() {
+            return None;
+        }
+        let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
+        let result = (k.as_bytes().to_vec(), v.clone());
+        self.cursor = unsafe { self.sl().node_next0(self.cursor) };
+        Some(result)
+    }
+}
+
+impl SeekableIterator for MemTableCursorIter {
+    fn seek_to(&mut self, target: &[u8]) {
+        self.seek_internal(target);
     }
 }
 

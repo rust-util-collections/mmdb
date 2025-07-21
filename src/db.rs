@@ -351,6 +351,18 @@ impl DB {
     /// Uses streaming TableIterators for SST files (O(1 block) memory per SST)
     /// instead of loading entire tables into memory.
     pub fn iter_with_options(&self, options: &ReadOptions) -> Result<DBIterator> {
+        self.iter_with_range(options, None, None)
+    }
+
+    /// Create a forward iterator that only includes sources overlapping [start_hint, end_hint].
+    /// SST files outside this range are skipped entirely, avoiding costly block reads.
+    /// `None` bounds mean unbounded in that direction.
+    pub fn iter_with_range(
+        &self,
+        options: &ReadOptions,
+        start_hint: Option<&[u8]>,
+        end_hint: Option<&[u8]>,
+    ) -> Result<DBIterator> {
         self.check_closed()?;
 
         let seq = match options.snapshot {
@@ -369,18 +381,50 @@ impl DB {
 
         let mut sources: Vec<IterSource> = Vec::new();
 
-        // Active memtable — collect to Vec (already in memory)
-        sources.push(IterSource::new(active_mem.iter().collect()));
-
-        // Immutable memtables — collect to Vec (already in memory)
-        for imm in &imm_mems {
-            sources.push(IterSource::new(imm.iter().collect()));
+        // Active memtable — cursor-based streaming iterator.
+        {
+            use crate::memtable::skiplist::MemTableCursorIter;
+            let cursor = MemTableCursorIter::new(active_mem.clone());
+            sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
-        // SST files — use streaming TableIterator (O(1 block) memory each)
-        // Use from_seekable so DBIterator can re-seek for prev() support.
+        // Immutable memtables
+        for imm in &imm_mems {
+            use crate::memtable::skiplist::MemTableCursorIter;
+            let cursor = MemTableCursorIter::new(imm.clone());
+            sources.push(IterSource::from_seekable(Box::new(cursor)));
+        }
+
+        // SST files — only include files whose key range overlaps [start_hint, end_hint].
+        // L0 files can overlap each other so we check each individually.
+        // L1+ files are sorted and non-overlapping, so we can binary-search.
         for level in 0..version.num_levels {
             for tf in version.level_files(level) {
+                // Check if this file's key range overlaps the hint range.
+                if let Some(start) = start_hint {
+                    // File's largest user key must be >= start
+                    let lk = &tf.meta.largest_key;
+                    let file_largest_uk = if lk.len() >= 8 {
+                        &lk[..lk.len() - 8]
+                    } else {
+                        lk.as_slice()
+                    };
+                    if file_largest_uk < start {
+                        continue; // File ends before our range starts
+                    }
+                }
+                if let Some(end) = end_hint {
+                    // File's smallest user key must be <= end
+                    let sk = &tf.meta.smallest_key;
+                    let file_smallest_uk = if sk.len() >= 8 {
+                        &sk[..sk.len() - 8]
+                    } else {
+                        sk.as_slice()
+                    };
+                    if file_smallest_uk > end {
+                        continue; // File starts after our range ends
+                    }
+                }
                 let iter = TableIterator::new(tf.reader.clone());
                 sources.push(IterSource::from_seekable(Box::new(iter)));
             }

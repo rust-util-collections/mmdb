@@ -21,6 +21,9 @@ pub struct TableReader {
     filter_data: Option<Vec<u8>>,
     file: std::sync::Mutex<File>,
     block_cache: Option<Arc<BlockCache>>,
+    /// Cached index entries, shared across all TableIterators for this file.
+    /// Populated once on first access, then reused (Arc for zero-copy sharing).
+    index_entry_cache: std::sync::OnceLock<Arc<Vec<(Vec<u8>, Vec<u8>)>>>,
 }
 
 impl TableReader {
@@ -71,7 +74,16 @@ impl TableReader {
             filter_data,
             file: std::sync::Mutex::new(file),
             block_cache,
+            index_entry_cache: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Get cached index entries (shared across all TableIterators for this file).
+    /// Populated once on first access, then reused via Arc.
+    pub fn cached_index_entries(&self) -> Arc<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.index_entry_cache
+            .get_or_init(|| Arc::new(self.index_block.iter().collect()))
+            .clone()
     }
 
     /// Look up a key in the SST (exact byte match). Returns the value if found.
@@ -280,8 +292,9 @@ impl TableReader {
 /// Memory usage: O(1 block) instead of O(entire table).
 pub struct TableIterator {
     reader: Arc<TableReader>,
-    /// Index block entries: (index_key, block_handle_bytes)
-    index_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Cached index entries (shared across all iterators for this table).
+    /// Lazily populated on first use, then cached in the TableReader.
+    index_entries: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
     /// Current index position
     index_pos: usize,
     /// Current block's entries (lazily loaded)
@@ -292,7 +305,7 @@ pub struct TableIterator {
 
 impl TableIterator {
     pub fn new(reader: Arc<TableReader>) -> Self {
-        let index_entries: Vec<_> = reader.index_block.iter().collect();
+        let index_entries = reader.cached_index_entries();
         Self {
             reader,
             index_entries,
@@ -305,6 +318,17 @@ impl TableIterator {
     /// Seek to the first entry >= target using the index block for O(log N) lookup.
     pub fn seek(&mut self, target: &[u8]) {
         use crate::types::compare_internal_key;
+
+        // Quick check: if target > file's largest key, mark exhausted.
+        // The last index entry's key is the largest key in the file.
+        if let Some((largest, _)) = self.index_entries.last() {
+            if compare_internal_key(target, largest) == std::cmp::Ordering::Greater {
+                self.index_pos = self.index_entries.len();
+                self.current_block_entries.clear();
+                self.block_pos = 0;
+                return;
+            }
+        }
 
         // Binary search index entries to find the first block that may contain target
         let idx = self.index_entries.partition_point(|(idx_key, _)| {
