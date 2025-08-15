@@ -153,12 +153,20 @@ impl LeveledCompaction {
         // Streaming merge in internal key order (lex = logical order)
         let mut merger = MergingIterator::new(sources, compare_internal_key);
 
+        let target_compression = if !options.compression_per_level.is_empty()
+            && target_level < options.compression_per_level.len()
+        {
+            options.compression_per_level[target_level]
+        } else {
+            options.compression
+        };
         let build_opts = TableBuildOptions {
             block_size: options.block_size,
             block_restart_interval: options.block_restart_interval,
             bloom_bits_per_key: options.bloom_bits_per_key,
             internal_keys: true,
-            compression: options.compression,
+            compression: target_compression,
+            prefix_len: options.prefix_len,
         };
 
         let mut edit = VersionEdit::new();
@@ -298,6 +306,152 @@ impl LeveledCompaction {
         }
 
         // Delete old SST files
+        for num in &input_file_numbers {
+            let old_path = db_path.join(format!("{:06}.sst", num));
+            let _ = std::fs::remove_file(old_path);
+        }
+
+        Ok(())
+    }
+
+    /// Force-merge all files at a given level into one output at the same level.
+    /// Drops tombstones if `is_bottommost` is true.
+    pub fn force_merge_level(
+        level: usize,
+        is_bottommost: bool,
+        versions: &mut VersionSet,
+        db_path: &Path,
+        options: &DbOptions,
+        table_cache: Option<&Arc<TableCache>>,
+    ) -> Result<()> {
+        let version = versions.current();
+        let files = version.level_files(level);
+        if files.len() <= 1 {
+            return Ok(());
+        }
+
+        let mut sources: Vec<IterSource> = Vec::new();
+        for tf in files {
+            let iter = TableIterator::new(tf.reader.clone());
+            sources.push(IterSource::from_boxed(Box::new(iter)));
+        }
+
+        let mut merger = MergingIterator::new(sources, compare_internal_key);
+
+        let compression = if !options.compression_per_level.is_empty()
+            && level < options.compression_per_level.len()
+        {
+            options.compression_per_level[level]
+        } else {
+            options.compression
+        };
+        let build_opts = TableBuildOptions {
+            block_size: options.block_size,
+            block_restart_interval: options.block_restart_interval,
+            bloom_bits_per_key: options.bloom_bits_per_key,
+            internal_keys: true,
+            compression,
+            prefix_len: options.prefix_len,
+        };
+
+        let mut edit = VersionEdit::new();
+        let mut builder: Option<TableBuilder> = None;
+        let mut current_file_number = 0u64;
+        let mut current_size = 0usize;
+        let mut last_user_key: Option<Vec<u8>> = None;
+        let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        while let Some((ikey, value)) = merger.next_entry() {
+            if ikey.len() < 8 {
+                continue;
+            }
+            let ikr = InternalKeyRef::new(&ikey);
+            let user_key = ikr.user_key();
+
+            if ikr.value_type() == ValueType::RangeDeletion {
+                range_tombstones.push((user_key.to_vec(), value.clone()));
+                if let Some(ref last) = last_user_key
+                    && last.as_slice() == user_key
+                {
+                    continue;
+                }
+                last_user_key = Some(user_key.to_vec());
+                if is_bottommost {
+                    continue;
+                }
+            } else {
+                if let Some(ref last) = last_user_key
+                    && last.as_slice() == user_key
+                {
+                    continue;
+                }
+                last_user_key = Some(user_key.to_vec());
+
+                if ikr.value_type() == ValueType::Deletion && is_bottommost {
+                    continue;
+                }
+
+                if ikr.value_type() == ValueType::Value {
+                    let covered = range_tombstones.iter().any(|(begin, end)| {
+                        user_key >= begin.as_slice() && user_key < end.as_slice()
+                    });
+                    if covered {
+                        continue;
+                    }
+                }
+            }
+
+            if builder.is_none() {
+                current_file_number = versions.new_file_number();
+                let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
+                builder = Some(TableBuilder::new(&sst_path, build_opts.clone())?);
+                current_size = 0;
+            }
+
+            builder.as_mut().unwrap().add(&ikey, &value)?;
+            current_size += ikey.len() + value.len();
+
+            if current_size >= options.target_file_size_base as usize {
+                let result = builder.take().unwrap().finish()?;
+                edit.add_file(
+                    level as u32,
+                    FileMetaData {
+                        number: current_file_number,
+                        file_size: result.file_size,
+                        smallest_key: result.smallest_key.unwrap_or_default(),
+                        largest_key: result.largest_key.unwrap_or_default(),
+                    },
+                );
+            }
+        }
+
+        if let Some(b) = builder {
+            let result = b.finish()?;
+            edit.add_file(
+                level as u32,
+                FileMetaData {
+                    number: current_file_number,
+                    file_size: result.file_size,
+                    smallest_key: result.smallest_key.unwrap_or_default(),
+                    largest_key: result.largest_key.unwrap_or_default(),
+                },
+            );
+        }
+
+        let input_file_numbers: HashSet<u64> = files.iter().map(|f| f.meta.number).collect();
+        for tf in files {
+            edit.delete_file(level as u32, tf.meta.number);
+        }
+
+        edit.set_next_file_number(versions.next_file_number());
+        versions.log_and_apply(edit)?;
+
+        if let Some(cache) = table_cache {
+            for num in &input_file_numbers {
+                cache.evict(*num);
+            }
+        }
+
         for num in &input_file_numbers {
             let old_path = db_path.join(format!("{:06}.sst", num));
             let _ = std::fs::remove_file(old_path);

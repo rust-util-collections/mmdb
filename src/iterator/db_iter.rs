@@ -30,6 +30,8 @@ pub struct DBIterator {
     needs_advance: bool,
     /// Collected range tombstones for filtering.
     range_tombstones: Vec<RangeTombstone>,
+    /// If set, iteration stops when user key no longer starts with this prefix.
+    prefix: Option<Vec<u8>>,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -53,6 +55,7 @@ impl DBIterator {
             current: None,
             needs_advance: true,
             range_tombstones: Vec::new(),
+            prefix: None,
         }
     }
 
@@ -70,6 +73,30 @@ impl DBIterator {
             current: None,
             needs_advance: true,
             range_tombstones: Vec::new(),
+            prefix: None,
+        }
+    }
+
+    /// Build a DB iterator with prefix-bounded iteration.
+    /// Iteration stops when user key no longer starts with `prefix`.
+    pub fn from_sources_with_prefix(
+        sources: Vec<IterSource>,
+        sequence: SequenceNumber,
+        prefix: Vec<u8>,
+    ) -> Self {
+        let merger = MergingIterator::new(
+            sources,
+            ikey_compare as fn(&[u8], &[u8]) -> std::cmp::Ordering,
+        );
+
+        Self {
+            merger,
+            sequence,
+            last_user_key: None,
+            current: None,
+            needs_advance: true,
+            range_tombstones: Vec::new(),
+            prefix: Some(prefix),
         }
     }
 
@@ -107,6 +134,13 @@ impl DBIterator {
             }
 
             let user_key = ikr.user_key();
+
+            // Prefix boundary check — stop immediately when prefix changes
+            if let Some(ref pfx) = self.prefix
+                && !user_key.starts_with(pfx)
+            {
+                return None;
+            }
 
             // Collect range tombstones
             if ikr.value_type() == ValueType::RangeDeletion {

@@ -5,6 +5,8 @@ pub mod skiplist_impl;
 
 pub use skiplist::SkipListMemTable;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use crate::types::{InternalKey, SequenceNumber, ValueType};
 
 /// A MemTable stores recent writes in memory before they are flushed to SST.
@@ -14,18 +16,18 @@ use crate::types::{InternalKey, SequenceNumber, ValueType};
 pub struct MemTable {
     inner: SkipListMemTable,
     /// Approximate memory usage in bytes.
-    approximate_size: std::sync::atomic::AtomicUsize,
+    approximate_size: AtomicUsize,
     /// Whether this memtable contains any RangeDeletion entries.
     /// Used to skip the expensive O(N) range tombstone scan in get().
-    has_range_deletions: std::sync::atomic::AtomicBool,
+    has_range_deletions: AtomicBool,
 }
 
 impl MemTable {
     pub fn new() -> Self {
         Self {
             inner: SkipListMemTable::new(),
-            approximate_size: std::sync::atomic::AtomicUsize::new(0),
-            has_range_deletions: std::sync::atomic::AtomicBool::new(false),
+            approximate_size: AtomicUsize::new(0),
+            has_range_deletions: AtomicBool::new(false),
         }
     }
 
@@ -38,15 +40,14 @@ impl MemTable {
             ValueType::RangeDeletion => {
                 // Release: ensures this flag is visible to any reader that
                 // subsequently Acquires skiplist entries via atomic pointers.
-                self.has_range_deletions
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.has_range_deletions.store(true, Ordering::Release);
                 value.to_vec()
             }
         };
         let entry_size = ikey.encoded_len() + val.len() + 16; // overhead estimate
         self.inner.insert(ikey.into_bytes(), val);
         self.approximate_size
-            .fetch_add(entry_size, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(entry_size, Ordering::Relaxed);
     }
 
     /// Look up a user key at or below the given sequence number.
@@ -64,8 +65,7 @@ impl MemTable {
 
     /// Approximate memory usage in bytes.
     pub fn approximate_size(&self) -> usize {
-        self.approximate_size
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.approximate_size.load(Ordering::Relaxed)
     }
 
     /// Return an iterator over all entries in order.
@@ -91,15 +91,12 @@ impl MemTable {
     pub fn has_range_deletions(&self) -> bool {
         // Acquire: pairs with the Release store in put() to ensure
         // visibility across cores on weakly-ordered architectures (ARM/RISC-V).
-        self.has_range_deletions
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.has_range_deletions.load(Ordering::Acquire)
     }
 
     /// Return true if empty.
     pub fn is_empty(&self) -> bool {
-        self.approximate_size
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
+        self.approximate_size.load(Ordering::Relaxed) == 0
     }
 }
 

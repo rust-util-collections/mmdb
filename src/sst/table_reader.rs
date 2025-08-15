@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::cache::block_cache::BlockCache;
 use crate::error::{Error, Result};
@@ -12,6 +12,15 @@ use crate::sst::filter::BloomFilter;
 use crate::sst::format::*;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType};
 
+/// Shared index entries: key-value pairs from the SST index block.
+type IndexEntries = Arc<Vec<(Vec<u8>, Vec<u8>)>>;
+
+/// Bloom filter data read from SST metaindex.
+struct FilterData {
+    bloom: Option<Vec<u8>>,
+    prefix: Option<Vec<u8>>,
+}
+
 /// Reader for an SST file.
 pub struct TableReader {
     path: PathBuf,
@@ -19,11 +28,12 @@ pub struct TableReader {
     file_number: u64,
     index_block: Block,
     filter_data: Option<Vec<u8>>,
-    file: std::sync::Mutex<File>,
+    prefix_filter_data: Option<Vec<u8>>,
+    file: Mutex<File>,
     block_cache: Option<Arc<BlockCache>>,
     /// Cached index entries, shared across all TableIterators for this file.
     /// Populated once on first access, then reused (Arc for zero-copy sharing).
-    index_entry_cache: std::sync::OnceLock<Arc<Vec<(Vec<u8>, Vec<u8>)>>>,
+    index_entry_cache: OnceLock<IndexEntries>,
 }
 
 impl TableReader {
@@ -63,24 +73,25 @@ impl TableReader {
         let index_data = Self::read_block_data(&mut file, &index_handle)?;
         let index_block = Block::new(index_data)?;
 
-        // Read filter from metaindex
-        let filter_data = Self::read_filter(&mut file, &metaindex_handle)?;
+        // Read filters from metaindex
+        let filters = Self::read_filters(&mut file, &metaindex_handle)?;
 
         Ok(Self {
             path: path.to_path_buf(),
             file_size,
             file_number,
             index_block,
-            filter_data,
-            file: std::sync::Mutex::new(file),
+            filter_data: filters.bloom,
+            prefix_filter_data: filters.prefix,
+            file: Mutex::new(file),
             block_cache,
-            index_entry_cache: std::sync::OnceLock::new(),
+            index_entry_cache: OnceLock::new(),
         })
     }
 
     /// Get cached index entries (shared across all TableIterators for this file).
     /// Populated once on first access, then reused via Arc.
-    pub fn cached_index_entries(&self) -> Arc<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn cached_index_entries(&self) -> IndexEntries {
         self.index_entry_cache
             .get_or_init(|| Arc::new(self.index_block.iter().collect()))
             .clone()
@@ -231,23 +242,40 @@ impl TableReader {
         Ok(data)
     }
 
-    fn read_filter(file: &mut File, metaindex_handle: &BlockHandle) -> Result<Option<Vec<u8>>> {
+    fn read_filters(file: &mut File, metaindex_handle: &BlockHandle) -> Result<FilterData> {
         if metaindex_handle.size == 0 {
-            return Ok(None);
+            return Ok(FilterData {
+                bloom: None,
+                prefix: None,
+            });
         }
 
         let metaindex_data = Self::read_block_data(file, metaindex_handle)?;
         let metaindex = Block::new(metaindex_data)?;
 
+        let mut bloom = None;
+        let mut prefix = None;
+
         for (key, value) in metaindex.iter() {
             if key == b"filter.bloom" {
-                let filter_handle = BlockHandle::decode(&value);
-                let filter_data = Self::read_block_data(file, &filter_handle)?;
-                return Ok(Some(filter_data));
+                let handle = BlockHandle::decode(&value);
+                bloom = Some(Self::read_block_data(file, &handle)?);
+            } else if key == b"filter.prefix" {
+                let handle = BlockHandle::decode(&value);
+                prefix = Some(Self::read_block_data(file, &handle)?);
             }
         }
 
-        Ok(None)
+        Ok(FilterData { bloom, prefix })
+    }
+
+    /// Check if a prefix may exist in this SST file using the prefix bloom filter.
+    /// Returns `true` if the prefix might be present (or if no prefix bloom exists).
+    pub fn prefix_may_match(&self, prefix: &[u8]) -> bool {
+        match self.prefix_filter_data {
+            Some(ref filter) => BloomFilter::key_may_match(prefix, filter),
+            None => true, // No prefix bloom — conservatively assume present
+        }
     }
 
     pub fn file_size(&self) -> u64 {
@@ -281,7 +309,7 @@ impl TableReader {
     }
 
     /// Get a file handle for reading. Uses the held file via mutex.
-    fn open_file(&self) -> Result<std::sync::MutexGuard<'_, File>> {
+    fn open_file(&self) -> Result<MutexGuard<'_, File>> {
         self.file
             .lock()
             .map_err(|_| Error::Corruption("file mutex poisoned".to_string()))
@@ -294,7 +322,7 @@ pub struct TableIterator {
     reader: Arc<TableReader>,
     /// Cached index entries (shared across all iterators for this table).
     /// Lazily populated on first use, then cached in the TableReader.
-    index_entries: Arc<Vec<(Vec<u8>, Vec<u8>)>>,
+    index_entries: IndexEntries,
     /// Current index position
     index_pos: usize,
     /// Current block's entries (lazily loaded)
@@ -321,13 +349,13 @@ impl TableIterator {
 
         // Quick check: if target > file's largest key, mark exhausted.
         // The last index entry's key is the largest key in the file.
-        if let Some((largest, _)) = self.index_entries.last() {
-            if compare_internal_key(target, largest) == std::cmp::Ordering::Greater {
-                self.index_pos = self.index_entries.len();
-                self.current_block_entries.clear();
-                self.block_pos = 0;
-                return;
-            }
+        if let Some((largest, _)) = self.index_entries.last()
+            && compare_internal_key(target, largest) == std::cmp::Ordering::Greater
+        {
+            self.index_pos = self.index_entries.len();
+            self.current_block_entries.clear();
+            self.block_pos = 0;
+            return;
         }
 
         // Binary search index entries to find the first block that may contain target

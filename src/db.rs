@@ -3,8 +3,13 @@
 use std::collections::VecDeque;
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::Sender,
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use parking_lot::{Condvar, Mutex};
 
@@ -36,17 +41,19 @@ struct WriteRequest {
 pub struct DB {
     path: PathBuf,
     options: DbOptions,
-    inner: Mutex<DBInner>,
+    inner: Arc<Mutex<DBInner>>,
     /// Global sequence number (next to assign).
     sequence: AtomicU64,
     /// Write queue and condvar for group commit.
     write_queue: Mutex<VecDeque<*mut WriteRequest>>,
     write_cv: Condvar,
-    /// Condvar for write backpressure — signaled after compaction completes.
-    compaction_cv: parking_lot::Condvar,
     closed: AtomicBool,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
+    /// Channel to signal the background compaction thread.
+    compaction_tx: Mutex<Option<Sender<()>>>,
+    /// Background compaction thread handle.
+    compaction_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -145,6 +152,7 @@ impl DB {
                 bloom_bits_per_key: options.bloom_bits_per_key,
                 internal_keys: true,
                 compression: options.compression,
+                prefix_len: options.prefix_len,
             };
             let mut builder = TableBuilder::new(&sst_path, build_opts)?;
             for (key, value) in active_memtable.iter() {
@@ -192,23 +200,59 @@ impl DB {
 
         let sequence_start = max_sequence + 1;
 
+        let inner = Arc::new(Mutex::new(DBInner {
+            active_memtable,
+            immutable_memtables: Vec::new(),
+            wal_writer: Some(wal_writer),
+            wal_number,
+            versions,
+        }));
+
+        // Spawn background compaction thread
+        let (compaction_tx, compaction_rx) = std::sync::mpsc::channel::<()>();
+        let bg_inner = Arc::clone(&inner);
+        let bg_path = path.clone();
+        let bg_options = options.clone();
+        let bg_table_cache = table_cache.clone();
+        let compaction_handle = thread::Builder::new()
+            .name("mmdb-compaction".into())
+            .spawn(move || {
+                while compaction_rx.recv().is_ok() {
+                    // Drain any additional pending signals
+                    while compaction_rx.try_recv().is_ok() {}
+                    // Run all pending compactions
+                    loop {
+                        let mut inner = bg_inner.lock();
+                        let version = inner.versions.current();
+                        match LeveledCompaction::pick_compaction(&version, &bg_options) {
+                            Some(task) => {
+                                let _ = LeveledCompaction::execute_compaction_with_cache(
+                                    &task,
+                                    &mut inner.versions,
+                                    &bg_path,
+                                    &bg_options,
+                                    Some(&bg_table_cache),
+                                );
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn compaction thread");
+
         let db = Self {
             path,
             options,
-            inner: Mutex::new(DBInner {
-                active_memtable,
-                immutable_memtables: Vec::new(),
-                wal_writer: Some(wal_writer),
-                wal_number,
-                versions,
-            }),
+            inner,
             sequence: AtomicU64::new(sequence_start),
             write_queue: Mutex::new(VecDeque::new()),
             write_cv: Condvar::new(),
-            compaction_cv: parking_lot::Condvar::new(),
             closed: AtomicBool::new(false),
             block_cache,
             table_cache,
+            compaction_tx: Mutex::new(Some(compaction_tx)),
+            compaction_handle: Mutex::new(Some(compaction_handle)),
         };
 
         Ok(db)
@@ -433,6 +477,58 @@ impl DB {
         Ok(DBIterator::from_sources(sources, seq))
     }
 
+    /// Create a prefix-bounded iterator.
+    ///
+    /// Uses prefix bloom filters to skip SST files that don't contain the prefix,
+    /// and stops iteration as soon as the prefix boundary is crossed.
+    pub fn iter_with_prefix(&self, prefix: &[u8]) -> Result<DBIterator> {
+        self.check_closed()?;
+
+        let seq = self.current_sequence();
+
+        let (active_mem, imm_mems, version) = {
+            let inner = self.inner.lock();
+            (
+                inner.active_memtable.clone(),
+                inner.immutable_memtables.clone(),
+                inner.versions.current(),
+            )
+        };
+
+        let mut sources: Vec<IterSource> = Vec::new();
+
+        // Active memtable
+        {
+            use crate::memtable::skiplist::MemTableCursorIter;
+            let cursor = MemTableCursorIter::new(active_mem.clone());
+            sources.push(IterSource::from_seekable(Box::new(cursor)));
+        }
+
+        // Immutable memtables
+        for imm in &imm_mems {
+            use crate::memtable::skiplist::MemTableCursorIter;
+            let cursor = MemTableCursorIter::new(imm.clone());
+            sources.push(IterSource::from_seekable(Box::new(cursor)));
+        }
+
+        // SST files — skip files where prefix bloom says prefix is absent
+        for level in 0..version.num_levels {
+            for tf in version.level_files(level) {
+                // Check prefix bloom filter if available
+                if !tf.reader.prefix_may_match(prefix) {
+                    continue; // bloom says prefix not in this SST
+                }
+                let iter = TableIterator::new(tf.reader.clone());
+                sources.push(IterSource::from_seekable(Box::new(iter)));
+            }
+        }
+
+        let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix.to_vec());
+        // Seek to the prefix start
+        iter.seek(prefix);
+        Ok(iter)
+    }
+
     /// Create a bidirectional iterator over all visible entries.
     ///
     /// Materializes entries at creation time. Supports `DoubleEndedIterator`
@@ -524,6 +620,7 @@ impl DB {
     }
 
     /// Run compaction if needed (L0 → L1 or Ln → Ln+1).
+    /// Runs inline while holding locks for deterministic behavior.
     pub fn compact(&self) -> Result<()> {
         self.check_closed()?;
         let _wg = self.write_queue.lock();
@@ -588,27 +685,11 @@ impl DB {
 
     // -- Internal --
 
-    /// Run compaction inline after a flush, signaling via condvar when done.
+    /// Signal background compaction thread (non-blocking).
     fn signal_compaction(&self) {
-        // Run compaction inline on a short-lived thread to avoid blocking the writer.
-        // This is safe because we lock inner inside.
-        let mut inner = self.inner.lock();
-        loop {
-            let version = inner.versions.current();
-            match LeveledCompaction::pick_compaction(&version, &self.options) {
-                Some(task) => {
-                    let _ = LeveledCompaction::execute_compaction_with_cache(
-                        &task,
-                        &mut inner.versions,
-                        &self.path,
-                        &self.options,
-                        Some(&self.table_cache),
-                    );
-                }
-                None => break,
-            }
+        if let Some(ref tx) = *self.compaction_tx.lock() {
+            let _ = tx.send(());
         }
-        self.compaction_cv.notify_all();
     }
 
     /// Check if a key is covered by any range tombstone visible at the given sequence.
@@ -688,7 +769,7 @@ impl DB {
         } else if l0_count >= self.options.l0_slowdown_trigger {
             // Progressive delay: more L0 files → longer sleep
             let delay_us = (l0_count - self.options.l0_slowdown_trigger + 1) as u64 * 1000;
-            std::thread::sleep(std::time::Duration::from_micros(delay_us));
+            thread::sleep(Duration::from_micros(delay_us));
         }
     }
 
@@ -873,9 +954,14 @@ impl DB {
     }
 
     fn do_compaction(&self, inner: &mut DBInner) -> Result<()> {
+        // Force-compact: use trigger=1 to compact any L0 files.
+        let force_opts = DbOptions {
+            l0_compaction_trigger: 1,
+            ..self.options.clone()
+        };
         loop {
             let version = inner.versions.current();
-            match LeveledCompaction::pick_compaction(&version, &self.options) {
+            match LeveledCompaction::pick_compaction(&version, &force_opts) {
                 Some(task) => {
                     LeveledCompaction::execute_compaction_with_cache(
                         &task,
@@ -887,6 +973,20 @@ impl DB {
                 }
                 None => break,
             }
+        }
+        // Force-merge levels that have multiple files (space reclamation).
+        // With background compaction, tombstones may end up in separate files
+        // from the data they cover. Merging fixes this.
+        for level in 1..self.options.num_levels {
+            let is_bottommost = level >= self.options.num_levels - 1;
+            LeveledCompaction::force_merge_level(
+                level,
+                is_bottommost,
+                &mut inner.versions,
+                &self.path,
+                &self.options,
+                Some(&self.table_cache),
+            )?;
         }
         Ok(())
     }
@@ -980,12 +1080,18 @@ impl DB {
         mem: &MemTable,
         path: &Path,
     ) -> Result<crate::sst::table_builder::TableBuildResult> {
+        let compression = if !self.options.compression_per_level.is_empty() {
+            self.options.compression_per_level[0]
+        } else {
+            self.options.compression
+        };
         let opts = TableBuildOptions {
             block_size: self.options.block_size,
             block_restart_interval: self.options.block_restart_interval,
             bloom_bits_per_key: self.options.bloom_bits_per_key,
             internal_keys: true,
-            compression: self.options.compression,
+            compression,
+            prefix_len: self.options.prefix_len,
         };
 
         let mut builder = TableBuilder::new(path, opts)?;
@@ -1003,6 +1109,12 @@ impl Drop for DB {
             if let Some(ref mut wal) = self.inner.lock().wal_writer {
                 let _ = wal.sync();
             }
+        }
+        // Shut down background compaction thread: drop sender to close channel
+        // (causes recv() to return Err), then join the thread.
+        drop(self.compaction_tx.lock().take());
+        if let Some(handle) = self.compaction_handle.lock().take() {
+            let _ = handle.join();
         }
     }
 }

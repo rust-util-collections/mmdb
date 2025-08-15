@@ -1,7 +1,7 @@
 //! Token-bucket rate limiter for controlling compaction write throughput.
 
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A token-bucket rate limiter.
 ///
@@ -60,7 +60,7 @@ impl RateLimiter {
         inner.available = 0.0;
         drop(inner);
 
-        std::thread::sleep(std::time::Duration::from_secs_f64(wait_secs));
+        std::thread::sleep(Duration::from_secs_f64(wait_secs));
     }
 
     /// Check if the rate limiter is enabled.

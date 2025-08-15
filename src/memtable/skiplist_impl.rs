@@ -12,6 +12,7 @@
 //!
 //! Max height 12, probability p = 0.25.
 
+use std::cell::UnsafeCell;
 use std::ops::RangeBounds;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -49,7 +50,7 @@ pub struct ConcurrentSkipList<K: Ord + Clone, V: Clone> {
     /// Current maximum height in the list.
     max_height: AtomicUsize,
     /// All allocated nodes for cleanup. Only mutated under writer serialization.
-    all_nodes: std::cell::UnsafeCell<Vec<*mut Node<K, V>>>,
+    all_nodes: UnsafeCell<Vec<*mut Node<K, V>>>,
 }
 
 // SAFETY: Node pointers are stable (individually heap-allocated via Box).
@@ -71,7 +72,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             head,
             len: AtomicUsize::new(0),
             max_height: AtomicUsize::new(1),
-            all_nodes: std::cell::UnsafeCell::new(Vec::new()),
+            all_nodes: UnsafeCell::new(Vec::new()),
         }
     }
 

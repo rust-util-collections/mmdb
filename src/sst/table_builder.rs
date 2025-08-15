@@ -8,6 +8,7 @@
 //! builder.finish()?;
 //! ```
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -27,6 +28,8 @@ pub struct TableBuildOptions {
     pub internal_keys: bool,
     /// Compression type for data blocks.
     pub compression: CompressionType,
+    /// Fixed prefix length for prefix bloom filter. 0 = disabled.
+    pub prefix_len: usize,
 }
 
 impl Default for TableBuildOptions {
@@ -37,6 +40,7 @@ impl Default for TableBuildOptions {
             bloom_bits_per_key: 10,
             internal_keys: false,
             compression: CompressionType::None,
+            prefix_len: 0,
         }
     }
 }
@@ -64,6 +68,9 @@ pub struct TableBuilder {
     smallest_key: Option<Vec<u8>>,
     largest_key: Option<Vec<u8>>,
 
+    // Prefix bloom: collected unique prefixes
+    prefix_set: HashSet<Vec<u8>>,
+
     finished: bool,
 }
 
@@ -82,6 +89,7 @@ impl TableBuilder {
             last_key: Vec::new(),
             smallest_key: None,
             largest_key: None,
+            prefix_set: HashSet::new(),
             finished: false,
         })
     }
@@ -109,10 +117,17 @@ impl TableBuilder {
         self.largest_key = Some(key.to_vec());
 
         // Collect key for bloom filter (use user key if internal_keys mode)
-        if self.options.internal_keys && key.len() >= 8 {
-            self.filter_keys.push(key[..key.len() - 8].to_vec());
+        let user_key_for_bloom = if self.options.internal_keys && key.len() >= 8 {
+            &key[..key.len() - 8]
         } else {
-            self.filter_keys.push(key.to_vec());
+            key
+        };
+        self.filter_keys.push(user_key_for_bloom.to_vec());
+
+        // Collect prefix for prefix bloom filter
+        if self.options.prefix_len > 0 && user_key_for_bloom.len() >= self.options.prefix_len {
+            self.prefix_set
+                .insert(user_key_for_bloom[..self.options.prefix_len].to_vec());
         }
 
         // Check if we need to flush the current data block
@@ -139,8 +154,11 @@ impl TableBuilder {
         // Write meta block (bloom filter)
         let filter_handle = self.write_filter_block()?;
 
+        // Write prefix filter block
+        let prefix_filter_handle = self.write_prefix_filter_block()?;
+
         // Write meta index block
-        let metaindex_handle = self.write_metaindex_block(&filter_handle)?;
+        let metaindex_handle = self.write_metaindex_block(&filter_handle, &prefix_filter_handle)?;
 
         // Write index block
         let index_handle = self.write_index_block()?;
@@ -231,13 +249,38 @@ impl TableBuilder {
         self.write_raw_block(&filter_data)
     }
 
-    fn write_metaindex_block(&mut self, filter_handle: &BlockHandle) -> Result<BlockHandle> {
+    fn write_prefix_filter_block(&mut self) -> Result<BlockHandle> {
+        if self.options.prefix_len == 0
+            || self.options.bloom_bits_per_key == 0
+            || self.prefix_set.is_empty()
+        {
+            return Ok(BlockHandle::default());
+        }
+
+        let mut prefixes: Vec<&[u8]> = self.prefix_set.iter().map(|p| p.as_slice()).collect();
+        prefixes.sort();
+
+        let bf = BloomFilter::new(self.options.bloom_bits_per_key);
+        let filter_data = bf.create_filter(&prefixes);
+
+        self.write_raw_block(&filter_data)
+    }
+
+    fn write_metaindex_block(
+        &mut self,
+        filter_handle: &BlockHandle,
+        prefix_filter_handle: &BlockHandle,
+    ) -> Result<BlockHandle> {
         let mut builder = BlockBuilder::new(1);
 
         if filter_handle.size > 0 {
-            // Add entry: "filter.bloom" => encoded BlockHandle
             let handle_bytes = filter_handle.encode();
             builder.add(b"filter.bloom", &handle_bytes);
+        }
+
+        if prefix_filter_handle.size > 0 {
+            let handle_bytes = prefix_filter_handle.encode();
+            builder.add(b"filter.prefix", &handle_bytes);
         }
 
         let data = builder.finish();

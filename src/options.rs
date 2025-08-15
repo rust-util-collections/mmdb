@@ -41,6 +41,13 @@ pub struct DbOptions {
     pub l0_stop_trigger: usize,
     /// Optional rate limiter for compaction writes (bytes/sec). 0 = no limit.
     pub rate_limiter_bytes_per_sec: u64,
+    /// Fixed prefix length for prefix bloom filter. 0 = disabled (default).
+    /// When set, each SST file stores a bloom filter of key prefixes,
+    /// allowing `iter_with_prefix()` to skip entire SST files.
+    pub prefix_len: usize,
+    /// Per-level compression types. If empty, uses `compression` for all levels.
+    /// Index corresponds to level number (0 = L0, 1 = L1, etc.).
+    pub compression_per_level: Vec<CompressionType>,
     /// Optional compaction filter.
     pub compaction_filter: Option<Box<dyn CompactionFilter>>,
 }
@@ -66,6 +73,8 @@ impl Default for DbOptions {
             l0_slowdown_trigger: 8,
             l0_stop_trigger: 12,
             rate_limiter_bytes_per_sec: 0,
+            prefix_len: 0,
+            compression_per_level: Vec::new(),
             compaction_filter: None,
         }
     }
@@ -92,6 +101,8 @@ impl Clone for DbOptions {
             l0_slowdown_trigger: self.l0_slowdown_trigger,
             l0_stop_trigger: self.l0_stop_trigger,
             rate_limiter_bytes_per_sec: self.rate_limiter_bytes_per_sec,
+            prefix_len: self.prefix_len,
+            compression_per_level: self.compression_per_level.clone(),
             compaction_filter: None, // Cannot clone trait objects
         }
     }
