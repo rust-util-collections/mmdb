@@ -511,12 +511,52 @@ impl DB {
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
-        // SST files — skip files where prefix bloom says prefix is absent
+        // Compute prefix upper bound for range pruning
+        let mut prefix_upper = prefix.to_vec();
+        // Increment prefix to get exclusive upper bound
+        let has_upper = {
+            let mut carry = true;
+            for byte in prefix_upper.iter_mut().rev() {
+                if carry {
+                    if *byte == 0xFF {
+                        *byte = 0x00;
+                    } else {
+                        *byte += 1;
+                        carry = false;
+                    }
+                }
+            }
+            !carry // false if prefix was all 0xFF (no upper bound)
+        };
+
+        // SST files — skip files via range pruning + prefix bloom
         for level in 0..version.num_levels {
             for tf in version.level_files(level) {
-                // Check prefix bloom filter if available
+                // Range pruning: file's largest user key must be >= prefix
+                let lk = &tf.meta.largest_key;
+                let file_largest_uk = if lk.len() >= 8 {
+                    &lk[..lk.len() - 8]
+                } else {
+                    lk.as_slice()
+                };
+                if file_largest_uk < prefix {
+                    continue;
+                }
+                // Range pruning: file's smallest user key must be < prefix upper bound
+                if has_upper {
+                    let sk = &tf.meta.smallest_key;
+                    let file_smallest_uk = if sk.len() >= 8 {
+                        &sk[..sk.len() - 8]
+                    } else {
+                        sk.as_slice()
+                    };
+                    if file_smallest_uk >= prefix_upper.as_slice() {
+                        continue;
+                    }
+                }
+                // Prefix bloom filter check
                 if !tf.reader.prefix_may_match(prefix) {
-                    continue; // bloom says prefix not in this SST
+                    continue;
                 }
                 let iter = TableIterator::new(tf.reader.clone());
                 sources.push(IterSource::from_seekable(Box::new(iter)));
