@@ -9,8 +9,11 @@ type CacheKey = (u64, u64);
 type CacheValue = Arc<Vec<u8>>;
 
 /// Thread-safe LRU cache for SST data blocks.
+/// Supports pinning entries that should never be evicted (e.g., L0 index/filter blocks).
 pub struct BlockCache {
     inner: moka::sync::Cache<CacheKey, CacheValue>,
+    /// Pinned entries — never evicted by LRU. Protected by mutex.
+    pinned: std::sync::Mutex<std::collections::HashMap<CacheKey, CacheValue>>,
 }
 
 impl BlockCache {
@@ -23,12 +26,17 @@ impl BlockCache {
                     value.len().min(u32::MAX as usize) as u32
                 })
                 .build(),
+            pinned: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
-    /// Look up a cached block.
+    /// Look up a cached block. Pinned entries are checked first.
     pub fn get(&self, file_number: u64, block_offset: u64) -> Option<Arc<Vec<u8>>> {
-        self.inner.get(&(file_number, block_offset))
+        let key = (file_number, block_offset);
+        if let Some(v) = self.pinned.lock().unwrap().get(&key) {
+            return Some(v.clone());
+        }
+        self.inner.get(&key)
     }
 
     /// Insert a block into the cache.
@@ -36,6 +44,28 @@ impl BlockCache {
         let arc = Arc::new(data);
         self.inner.insert((file_number, block_offset), arc.clone());
         arc
+    }
+
+    /// Insert a pinned block — never evicted by LRU.
+    /// Used for L0 index and filter blocks.
+    pub fn insert_pinned(
+        &self,
+        file_number: u64,
+        block_offset: u64,
+        data: Vec<u8>,
+    ) -> Arc<Vec<u8>> {
+        let key = (file_number, block_offset);
+        let arc = Arc::new(data);
+        self.pinned.lock().unwrap().insert(key, arc.clone());
+        arc
+    }
+
+    /// Unpin all entries for a specific file (e.g., when L0 file is compacted away).
+    pub fn unpin_file(&self, file_number: u64) {
+        self.pinned
+            .lock()
+            .unwrap()
+            .retain(|&(f, _), _| f != file_number);
     }
 
     /// Invalidate a specific cached block.

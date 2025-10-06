@@ -102,7 +102,7 @@ mod tests {
         builder.add(b"abcxyz", b"v2");
         let data = builder.finish();
 
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
         let entries: Vec<_> = block.iter().collect();
         assert_eq!(entries[0], (b"abcdef".to_vec(), b"v1".to_vec()));
         assert_eq!(entries[1], (b"abcxyz".to_vec(), b"v2".to_vec()));
@@ -118,7 +118,7 @@ mod tests {
         builder.add(b"bbc", b"4");
 
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
 
         let entries: Vec<_> = block.iter().collect();
         assert_eq!(entries.len(), 4);

@@ -50,6 +50,38 @@ pub struct DbOptions {
     pub compression_per_level: Vec<CompressionType>,
     /// Optional compaction filter.
     pub compaction_filter: Option<Box<dyn CompactionFilter>>,
+
+    // ---- Compaction parallelism (RocksDB: increase_parallelism) ----
+    /// Maximum number of background compaction threads. Default: 1.
+    /// RocksDB equivalent: `max_background_compactions` / `increase_parallelism`.
+    pub max_background_compactions: usize,
+    /// Maximum sub-compactions per compaction job. Default: 1 (no sub-compaction).
+    /// RocksDB equivalent: `max_subcompactions`.
+    pub max_subcompactions: usize,
+
+    // ---- Cache behavior ----
+    /// Pin L0 index and filter blocks in block cache (never evict). Default: true.
+    /// RocksDB equivalent: `pin_l0_filter_and_index_blocks_in_cache`.
+    pub pin_l0_filter_and_index_blocks_in_cache: bool,
+    /// Cache index and filter blocks in block cache. Default: true.
+    /// RocksDB equivalent: `cache_index_and_filter_blocks`.
+    pub cache_index_and_filter_blocks: bool,
+
+    // ---- Write buffer ----
+    /// Maximum total number of write buffers (active + immutable). Default: 6.
+    /// RocksDB equivalent: `max_write_buffer_number`.
+    pub max_write_buffer_number: usize,
+
+    // ---- Advanced tuning (reserved, documented) ----
+    /// Use dynamic level sizes for compaction. Default: false.
+    /// RocksDB equivalent: `level_compaction_dynamic_level_bytes`.
+    pub level_compaction_dynamic_level_bytes: bool,
+    /// Allow concurrent memtable writes from multiple threads. Default: false.
+    /// RocksDB equivalent: `allow_concurrent_memtable_write`.
+    pub allow_concurrent_memtable_write: bool,
+    /// Memtable prefix bloom ratio (fraction of memtable for bloom). Default: 0.0 (disabled).
+    /// RocksDB equivalent: `memtable_prefix_bloom_ratio`.
+    pub memtable_prefix_bloom_ratio: f64,
 }
 
 impl Default for DbOptions {
@@ -76,6 +108,14 @@ impl Default for DbOptions {
             prefix_len: 0,
             compression_per_level: Vec::new(),
             compaction_filter: None,
+            max_background_compactions: 1,
+            max_subcompactions: 1,
+            pin_l0_filter_and_index_blocks_in_cache: true,
+            cache_index_and_filter_blocks: true,
+            max_write_buffer_number: 6,
+            level_compaction_dynamic_level_bytes: false,
+            allow_concurrent_memtable_write: false,
+            memtable_prefix_bloom_ratio: 0.0,
         }
     }
 }
@@ -104,6 +144,14 @@ impl Clone for DbOptions {
             prefix_len: self.prefix_len,
             compression_per_level: self.compression_per_level.clone(),
             compaction_filter: None, // Cannot clone trait objects
+            max_background_compactions: self.max_background_compactions,
+            max_subcompactions: self.max_subcompactions,
+            pin_l0_filter_and_index_blocks_in_cache: self.pin_l0_filter_and_index_blocks_in_cache,
+            cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
+            max_write_buffer_number: self.max_write_buffer_number,
+            level_compaction_dynamic_level_bytes: self.level_compaction_dynamic_level_bytes,
+            allow_concurrent_memtable_write: self.allow_concurrent_memtable_write,
+            memtable_prefix_bloom_ratio: self.memtable_prefix_bloom_ratio,
         }
     }
 }
@@ -120,7 +168,11 @@ impl DbOptions {
         Self {
             write_buffer_size: 128 * 1024 * 1024, // 128 MB
             l0_compaction_trigger: 8,
+            l0_slowdown_trigger: 20,
+            l0_stop_trigger: 36,
             compression: CompressionType::Lz4,
+            max_background_compactions: 4,
+            max_write_buffer_number: 8,
             ..Default::default()
         }
     }
@@ -132,6 +184,7 @@ impl DbOptions {
             l0_compaction_trigger: 2,
             block_cache_capacity: 256 * 1024 * 1024, // 256 MB
             bloom_bits_per_key: 14,
+            pin_l0_filter_and_index_blocks_in_cache: true,
             ..Default::default()
         }
     }
@@ -146,6 +199,15 @@ pub struct ReadOptions {
     pub fill_cache: bool,
     /// Whether to verify checksums on reads. Default: false.
     pub verify_checksums: bool,
+    /// Readahead size hint in bytes for sequential iteration. 0 = auto. Default: 0.
+    /// RocksDB equivalent: `readahead_size`.
+    pub readahead_size: usize,
+    /// If true, ignore prefix bloom filters and do a total order seek. Default: false.
+    /// RocksDB equivalent: `total_order_seek`.
+    pub total_order_seek: bool,
+    /// If true, pin data blocks in memory during iteration. Default: false.
+    /// RocksDB equivalent: `pin_data`.
+    pub pin_data: bool,
 }
 
 impl Default for ReadOptions {
@@ -154,6 +216,9 @@ impl Default for ReadOptions {
             snapshot: None,
             fill_cache: true,
             verify_checksums: false,
+            readahead_size: 0,
+            total_order_seek: false,
+            pin_data: false,
         }
     }
 }

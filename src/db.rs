@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc::Sender,
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -18,6 +17,7 @@ use crate::cache::table_cache::TableCache;
 use crate::compaction::LeveledCompaction;
 use crate::error::{Error, Result};
 use crate::iterator::BidiIterator;
+use crate::iterator::LevelIterator;
 use crate::iterator::db_iter::DBIterator;
 use crate::iterator::merge::IterSource;
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
@@ -50,10 +50,12 @@ pub struct DB {
     closed: AtomicBool,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
-    /// Channel to signal the background compaction thread.
-    compaction_tx: Mutex<Option<Sender<()>>>,
-    /// Background compaction thread handle.
-    compaction_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Shutdown flag for compaction threads.
+    compaction_shutdown: Arc<AtomicBool>,
+    /// Notification condvar for compaction threads: (has_work, condvar).
+    compaction_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Background compaction thread handles.
+    compaction_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -208,38 +210,58 @@ impl DB {
             versions,
         }));
 
-        // Spawn background compaction thread
-        let (compaction_tx, compaction_rx) = std::sync::mpsc::channel::<()>();
-        let bg_inner = Arc::clone(&inner);
-        let bg_path = path.clone();
-        let bg_options = options.clone();
-        let bg_table_cache = table_cache.clone();
-        let compaction_handle = thread::Builder::new()
-            .name("mmdb-compaction".into())
-            .spawn(move || {
-                while compaction_rx.recv().is_ok() {
-                    // Drain any additional pending signals
-                    while compaction_rx.try_recv().is_ok() {}
-                    // Run all pending compactions
+        // Spawn background compaction threads
+        let compaction_shutdown = Arc::new(AtomicBool::new(false));
+        let compaction_notify = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let num_compaction_threads = options.max_background_compactions.max(1);
+        let mut compaction_handles = Vec::with_capacity(num_compaction_threads);
+
+        for i in 0..num_compaction_threads {
+            let bg_inner = Arc::clone(&inner);
+            let bg_path = path.clone();
+            let bg_options = options.clone();
+            let bg_table_cache = table_cache.clone();
+            let shutdown = compaction_shutdown.clone();
+            let notify = compaction_notify.clone();
+
+            let handle = thread::Builder::new()
+                .name(format!("mmdb-compaction-{}", i))
+                .spawn(move || {
                     loop {
-                        let mut inner = bg_inner.lock();
-                        let version = inner.versions.current();
-                        match LeveledCompaction::pick_compaction(&version, &bg_options) {
-                            Some(task) => {
-                                let _ = LeveledCompaction::execute_compaction_with_cache(
-                                    &task,
-                                    &mut inner.versions,
-                                    &bg_path,
-                                    &bg_options,
-                                    Some(&bg_table_cache),
-                                );
+                        // Wait for notification
+                        {
+                            let (lock, cvar) = &*notify;
+                            let mut has_work = lock.lock().unwrap();
+                            while !*has_work && !shutdown.load(Ordering::Acquire) {
+                                has_work = cvar.wait(has_work).unwrap();
                             }
-                            None => break,
+                            *has_work = false; // consumed
+                        }
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                        // Run pending compactions
+                        loop {
+                            let mut inner = bg_inner.lock();
+                            let version = inner.versions.current();
+                            match LeveledCompaction::pick_compaction(&version, &bg_options) {
+                                Some(task) => {
+                                    let _ = LeveledCompaction::execute_compaction_with_cache(
+                                        &task,
+                                        &mut inner.versions,
+                                        &bg_path,
+                                        &bg_options,
+                                        Some(&bg_table_cache),
+                                    );
+                                }
+                                None => break,
+                            }
                         }
                     }
-                }
-            })
-            .expect("failed to spawn compaction thread");
+                })
+                .expect("failed to spawn compaction thread");
+            compaction_handles.push(handle);
+        }
 
         let db = Self {
             path,
@@ -251,8 +273,9 @@ impl DB {
             closed: AtomicBool::new(false),
             block_cache,
             table_cache,
-            compaction_tx: Mutex::new(Some(compaction_tx)),
-            compaction_handle: Mutex::new(Some(compaction_handle)),
+            compaction_shutdown,
+            compaction_notify,
+            compaction_handles: Mutex::new(compaction_handles),
         };
 
         Ok(db)
@@ -441,37 +464,42 @@ impl DB {
 
         // SST files — only include files whose key range overlaps [start_hint, end_hint].
         // L0 files can overlap each other so we check each individually.
-        // L1+ files are sorted and non-overlapping, so we can binary-search.
-        for level in 0..version.num_levels {
-            for tf in version.level_files(level) {
-                // Check if this file's key range overlaps the hint range.
-                if let Some(start) = start_hint {
-                    // File's largest user key must be >= start
-                    let lk = &tf.meta.largest_key;
-                    let file_largest_uk = if lk.len() >= 8 {
-                        &lk[..lk.len() - 8]
-                    } else {
-                        lk.as_slice()
-                    };
-                    if file_largest_uk < start {
-                        continue; // File ends before our range starts
-                    }
+        // L1+ files are sorted and non-overlapping — use a single LevelIterator per level.
+        for tf in version.level_files(0) {
+            // Check if this file's key range overlaps the hint range.
+            if let Some(start) = start_hint {
+                let lk = &tf.meta.largest_key;
+                let file_largest_uk = if lk.len() >= 8 {
+                    &lk[..lk.len() - 8]
+                } else {
+                    lk.as_slice()
+                };
+                if file_largest_uk < start {
+                    continue;
                 }
-                if let Some(end) = end_hint {
-                    // File's smallest user key must be <= end
-                    let sk = &tf.meta.smallest_key;
-                    let file_smallest_uk = if sk.len() >= 8 {
-                        &sk[..sk.len() - 8]
-                    } else {
-                        sk.as_slice()
-                    };
-                    if file_smallest_uk > end {
-                        continue; // File starts after our range ends
-                    }
-                }
-                let iter = TableIterator::new(tf.reader.clone());
-                sources.push(IterSource::from_seekable(Box::new(iter)));
             }
+            if let Some(end) = end_hint {
+                let sk = &tf.meta.smallest_key;
+                let file_smallest_uk = if sk.len() >= 8 {
+                    &sk[..sk.len() - 8]
+                } else {
+                    sk.as_slice()
+                };
+                if file_smallest_uk > end {
+                    continue;
+                }
+            }
+            let iter = TableIterator::new(tf.reader.clone());
+            sources.push(IterSource::from_seekable(Box::new(iter)));
+        }
+        for level in 1..version.num_levels {
+            let files = version.level_files(level);
+            if files.is_empty() {
+                continue;
+            }
+            let level_iter = LevelIterator::new(files.to_vec())
+                .with_range_hints(start_hint.map(|s| s.to_vec()), end_hint.map(|e| e.to_vec()));
+            sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
         Ok(DBIterator::from_sources(sources, seq))
@@ -529,38 +557,52 @@ impl DB {
             !carry // false if prefix was all 0xFF (no upper bound)
         };
 
-        // SST files — skip files via range pruning + prefix bloom
-        for level in 0..version.num_levels {
-            for tf in version.level_files(level) {
-                // Range pruning: file's largest user key must be >= prefix
-                let lk = &tf.meta.largest_key;
-                let file_largest_uk = if lk.len() >= 8 {
-                    &lk[..lk.len() - 8]
-                } else {
-                    lk.as_slice()
-                };
-                if file_largest_uk < prefix {
-                    continue;
-                }
-                // Range pruning: file's smallest user key must be < prefix upper bound
-                if has_upper {
-                    let sk = &tf.meta.smallest_key;
-                    let file_smallest_uk = if sk.len() >= 8 {
-                        &sk[..sk.len() - 8]
-                    } else {
-                        sk.as_slice()
-                    };
-                    if file_smallest_uk >= prefix_upper.as_slice() {
-                        continue;
-                    }
-                }
-                // Prefix bloom filter check
-                if !tf.reader.prefix_may_match(prefix) {
-                    continue;
-                }
-                let iter = TableIterator::new(tf.reader.clone());
-                sources.push(IterSource::from_seekable(Box::new(iter)));
+        // SST files — skip files via range pruning + prefix bloom.
+        // L0: per-file filtering (files may overlap).
+        for tf in version.level_files(0) {
+            let lk = &tf.meta.largest_key;
+            let file_largest_uk = if lk.len() >= 8 {
+                &lk[..lk.len() - 8]
+            } else {
+                lk.as_slice()
+            };
+            if file_largest_uk < prefix {
+                continue;
             }
+            if has_upper {
+                let sk = &tf.meta.smallest_key;
+                let file_smallest_uk = if sk.len() >= 8 {
+                    &sk[..sk.len() - 8]
+                } else {
+                    sk.as_slice()
+                };
+                if file_smallest_uk >= prefix_upper.as_slice() {
+                    continue;
+                }
+            }
+            if !tf.reader.prefix_may_match(prefix) {
+                continue;
+            }
+            let iter = TableIterator::new(tf.reader.clone());
+            sources.push(IterSource::from_seekable(Box::new(iter)));
+        }
+        // L1+: one LevelIterator per level with lazy file opening.
+        for level in 1..version.num_levels {
+            let files = version.level_files(level);
+            if files.is_empty() {
+                continue;
+            }
+            let level_iter = LevelIterator::new(files.to_vec())
+                .with_prefix(prefix.to_vec())
+                .with_range_hints(
+                    Some(prefix.to_vec()),
+                    if has_upper {
+                        Some(prefix_upper.clone())
+                    } else {
+                        None
+                    },
+                );
+            sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
         let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix.to_vec());
@@ -725,10 +767,12 @@ impl DB {
 
     // -- Internal --
 
-    /// Signal background compaction thread (non-blocking).
+    /// Signal background compaction threads (non-blocking).
     fn signal_compaction(&self) {
-        if let Some(ref tx) = *self.compaction_tx.lock() {
-            let _ = tx.send(());
+        let (lock, cvar) = &*self.compaction_notify;
+        if let Ok(mut has_work) = lock.lock() {
+            *has_work = true;
+            cvar.notify_one();
         }
     }
 
@@ -978,6 +1022,17 @@ impl DB {
         );
         inner.versions.log_and_apply(edit)?;
 
+        // Pin new L0 file's index in cache for fast iterator creation
+        if self.options.pin_l0_filter_and_index_blocks_in_cache {
+            let version = inner.versions.current();
+            for tf in version.level_files(0) {
+                if tf.meta.number == sst_number {
+                    tf.reader.pin_metadata_in_cache();
+                    break;
+                }
+            }
+        }
+
         // Clean up old WAL
         let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
         let _ = std::fs::remove_file(old_wal_path);
@@ -1150,10 +1205,10 @@ impl Drop for DB {
                 let _ = wal.sync();
             }
         }
-        // Shut down background compaction thread: drop sender to close channel
-        // (causes recv() to return Err), then join the thread.
-        drop(self.compaction_tx.lock().take());
-        if let Some(handle) = self.compaction_handle.lock().take() {
+        // Shut down background compaction threads: set shutdown flag, wake all, join.
+        self.compaction_shutdown.store(true, Ordering::Release);
+        self.compaction_notify.1.notify_all();
+        for handle in self.compaction_handles.lock().drain(..) {
             let _ = handle.join();
         }
     }

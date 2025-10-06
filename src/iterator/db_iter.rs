@@ -2,14 +2,8 @@
 //! sequence numbers, and skips tombstones.
 
 use crate::iterator::merge::{IterSource, MergingIterator};
+use crate::iterator::range_del::RangeTombstoneTracker;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
-
-/// A range tombstone: keys in [begin, end) at sequence `seq` are deleted.
-struct RangeTombstone {
-    begin: Vec<u8>,
-    end: Vec<u8>,
-    seq: SequenceNumber,
-}
 
 type IKeyCompareFn = fn(&[u8], &[u8]) -> std::cmp::Ordering;
 
@@ -22,14 +16,16 @@ pub struct DBIterator {
     merger: MergingIterator<IKeyCompareFn>,
     /// Snapshot sequence number for visibility filtering.
     sequence: SequenceNumber,
-    /// Last user key yielded (for deduplication).
-    last_user_key: Option<Vec<u8>>,
+    /// Reusable buffer for last user key (for deduplication).
+    last_user_key: Vec<u8>,
+    /// Whether last_user_key has been set at least once.
+    has_last_key: bool,
     /// Buffered current entry for valid()/key()/value() API.
     current: Option<(Vec<u8>, Vec<u8>)>,
     /// Whether we've already consumed current via advance().
     needs_advance: bool,
-    /// Collected range tombstones for filtering.
-    range_tombstones: Vec<RangeTombstone>,
+    /// Efficient range tombstone tracker with sweep-line algorithm.
+    range_tombstones: RangeTombstoneTracker,
     /// If set, iteration stops when user key no longer starts with this prefix.
     prefix: Option<Vec<u8>>,
 }
@@ -51,10 +47,11 @@ impl DBIterator {
         Self {
             merger,
             sequence,
-            last_user_key: None,
+            last_user_key: Vec::new(),
+            has_last_key: false,
             current: None,
             needs_advance: true,
-            range_tombstones: Vec::new(),
+            range_tombstones: RangeTombstoneTracker::new(),
             prefix: None,
         }
     }
@@ -69,10 +66,11 @@ impl DBIterator {
         Self {
             merger,
             sequence,
-            last_user_key: None,
+            last_user_key: Vec::new(),
+            has_last_key: false,
             current: None,
             needs_advance: true,
-            range_tombstones: Vec::new(),
+            range_tombstones: RangeTombstoneTracker::new(),
             prefix: None,
         }
     }
@@ -92,26 +90,22 @@ impl DBIterator {
         Self {
             merger,
             sequence,
-            last_user_key: None,
+            last_user_key: Vec::new(),
+            has_last_key: false,
             current: None,
             needs_advance: true,
-            range_tombstones: Vec::new(),
+            range_tombstones: RangeTombstoneTracker::new(),
             prefix: Some(prefix),
         }
     }
 
     /// Check if a user key is covered by any range tombstone visible at our snapshot.
-    fn is_range_deleted(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
-        for rt in &self.range_tombstones {
-            if rt.seq <= self.sequence
-                && user_key >= rt.begin.as_slice()
-                && user_key < rt.end.as_slice()
-                && rt.seq >= seq
-            {
-                return true;
-            }
+    fn is_range_deleted(&mut self, user_key: &[u8], seq: SequenceNumber) -> bool {
+        if self.range_tombstones.is_empty() {
+            return false;
         }
-        false
+        self.range_tombstones
+            .is_deleted(user_key, seq, self.sequence)
     }
 
     /// Advance the streaming iterator to the next visible (user_key, value) pair.
@@ -144,29 +138,27 @@ impl DBIterator {
 
             // Collect range tombstones
             if ikr.value_type() == ValueType::RangeDeletion {
-                self.range_tombstones.push(RangeTombstone {
-                    begin: user_key.to_vec(),
-                    end: value.clone(),
-                    seq,
-                });
+                self.range_tombstones
+                    .add(user_key.to_vec(), value.clone(), seq);
+                self.range_tombstones.reset();
                 // Still need to deduplicate the begin key
-                if let Some(ref last) = self.last_user_key
-                    && last.as_slice() == user_key
-                {
+                if self.has_last_key && self.last_user_key.as_slice() == user_key {
                     continue;
                 }
-                self.last_user_key = Some(user_key.to_vec());
+                self.last_user_key.clear();
+                self.last_user_key.extend_from_slice(user_key);
+                self.has_last_key = true;
                 continue;
             }
 
             // Skip duplicate user keys (we already saw the newest version)
-            if let Some(ref last) = self.last_user_key
-                && last.as_slice() == user_key
-            {
+            if self.has_last_key && self.last_user_key.as_slice() == user_key {
                 continue;
             }
 
-            self.last_user_key = Some(user_key.to_vec());
+            self.last_user_key.clear();
+            self.last_user_key.extend_from_slice(user_key);
+            self.has_last_key = true;
 
             // Skip tombstones
             if ikr.value_type() == ValueType::Deletion {
@@ -225,7 +217,7 @@ impl DBIterator {
         let seek_key =
             InternalKey::new(target, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
         self.merger.seek(seek_key.as_bytes());
-        self.last_user_key = None;
+        self.has_last_key = false;
         self.needs_advance = true;
         self.current = None;
     }
@@ -235,7 +227,7 @@ impl DBIterator {
         // Seek to the smallest possible internal key (empty user key, max sequence).
         let seek_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
         self.merger.seek(seek_key.as_bytes());
-        self.last_user_key = None;
+        self.has_last_key = false;
         self.needs_advance = true;
         self.current = None;
     }
@@ -261,7 +253,7 @@ impl DBIterator {
 
         let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
         self.merger.seek_to(first_key.as_bytes());
-        self.last_user_key = None;
+        self.has_last_key = false;
         self.range_tombstones.clear();
 
         let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
@@ -285,7 +277,7 @@ impl DBIterator {
                 let reseek_key =
                     InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
                 self.merger.seek_to(reseek_key.as_bytes());
-                self.last_user_key = None;
+                self.has_last_key = false;
                 self.range_tombstones.clear();
 
                 // Consume through to our key
@@ -330,7 +322,7 @@ impl DBIterator {
         // the last visible entry before saved_key.
         let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
         self.merger.seek_to(first_key.as_bytes());
-        self.last_user_key = None;
+        self.has_last_key = false;
         self.range_tombstones.clear();
 
         // Scan forward, collecting the last visible entry before saved_key
@@ -359,7 +351,7 @@ impl DBIterator {
                 let reseek_key =
                     InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
                 self.merger.seek_to(reseek_key.as_bytes());
-                self.last_user_key = None;
+                self.has_last_key = false;
                 self.range_tombstones.clear();
 
                 // Advance the merger past this key so next() gives the right entry
@@ -396,7 +388,7 @@ impl DBIterator {
         // Seek to the beginning and scan to find the last visible entry
         let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
         self.merger.seek_to(first_key.as_bytes());
-        self.last_user_key = None;
+        self.has_last_key = false;
         self.range_tombstones.clear();
 
         let mut last_entry: Option<(Vec<u8>, Vec<u8>)> = None;
@@ -417,7 +409,7 @@ impl DBIterator {
                 let reseek_key =
                     InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
                 self.merger.seek_to(reseek_key.as_bytes());
-                self.last_user_key = None;
+                self.has_last_key = false;
                 self.range_tombstones.clear();
 
                 // Consume through to our key

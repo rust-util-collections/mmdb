@@ -7,8 +7,12 @@ use std::cmp::Ordering;
 /// A source of sorted (key, value) pairs — can be backed by a Vec or a streaming iterator.
 pub struct IterSource {
     inner: IterSourceInner,
-    /// Peeked entry (buffered for comparison).
-    pub(crate) peeked: Option<(Vec<u8>, Vec<u8>)>,
+    /// Reusable key buffer for peeked entry.
+    peeked_key: Vec<u8>,
+    /// Reusable value buffer for peeked entry.
+    peeked_value: Vec<u8>,
+    /// Whether a peeked entry is available.
+    pub(crate) has_peeked: bool,
 }
 
 enum IterSourceInner {
@@ -27,59 +31,107 @@ enum IterSourceInner {
 pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
     /// Seek to the first entry >= target.
     fn seek_to(&mut self, target: &[u8]);
+    /// Hint the OS to prefetch the first data block. Default: no-op.
+    /// Called by init_heap before peek() to overlap I/O across sources.
+    fn prefetch_first_block(&mut self) {}
+    /// Decode next entry directly into caller-provided buffers. Returns true if an entry
+    /// was loaded, false if exhausted. Avoids intermediate allocation.
+    fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
+        match self.next() {
+            Some((k, v)) => {
+                *key_buf = k;
+                *value_buf = v;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl IterSource {
     pub fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
         Self {
             inner: IterSourceInner::Vec { entries, pos: 0 },
-            peeked: None,
+            peeked_key: Vec::new(),
+            peeked_value: Vec::new(),
+            has_peeked: false,
         }
     }
 
     pub fn from_boxed(iter: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>>) -> Self {
         Self {
             inner: IterSourceInner::Boxed(iter),
-            peeked: None,
+            peeked_key: Vec::new(),
+            peeked_value: Vec::new(),
+            has_peeked: false,
         }
     }
 
     pub fn from_seekable(iter: Box<dyn SeekableIterator>) -> Self {
         Self {
             inner: IterSourceInner::SeekableBoxed { iter },
-            peeked: None,
+            peeked_key: Vec::new(),
+            peeked_value: Vec::new(),
+            has_peeked: false,
         }
     }
 
     pub fn peek(&mut self) -> Option<(&[u8], &[u8])> {
-        if self.peeked.is_none() {
-            self.peeked = self.advance_inner();
+        if !self.has_peeked {
+            self.has_peeked = self.advance_into_buffers();
         }
-        self.peeked
-            .as_ref()
-            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+        if self.has_peeked {
+            Some((self.peeked_key.as_slice(), self.peeked_value.as_slice()))
+        } else {
+            None
+        }
     }
 
+    /// Take the peeked key/value, transferring ownership.
+    /// Leaves empty Vecs in the buffers for reuse on the next advance.
     pub fn take_peeked(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        if self.peeked.is_none() {
-            self.peeked = self.advance_inner();
+        if !self.has_peeked {
+            self.has_peeked = self.advance_into_buffers();
         }
-        self.peeked.take()
+        if self.has_peeked {
+            self.has_peeked = false;
+            Some((
+                std::mem::take(&mut self.peeked_key),
+                std::mem::take(&mut self.peeked_value),
+            ))
+        } else {
+            None
+        }
     }
 
-    fn advance_inner(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// Advance the inner iterator and store the result in reusable buffers.
+    /// Returns true if a new entry was loaded.
+    fn advance_into_buffers(&mut self) -> bool {
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 if *pos < entries.len() {
-                    let entry = entries[*pos].clone();
+                    let (ref k, ref v) = entries[*pos];
+                    self.peeked_key.clear();
+                    self.peeked_key.extend_from_slice(k);
+                    self.peeked_value.clear();
+                    self.peeked_value.extend_from_slice(v);
                     *pos += 1;
-                    Some(entry)
+                    true
                 } else {
-                    None
+                    false
                 }
             }
-            IterSourceInner::Boxed(iter) => iter.next(),
-            IterSourceInner::SeekableBoxed { iter } => iter.next(),
+            IterSourceInner::Boxed(iter) => match iter.next() {
+                Some((k, v)) => {
+                    self.peeked_key = k;
+                    self.peeked_value = v;
+                    true
+                }
+                None => false,
+            },
+            IterSourceInner::SeekableBoxed { iter } => {
+                iter.next_into(&mut self.peeked_key, &mut self.peeked_value)
+            }
         }
     }
 
@@ -87,30 +139,42 @@ impl IterSource {
         self.peek().is_none()
     }
 
+    /// Issue a prefetch hint for the first data block (if backed by a seekable iterator).
+    pub fn prefetch_hint(&mut self) {
+        if let IterSourceInner::SeekableBoxed { ref mut iter } = self.inner {
+            iter.prefetch_first_block();
+        }
+    }
+
     /// Seek to the first key >= target, supporting backward movement.
     /// For Vec sources, resets position and re-scans from the appropriate point.
     /// For SeekableBoxed sources, delegates to the underlying iterator's seek.
     /// For plain Boxed sources, can only seek forward (same as `seek`).
     pub fn seek_to<F: Fn(&[u8], &[u8]) -> Ordering>(&mut self, target: &[u8], compare: &F) {
-        self.peeked = None;
+        self.has_peeked = false;
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
-                // Binary search for the first entry >= target
                 let idx = entries.partition_point(|(k, _)| compare(k, target) == Ordering::Less);
                 *pos = idx;
-                // Pre-load peeked
                 if *pos < entries.len() {
-                    self.peeked = Some(entries[*pos].clone());
+                    let (ref k, ref v) = entries[*pos];
+                    self.peeked_key.clear();
+                    self.peeked_key.extend_from_slice(k);
+                    self.peeked_value.clear();
+                    self.peeked_value.extend_from_slice(v);
+                    self.has_peeked = true;
                     *pos += 1;
                 }
             }
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_to(target);
-                // Pre-load peeked
-                self.peeked = iter.next();
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k;
+                    self.peeked_value = v;
+                    self.has_peeked = true;
+                }
             }
             IterSourceInner::Boxed(_) => {
-                // Fall back to forward-only seek
                 self.seek(target, compare);
             }
         }
@@ -122,10 +186,9 @@ impl IterSource {
         loop {
             match self.peek() {
                 Some((k, _)) if compare(k, target) == Ordering::Less => {
-                    self.peeked = None;
-                    // Advance inner
-                    self.peeked = self.advance_inner();
-                    if self.peeked.is_none() {
+                    self.has_peeked = false;
+                    self.has_peeked = self.advance_into_buffers();
+                    if !self.has_peeked {
                         break;
                     }
                 }
@@ -166,7 +229,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
         self.initialized = true;
 
-        // Ensure all sources have a peeked value
+        // Phase 1: issue prefetch hints for all seekable sources (overlaps I/O)
+        for source in self.sources.iter_mut() {
+            source.prefetch_hint();
+        }
+        // Phase 2: peek all sources (I/O should hit page cache / block cache)
         for source in self.sources.iter_mut() {
             let _ = source.peek();
         }
@@ -174,7 +241,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         // Collect non-exhausted source indices
         let mut valid = Vec::new();
         for i in 0..self.sources.len() {
-            if self.sources[i].peeked.is_some() {
+            if self.sources[i].has_peeked {
                 valid.push(i);
             }
         }
@@ -193,13 +260,15 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Compare two sources by their peeked key.
     #[inline]
     fn source_less(&self, a: usize, b: usize) -> bool {
-        let ka = self.sources[a].peeked.as_ref().map(|(k, _)| k.as_slice());
-        let kb = self.sources[b].peeked.as_ref().map(|(k, _)| k.as_slice());
-        match (ka, kb) {
-            (Some(a), Some(b)) => (self.compare)(a, b) == Ordering::Less,
-            (Some(_), None) => true,
-            (None, Some(_)) => false,
-            (None, None) => false,
+        let sa = &self.sources[a];
+        let sb = &self.sources[b];
+        match (sa.has_peeked, sb.has_peeked) {
+            (true, true) => {
+                (self.compare)(sa.peeked_key.as_slice(), sb.peeked_key.as_slice()) == Ordering::Less
+            }
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => false,
         }
     }
 
@@ -239,7 +308,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         // Advance the source and peek its next entry
         let _ = self.sources[min_idx].peek();
 
-        if self.sources[min_idx].peeked.is_some() {
+        if self.sources[min_idx].has_peeked {
             // Source still has entries — sift down to maintain heap
             self.sift_down(0);
         } else {

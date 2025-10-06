@@ -13,6 +13,7 @@ moka = { version = "0.12", features = ["sync"] }
 parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

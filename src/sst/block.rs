@@ -18,6 +18,8 @@
 //! └──────────────────────────────────────────────────┘
 //! ```
 
+use std::sync::Arc;
+
 use crate::error::{Error, Result};
 
 /// Decode a varint from the given buffer. Returns (value, bytes_consumed).
@@ -58,14 +60,14 @@ pub fn encode_varint_vec(buf: &mut Vec<u8>, value: u32) {
 
 /// A read-only view of a data block.
 pub struct Block {
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     restart_offset: usize,
     num_restarts: u32,
 }
 
 impl Block {
-    /// Parse a data block from raw bytes.
-    pub fn new(data: Vec<u8>) -> Result<Self> {
+    /// Parse a data block from shared (Arc) raw bytes — zero-copy from block cache.
+    pub fn new(data: Arc<Vec<u8>>) -> Result<Self> {
         if data.len() < 4 {
             return Err(Error::Corruption("block too short".to_string()));
         }
@@ -81,6 +83,11 @@ impl Block {
             restart_offset,
             num_restarts,
         })
+    }
+
+    /// Parse a data block from owned bytes (convenience for tests and non-cached paths).
+    pub fn from_vec(data: Vec<u8>) -> Result<Self> {
+        Self::new(Arc::new(data))
     }
 
     /// Get the restart point offset at index `i`.
@@ -249,6 +256,16 @@ impl Block {
         self.num_restarts
     }
 
+    /// Return the offset where entry data ends and restart array begins.
+    pub fn data_end_offset(&self) -> usize {
+        self.restart_offset
+    }
+
+    /// Return a reference to the underlying raw data.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     /// Binary search for a key using restart points, then linear scan.
     /// Returns Some((key, value)) for exact user key match at the latest sequence,
     /// or None if not found.
@@ -342,6 +359,43 @@ fn decode_entry_at(
     Some((key, value, pos))
 }
 
+/// Decode one entry at `offset`, reusing `key_buf` for the key (zero-alloc for key).
+/// Returns (value_start, value_len, next_offset) — value is a slice into `data`.
+/// The key is reconstructed in-place in `key_buf`.
+pub(crate) fn decode_entry_reuse(
+    data: &[u8],
+    offset: usize,
+    key_buf: &mut Vec<u8>,
+) -> Option<(usize, usize, usize)> {
+    let mut pos = offset;
+
+    let (shared_len, n) = decode_varint(&data[pos..]).ok()?;
+    pos += n;
+    let (unshared_len, n) = decode_varint(&data[pos..]).ok()?;
+    pos += n;
+    let (value_len, n) = decode_varint(&data[pos..]).ok()?;
+    pos += n;
+
+    let shared = shared_len as usize;
+    let unshared = unshared_len as usize;
+    let vlen = value_len as usize;
+
+    if pos + unshared + vlen > data.len() {
+        return None;
+    }
+    if shared > key_buf.len() {
+        return None;
+    }
+
+    // Reconstruct key in-place: truncate to shared prefix, append unshared suffix
+    key_buf.truncate(shared);
+    key_buf.extend_from_slice(&data[pos..pos + unshared]);
+    let value_start = pos + unshared;
+    let next_offset = value_start + vlen;
+
+    Some((value_start, vlen, next_offset))
+}
+
 /// Iterator over entries in a block.
 pub struct BlockIterator<'a> {
     block: &'a Block,
@@ -405,7 +459,7 @@ mod tests {
         }
 
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
 
         let entries: Vec<_> = block.iter().collect();
         assert_eq!(entries.len(), pairs.len());
@@ -426,7 +480,7 @@ mod tests {
         }
 
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
 
         // Exact seek
         let (k, v) = block.seek(b"key_0010").unwrap();
@@ -446,7 +500,7 @@ mod tests {
         // A block with zero entries: just the restart array [0] and restart count [1]
         let builder = BlockBuilder::new(16);
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
 
         // Iterator should yield no entries
         let entries: Vec<_> = block.iter().collect();
@@ -461,7 +515,7 @@ mod tests {
         let mut builder = BlockBuilder::new(16);
         builder.add(b"only_key", b"only_value");
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
 
         let entries: Vec<_> = block.iter().collect();
         assert_eq!(entries.len(), 1);
@@ -488,7 +542,7 @@ mod tests {
         builder.add(b"big", &large_value);
         builder.add(b"small", b"tiny");
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
 
         let entries: Vec<_> = block.iter().collect();
         assert_eq!(entries.len(), 2);
@@ -531,7 +585,7 @@ mod tests {
         let val_16384 = vec![b'v'; 16384];
         builder.add(&key_128, &val_16384);
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
         let entries: Vec<_> = block.iter().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0.len(), 128);
@@ -549,7 +603,7 @@ mod tests {
         }
 
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
         let compare = |a: &[u8], b: &[u8]| a.cmp(b);
 
         // Exact match: seek_for_prev to key_0010 (exists)
@@ -588,7 +642,7 @@ mod tests {
         }
 
         let data = builder.finish();
-        let block = Block::new(data).unwrap();
+        let block = Block::from_vec(data).unwrap();
 
         // Restart 0: entries 0..4 and beyond
         let entries = block.iter_from_restart(0);
