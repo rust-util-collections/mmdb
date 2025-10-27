@@ -52,8 +52,10 @@ pub struct TableBuilder {
 
     // Current data block being built
     data_block: BlockBuilder,
-    // Index entries: (last_key_of_block, BlockHandle)
-    index_entries: Vec<(Vec<u8>, BlockHandle)>,
+    // Index entries: (last_key, handle, first_key_of_block)
+    index_entries: Vec<(Vec<u8>, BlockHandle, Vec<u8>)>,
+    // First key of the current (not-yet-flushed) data block
+    pending_first_key: Option<Vec<u8>>,
     // Keys for bloom filter
     filter_keys: Vec<Vec<u8>>,
 
@@ -83,6 +85,7 @@ impl TableBuilder {
             data_block: BlockBuilder::new(options.block_restart_interval),
             options,
             index_entries: Vec::new(),
+            pending_first_key: None,
             filter_keys: Vec::new(),
             offset: 0,
             num_entries: 0,
@@ -137,6 +140,11 @@ impl TableBuilder {
             self.flush_data_block()?;
         }
 
+        // Record first key of a new data block
+        if self.data_block.is_empty() {
+            self.pending_first_key = Some(key.to_vec());
+        }
+
         self.data_block.add(key, value);
         self.last_key = key.to_vec();
         self.num_entries += 1;
@@ -182,6 +190,7 @@ impl TableBuilder {
 
     fn flush_data_block(&mut self) -> Result<()> {
         let last_key = self.last_key.clone();
+        let first_key = self.pending_first_key.take().unwrap_or_default();
 
         // Take out the current block builder and replace with a new one
         let builder = std::mem::replace(
@@ -191,7 +200,7 @@ impl TableBuilder {
         let block_data = builder.finish();
 
         let handle = self.write_raw_block(&block_data)?;
-        self.index_entries.push((last_key, handle));
+        self.index_entries.push((last_key, handle, first_key));
 
         Ok(())
     }
@@ -290,9 +299,9 @@ impl TableBuilder {
     fn write_index_block(&mut self) -> Result<BlockHandle> {
         let mut builder = BlockBuilder::new(1);
 
-        for (last_key, handle) in &self.index_entries {
-            let handle_bytes = handle.encode();
-            builder.add(last_key, &handle_bytes);
+        for (last_key, handle, first_key) in &self.index_entries {
+            let value = encode_index_value(handle, first_key);
+            builder.add(last_key, &value);
         }
 
         let data = builder.finish();

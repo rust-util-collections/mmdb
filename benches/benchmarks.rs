@@ -330,7 +330,7 @@ fn bench_compression(c: &mut Criterion) {
     let mut group = c.benchmark_group("compression");
     let count = 5_000u64;
     // Compressible data (repeated patterns)
-    let value: Vec<u8> = (0..256u8).cycle().take(256).collect();
+    let value: Vec<u8> = (0..=255u8).cycle().take(256).collect();
 
     group.throughput(Throughput::Elements(count));
 

@@ -6,7 +6,7 @@ fmt:
 	cargo fmt
 
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets -- -D warnings
 
 check:
 	cargo check

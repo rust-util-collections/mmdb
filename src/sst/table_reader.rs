@@ -9,11 +9,24 @@ use crate::cache::block_cache::BlockCache;
 use crate::error::{Error, Result};
 use crate::sst::block::Block;
 use crate::sst::filter::BloomFilter;
-use crate::sst::format::*;
+use crate::sst::format::{
+    BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, decode_footer,
+    decode_index_value,
+};
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType};
 
-/// Shared index entries: key-value pairs from the SST index block.
-type IndexEntries = Arc<Vec<(Vec<u8>, Vec<u8>)>>;
+/// Parsed index entry: separator key + block handle + optional first key.
+pub struct IndexEntry {
+    /// Separator key (last key of the data block).
+    pub separator_key: Vec<u8>,
+    /// Handle pointing to the data block.
+    pub handle: BlockHandle,
+    /// First key of the data block (for deferred block reads). None for old SST format.
+    pub first_key: Option<Vec<u8>>,
+}
+
+/// Shared index entries parsed from the SST index block.
+type IndexEntries = Arc<Vec<IndexEntry>>;
 
 /// Bloom filter data read from SST metaindex.
 struct FilterData {
@@ -91,9 +104,24 @@ impl TableReader {
 
     /// Get cached index entries (shared across all TableIterators for this file).
     /// Populated once on first access, then reused via Arc.
+    /// Parses extended index values (BlockHandle + optional first_key).
     pub fn cached_index_entries(&self) -> IndexEntries {
         self.index_entry_cache
-            .get_or_init(|| Arc::new(self.index_block.iter().collect()))
+            .get_or_init(|| {
+                Arc::new(
+                    self.index_block
+                        .iter()
+                        .map(|(k, v)| {
+                            let (handle, first_key) = decode_index_value(&v);
+                            IndexEntry {
+                                separator_key: k,
+                                handle,
+                                first_key: first_key.map(|fk| fk.to_vec()),
+                            }
+                        })
+                        .collect(),
+                )
+            })
             .clone()
     }
 
@@ -316,9 +344,8 @@ impl TableReader {
         // Populate the OnceLock index entry cache eagerly
         let entries = self.cached_index_entries();
         // Also pre-read first data block into cache
-        if let Some((_, hb)) = entries.first() {
-            let handle = BlockHandle::decode(hb);
-            let _ = self.read_block_cached(&handle);
+        if let Some(entry) = entries.first() {
+            let _ = self.read_block_cached(&entry.handle);
         }
     }
 
@@ -382,6 +409,12 @@ pub struct TableIterator {
     /// Previous block's index position (for detecting sequential access).
     prev_block_index: usize,
 
+    // --- Deferred block read (first_key_from_index) ---
+    /// True when positioned at first_key from index without loading data block.
+    at_first_key_from_index: bool,
+    /// The index position for deferred materialization.
+    deferred_index_pos: usize,
+
     // --- Backward iteration (materialized) ---
     /// Materialized block entries — only populated by seek_for_prev/prev.
     current_block_entries: Vec<(Vec<u8>, Vec<u8>)>,
@@ -401,6 +434,8 @@ impl TableIterator {
             block_cursor_key: Vec::new(),
             sequential_reads: 0,
             prev_block_index: usize::MAX,
+            at_first_key_from_index: false,
+            deferred_index_pos: 0,
             current_block_entries: Vec::new(),
             block_pos: 0,
         }
@@ -423,6 +458,18 @@ impl TableIterator {
         // Invalidate materialized entries
         self.current_block_entries.clear();
         self.block_pos = 0;
+    }
+
+    /// Materialize the deferred block: load the data block for deferred_index_pos.
+    fn materialize_deferred_block(&mut self) {
+        if let Some(ref index_entries) = self.index_entries
+            && let Ok(data) = self
+                .reader
+                .read_block_cached(&index_entries[self.deferred_index_pos].handle)
+            && let Ok(block) = Block::new(data)
+        {
+            self.set_block_for_cursor(block);
+        }
     }
 
     /// Decode the next entry from the current block using the cursor.
@@ -454,8 +501,8 @@ impl TableIterator {
         let index_entries = self.index_entries.as_ref().unwrap();
 
         // Quick check: if target > file's largest key, mark exhausted.
-        if let Some((largest, _)) = index_entries.last()
-            && compare_internal_key(target, largest) == std::cmp::Ordering::Greater
+        if let Some(last) = index_entries.last()
+            && compare_internal_key(target, &last.separator_key) == std::cmp::Ordering::Greater
         {
             self.index_pos = index_entries.len();
             self.current_block_entries.clear();
@@ -464,8 +511,8 @@ impl TableIterator {
         }
 
         // Binary search index entries to find the first block that may contain target
-        let idx = index_entries.partition_point(|(idx_key, _)| {
-            compare_internal_key(idx_key, target) == std::cmp::Ordering::Less
+        let idx = index_entries.partition_point(|entry| {
+            compare_internal_key(&entry.separator_key, target) == std::cmp::Ordering::Less
         });
 
         self.index_pos = idx;
@@ -475,11 +522,22 @@ impl TableIterator {
 
         // Load the found block and seek within it using the cursor
         if self.index_pos < index_entries.len() {
-            let (_, ref handle_bytes) = index_entries[self.index_pos];
-            let handle = BlockHandle::decode(handle_bytes);
+            let entry = &index_entries[self.index_pos];
             self.index_pos += 1;
 
-            if let Ok(data) = self.reader.read_block_cached(&handle)
+            // Deferred block read: if target <= first_key, position without I/O
+            if let Some(ref first_key) = entry.first_key
+                && compare_internal_key(target, first_key) != std::cmp::Ordering::Greater
+            {
+                self.at_first_key_from_index = true;
+                self.deferred_index_pos = self.index_pos - 1;
+                self.block_cursor_key.clear();
+                self.block_cursor_key.extend_from_slice(first_key);
+                self.current_block = None;
+                return;
+            }
+
+            if let Ok(data) = self.reader.read_block_cached(&entry.handle)
                 && let Ok(block) = Block::new(data)
             {
                 self.seek_within_block(block, target, compare_internal_key);
@@ -592,8 +650,8 @@ impl TableIterator {
         self.ensure_index();
         let index_entries = self.index_entries.as_ref().unwrap();
 
-        let idx = index_entries.partition_point(|(idx_key, _)| {
-            compare_internal_key(idx_key, target) == std::cmp::Ordering::Less
+        let idx = index_entries.partition_point(|entry| {
+            compare_internal_key(&entry.separator_key, target) == std::cmp::Ordering::Less
         });
 
         // Try the block at `idx` first, then fall back to previous blocks.
@@ -609,8 +667,7 @@ impl TableIterator {
                 continue;
             }
 
-            let (_, ref handle_bytes) = index_entries[try_idx];
-            let handle = BlockHandle::decode(handle_bytes);
+            let handle = index_entries[try_idx].handle;
 
             if let Ok(data) = self.reader.read_block_cached(&handle)
                 && let Ok(block) = Block::new(data)
@@ -673,8 +730,7 @@ impl TableIterator {
 
         let prev_block_index = current_block_index - 1;
         self.ensure_index();
-        let (_, ref handle_bytes) = self.index_entries.as_ref().unwrap()[prev_block_index];
-        let handle = BlockHandle::decode(handle_bytes);
+        let handle = self.index_entries.as_ref().unwrap()[prev_block_index].handle;
 
         if let Ok(data) = self.reader.read_block_cached(&handle)
             && let Ok(block) = Block::new(data)
@@ -705,8 +761,7 @@ impl TableIterator {
         let index_entries = self.index_entries.as_ref().unwrap();
         while self.index_pos < index_entries.len() {
             let block_idx = self.index_pos;
-            let (_, ref handle_bytes) = index_entries[self.index_pos];
-            let handle = BlockHandle::decode(handle_bytes);
+            let handle = index_entries[self.index_pos].handle;
             self.index_pos += 1;
 
             // Detect sequential access and trigger readahead
@@ -737,7 +792,7 @@ impl TableIterator {
     }
 
     /// Issue a readahead hint for upcoming blocks.
-    fn maybe_readahead(&self, index_entries: &[(Vec<u8>, Vec<u8>)], current_idx: usize) {
+    fn maybe_readahead(&self, index_entries: &[IndexEntry], current_idx: usize) {
         // Prefetch the next N blocks (adaptive: starts at 2, grows to 8)
         let prefetch_count = (self.sequential_reads as usize).min(8);
         let start = current_idx + 1;
@@ -747,8 +802,8 @@ impl TableIterator {
         }
 
         // Compute the file range covering the upcoming blocks
-        let first_handle = BlockHandle::decode(&index_entries[start].1);
-        let last_handle = BlockHandle::decode(&index_entries[end - 1].1);
+        let first_handle = index_entries[start].handle;
+        let last_handle = index_entries[end - 1].handle;
         let offset = first_handle.offset;
         let len = (last_handle.offset + last_handle.size + BLOCK_TRAILER_SIZE as u64) - offset;
 
@@ -761,6 +816,15 @@ impl Iterator for TableIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
+            // Handle deferred block read: materialize now that we need the value
+            if self.at_first_key_from_index {
+                self.at_first_key_from_index = false;
+                self.materialize_deferred_block();
+                if let Some(entry) = self.cursor_next() {
+                    return Some(entry);
+                }
+                // Fall through to load_next_block if materialize failed
+            }
             // Try cursor-based path first (forward iteration)
             if let Some(entry) = self.cursor_next() {
                 return Some(entry);
@@ -785,6 +849,11 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     }
 
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
+        // Handle deferred block read
+        if self.at_first_key_from_index {
+            self.at_first_key_from_index = false;
+            self.materialize_deferred_block();
+        }
         loop {
             // Try cursor-based path (forward iteration)
             if let Some(ref block) = self.current_block
@@ -823,11 +892,12 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     fn prefetch_first_block(&mut self) {
         self.ensure_index();
         if let Some(index) = self.index_entries.as_ref()
-            && let Some((_, hb)) = index.first()
+            && let Some(entry) = index.first()
         {
-            let handle = BlockHandle::decode(hb);
-            self.reader
-                .advise_willneed(handle.offset, handle.size + BLOCK_TRAILER_SIZE as u64);
+            self.reader.advise_willneed(
+                entry.handle.offset,
+                entry.handle.size + BLOCK_TRAILER_SIZE as u64,
+            );
         }
     }
 }
