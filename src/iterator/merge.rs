@@ -333,9 +333,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     }
 
     /// Seek all sources to a target key, then rebuild the heap.
+    /// Uses `seek_to` for seekable sources (O(log N) binary search)
+    /// instead of forward-only linear scan.
     pub fn seek(&mut self, target: &[u8]) {
         for source in self.sources.iter_mut() {
-            source.seek(target, &self.compare);
+            source.seek_to(target, &self.compare);
         }
         // Rebuild heap
         self.initialized = false;
