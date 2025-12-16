@@ -259,7 +259,7 @@ fn test_crash_partial_wal_record() {
         let mut wal_files: Vec<_> = std::fs::read_dir(&path)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "wal"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "wal"))
             .collect();
         wal_files.sort_by_key(|e| e.path());
         assert!(!wal_files.is_empty(), "expected at least one WAL file");
@@ -319,7 +319,7 @@ fn test_crash_during_flush() {
     let sst_files: Vec<_> = std::fs::read_dir(&path)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "sst"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
         .map(|e| e.path())
         .collect();
     for sst in &sst_files {

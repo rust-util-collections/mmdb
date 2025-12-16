@@ -607,8 +607,8 @@ mod tests {
 
         let items: Vec<_> = sl.iter().collect();
         assert_eq!(items.len(), 10_000);
-        for i in 0..10_000 {
-            assert_eq!(items[i], (i as i32, i as i32));
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(*item, (i as i32, i as i32));
         }
 
         let rev: Vec<_> = sl.iter().rev().collect();

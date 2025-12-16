@@ -16,6 +16,7 @@ tracing = "0.1"
 libc = "0.2"
 
 [dev-dependencies]
+mmdb = { path = ".", features = ["test-utils"] }
 tempfile = "3"
 proptest = "1"
 rand = "0.9"
@@ -32,3 +33,4 @@ opt-level = 3
 
 [features]
 default = []
+test-utils = []  # Exposes test helpers like DB::simulate_crash()

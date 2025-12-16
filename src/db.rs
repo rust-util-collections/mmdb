@@ -1197,6 +1197,22 @@ impl DB {
     }
 }
 
+/// Test utilities gated behind the `test-utils` feature.
+#[cfg(any(test, feature = "test-utils"))]
+impl DB {
+    /// Simulate a crash: shut down background threads without flushing memtable.
+    /// Useful for testing WAL recovery without zombie compaction threads.
+    pub fn simulate_crash(self) {
+        self.closed.store(true, Ordering::Release);
+        self.compaction_shutdown.store(true, Ordering::Release);
+        self.compaction_notify.1.notify_all();
+        for handle in self.compaction_handles.lock().drain(..) {
+            let _ = handle.join();
+        }
+        std::mem::forget(self);
+    }
+}
+
 impl Drop for DB {
     fn drop(&mut self) {
         if !self.closed.load(Ordering::Acquire) {

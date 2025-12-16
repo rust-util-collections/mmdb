@@ -208,25 +208,22 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..8 {
             let mt = Arc::clone(&mt);
-            let done = Arc::clone(&done);
+            let _done = Arc::clone(&done);
             handles.push(thread::spawn(move || {
-                while !done.load(Ordering::Relaxed) {
-                    for i in 0..num_entries {
-                        let t = i / 100;
-                        let j = i % 100;
-                        let key = format!("t{}_k{:04}", t, j);
-                        let val = format!("t{}_v{}", t, j);
-                        let seq = (i + 1) as u64;
-                        let result = mt.get(key.as_bytes(), seq);
-                        assert_eq!(
-                            result,
-                            Some(Some(val.into_bytes())),
-                            "missing key {} at seq {}",
-                            key,
-                            seq
-                        );
-                    }
-                    break; // One full pass is enough
+                for i in 0..num_entries {
+                    let t = i / 100;
+                    let j = i % 100;
+                    let key = format!("t{}_k{:04}", t, j);
+                    let val = format!("t{}_v{}", t, j);
+                    let seq = (i + 1) as u64;
+                    let result = mt.get(key.as_bytes(), seq);
+                    assert_eq!(
+                        result,
+                        Some(Some(val.into_bytes())),
+                        "missing key {} at seq {}",
+                        key,
+                        seq
+                    );
                 }
             }));
         }

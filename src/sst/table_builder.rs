@@ -431,15 +431,15 @@ mod tests {
         let entries = reader.iter().unwrap();
         assert_eq!(entries.len(), 500);
 
-        for i in 0..500 {
+        for (i, entry) in entries.iter().enumerate().take(500) {
             let key = format!("key_{:06}", i);
             let val = format!(
                 "value_{}_padding_data_to_make_it_compressible_{}",
                 i,
                 "x".repeat(100)
             );
-            assert_eq!(entries[i].0, key.as_bytes());
-            assert_eq!(entries[i].1, val.as_bytes());
+            assert_eq!(entry.0, key.as_bytes());
+            assert_eq!(entry.1, val.as_bytes());
         }
 
         // Point lookups should also work

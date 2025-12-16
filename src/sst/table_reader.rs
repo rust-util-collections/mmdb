@@ -1052,7 +1052,7 @@ mod tests {
         // Collect all entries via the streaming iterator
         let mut count = 0;
         let mut prev_key: Option<Vec<u8>> = None;
-        while let Some((k, v)) = iter.next() {
+        for (k, v) in &mut iter {
             let expected_key = format!("key_{:06}", count);
             let expected_val = format!("value_{}", count);
             assert_eq!(

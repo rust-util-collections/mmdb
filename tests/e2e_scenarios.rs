@@ -250,7 +250,7 @@ fn test_log_system_scenario() {
         .iter()
         .filter(|(k, _)| {
             let s = std::str::from_utf8(k).unwrap();
-            s >= "log:00000500" && s < "log:00000550"
+            ("log:00000500".."log:00000550").contains(&s)
         })
         .collect();
     assert_eq!(
@@ -646,7 +646,7 @@ fn test_restart_recovery() {
             b"synced",
         )
         .unwrap();
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Phase 3: recover and verify.
