@@ -187,7 +187,6 @@ mod tests {
     #[test]
     fn test_memtable_single_writer_concurrent_readers() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::thread;
 
         let mt = Arc::new(MemTable::new());
@@ -204,11 +203,9 @@ mod tests {
         }
 
         // Spawn concurrent readers to verify all entries.
-        let done = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let mt = Arc::clone(&mt);
-            let _done = Arc::clone(&done);
             handles.push(thread::spawn(move || {
                 for i in 0..num_entries {
                     let t = i / 100;
@@ -228,7 +225,6 @@ mod tests {
             }));
         }
 
-        done.store(true, Ordering::Relaxed);
         for h in handles {
             h.join().unwrap();
         }

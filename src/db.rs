@@ -16,17 +16,17 @@ use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
 use crate::compaction::LeveledCompaction;
 use crate::error::{Error, Result};
-use crate::iterator::BidiIterator;
-use crate::iterator::LevelIterator;
 use crate::iterator::db_iter::DBIterator;
 use crate::iterator::merge::IterSource;
+use crate::iterator::{BidiIterator, LevelIterator};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
 use crate::memtable::MemTable;
+use crate::memtable::skiplist::MemTableCursorIter;
 use crate::options::{DbOptions, ReadOptions, WriteOptions};
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
-use crate::types::{SequenceNumber, ValueType, WriteBatch};
+use crate::types::{self, SequenceNumber, ValueType, WriteBatch};
 use crate::wal::{WalReader, WalWriter};
 
 /// A pending write request for group commit.
@@ -450,14 +450,12 @@ impl DB {
 
         // Active memtable — cursor-based streaming iterator.
         {
-            use crate::memtable::skiplist::MemTableCursorIter;
             let cursor = MemTableCursorIter::new(active_mem.clone());
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
         // Immutable memtables
         for imm in &imm_mems {
-            use crate::memtable::skiplist::MemTableCursorIter;
             let cursor = MemTableCursorIter::new(imm.clone());
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
@@ -467,27 +465,15 @@ impl DB {
         // L1+ files are sorted and non-overlapping — use a single LevelIterator per level.
         for tf in version.level_files(0) {
             // Check if this file's key range overlaps the hint range.
-            if let Some(start) = start_hint {
-                let lk = &tf.meta.largest_key;
-                let file_largest_uk = if lk.len() >= 8 {
-                    &lk[..lk.len() - 8]
-                } else {
-                    lk.as_slice()
-                };
-                if file_largest_uk < start {
-                    continue;
-                }
+            if let Some(start) = start_hint
+                && types::user_key(&tf.meta.largest_key) < start
+            {
+                continue;
             }
-            if let Some(end) = end_hint {
-                let sk = &tf.meta.smallest_key;
-                let file_smallest_uk = if sk.len() >= 8 {
-                    &sk[..sk.len() - 8]
-                } else {
-                    sk.as_slice()
-                };
-                if file_smallest_uk > end {
-                    continue;
-                }
+            if let Some(end) = end_hint
+                && types::user_key(&tf.meta.smallest_key) > end
+            {
+                continue;
             }
             let iter = TableIterator::new(tf.reader.clone());
             sources.push(IterSource::from_seekable(Box::new(iter)));
@@ -527,14 +513,12 @@ impl DB {
 
         // Active memtable
         {
-            use crate::memtable::skiplist::MemTableCursorIter;
             let cursor = MemTableCursorIter::new(active_mem.clone());
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
         // Immutable memtables
         for imm in &imm_mems {
-            use crate::memtable::skiplist::MemTableCursorIter;
             let cursor = MemTableCursorIter::new(imm.clone());
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
@@ -560,25 +544,11 @@ impl DB {
         // SST files — skip files via range pruning + prefix bloom.
         // L0: per-file filtering (files may overlap).
         for tf in version.level_files(0) {
-            let lk = &tf.meta.largest_key;
-            let file_largest_uk = if lk.len() >= 8 {
-                &lk[..lk.len() - 8]
-            } else {
-                lk.as_slice()
-            };
-            if file_largest_uk < prefix {
+            if types::user_key(&tf.meta.largest_key) < prefix {
                 continue;
             }
-            if has_upper {
-                let sk = &tf.meta.smallest_key;
-                let file_smallest_uk = if sk.len() >= 8 {
-                    &sk[..sk.len() - 8]
-                } else {
-                    sk.as_slice()
-                };
-                if file_smallest_uk >= prefix_upper.as_slice() {
-                    continue;
-                }
+            if has_upper && types::user_key(&tf.meta.smallest_key) >= prefix_upper.as_slice() {
+                continue;
             }
             if !tf.reader.prefix_may_match(prefix) {
                 continue;

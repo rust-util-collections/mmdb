@@ -3,7 +3,7 @@ name = "mmdb"
 version = "2.0.0"
 edition = "2024"
 description = "A modern LSM-Tree storage engine in pure Rust"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 crc32fast = "1"

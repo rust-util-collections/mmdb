@@ -181,6 +181,17 @@ pub fn compare_internal_key(a: &[u8], b: &[u8]) -> Ordering {
         .then_with(|| a[a.len() - 8..].cmp(&b[b.len() - 8..]))
 }
 
+/// Extract the user key from an internal key by stripping the 8-byte trailer.
+/// Returns the full slice if the key is shorter than 8 bytes.
+#[inline]
+pub fn user_key(internal_key: &[u8]) -> &[u8] {
+    if internal_key.len() >= 8 {
+        &internal_key[..internal_key.len() - 8]
+    } else {
+        internal_key
+    }
+}
+
 /// A write batch groups multiple mutations to be applied atomically.
 pub struct WriteBatch {
     pub(crate) entries: Vec<WriteBatchEntry>,

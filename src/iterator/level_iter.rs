@@ -8,14 +8,7 @@ use crate::manifest::version::TableFile;
 use crate::sst::table_reader::TableIterator;
 use crate::types::compare_internal_key;
 
-/// Extract user key from an internal key by stripping the 8-byte trailer.
-fn user_key_from_internal(ikey: &[u8]) -> &[u8] {
-    if ikey.len() >= 8 {
-        &ikey[..ikey.len() - 8]
-    } else {
-        ikey
-    }
-}
+use crate::types::user_key as user_key_from_internal;
 
 /// A lazy iterator over a sorted, non-overlapping set of SST files (L1+).
 ///
