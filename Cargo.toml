@@ -4,6 +4,15 @@ version = "2.0.0"
 edition = "2024"
 description = "A modern LSM-Tree storage engine in pure Rust"
 license = "MIT"
+authors = ["hui.fan@mail.ru"]
+repository = "https://github.com/rust-util-collections/mmdb"
+homepage = "https://github.com/rust-util-collections/mmdb"
+documentation = "https://docs.rs/mmdb"
+keywords = ["rocksdb", "leveldb", "kv", "database", "db"]
+categories = ["database-implementations"]
+readme = "README.md"
+rust-version = "1.85"
+exclude = [".github/"]
 
 [dependencies]
 crc32fast = "1"
