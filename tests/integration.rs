@@ -1281,3 +1281,169 @@ fn test_iter_rev_after_flush_compact() {
         assert!(forward[i].0 > forward[i - 1].0, "not sorted at {}", i);
     }
 }
+
+// ── Multi-threaded compaction ───────────────────────────────────────────
+
+#[test]
+fn test_multi_thread_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 4 * 1024, // tiny — force many flushes
+            l0_compaction_trigger: 2,
+            max_background_compactions: 4,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    // Write enough data to trigger many compactions
+    for i in 0..5_000u64 {
+        let key = format!("mt_{:06}", i);
+        db.put(key.as_bytes(), b"value").unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+
+    // Verify all data
+    for i in 0..5_000u64 {
+        let key = format!("mt_{:06}", i);
+        assert_eq!(
+            db.get(key.as_bytes()).unwrap(),
+            Some(b"value".to_vec()),
+            "missing key {}",
+            i
+        );
+    }
+
+    // Iterator should see all keys in order
+    let count = db.iter().unwrap().count();
+    assert_eq!(count, 5_000);
+}
+
+// ── Deferred block read (first_key in index) ────────────────────────────
+
+#[test]
+fn test_deferred_block_read_correctness() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 4 * 1024, // force SST creation
+            l0_compaction_trigger: 100,  // don't compact
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    // Write enough to create SST files
+    for i in 0..1_000u64 {
+        let key = format!("df_{:06}", i);
+        let val = format!("val_{:06}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
+
+    // Seek to various positions — exercises deferred block read path.
+    // Each seek uses a fresh iterator (re-seek on same iter is a separate concern).
+
+    // Seek to beginning
+    let mut iter = db.iter().unwrap();
+    iter.seek(b"df_000000");
+    let (k, v) = iter.next().unwrap();
+    assert_eq!(k, b"df_000000");
+    assert_eq!(v, b"val_000000");
+
+    // Seek to middle
+    let mut iter = db.iter().unwrap();
+    iter.seek(b"df_000500");
+    let (k, _) = iter.next().unwrap();
+    assert_eq!(k, b"df_000500");
+
+    // Seek to key between entries
+    let mut iter = db.iter().unwrap();
+    iter.seek(b"df_000500x");
+    let (k, _) = iter.next().unwrap();
+    assert_eq!(k, b"df_000501");
+
+    // Seek past end
+    let mut iter = db.iter().unwrap();
+    iter.seek(b"zz");
+    assert!(iter.next().is_none());
+
+    // Full scan sees all entries
+    assert_eq!(db.iter().unwrap().count(), 1_000);
+}
+
+// ── Prefix scan with SST across levels ──────────────────────────────────
+
+#[test]
+fn test_prefix_scan_across_levels() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 4 * 1024,
+            l0_compaction_trigger: 2,
+            prefix_len: 4,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    // Write keys with different 4-byte prefixes
+    for prefix in &["aaa_", "bbb_", "ccc_"] {
+        for i in 0..100u64 {
+            let key = format!("{}{:06}", prefix, i);
+            db.put(key.as_bytes(), b"v").unwrap();
+        }
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+
+    // Prefix scan should return exactly the matching prefix
+    let aaa: Vec<_> = db.iter_with_prefix(b"aaa_").unwrap().collect();
+    assert_eq!(aaa.len(), 100, "aaa_ prefix should have 100 entries");
+    assert!(aaa[0].0.starts_with(b"aaa_"));
+    assert!(aaa[99].0.starts_with(b"aaa_"));
+
+    let bbb: Vec<_> = db.iter_with_prefix(b"bbb_").unwrap().collect();
+    assert_eq!(bbb.len(), 100);
+
+    // Non-existent prefix
+    let zzz: Vec<_> = db.iter_with_prefix(b"zzz_").unwrap().collect();
+    assert_eq!(zzz.len(), 0);
+}
+
+// ── New options fields are respected ────────────────────────────────────
+
+#[test]
+fn test_new_options_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            max_background_compactions: 4,
+            max_subcompactions: 2,
+            pin_l0_filter_and_index_blocks_in_cache: true,
+            cache_index_and_filter_blocks: true,
+            max_write_buffer_number: 8,
+            level_compaction_dynamic_level_bytes: false,
+            allow_concurrent_memtable_write: false,
+            memtable_prefix_bloom_ratio: 0.0,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    // Basic operations should work with all options set
+    db.put(b"k1", b"v1").unwrap();
+    assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+    db.flush().unwrap();
+    assert_eq!(db.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+}

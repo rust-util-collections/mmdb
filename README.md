@@ -1,9 +1,11 @@
-# MMDB — A Modern LSM-Tree Storage Engine
+# MMDB
+
+**A Modern LSM-Tree Storage Engine!**
 
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-206_passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-210_passing-brightgreen.svg)]()
 
 A pure-Rust, synchronous LSM-Tree key-value storage engine. Designed as a native Rust alternative to RocksDB with competitive performance — **scan throughput matches or exceeds RocksDB** on equivalent configurations.
 
@@ -223,10 +225,14 @@ let opts = DbOptions::read_heavy();   // large cache, 14 bits/key bloom
 
 ```bash
 cargo build
-cargo test               # 206 tests (unit + integration + e2e + proptest)
-cargo bench              # criterion benchmarks
+cargo test               # 210 tests (unit + integration + e2e + proptest)
 make all                 # fmt + lint + check + test
+make bench               # criterion benchmarks (warm + cold cache scenarios)
+cargo bench -- "cold"    # cold-cache benchmarks only
+cargo bench -- "warm"    # warm-cache benchmarks only
 ```
+
+Benchmarks test both warm-cache (256MB, data in memory) and cold-cache (256KB, I/O-bound) scenarios. Cold-cache tests use smaller datasets to keep runtime reasonable.
 
 ---
 

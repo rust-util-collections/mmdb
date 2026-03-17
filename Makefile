@@ -1,6 +1,6 @@
-.PHONY: all fmt lint check test clean
+.PHONY: all fmt lint check test bench clean
 
-all: fmt lint check test
+all: fmt lint test
 
 fmt:
 	cargo fmt
@@ -16,6 +16,9 @@ check:
 test:
 	cargo test
 	cargo test --release
+
+bench:
+	cargo bench
 
 clean:
 	cargo clean

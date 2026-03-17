@@ -1,35 +1,29 @@
 //! MMDB Benchmarks — comparable to RocksDB's db_bench report format.
 //!
-//! Run: cargo bench
-//! Results are saved in target/criterion/ with HTML reports.
+//! Run:
+//!   cargo bench                    # all benchmarks
+//!   cargo bench -- "fillseq"       # specific group
+//!   cargo bench -- "cold"          # cold-cache scenarios only
+//!   cargo bench -- "warm"          # warm-cache scenarios only
 //!
-//! Benchmark categories (matching RocksDB db_bench):
-//! - fillseq: Sequential write throughput
-//! - fillrandom: Random write throughput
-//! - readrandom: Random point read throughput
-//! - readseq: Sequential scan throughput
-//! - fillbatch: Batch write throughput
-//! - overwrite: Overwrite existing keys
-//! - Various value sizes and compression types
+//! Two configurations are tested for I/O-sensitive operations:
+//! - **warm**: Large cache (256MB), data fits in memory — measures CPU/algorithm cost
+//! - **cold**: Tiny cache (256KB), data exceeds cache — measures I/O + cache-miss cost
+//!
+//! Cold-cache tests use smaller datasets to keep total bench time reasonable.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::path::Path;
+use std::time::Duration;
 
-fn mmdb_open(path: &Path) -> mmdb::DB {
-    mmdb::DB::open(
-        mmdb::DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 64 * 1024 * 1024,
-            ..Default::default()
-        },
-        path,
-    )
-    .unwrap()
+/// Custom criterion config: 10 samples, 3s measurement — keeps total bench under 5 min.
+fn bench_config() -> Criterion {
+    Criterion::default()
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(3))
 }
 
-fn mmdb_open_opts(path: &Path, opts: mmdb::DbOptions) -> mmdb::DB {
-    mmdb::DB::open(opts, path).unwrap()
-}
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 fn make_key(i: u64) -> Vec<u8> {
     format!("key_{:016}", i).into_bytes()
@@ -39,19 +33,53 @@ fn make_value(size: usize) -> Vec<u8> {
     vec![0x42u8; size]
 }
 
-// ── fillseq: Sequential Write ────────────────────────────────────────────────
+/// Open DB with warm cache (256MB) — data stays in memory.
+fn open_warm(path: &Path) -> mmdb::DB {
+    mmdb::DB::open(
+        mmdb::DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 64 * 1024 * 1024,
+            block_cache_capacity: 256 * 1024 * 1024,
+            ..Default::default()
+        },
+        path,
+    )
+    .unwrap()
+}
+
+/// Open DB with cold cache (256KB) — forces disk I/O on reads.
+fn open_cold(path: &Path) -> mmdb::DB {
+    mmdb::DB::open(
+        mmdb::DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 4 * 1024 * 1024, // 4MB — frequent flushes
+            block_cache_capacity: 256 * 1024,   // 256KB — almost nothing cached
+            l0_compaction_trigger: 4,
+            ..Default::default()
+        },
+        path,
+    )
+    .unwrap()
+}
+
+fn open_with(path: &Path, opts: mmdb::DbOptions) -> mmdb::DB {
+    mmdb::DB::open(opts, path).unwrap()
+}
+
+// ── fillseq: Sequential Write ───────────────────────────────────────────
 
 fn bench_fillseq(c: &mut Criterion) {
     let mut group = c.benchmark_group("fillseq");
+
     let value = make_value(100);
 
-    for &count in &[1_000u64, 10_000, 100_000] {
+    for &count in &[1_000u64, 10_000] {
         group.throughput(Throughput::Elements(count));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             b.iter_with_setup(
                 || {
                     let dir = tempfile::tempdir().unwrap();
-                    let db = mmdb_open(dir.path());
+                    let db = open_warm(dir.path());
                     (dir, db)
                 },
                 |(dir, db)| {
@@ -67,19 +95,20 @@ fn bench_fillseq(c: &mut Criterion) {
     group.finish();
 }
 
-// ── fillrandom: Random Write ─────────────────────────────────────────────────
+// ── fillrandom: Random Write ────────────────────────────────────────────
 
 fn bench_fillrandom(c: &mut Criterion) {
     let mut group = c.benchmark_group("fillrandom");
+
     let value = make_value(100);
 
-    for &count in &[1_000u64, 10_000, 100_000] {
+    for &count in &[1_000u64, 10_000] {
         group.throughput(Throughput::Elements(count));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
             b.iter_with_setup(
                 || {
                     let dir = tempfile::tempdir().unwrap();
-                    let db = mmdb_open(dir.path());
+                    let db = open_warm(dir.path());
                     let keys: Vec<Vec<u8>> = (0..count)
                         .map(|i| make_key(i.wrapping_mul(6364136223846793005).wrapping_add(1)))
                         .collect();
@@ -98,136 +127,11 @@ fn bench_fillrandom(c: &mut Criterion) {
     group.finish();
 }
 
-// ── readrandom: Random Point Read ────────────────────────────────────────────
-
-fn bench_readrandom(c: &mut Criterion) {
-    let mut group = c.benchmark_group("readrandom");
-    let value = make_value(100);
-    let read_count = 1_000u64;
-
-    // Data in memtable only
-    group.throughput(Throughput::Elements(read_count));
-    group.bench_function("memtable_10k", |b| {
-        b.iter_with_setup(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let db = mmdb_open(dir.path());
-                for i in 0..10_000u64 {
-                    db.put(&make_key(i), &value).unwrap();
-                }
-                let read_keys: Vec<Vec<u8>> = (0..read_count)
-                    .map(|i| make_key((i * 7) % 10_000))
-                    .collect();
-                (dir, db, read_keys)
-            },
-            |(_dir, db, keys)| {
-                for key in &keys {
-                    let _ = db.get(key).unwrap();
-                }
-            },
-        );
-    });
-
-    // Data in SST (after flush)
-    group.bench_function("sst_10k", |b| {
-        b.iter_with_setup(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let db = mmdb_open(dir.path());
-                for i in 0..10_000u64 {
-                    db.put(&make_key(i), &value).unwrap();
-                }
-                db.flush().unwrap();
-                let read_keys: Vec<Vec<u8>> = (0..read_count)
-                    .map(|i| make_key((i * 7) % 10_000))
-                    .collect();
-                (dir, db, read_keys)
-            },
-            |(_dir, db, keys)| {
-                for key in &keys {
-                    let _ = db.get(key).unwrap();
-                }
-            },
-        );
-    });
-
-    // Data across multiple levels (after compaction)
-    group.bench_function("compacted_10k", |b| {
-        b.iter_with_setup(
-            || {
-                let dir = tempfile::tempdir().unwrap();
-                let opts = mmdb::DbOptions {
-                    create_if_missing: true,
-                    write_buffer_size: 8 * 1024,
-                    l0_compaction_trigger: 2,
-                    ..Default::default()
-                };
-                let db = mmdb_open_opts(dir.path(), opts);
-                for i in 0..10_000u64 {
-                    db.put(&make_key(i), &value).unwrap();
-                }
-                db.flush().unwrap();
-                db.compact().unwrap();
-                let read_keys: Vec<Vec<u8>> = (0..read_count)
-                    .map(|i| make_key((i * 7) % 10_000))
-                    .collect();
-                (dir, db, read_keys)
-            },
-            |(_dir, db, keys)| {
-                for key in &keys {
-                    let _ = db.get(key).unwrap();
-                }
-            },
-        );
-    });
-
-    group.finish();
-}
-
-// ── readseq: Sequential Scan (Iterator) ──────────────────────────────────────
-
-fn bench_readseq(c: &mut Criterion) {
-    let mut group = c.benchmark_group("readseq");
-    let value = make_value(100);
-    let total = 10_000u64;
-
-    for &scan_count in &[100usize, 1000, 10_000] {
-        group.throughput(Throughput::Elements(scan_count as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(scan_count),
-            &scan_count,
-            |b, &scan_count| {
-                b.iter_with_setup(
-                    || {
-                        let dir = tempfile::tempdir().unwrap();
-                        let db = mmdb_open(dir.path());
-                        for i in 0..total {
-                            db.put(&make_key(i), &value).unwrap();
-                        }
-                        db.flush().unwrap();
-                        (dir, db)
-                    },
-                    |(_dir, db)| {
-                        let mut iter = db.iter().unwrap();
-                        let mut n = 0;
-                        while iter.next().is_some() {
-                            n += 1;
-                            if n >= scan_count {
-                                break;
-                            }
-                        }
-                    },
-                );
-            },
-        );
-    }
-    group.finish();
-}
-
-// ── fillbatch: Batch Write ───────────────────────────────────────────────────
+// ── fillbatch: Batch Write ──────────────────────────────────────────────
 
 fn bench_fillbatch(c: &mut Criterion) {
     let mut group = c.benchmark_group("fillbatch");
+
     let value = make_value(100);
 
     for &batch_size in &[10usize, 100, 1000] {
@@ -240,7 +144,7 @@ fn bench_fillbatch(c: &mut Criterion) {
                 b.iter_with_setup(
                     || {
                         let dir = tempfile::tempdir().unwrap();
-                        let db = mmdb_open(dir.path());
+                        let db = open_warm(dir.path());
                         (dir, db)
                     },
                     |(dir, db)| {
@@ -261,10 +165,11 @@ fn bench_fillbatch(c: &mut Criterion) {
     group.finish();
 }
 
-// ── overwrite: Overwrite Existing Keys ───────────────────────────────────────
+// ── overwrite ───────────────────────────────────────────────────────────
 
 fn bench_overwrite(c: &mut Criterion) {
     let mut group = c.benchmark_group("overwrite");
+
     let value = make_value(100);
     let count = 10_000u64;
 
@@ -273,7 +178,7 @@ fn bench_overwrite(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let db = mmdb_open(dir.path());
+                let db = open_warm(dir.path());
                 for i in 0..count {
                     db.put(&make_key(i), &value).unwrap();
                 }
@@ -290,15 +195,316 @@ fn bench_overwrite(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Value Size Comparison ────────────────────────────────────────────────────
+// ── readrandom: warm vs cold ────────────────────────────────────────────
+
+fn bench_readrandom(c: &mut Criterion) {
+    let mut group = c.benchmark_group("readrandom");
+
+    let value = make_value(100);
+    let read_count = 1_000u64;
+
+    group.throughput(Throughput::Elements(read_count));
+
+    // Warm: memtable only (no SST I/O)
+    group.bench_function("warm/memtable_10k", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = open_warm(dir.path());
+                for i in 0..10_000u64 {
+                    db.put(&make_key(i), &value).unwrap();
+                }
+                let keys: Vec<Vec<u8>> = (0..read_count)
+                    .map(|i| make_key((i * 7) % 10_000))
+                    .collect();
+                (dir, db, keys)
+            },
+            |(_dir, db, keys)| {
+                for key in &keys {
+                    let _ = db.get(key).unwrap();
+                }
+            },
+        );
+    });
+
+    // Warm: SST with large cache (all blocks cached)
+    group.bench_function("warm/sst_10k", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = open_warm(dir.path());
+                for i in 0..10_000u64 {
+                    db.put(&make_key(i), &value).unwrap();
+                }
+                db.flush().unwrap();
+                // Pre-warm cache by reading all keys once
+                for i in 0..10_000u64 {
+                    let _ = db.get(&make_key(i));
+                }
+                let keys: Vec<Vec<u8>> = (0..read_count)
+                    .map(|i| make_key((i * 7) % 10_000))
+                    .collect();
+                (dir, db, keys)
+            },
+            |(_dir, db, keys)| {
+                for key in &keys {
+                    let _ = db.get(key).unwrap();
+                }
+            },
+        );
+    });
+
+    // Cold: SST with tiny cache (cache misses on most reads)
+    // Smaller dataset (2K entries) to keep bench time reasonable
+    group.bench_function("cold/sst_2k", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = open_cold(dir.path());
+                for i in 0..2_000u64 {
+                    db.put(&make_key(i), &value).unwrap();
+                }
+                db.flush().unwrap();
+                db.compact().unwrap();
+                let keys: Vec<Vec<u8>> = (0..500u64).map(|i| make_key((i * 7) % 2_000)).collect();
+                (dir, db, keys)
+            },
+            |(_dir, db, keys)| {
+                for key in &keys {
+                    let _ = db.get(key).unwrap();
+                }
+            },
+        );
+    });
+
+    group.finish();
+}
+
+// ── readseq (scan): warm vs cold ────────────────────────────────────────
+
+fn bench_readseq(c: &mut Criterion) {
+    let mut group = c.benchmark_group("readseq");
+
+    let value = make_value(100);
+
+    // Warm: 10K entries, large cache, data mostly in memtable/cache
+    for &scan_count in &[100usize, 1_000, 10_000] {
+        group.throughput(Throughput::Elements(scan_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("warm", scan_count),
+            &scan_count,
+            |b, &scan_count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempfile::tempdir().unwrap();
+                        let db = open_warm(dir.path());
+                        for i in 0..10_000u64 {
+                            db.put(&make_key(i), &value).unwrap();
+                        }
+                        db.flush().unwrap();
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        let n = db.iter().unwrap().take(scan_count).count();
+                        assert!(n > 0);
+                    },
+                );
+            },
+        );
+    }
+
+    // Cold: 5K entries (smaller to stay fast), tiny cache, multi-level SST
+    for &scan_count in &[100usize, 1_000] {
+        group.throughput(Throughput::Elements(scan_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("cold", scan_count),
+            &scan_count,
+            |b, &scan_count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempfile::tempdir().unwrap();
+                        let db = open_cold(dir.path());
+                        for i in 0..5_000u64 {
+                            db.put(&make_key(i), &value).unwrap();
+                        }
+                        db.flush().unwrap();
+                        db.compact().unwrap();
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        let n = db.iter().unwrap().take(scan_count).count();
+                        assert!(n > 0);
+                    },
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ── prefix scan: warm vs cold ───────────────────────────────────────────
+
+fn bench_prefix_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("prefix_scan");
+
+    let value = make_value(100);
+    let num_prefixes = 50u64;
+
+    // Warm: prefix scan over 10K entries
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("warm/100", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let opts = mmdb::DbOptions {
+                    create_if_missing: true,
+                    write_buffer_size: 64 * 1024 * 1024,
+                    block_cache_capacity: 256 * 1024 * 1024,
+                    prefix_len: 8,
+                    ..Default::default()
+                };
+                let db = open_with(dir.path(), opts);
+                for i in 0..10_000u64 {
+                    let pfx = i % num_prefixes;
+                    let key = format!("pfx_{:04}_{:010}", pfx, i);
+                    db.put(key.as_bytes(), &value).unwrap();
+                }
+                db.flush().unwrap();
+                (dir, db)
+            },
+            |(_dir, db)| {
+                let n = db.iter_with_prefix(b"pfx_0025").unwrap().take(100).count();
+                assert!(n > 0);
+            },
+        );
+    });
+
+    // Cold: prefix scan, tiny cache, 3K entries (fast enough)
+    group.throughput(Throughput::Elements(100));
+    group.bench_function("cold/100", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let opts = mmdb::DbOptions {
+                    create_if_missing: true,
+                    write_buffer_size: 4 * 1024 * 1024,
+                    block_cache_capacity: 256 * 1024,
+                    prefix_len: 8,
+                    l0_compaction_trigger: 4,
+                    ..Default::default()
+                };
+                let db = open_with(dir.path(), opts);
+                for i in 0..3_000u64 {
+                    let pfx = i % num_prefixes;
+                    let key = format!("pfx_{:04}_{:010}", pfx, i);
+                    db.put(key.as_bytes(), &value).unwrap();
+                }
+                db.flush().unwrap();
+                db.compact().unwrap();
+                (dir, db)
+            },
+            |(_dir, db)| {
+                let n = db.iter_with_prefix(b"pfx_0025").unwrap().take(100).count();
+                assert!(n > 0);
+            },
+        );
+    });
+
+    group.finish();
+}
+
+// ── seek ────────────────────────────────────────────────────────────────
+
+fn bench_seek(c: &mut Criterion) {
+    let mut group = c.benchmark_group("seek");
+
+    let value = make_value(100);
+
+    group.throughput(Throughput::Elements(500));
+    group.bench_function("warm/random_500", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = open_warm(dir.path());
+                for i in 0..50_000u64 {
+                    db.put(&make_key(i), &value).unwrap();
+                }
+                db.flush().unwrap();
+                let targets: Vec<Vec<u8>> = (0..500u64)
+                    .map(|i| make_key((i.wrapping_mul(6364136223846793005)) % 50_000))
+                    .collect();
+                (dir, db, targets)
+            },
+            |(_dir, db, targets)| {
+                for target in &targets {
+                    let mut iter = db.iter().unwrap();
+                    iter.seek(target);
+                    let _ = iter.next();
+                }
+            },
+        );
+    });
+    group.finish();
+}
+
+// ── delete + range delete ───────────────────────────────────────────────
+
+fn bench_delete(c: &mut Criterion) {
+    let mut group = c.benchmark_group("delete");
+
+    let value = make_value(100);
+    let count = 10_000u64;
+
+    group.throughput(Throughput::Elements(count));
+
+    group.bench_function("point_delete_10k", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = open_warm(dir.path());
+                for i in 0..count {
+                    db.put(&make_key(i), &value).unwrap();
+                }
+                (dir, db)
+            },
+            |(_dir, db)| {
+                for i in 0..count {
+                    db.delete(&make_key(i)).unwrap();
+                }
+            },
+        );
+    });
+
+    group.bench_function("range_delete", |b| {
+        b.iter_with_setup(
+            || {
+                let dir = tempfile::tempdir().unwrap();
+                let db = open_warm(dir.path());
+                for i in 0..count {
+                    db.put(&make_key(i), &value).unwrap();
+                }
+                (dir, db)
+            },
+            |(_dir, db)| {
+                db.delete_range(&make_key(0), &make_key(count / 2)).unwrap();
+            },
+        );
+    });
+
+    group.finish();
+}
+
+// ── value sizes ─────────────────────────────────────────────────────────
 
 fn bench_value_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("value_sizes");
+
     let count = 1_000u64;
 
-    for &vsize in &[16usize, 100, 256, 1024, 4096, 65536] {
+    for &vsize in &[16usize, 100, 1024, 65536] {
         let value = make_value(vsize);
-        let bytes_per_op = (24 + vsize) as u64; // key ~24B + value
+        let bytes_per_op = (24 + vsize) as u64;
         group.throughput(Throughput::Bytes(count * bytes_per_op));
         group.bench_with_input(
             BenchmarkId::new("write", format!("{}B", vsize)),
@@ -307,7 +513,7 @@ fn bench_value_sizes(c: &mut Criterion) {
                 b.iter_with_setup(
                     || {
                         let dir = tempfile::tempdir().unwrap();
-                        let db = mmdb_open(dir.path());
+                        let db = open_warm(dir.path());
                         (dir, db)
                     },
                     |(dir, db)| {
@@ -324,20 +530,20 @@ fn bench_value_sizes(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Compression Comparison ───────────────────────────────────────────────────
+// ── compression ─────────────────────────────────────────────────────────
 
 fn bench_compression(c: &mut Criterion) {
     let mut group = c.benchmark_group("compression");
+
     let count = 5_000u64;
-    // Compressible data (repeated patterns)
     let value: Vec<u8> = (0..=255u8).cycle().take(256).collect();
 
     group.throughput(Throughput::Elements(count));
 
     for (name, compression) in [
-        ("none", mmdb::sst::format::CompressionType::None),
-        ("lz4", mmdb::sst::format::CompressionType::Lz4),
-        ("zstd", mmdb::sst::format::CompressionType::Zstd),
+        ("none", mmdb::CompressionType::None),
+        ("lz4", mmdb::CompressionType::Lz4),
+        ("zstd", mmdb::CompressionType::Zstd),
     ] {
         group.bench_with_input(
             BenchmarkId::from_parameter(name),
@@ -346,7 +552,7 @@ fn bench_compression(c: &mut Criterion) {
                 b.iter_with_setup(
                     || {
                         let dir = tempfile::tempdir().unwrap();
-                        let db = mmdb_open_opts(
+                        let db = open_with(
                             dir.path(),
                             mmdb::DbOptions {
                                 create_if_missing: true,
@@ -372,22 +578,85 @@ fn bench_compression(c: &mut Criterion) {
     group.finish();
 }
 
-// ── Mixed Workload ───────────────────────────────────────────────────────────
+// ── large scan: warm vs cold ────────────────────────────────────────────
 
-fn bench_readwhilewriting(c: &mut Criterion) {
-    let mut group = c.benchmark_group("readwhilewriting");
+fn bench_scan_large(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scan_large");
+
+    let value = make_value(128);
+
+    // Warm: 100K entries, large cache
+    for &scan_count in &[100usize, 1_000, 10_000] {
+        group.throughput(Throughput::Elements(scan_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("warm", scan_count),
+            &scan_count,
+            |b, &scan_count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempfile::tempdir().unwrap();
+                        let db = open_warm(dir.path());
+                        for i in 0..100_000u64 {
+                            db.put(&make_key(i), &value).unwrap();
+                        }
+                        db.flush().unwrap();
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        let n = db.iter().unwrap().take(scan_count).count();
+                        assert!(n > 0);
+                    },
+                );
+            },
+        );
+    }
+
+    // Cold: 10K entries (smaller!), tiny cache, multi-level SST
+    for &scan_count in &[100usize, 1_000] {
+        group.throughput(Throughput::Elements(scan_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("cold", scan_count),
+            &scan_count,
+            |b, &scan_count| {
+                b.iter_with_setup(
+                    || {
+                        let dir = tempfile::tempdir().unwrap();
+                        let db = open_cold(dir.path());
+                        for i in 0..10_000u64 {
+                            db.put(&make_key(i), &value).unwrap();
+                        }
+                        db.flush().unwrap();
+                        db.compact().unwrap();
+                        (dir, db)
+                    },
+                    |(_dir, db)| {
+                        let n = db.iter().unwrap().take(scan_count).count();
+                        assert!(n > 0);
+                    },
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ── mixed workload ──────────────────────────────────────────────────────
+
+fn bench_mixed(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mixed");
+
     let value = make_value(100);
     let preload = 10_000u64;
     let ops = 5_000u64;
 
     group.throughput(Throughput::Elements(ops));
 
-    // 90% reads, 10% writes
     group.bench_function("read90_write10", |b| {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let db = mmdb_open(dir.path());
+                let db = open_warm(dir.path());
                 for i in 0..preload {
                     db.put(&make_key(i), &value).unwrap();
                 }
@@ -405,12 +674,11 @@ fn bench_readwhilewriting(c: &mut Criterion) {
         );
     });
 
-    // 50/50
     group.bench_function("read50_write50", |b| {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let db = mmdb_open(dir.path());
+                let db = open_warm(dir.path());
                 for i in 0..preload {
                     db.put(&make_key(i), &value).unwrap();
                 }
@@ -431,16 +699,22 @@ fn bench_readwhilewriting(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
+criterion_group! {
+    name = benches;
+    config = bench_config();
+    targets =
     bench_fillseq,
     bench_fillrandom,
-    bench_readrandom,
-    bench_readseq,
     bench_fillbatch,
     bench_overwrite,
+    bench_readrandom,
+    bench_readseq,
+    bench_prefix_scan,
+    bench_seek,
+    bench_delete,
     bench_value_sizes,
     bench_compression,
-    bench_readwhilewriting,
-);
+    bench_scan_large,
+    bench_mixed,
+}
 criterion_main!(benches);
