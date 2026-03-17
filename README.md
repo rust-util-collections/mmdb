@@ -90,7 +90,7 @@ Benchmarked via [vsdb](https://github.com/rust-util-collections/vsdb) (500K entr
 
 1. Encode as InternalKey (`user_key + !pack(sequence, type)` — inverted big-endian for descending sequence order)
 2. Append to WAL (group commit: leader batches multiple writers into one fsync)
-3. Insert into active MemTable (lock-free crossbeam-skiplist)
+3. Insert into active MemTable (concurrent skiplist)
 4. When MemTable exceeds `write_buffer_size`, freeze and flush to L0 SST
 5. Signal background compaction threads if L0 file count exceeds threshold
 

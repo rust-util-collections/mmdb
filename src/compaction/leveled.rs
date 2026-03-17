@@ -18,7 +18,7 @@ use crate::manifest::version_set::VersionSet;
 use crate::options::DbOptions;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
-use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
+use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
 
 /// Description of a compaction to perform.
 pub struct CompactionTask {
@@ -174,8 +174,9 @@ impl LeveledCompaction {
         let mut current_file_number = 0u64;
         let mut current_size = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
-        // Collect range tombstones to filter covered keys
-        let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (begin, end)
+        // Collect range tombstones with sequence numbers to filter covered keys.
+        // A range tombstone only deletes entries with seq < tombstone_seq.
+        let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> = Vec::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
             if ikey.len() < 8 {
@@ -186,7 +187,7 @@ impl LeveledCompaction {
 
             // Collect range tombstones for filtering
             if ikr.value_type() == ValueType::RangeDeletion {
-                range_tombstones.push((user_key.to_vec(), value.clone()));
+                range_tombstones.push((user_key.to_vec(), value.clone(), ikr.sequence()));
                 // Skip older versions of the begin key
                 if let Some(ref last) = last_user_key
                     && last.as_slice() == user_key
@@ -216,8 +217,11 @@ impl LeveledCompaction {
 
                 // Skip keys covered by range tombstones
                 if ikr.value_type() == ValueType::Value {
-                    let covered = range_tombstones.iter().any(|(begin, end)| {
-                        user_key >= begin.as_slice() && user_key < end.as_slice()
+                    let entry_seq = ikr.sequence();
+                    let covered = range_tombstones.iter().any(|(begin, end, tomb_seq)| {
+                        user_key >= begin.as_slice()
+                            && user_key < end.as_slice()
+                            && *tomb_seq > entry_seq
                     });
                     if covered {
                         continue;
@@ -359,7 +363,7 @@ impl LeveledCompaction {
         let mut current_file_number = 0u64;
         let mut current_size = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
-        let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> = Vec::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
             if ikey.len() < 8 {
@@ -369,7 +373,7 @@ impl LeveledCompaction {
             let user_key = ikr.user_key();
 
             if ikr.value_type() == ValueType::RangeDeletion {
-                range_tombstones.push((user_key.to_vec(), value.clone()));
+                range_tombstones.push((user_key.to_vec(), value.clone(), ikr.sequence()));
                 if let Some(ref last) = last_user_key
                     && last.as_slice() == user_key
                 {
@@ -392,8 +396,11 @@ impl LeveledCompaction {
                 }
 
                 if ikr.value_type() == ValueType::Value {
-                    let covered = range_tombstones.iter().any(|(begin, end)| {
-                        user_key >= begin.as_slice() && user_key < end.as_slice()
+                    let entry_seq = ikr.sequence();
+                    let covered = range_tombstones.iter().any(|(begin, end, tomb_seq)| {
+                        user_key >= begin.as_slice()
+                            && user_key < end.as_slice()
+                            && *tomb_seq > entry_seq
                     });
                     if covered {
                         continue;

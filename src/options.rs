@@ -1,5 +1,7 @@
 //! Configuration options for MMDB.
 
+use std::sync::Arc;
+
 use crate::sst::format::CompressionType;
 
 /// Database-level options.
@@ -49,7 +51,9 @@ pub struct DbOptions {
     /// Index corresponds to level number (0 = L0, 1 = L1, etc.).
     pub compression_per_level: Vec<CompressionType>,
     /// Optional compaction filter.
-    pub compaction_filter: Option<Box<dyn CompactionFilter>>,
+    /// Optional compaction filter. Wrapped in `Arc` so it survives Clone
+    /// and is shared with background compaction threads.
+    pub compaction_filter: Option<Arc<dyn CompactionFilter>>,
 
     // ---- Compaction parallelism (RocksDB: increase_parallelism) ----
     /// Maximum number of background compaction threads. Default: 1.
@@ -143,7 +147,7 @@ impl Clone for DbOptions {
             rate_limiter_bytes_per_sec: self.rate_limiter_bytes_per_sec,
             prefix_len: self.prefix_len,
             compression_per_level: self.compression_per_level.clone(),
-            compaction_filter: None, // Cannot clone trait objects
+            compaction_filter: self.compaction_filter.clone(),
             max_background_compactions: self.max_background_compactions,
             max_subcompactions: self.max_subcompactions,
             pin_l0_filter_and_index_blocks_in_cache: self.pin_l0_filter_and_index_blocks_in_cache,

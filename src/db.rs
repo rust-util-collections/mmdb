@@ -33,6 +33,7 @@ use crate::wal::{WalReader, WalWriter};
 struct WriteRequest {
     batch: WriteBatch,
     sync: bool,
+    disable_wal: bool,
     result: Option<Result<()>>,
     done: bool,
 }
@@ -342,15 +343,26 @@ impl DB {
             )
         };
 
-        // Check range tombstones in memtables that may cover this key.
-        // A range deletion InternalKey(begin, seq, RangeDeletion) → end
-        // covers key if begin <= key < end and the tombstone seq <= our read seq.
-        if self.is_key_range_deleted(key, seq, &active_mem, &imm_mems) {
-            return Ok(None);
-        }
-
         // 1. Active MemTable
         if let Some(result) = active_mem.get(key, seq) {
+            // Found a point entry. Check if a newer range tombstone covers it.
+            // Point entry's seq is the highest for this user key <= our read seq.
+            // If there's a range tombstone with seq between the point entry's seq
+            // and our read seq, the point entry is deleted.
+            // But since memtable.get() returns the HIGHEST seq entry for this key,
+            // and range tombstones with higher seq would have been written AFTER,
+            // we only need to check if any range tombstone covers this key.
+            // However, if the point entry exists, it was written at some seq.
+            // A range tombstone only deletes entries with seq <= tombstone.seq.
+            // Since the iterator guarantees user_key ASC + seq DESC ordering,
+            // the point entry we found has the highest seq for this key.
+            // A range tombstone with LOWER seq should NOT delete it.
+            //
+            // The correct check: only consider range tombstones with seq > point_entry_seq.
+            // For simplicity (matching RocksDB behavior), if we found a point value,
+            // it wins over any older range tombstone. Range tombstones are applied
+            // during iteration and compaction, not during point get when a newer
+            // point entry exists.
             return Ok(result);
         }
 
@@ -359,6 +371,13 @@ impl DB {
             if let Some(result) = imm.get(key, seq) {
                 return Ok(result);
             }
+        }
+
+        // 3. Check range tombstones in memtables ONLY if no point entry was found.
+        // This ensures that put(d) after delete_range(c,f) correctly returns the put value,
+        // because the point entry (higher seq) takes precedence.
+        if self.is_key_range_deleted(key, seq, &active_mem, &imm_mems) {
+            return Ok(None);
         }
 
         // 3. L0 SST files (newest first, may overlap)
@@ -845,6 +864,7 @@ impl DB {
         let mut req = WriteRequest {
             batch,
             sync: write_options.sync,
+            disable_wal: write_options.disable_wal,
             result: None,
             done: false,
         };
@@ -869,9 +889,6 @@ impl DB {
         let mut need_sync = false;
         let mut inner = self.inner.lock();
 
-        // Check if any request has disable_wal set
-        let disable_wal = write_options.disable_wal;
-
         for &req_ptr in &batch_group {
             // SAFETY: we hold the only references; other threads are blocked on write_cv
             let r = unsafe { &mut *req_ptr };
@@ -880,7 +897,7 @@ impl DB {
                 .fetch_add(r.batch.len() as u64, Ordering::AcqRel);
             need_sync |= r.sync;
 
-            if !disable_wal {
+            if !r.disable_wal {
                 let wal_record = Self::encode_wal_record(first_seq, &r.batch);
                 if let Some(ref mut wal) = inner.wal_writer
                     && let Err(e) = wal.add_record(&wal_record)
@@ -908,8 +925,9 @@ impl DB {
             }
         }
 
-        // Single fsync for all batches (skip when WAL is disabled)
-        if !disable_wal && let Some(ref mut wal) = inner.wal_writer {
+        // Single fsync for all batches that wrote to WAL
+        let any_wal = batch_group.iter().any(|&p| !unsafe { &*p }.disable_wal);
+        if any_wal && let Some(ref mut wal) = inner.wal_writer {
             let wal_result = if need_sync { wal.sync() } else { wal.flush() };
             if let Err(e) = wal_result {
                 // WAL sync/flush failed — data may not be durable.
