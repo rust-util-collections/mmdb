@@ -350,8 +350,9 @@ impl TableReader {
     }
 
     /// Hint the OS to prefetch the given file range into page cache.
+    /// Uses `posix_fadvise` on Linux; no-op on other platforms.
     fn advise_willneed(&self, offset: u64, len: u64) {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
             if let Ok(file) = self.open_file() {
@@ -365,7 +366,7 @@ impl TableReader {
                 }
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(not(target_os = "linux"))]
         {
             let _ = (offset, len);
         }

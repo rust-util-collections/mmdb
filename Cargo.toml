@@ -11,7 +11,7 @@ documentation = "https://docs.rs/mmdb"
 keywords = ["rocksdb", "leveldb", "kv", "database", "db"]
 categories = ["database-implementations"]
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.89"
 exclude = [".github/"]
 
 [dependencies]
@@ -22,6 +22,8 @@ moka = { version = "0.12", features = ["sync"] }
 parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
