@@ -141,6 +141,10 @@ impl super::merge::SeekableIterator for LevelIterator {
         self.seek_impl(target);
     }
 
+    fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.current_iter.as_ref().and_then(|iter| iter.current())
+    }
+
     fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         // Try prev within current table iterator
         if let Some(ref mut iter) = self.current_iter
@@ -161,8 +165,9 @@ impl super::merge::SeekableIterator for LevelIterator {
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
             table_iter.seek_to_last();
-            // The seek_to_last positions on the last entry; next() returns it
-            if let Some(entry) = table_iter.next() {
+            // Use current() to read without advancing the cursor, so
+            // subsequent prev() calls work correctly.
+            if let Some(entry) = table_iter.current() {
                 self.current_iter = Some(table_iter);
                 return Some(entry);
             }

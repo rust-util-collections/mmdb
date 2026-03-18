@@ -190,6 +190,14 @@ impl SeekableIterator for MemTableCursorIter {
         self.seek_internal(target);
     }
 
+    fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.cursor.is_null() {
+            return None;
+        }
+        let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
+        Some((k.as_bytes().to_vec(), v.clone()))
+    }
+
     /// Copy directly into caller buffers, reusing their capacity.
     /// After the first call, subsequent calls are memcpy-only (zero heap allocation).
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {

@@ -284,49 +284,67 @@ impl DBIterator {
 
     /// Internal: given the merger positioned backward at or before target,
     /// find the previous visible user key and position on it.
+    ///
+    /// Uses a loop instead of recursion to avoid stack overflow when
+    /// consecutive tombstones or prefix-out-of-bounds keys are encountered.
     fn resolve_prev_user_key(&mut self, skip_bound: &[u8]) {
         use crate::types::InternalKey;
 
-        // Walk backward through prev_entry() to find the first user key < skip_bound
-        let mut prev_uk: Option<Vec<u8>> = None;
-        while let Some((ikey, _value)) = self.merger.prev_entry() {
-            if ikey.len() < 8 {
-                continue;
-            }
-            let uk = &ikey[..ikey.len() - 8];
-            if uk < skip_bound {
-                prev_uk = Some(uk.to_vec());
-                break;
-            }
-        }
+        let mut current_bound: Vec<u8> = skip_bound.to_vec();
 
-        match prev_uk {
-            Some(uk) => {
-                // Forward-seek to this user key and resolve visibility
-                let reseek_key =
-                    InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
-                self.merger.seek_to(reseek_key.as_bytes());
-                self.has_last_key = false;
-                self.range_tombstones.clear();
+        loop {
+            // Walk backward through prev_entry() to find the first user key < current_bound
+            let mut prev_uk: Option<Vec<u8>> = None;
+            while let Some((ikey, _value)) = self.merger.prev_entry() {
+                if ikey.len() < 8 {
+                    continue;
+                }
+                let uk = &ikey[..ikey.len() - 8];
 
-                // next_visible() finds the newest visible version
-                let visible = self.next_visible();
-                match visible {
-                    Some((found_uk, val)) if found_uk == uk => {
-                        self.current = Some((found_uk, val));
-                        self.needs_advance = false;
-                    }
-                    _ => {
-                        // The found key was deleted/tombstoned; try the next earlier key
-                        self.current = None;
-                        self.needs_advance = false;
-                        self.resolve_prev_user_key(&uk);
+                // Prefix guard: if we've left the prefix, stop immediately.
+                // In a decreasing key sequence, once we leave the prefix we
+                // can never re-enter it.
+                if let Some(ref pfx) = self.prefix {
+                    if !uk.starts_with(pfx) {
+                        break;
                     }
                 }
+
+                if uk < current_bound.as_slice() {
+                    prev_uk = Some(uk.to_vec());
+                    break;
+                }
             }
-            None => {
-                self.current = None;
-                self.needs_advance = false;
+
+            match prev_uk {
+                Some(uk) => {
+                    // Forward-seek to this user key and resolve visibility
+                    let reseek_key =
+                        InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+                    self.merger.seek_to(reseek_key.as_bytes());
+                    self.has_last_key = false;
+                    self.range_tombstones.clear();
+
+                    // next_visible() finds the newest visible version
+                    let visible = self.next_visible();
+                    match visible {
+                        Some((found_uk, val)) if found_uk == uk => {
+                            self.current = Some((found_uk, val));
+                            self.needs_advance = false;
+                            return;
+                        }
+                        _ => {
+                            // The found key was deleted/tombstoned; try the next earlier key
+                            current_bound = uk;
+                            // Continue the loop instead of recursing
+                        }
+                    }
+                }
+                None => {
+                    self.current = None;
+                    self.needs_advance = false;
+                    return;
+                }
             }
         }
     }
@@ -395,11 +413,12 @@ impl DBIterator {
                 continue;
             }
             let uk = &ikey[..ikey.len() - 8];
-            // Check prefix boundary
+            // Check prefix boundary — once we've left the prefix going
+            // backward, we can never re-enter it, so stop scanning.
             if let Some(ref pfx) = self.prefix
                 && !uk.starts_with(pfx)
             {
-                continue;
+                break;
             }
             last_uk = Some(uk.to_vec());
             break;

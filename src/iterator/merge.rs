@@ -68,6 +68,13 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
         }
     }
 
+    /// Return the entry at the current cursor position WITHOUT advancing.
+    /// Used after seek_for_prev() / seek_to_last() to peek the current entry
+    /// without moving the cursor forward — critical for correct backward iteration.
+    fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        None
+    }
+
     /// Seek to the last entry <= target.
     fn seek_for_prev(&mut self, target: &[u8]);
 
@@ -280,7 +287,10 @@ impl IterSource {
             }
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_for_prev(target);
-                if let Some((k, v)) = iter.next() {
+                // Use current() to peek without advancing the cursor.
+                // next() would advance past the entry, causing prev() to
+                // return the same entry again (duplicate).
+                if let Some((k, v)) = iter.current() {
                     self.peeked_key = k;
                     self.peeked_value = v;
                     self.has_peeked = true;
@@ -340,7 +350,10 @@ impl IterSource {
             }
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_to_last();
-                if let Some((k, v)) = iter.next() {
+                // Use current() to peek without advancing the cursor.
+                // next() would advance past the last entry to null, causing
+                // prev() to return the same last entry again (duplicate).
+                if let Some((k, v)) = iter.current() {
                     self.peeked_key = k;
                     self.peeked_value = v;
                     self.has_peeked = true;

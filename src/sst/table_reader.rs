@@ -967,6 +967,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.seek(target);
     }
 
+    fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        TableIterator::current(self)
+    }
+
     fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         TableIterator::prev(self)
     }
