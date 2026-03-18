@@ -124,73 +124,71 @@ impl DBIterator {
     /// Advance the streaming iterator to the next visible (user_key, value) pair.
     fn next_visible(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         loop {
-            let (ikey, value) = self.merger.next_entry()?;
+            let (mut ikey, value) = self.merger.next_entry()?;
             if ikey.len() < 8 {
                 continue;
             }
             let ikr = InternalKeyRef::new(&ikey);
             let seq = ikr.sequence();
+            let vt = ikr.value_type();
 
             // Skip entries newer than our snapshot
             if seq > self.sequence {
-                // But still collect range tombstones for filtering
-                if ikr.value_type() == ValueType::RangeDeletion {
-                    // Don't collect — it's newer than our snapshot
-                }
                 continue;
             }
 
-            let user_key = ikr.user_key();
+            let uk_len = ikey.len() - 8;
 
             // Prefix boundary check — stop immediately when prefix changes
             if let Some(ref pfx) = self.prefix
-                && !user_key.starts_with(pfx)
+                && !ikey[..uk_len].starts_with(pfx)
             {
                 return None;
             }
 
             // Upper bound check — stop when user key >= upper bound (exclusive)
             if let Some(ref ub) = self.iterate_upper_bound
-                && user_key >= ub.as_slice()
+                && ikey[..uk_len] >= **ub
             {
                 return None;
             }
 
             // Collect range tombstones
-            if ikr.value_type() == ValueType::RangeDeletion {
+            if vt == ValueType::RangeDeletion {
                 self.range_tombstones
-                    .add(user_key.to_vec(), value.clone(), seq);
+                    .add(ikey[..uk_len].to_vec(), value.clone(), seq);
                 self.range_tombstones.reset();
-                // Still need to deduplicate the begin key
-                if self.has_last_key && self.last_user_key.as_slice() == user_key {
+                if self.has_last_key && self.last_user_key.as_slice() == &ikey[..uk_len] {
                     continue;
                 }
                 self.last_user_key.clear();
-                self.last_user_key.extend_from_slice(user_key);
+                self.last_user_key.extend_from_slice(&ikey[..uk_len]);
                 self.has_last_key = true;
                 continue;
             }
 
             // Skip duplicate user keys (we already saw the newest version)
-            if self.has_last_key && self.last_user_key.as_slice() == user_key {
+            if self.has_last_key && self.last_user_key.as_slice() == &ikey[..uk_len] {
                 continue;
             }
 
             self.last_user_key.clear();
-            self.last_user_key.extend_from_slice(user_key);
+            self.last_user_key.extend_from_slice(&ikey[..uk_len]);
             self.has_last_key = true;
 
             // Skip tombstones
-            if ikr.value_type() == ValueType::Deletion {
+            if vt == ValueType::Deletion {
                 continue;
             }
 
             // Skip entries covered by range tombstones
-            if self.is_range_deleted(user_key, seq) {
+            if self.is_range_deleted(&ikey[..uk_len], seq) {
                 continue;
             }
 
-            return Some((user_key.to_vec(), value));
+            // Truncate internal key to user key in-place (zero allocation).
+            ikey.truncate(uk_len);
+            return Some((ikey, value));
         }
     }
 
@@ -250,6 +248,17 @@ impl DBIterator {
         self.has_last_key = false;
         self.needs_advance = true;
         self.current = None;
+    }
+
+    /// Fully reset internal deduplication/tombstone state, then seek to first.
+    /// Used by BidiIterator when materializing after a seek_to_last().
+    pub fn reset_and_seek_to_first(&mut self) {
+        self.has_last_key = false;
+        self.last_user_key.clear();
+        self.range_tombstones.clear();
+        self.current = None;
+        self.needs_advance = true;
+        self.seek_to_first();
     }
 
     /// Seek to the last visible user key <= target.
@@ -342,23 +351,56 @@ impl DBIterator {
 
     /// Seek to the last visible key. Positions the iterator on the very last entry.
     ///
+    /// If a prefix is set, seeks to the last key within the prefix.
     /// Uses merger backward seek to find the last user key efficiently,
     /// then resolves visibility via forward scan.
     pub fn seek_to_last(&mut self) {
         use crate::types::InternalKey;
 
-        // Seek merger to last entry (backward direction)
-        self.merger.seek_to_last_merge();
+        if let Some(ref pfx) = self.prefix {
+            // Prefix-bounded: seek backward from prefix upper bound.
+            let mut upper = pfx.clone();
+            let has_upper = {
+                let mut carry = true;
+                for byte in upper.iter_mut().rev() {
+                    if carry {
+                        if *byte == 0xFF {
+                            *byte = 0x00;
+                        } else {
+                            *byte += 1;
+                            carry = false;
+                        }
+                    }
+                }
+                !carry
+            };
+            if has_upper {
+                let seek_key =
+                    InternalKey::new(&upper, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+                self.merger.seek_for_prev(seek_key.as_bytes());
+            } else {
+                self.merger.seek_to_last_merge();
+            }
+        } else {
+            self.merger.seek_to_last_merge();
+        }
+
         self.has_last_key = false;
         self.range_tombstones.clear();
 
-        // Walk backward to find the last user key, then forward-resolve visibility
+        // Walk backward to find the last user key within prefix, then forward-resolve
         let mut last_uk: Option<Vec<u8>> = None;
         while let Some((ikey, _value)) = self.merger.prev_entry() {
             if ikey.len() < 8 {
                 continue;
             }
             let uk = &ikey[..ikey.len() - 8];
+            // Check prefix boundary
+            if let Some(ref pfx) = self.prefix {
+                if !uk.starts_with(pfx) {
+                    continue;
+                }
+            }
             last_uk = Some(uk.to_vec());
             break;
         }

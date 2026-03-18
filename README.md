@@ -109,6 +109,10 @@ The scan path uses a **MergingIterator** (min-heap) that merges entries from:
 - LevelIterators (one per L1+ level — lazy two-level iterator)
 
 Key optimizations that match/exceed RocksDB:
+- **Single-source bypass**: When only one source exists (memtable-only reads), `MergingIterator` bypasses heap machinery entirely — direct delegation with zero overhead (mirrors RocksDB's `MergeIteratorBuilder` n==1 optimization)
+- **SuperVersion lock-free reads**: Read path (get/iter) uses `RwLock<Arc<SuperVersion>>` snapshot instead of locking the inner mutex, similar to RocksDB's SuperVersion mechanism
+- **Buffer-reusing memtable iteration**: `MemTableCursorIter::next_into()` copies directly into caller buffers via `extend_from_slice` — after warm-up, zero heap allocation per entry
+- **In-place key truncation**: `DBIterator::next_visible()` truncates internal keys to user keys in-place instead of allocating a new `Vec`
 - **Zero-copy block cache**: `Block` stores `Arc<Vec<u8>>` — cache hits avoid memcpy
 - **Cursor-based block iteration**: Decodes entries one-at-a-time from raw block data (`decode_entry_reuse`) — no per-block Vec allocation
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
@@ -117,6 +121,7 @@ Key optimizations that match/exceed RocksDB:
 - **L0 metadata pinning**: Index entries and first data blocks pinned (non-evictable) for L0 files via `insert_pinned`; unpinned on compaction
 - **Sweep-line range tombstone tracking**: O(1) amortized instead of O(T) per key
 - **Lazy index loading**: `TableIterator::new()` is O(1) — index parsed on first use
+- **Atomic L0 counter**: Write-throttle checks use an atomic counter instead of locking inner, eliminating mutex contention on every put
 
 ### SST Format
 

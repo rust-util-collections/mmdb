@@ -385,11 +385,15 @@ pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
     direction: Direction,
     /// Current key (for direction switching).
     current_key: Vec<u8>,
+    /// Fast path: bypass heap when exactly one source exists.
+    /// Models RocksDB's MergeIteratorBuilder single-source optimization.
+    single_source: bool,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     pub fn new(sources: Vec<IterSource>, compare: F) -> Self {
         let n = sources.len();
+        let single = n == 1;
         Self {
             sources,
             compare,
@@ -397,6 +401,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             heap_size: 0,
             initialized: false,
             direction: Direction::Forward,
+            single_source: single,
             current_key: Vec::new(),
         }
     }
@@ -480,6 +485,17 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Get the next (key, value) pair from the merged stream (forward direction).
     pub fn next_entry(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        // Single-source fast path: bypass heap entirely.
+        if self.single_source {
+            if !self.initialized {
+                self.initialized = true;
+                let _ = self.sources[0].peek();
+            }
+            return self.sources[0].take_peeked().inspect(|_| {
+                let _ = self.sources[0].peek();
+            });
+        }
+
         if self.direction != Direction::Forward {
             self.switch_to_forward();
         }
@@ -602,20 +618,26 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             source.seek_to(target, &self.compare);
         }
         self.current_key.clear();
+        if self.single_source {
+            self.initialized = true;
+            return;
+        }
         // Rebuild heap
         self.initialized = false;
         self.init_heap();
     }
 
     /// Seek all sources to a target key with backward support, then rebuild the heap.
-    /// Unlike `seek()`, this can move sources backward (for Vec and SeekableBoxed sources).
     pub fn seek_to(&mut self, target: &[u8]) {
         self.direction = Direction::Forward;
         for source in self.sources.iter_mut() {
             source.seek_to(target, &self.compare);
         }
         self.current_key.clear();
-        // Rebuild heap
+        if self.single_source {
+            self.initialized = true;
+            return;
+        }
         self.initialized = false;
         self.init_heap();
     }
@@ -638,6 +660,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             source.seek_to_first_impl();
         }
         self.current_key.clear();
+        if self.single_source {
+            self.initialized = true;
+            return;
+        }
         self.initialized = false;
         self.init_heap();
     }

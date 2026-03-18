@@ -67,7 +67,7 @@ pub struct DB {
     /// Lock-free read snapshot (SuperVersion).
     /// Readers take a read lock (uncontended, ~10ns). Writers update after
     /// memtable/version changes. Models RocksDB's SuperVersion mechanism.
-    super_version: RwLock<Arc<SuperVersion>>,
+    super_version: Arc<RwLock<Arc<SuperVersion>>>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -241,9 +241,16 @@ impl DB {
         // Spawn background compaction threads
         let compaction_shutdown = Arc::new(AtomicBool::new(false));
         let compaction_notify = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let l0_file_count = Arc::new(AtomicUsize::new(
-            inner.lock().versions.current().l0_file_count(),
-        ));
+        let (l0_file_count, super_version) = {
+            let g = inner.lock();
+            let l0 = Arc::new(AtomicUsize::new(g.versions.current().l0_file_count()));
+            let sv = Arc::new(RwLock::new(Arc::new(SuperVersion {
+                active_memtable: g.active_memtable.clone(),
+                immutable_memtables: g.immutable_memtables.clone(),
+                version: g.versions.current(),
+            })));
+            (l0, sv)
+        };
         let num_compaction_threads = options.max_background_compactions.max(1);
         let mut compaction_handles = Vec::with_capacity(num_compaction_threads);
 
@@ -256,6 +263,7 @@ impl DB {
             let bg_rate_limiter = rate_limiter.clone();
             let bg_stats = stats.clone();
             let bg_l0_count = l0_file_count.clone();
+            let bg_sv = super_version.clone();
             let shutdown = compaction_shutdown.clone();
             let notify = compaction_notify.clone();
 
@@ -303,11 +311,16 @@ impl DB {
                                     for num in &l0_inputs {
                                         bg_block_cache.unpin_file(*num);
                                     }
-                                    // Update cached L0 count
+                                    // Update cached L0 count + SuperVersion
                                     bg_l0_count.store(
                                         inner.versions.current().l0_file_count(),
                                         Ordering::Relaxed,
                                     );
+                                    *bg_sv.write() = Arc::new(SuperVersion {
+                                        active_memtable: inner.active_memtable.clone(),
+                                        immutable_memtables: inner.immutable_memtables.clone(),
+                                        version: inner.versions.current(),
+                                    });
                                 }
                                 None => break,
                             }
@@ -317,15 +330,6 @@ impl DB {
                 .expect("failed to spawn compaction thread");
             compaction_handles.push(handle);
         }
-
-        let initial_sv = {
-            let g = inner.lock();
-            Arc::new(SuperVersion {
-                active_memtable: g.active_memtable.clone(),
-                immutable_memtables: g.immutable_memtables.clone(),
-                version: g.versions.current(),
-            })
-        };
 
         let db = Self {
             path,
@@ -343,7 +347,7 @@ impl DB {
             compaction_notify,
             compaction_handles: Mutex::new(compaction_handles),
             l0_file_count,
-            super_version: RwLock::new(initial_sv),
+            super_version,
         };
 
         Ok(db)
@@ -675,6 +679,7 @@ impl DB {
         let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix.to_vec());
         // Seek to the prefix start
         iter.seek(prefix);
+
         Ok(iter)
     }
 
@@ -688,10 +693,9 @@ impl DB {
         Ok(BidiIterator::lazy(db_iter))
     }
 
-    /// Create a bidirectional iterator over entries whose keys start with `prefix`.
+    /// Create a prefix iterator with lazy streaming.
     ///
-    /// Uses lazy streaming: forward iteration is O(1) per step.
-    /// Backward access materializes remaining entries on first `next_back()`.
+    /// Forward iteration is streamed; backward access materializes on first `next_back()`.
     pub fn prefix_iterator(&self, prefix: &[u8]) -> Result<BidiIterator> {
         let db_iter = self.iter_with_prefix(prefix).c(d!())?;
         Ok(BidiIterator::lazy(db_iter))
