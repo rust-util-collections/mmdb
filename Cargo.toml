@@ -16,7 +16,7 @@ exclude = [".github/"]
 
 [dependencies]
 crc32fast = "1"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 zstd = "0.13"
 moka = { version = "0.12", features = ["sync"] }
 parking_lot = "0.12"
@@ -30,8 +30,7 @@ libc = "0.2"
 mmdb = { path = ".", features = ["test-utils"] }
 tempfile = "3"
 proptest = "1"
-rand = "0.9"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "benchmarks"
