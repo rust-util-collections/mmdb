@@ -552,15 +552,22 @@ impl DB {
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
         let mut sources: Vec<IterSource> = Vec::new();
+        let mut any_range_deletions = false;
 
         // Active memtable — cursor-based streaming iterator.
         {
+            if active_mem.has_range_deletions() {
+                any_range_deletions = true;
+            }
             let cursor = MemTableCursorIter::new(active_mem.clone());
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
         // Immutable memtables
         for imm in imm_mems {
+            if imm.has_range_deletions() {
+                any_range_deletions = true;
+            }
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
@@ -580,6 +587,9 @@ impl DB {
             {
                 continue;
             }
+            if tf.meta.has_range_deletions {
+                any_range_deletions = true;
+            }
             let iter = TableIterator::new(tf.reader.clone());
             sources.push(IterSource::from_seekable(Box::new(iter)));
         }
@@ -587,6 +597,14 @@ impl DB {
             let files = version.level_files(level);
             if files.is_empty() {
                 continue;
+            }
+            if !any_range_deletions {
+                for tf in files {
+                    if tf.meta.has_range_deletions {
+                        any_range_deletions = true;
+                        break;
+                    }
+                }
             }
             let level_iter = LevelIterator::new(files.to_vec())
                 .with_range_hints(start_hint.map(|s| s.to_vec()), end_hint.map(|e| e.to_vec()));
@@ -596,6 +614,9 @@ impl DB {
         let mut db_iter = DBIterator::from_sources(sources, seq);
         if let Some(end) = end_hint {
             db_iter.set_upper_bound(end.to_vec());
+        }
+        if !any_range_deletions {
+            db_iter.set_no_range_deletions();
         }
         Ok(db_iter)
     }
@@ -615,15 +636,22 @@ impl DB {
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
         let mut sources: Vec<IterSource> = Vec::new();
+        let mut any_range_deletions = false;
 
         // Active memtable
         {
+            if active_mem.has_range_deletions() {
+                any_range_deletions = true;
+            }
             let cursor = MemTableCursorIter::new(active_mem.clone());
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
         // Immutable memtables
         for imm in imm_mems {
+            if imm.has_range_deletions() {
+                any_range_deletions = true;
+            }
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
@@ -658,6 +686,9 @@ impl DB {
             if !tf.reader.prefix_may_match(prefix) {
                 continue;
             }
+            if tf.meta.has_range_deletions {
+                any_range_deletions = true;
+            }
             let iter = TableIterator::new(tf.reader.clone());
             sources.push(IterSource::from_seekable(Box::new(iter)));
         }
@@ -666,6 +697,14 @@ impl DB {
             let files = version.level_files(level);
             if files.is_empty() {
                 continue;
+            }
+            if !any_range_deletions {
+                for tf in files {
+                    if tf.meta.has_range_deletions {
+                        any_range_deletions = true;
+                        break;
+                    }
+                }
             }
             let level_iter = LevelIterator::new(files.to_vec())
                 .with_prefix(prefix.to_vec())
@@ -681,6 +720,9 @@ impl DB {
         }
 
         let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix.to_vec());
+        if !any_range_deletions {
+            iter.set_no_range_deletions();
+        }
         // Seek to the prefix start
         iter.seek(prefix);
 

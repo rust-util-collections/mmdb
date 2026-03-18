@@ -44,6 +44,9 @@ pub struct DBIterator {
     /// keys they cover (since begin_key < covered keys). Preloading ensures all
     /// tombstones are in the tracker before any backward visibility check.
     range_tombstones_preloaded: bool,
+    /// Hint: if false, no source contains range deletions, so preload can be skipped.
+    /// Set by DB layer which knows per-file and per-memtable range deletion status.
+    may_have_range_deletions: bool,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -73,6 +76,7 @@ impl DBIterator {
             prev_overshoot: None,
             backward_positioned: false,
             range_tombstones_preloaded: false,
+            may_have_range_deletions: true,
         }
     }
 
@@ -96,6 +100,7 @@ impl DBIterator {
             prev_overshoot: None,
             backward_positioned: false,
             range_tombstones_preloaded: false,
+            may_have_range_deletions: true,
         }
     }
 
@@ -124,7 +129,15 @@ impl DBIterator {
             prev_overshoot: None,
             backward_positioned: false,
             range_tombstones_preloaded: false,
+            may_have_range_deletions: true,
         }
+    }
+
+    /// Hint that no source contains range deletions, so the expensive
+    /// preload scan can be skipped entirely on backward iteration.
+    pub fn set_no_range_deletions(&mut self) {
+        self.may_have_range_deletions = false;
+        self.range_tombstones_preloaded = true; // nothing to preload
     }
 
     /// Set an exclusive upper bound on user keys.
