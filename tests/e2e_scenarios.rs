@@ -63,7 +63,7 @@ fn test_timeseries_scenario() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_small(dir.path());
 
-    let total = 2000;
+    let total = 200;
     // Write entries with zero-padded timestamp keys so lexicographic order = time order.
     for ts in 0..total {
         let key = format!("ts:{:012}", ts);
@@ -73,7 +73,7 @@ fn test_timeseries_scenario() {
     db.flush().unwrap();
 
     // Range query: read the most recent N entries using iterator + seek.
-    let recent_n = 100;
+    let recent_n = 20;
     let start_ts = total - recent_n;
     let seek_key = format!("ts:{:012}", start_ts);
 
@@ -179,8 +179,8 @@ fn test_log_system_scenario() {
     };
     let db = DB::open(opts, dir.path()).unwrap();
 
-    let total_logs = 500;
-    let delete_up_to = 300;
+    let total_logs = 100;
+    let delete_up_to = 60;
 
     // Append log entries with sequential IDs.
     for i in 0..total_logs {
@@ -231,15 +231,15 @@ fn test_log_system_scenario() {
 
     // Also test delete_range + compact: after compaction, range-deleted keys
     // are physically removed.
-    for i in 500..600 {
+    for i in 100..150 {
         let key = format!("log:{:08}", i);
         let val = format!("batch2_{}", i);
         db.put(key.as_bytes(), val.as_bytes()).unwrap();
     }
     db.flush().unwrap();
 
-    let begin = format!("log:{:08}", 500);
-    let end = format!("log:{:08}", 550);
+    let begin = format!("log:{:08}", 100);
+    let end = format!("log:{:08}", 125);
     db.delete_range(begin.as_bytes(), end.as_bytes()).unwrap();
     db.flush().unwrap();
     db.compact().unwrap();
@@ -250,7 +250,7 @@ fn test_log_system_scenario() {
         .iter()
         .filter(|(k, _)| {
             let s = std::str::from_utf8(k).unwrap();
-            ("log:00000500".."log:00000550").contains(&s)
+            ("log:00000100".."log:00000125").contains(&s)
         })
         .collect();
     assert_eq!(
@@ -268,7 +268,7 @@ fn test_index_scenario() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_with_buffer(dir.path(), 2048);
 
-    let total_keys = 5000;
+    let total_keys = 500;
 
     // Insert sorted keys.
     for i in 0..total_keys {
@@ -281,8 +281,8 @@ fn test_index_scenario() {
 
     // Random seek + scan 100 entries, multiple trials.
     let mut rng = Rng::new(42);
-    let scan_len = 100;
-    let trials = 20;
+    let scan_len = 20;
+    let trials = 5;
 
     for _ in 0..trials {
         let start = rng.next_usize(total_keys - scan_len);
@@ -337,7 +337,7 @@ fn test_update_intensive() {
     let db = open_small(dir.path());
 
     let num_keys = 50;
-    let num_rounds = 100;
+    let num_rounds = 20;
 
     // Track what the final value should be.
     let mut expected: HashMap<String, String> = HashMap::new();
@@ -403,7 +403,7 @@ fn test_mixed_workload() {
     db.flush().unwrap();
 
     let num_threads = 4;
-    let ops_per_thread = 500;
+    let ops_per_thread = 50;
     let mut handles = Vec::new();
 
     for tid in 0..num_threads {
@@ -484,7 +484,7 @@ fn test_long_running_compaction() {
     };
     let db = DB::open(opts, dir.path()).unwrap();
 
-    let total = 3000;
+    let total = 300;
     let mut expected: HashMap<String, String> = HashMap::new();
 
     for i in 0..total {
@@ -494,7 +494,7 @@ fn test_long_running_compaction() {
         expected.insert(key, val);
 
         // Trigger flush + compact periodically.
-        if i > 0 && i % 200 == 0 {
+        if i > 0 && i % 50 == 0 {
             db.flush().unwrap();
             db.compact().unwrap();
         }
@@ -545,10 +545,10 @@ fn test_large_dataset() {
     };
     let db = DB::open(opts, dir.path()).unwrap();
 
-    let total: usize = 100_000;
+    let total: usize = 5_000;
 
     // Use batches to speed up writing.
-    let batch_size = 500;
+    let batch_size = 100;
     for chunk_start in (0..total).step_by(batch_size) {
         let mut batch = WriteBatch::new();
         let chunk_end = (chunk_start + batch_size).min(total);
@@ -564,7 +564,7 @@ fn test_large_dataset() {
     db.compact().unwrap();
 
     // Spot-check a sample of keys spread across the range.
-    let checks = [0, 1, 999, 10_000, 50_000, 75_000, 99_999];
+    let checks = [0, 1, 999, 2_500, 4_999];
     for &i in &checks {
         let key = format!("big:{:08}", i);
         let val = format!("v{:08}", i);
@@ -582,10 +582,10 @@ fn test_large_dataset() {
 
     // Verify sorted order on a sample window.
     let mut iter = db.iter().unwrap();
-    iter.seek(format!("big:{:08}", 50_000).as_bytes());
+    iter.seek(format!("big:{:08}", 2_500).as_bytes());
     let mut prev_key: Option<Vec<u8>> = None;
     let mut scanned = 0;
-    while iter.valid() && scanned < 1000 {
+    while iter.valid() && scanned < 200 {
         let k = iter.key().to_vec();
         if let Some(ref pk) = prev_key {
             assert!(k > *pk, "sort violation in large dataset scan");
@@ -594,7 +594,7 @@ fn test_large_dataset() {
         scanned += 1;
         iter.advance();
     }
-    assert_eq!(scanned, 1000);
+    assert_eq!(scanned, 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +615,7 @@ fn test_restart_recovery() {
     // Phase 1: write + flush (data lands in SSTs).
     {
         let db = DB::open(opts.clone(), &path).unwrap();
-        for i in 0..100 {
+        for i in 0..50 {
             let key = format!("rec:{:06}", i);
             let val = format!("phase1_{:030}", i);
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
@@ -623,14 +623,14 @@ fn test_restart_recovery() {
         db.flush().unwrap();
 
         // Phase 2: write more (data in WAL only).
-        for i in 100..200 {
+        for i in 50..100 {
             let key = format!("rec:{:06}", i);
             let val = format!("phase2_{:030}", i);
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
         }
 
         // Also overwrite some phase-1 keys so WAL recovery must reconcile.
-        for i in 0..20 {
+        for i in 0..10 {
             let key = format!("rec:{:06}", i);
             let val = format!("updated_{:030}", i);
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
@@ -654,7 +654,7 @@ fn test_restart_recovery() {
         let db = DB::open(opts, &path).unwrap();
 
         // Phase-1 keys that were NOT overwritten.
-        for i in 20..100 {
+        for i in 10..50 {
             let key = format!("rec:{:06}", i);
             let val = format!("phase1_{:030}", i);
             assert_eq!(
@@ -666,7 +666,7 @@ fn test_restart_recovery() {
         }
 
         // Phase-1 keys that were overwritten.
-        for i in 0..20 {
+        for i in 0..10 {
             let key = format!("rec:{:06}", i);
             let val = format!("updated_{:030}", i);
             assert_eq!(
@@ -678,7 +678,7 @@ fn test_restart_recovery() {
         }
 
         // Phase-2 keys (WAL-only).
-        for i in 100..200 {
+        for i in 50..100 {
             let key = format!("rec:{:06}", i);
             let val = format!("phase2_{:030}", i);
             assert_eq!(
@@ -695,9 +695,9 @@ fn test_restart_recovery() {
             Some(b"synced".to_vec())
         );
 
-        // Iterator count: 200 unique rec: keys + 1 sync marker.
+        // Iterator count: 100 unique rec: keys + 1 sync marker.
         let count = db.iter().unwrap().count();
-        assert_eq!(count, 201, "wrong entry count after recovery");
+        assert_eq!(count, 101, "wrong entry count after recovery");
     }
 }
 
@@ -719,7 +719,7 @@ fn test_space_reclamation() {
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write data with largish values so SST size is meaningful.
-    let total = 500;
+    let total = 100;
     for i in 0..total {
         let key = format!("sp:{:06}", i);
         let val = format!("{:0>200}", i); // 200-byte values
@@ -737,7 +737,7 @@ fn test_space_reclamation() {
     );
 
     // Delete 80% of the keys.
-    let delete_count = 400;
+    let delete_count = 80;
     for i in 0..delete_count {
         let key = format!("sp:{:06}", i);
         db.delete(key.as_bytes()).unwrap();

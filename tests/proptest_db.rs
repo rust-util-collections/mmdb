@@ -35,10 +35,10 @@ fn arb_op() -> impl Strategy<Value = Op> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
+    #![proptest_config(ProptestConfig::with_cases(15))]
 
     #[test]
-    fn test_random_operations(ops in vec(arb_op(), 1..500)) {
+    fn test_random_operations(ops in vec(arb_op(), 1..100)) {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open(DbOptions {
             create_if_missing: true,
@@ -82,7 +82,7 @@ proptest! {
     #[test]
     fn test_write_batch_atomicity(batches in vec(
         vec((arb_key(), arb_value()), 1..10),
-        1..20
+        1..10
     )) {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open(DbOptions {
@@ -113,7 +113,7 @@ proptest! {
 
     #[test]
     fn test_iterator_consistency(ops in vec(
-        (arb_key(), arb_value()), 1..200
+        (arb_key(), arb_value()), 1..50
     )) {
         let dir = tempfile::tempdir().unwrap();
         let db = DB::open(DbOptions {

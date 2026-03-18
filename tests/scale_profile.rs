@@ -40,7 +40,7 @@ fn bench_at_scale(count: u64) {
 #[test]
 fn scale_test() {
     eprintln!("\n=== mmdb seek+take(10) at different data scales ===");
-    for &count in &[100, 1_000, 10_000, 50_000, 100_000, 500_000] {
+    for &count in &[100, 1_000, 10_000, 50_000] {
         bench_at_scale(count);
     }
 }

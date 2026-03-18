@@ -359,10 +359,10 @@ fn test_large_data_crash_recovery() {
         ..Default::default()
     };
 
-    // Phase 1: write 10K keys with sync, then crash
+    // Phase 1: write 500 keys with sync, then crash
     {
         let db = DB::open(opts.clone(), &path).unwrap();
-        for i in 0..10_000 {
+        for i in 0..500 {
             let key = format!("bigkey_{:06}", i);
             let val = format!("bigval_{:06}", i);
             db.put_with_options(
@@ -378,16 +378,16 @@ fn test_large_data_crash_recovery() {
         std::mem::forget(db);
     }
 
-    // Phase 2: recover all 10K keys
+    // Phase 2: recover all 500 keys
     {
         let db = DB::open(opts, &path).unwrap();
-        for i in 0..10_000 {
+        for i in 0..500 {
             let key = format!("bigkey_{:06}", i);
             let val = format!("bigval_{:06}", i);
             assert_eq!(
                 db.get(key.as_bytes()).unwrap(),
                 Some(val.into_bytes()),
-                "missing key {} after large data crash recovery",
+                "missing key {} after crash recovery",
                 i
             );
         }

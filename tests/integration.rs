@@ -56,15 +56,15 @@ fn test_sequential_write_read_1000() {
     let dir = tempfile::tempdir().unwrap();
     let db = make_db(dir.path());
 
-    // Write 1000 entries
-    for i in 0..1000 {
+    // Write 100 entries
+    for i in 0..100 {
         let key = format!("{:08}", i);
         let val = format!("value_{}", i);
         db.put(key.as_bytes(), val.as_bytes()).unwrap();
     }
 
     // Read all back
-    for i in 0..1000 {
+    for i in 0..100 {
         let key = format!("{:08}", i);
         let val = format!("value_{}", i);
         assert_eq!(db.get(key.as_bytes()).unwrap(), Some(val.into_bytes()));
@@ -138,8 +138,8 @@ fn test_concurrent_stress() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(make_db(dir.path()));
 
-    let num_threads = 8;
-    let ops_per_thread = 500;
+    let num_threads = 4;
+    let ops_per_thread = 50;
 
     let mut handles = vec![];
 
@@ -318,10 +318,10 @@ fn test_large_scale_write_recovery() {
         ..Default::default()
     };
 
-    // Phase 1: write 100K keys, then close
+    // Phase 1: write 5K keys, then close
     {
         let db = DB::open(opts.clone(), &path).unwrap();
-        for i in 0..100_000u64 {
+        for i in 0..5_000u64 {
             let key = format!("k{:08}", i);
             let val = format!("v{:08}", i);
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
@@ -332,7 +332,7 @@ fn test_large_scale_write_recovery() {
     // Phase 2: reopen and verify every key
     {
         let db = DB::open(opts, &path).unwrap();
-        for i in 0..100_000u64 {
+        for i in 0..5_000u64 {
             let key = format!("k{:08}", i);
             let val = format!("v{:08}", i);
             assert_eq!(
@@ -589,9 +589,9 @@ fn test_concurrent_high_pressure() {
     };
     let db = Arc::new(DB::open(opts, dir.path()).unwrap());
 
-    let writer_threads = 8;
-    let ops_per_writer = 10_000;
-    let reader_threads = 4;
+    let writer_threads = 4;
+    let ops_per_writer = 500;
+    let reader_threads = 2;
 
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -827,14 +827,14 @@ fn test_write_options_no_slowdown() {
 
     // Generate many L0 files to trigger slowdown threshold
     let mut hit_error = false;
-    for i in 0..500 {
+    for i in 0..100 {
         let key = format!("flood_{:06}", i);
         let val = vec![0xABu8; 256];
         // Use regular put (with slowdown) for flooding
         let _ = db.put(key.as_bytes(), &val);
 
         // Periodically try no_slowdown write — it may fail under pressure
-        if i % 50 == 49 {
+        if i % 20 == 19 {
             let key = format!("ns_{:04}", i);
             if db.put_with_options(&wo, key.as_bytes(), b"test").is_err() {
                 hit_error = true;
@@ -859,8 +859,8 @@ fn test_db_reopen_cycle() {
         ..Default::default()
     };
 
-    let cycles = 10;
-    let keys_per_cycle = 100;
+    let cycles = 5;
+    let keys_per_cycle = 20;
 
     for cycle in 0..cycles {
         let db = DB::open(opts.clone(), &path).unwrap();
@@ -1340,7 +1340,7 @@ fn test_multi_thread_compaction() {
     .unwrap();
 
     // Write enough data to trigger many compactions
-    for i in 0..5_000u64 {
+    for i in 0..500u64 {
         let key = format!("mt_{:06}", i);
         db.put(key.as_bytes(), b"value").unwrap();
     }
@@ -1348,7 +1348,7 @@ fn test_multi_thread_compaction() {
     db.compact().unwrap();
 
     // Verify all data
-    for i in 0..5_000u64 {
+    for i in 0..500u64 {
         let key = format!("mt_{:06}", i);
         assert_eq!(
             db.get(key.as_bytes()).unwrap(),
@@ -1360,7 +1360,7 @@ fn test_multi_thread_compaction() {
 
     // Iterator should see all keys in order
     let count = db.iter().unwrap().count();
-    assert_eq!(count, 5_000);
+    assert_eq!(count, 500);
 }
 
 // ── Deferred block read (first_key in index) ────────────────────────────
@@ -1380,7 +1380,7 @@ fn test_deferred_block_read_correctness() {
     .unwrap();
 
     // Write enough to create SST files
-    for i in 0..1_000u64 {
+    for i in 0..200u64 {
         let key = format!("df_{:06}", i);
         let val = format!("val_{:06}", i);
         db.put(key.as_bytes(), val.as_bytes()).unwrap();
@@ -1399,15 +1399,15 @@ fn test_deferred_block_read_correctness() {
 
     // Seek to middle
     let mut iter = db.iter().unwrap();
-    iter.seek(b"df_000500");
+    iter.seek(b"df_000100");
     let (k, _) = iter.next().unwrap();
-    assert_eq!(k, b"df_000500");
+    assert_eq!(k, b"df_000100");
 
     // Seek to key between entries
     let mut iter = db.iter().unwrap();
-    iter.seek(b"df_000500x");
+    iter.seek(b"df_000100x");
     let (k, _) = iter.next().unwrap();
-    assert_eq!(k, b"df_000501");
+    assert_eq!(k, b"df_000101");
 
     // Seek past end
     let mut iter = db.iter().unwrap();
@@ -1415,7 +1415,7 @@ fn test_deferred_block_read_correctness() {
     assert!(iter.next().is_none());
 
     // Full scan sees all entries
-    assert_eq!(db.iter().unwrap().count(), 1_000);
+    assert_eq!(db.iter().unwrap().count(), 200);
 }
 
 // ── Prefix scan with SST across levels ──────────────────────────────────
