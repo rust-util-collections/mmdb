@@ -40,6 +40,13 @@ struct WriteRequest {
     done: bool,
 }
 
+/// Group commit queue state. The `leader_active` flag prevents new arrivals
+/// from becoming false "leaders" while the real leader holds `inner` lock.
+struct WriteQueueState {
+    queue: VecDeque<*mut WriteRequest>,
+    leader_active: bool,
+}
+
 /// The core database handle.
 pub struct DB {
     path: PathBuf,
@@ -48,7 +55,7 @@ pub struct DB {
     /// Global sequence number (next to assign).
     sequence: AtomicU64,
     /// Write queue and condvar for group commit.
-    write_queue: Mutex<VecDeque<*mut WriteRequest>>,
+    write_queue: Mutex<WriteQueueState>,
     write_cv: Condvar,
     closed: AtomicBool,
     /// Background error (e.g. WAL sync failure). Once set, all subsequent
@@ -339,7 +346,10 @@ impl DB {
             options,
             inner,
             sequence: AtomicU64::new(sequence_start),
-            write_queue: Mutex::new(VecDeque::new()),
+            write_queue: Mutex::new(WriteQueueState {
+                queue: VecDeque::new(),
+                leader_active: false,
+            }),
             write_cv: Condvar::new(),
             closed: AtomicBool::new(false),
             bg_error: Mutex::new(None),
@@ -1158,28 +1168,90 @@ impl DB {
         };
         let req_ptr: *mut WriteRequest = &mut req;
 
-        // Enqueue and check if we're the leader
-        let mut queue = self.write_queue.lock();
-        queue.push_back(req_ptr);
-        let is_leader = queue.len() == 1;
+        // Enqueue and check if we should become the leader.
+        // The leader_active flag prevents new arrivals from becoming false
+        // "leaders" while the real leader holds `inner` — this is critical for
+        // group commit to actually batch writes.
+        let mut wq = self.write_queue.lock();
+        wq.queue.push_back(req_ptr);
 
-        if !is_leader {
-            // Wait for the leader to process our request
-            self.write_cv.wait_while(&mut queue, |_| !req.done);
+        // Wait until either: our request is done (leader processed it), or
+        // no leader is active (we should become the leader).
+        while !req.done && wq.leader_active {
+            self.write_cv.wait(&mut wq);
+        }
+        if req.done {
             return req.result.take().unwrap_or(Ok(()));
         }
 
-        // Leader: collect all pending writes from the queue
-        let batch_group: Vec<*mut WriteRequest> = queue.drain(..).collect();
-        drop(queue); // release queue lock while doing I/O
+        // Become the leader. The flag ensures only one thread reaches here.
+        debug_assert!(!wq.leader_active);
+        wq.leader_active = true;
+        let mut leader_result: Result<()> = Ok(());
 
-        // Allocate sequences and write WAL for all batches
+        loop {
+            if wq.queue.is_empty() {
+                // Queue was drained by previous leader while we were waking.
+                // Our request must have been processed (done=true checked above).
+                wq.leader_active = false;
+                self.write_cv.notify_all();
+                drop(wq);
+                break;
+            }
+            let batch_group: Vec<*mut WriteRequest> = wq.queue.drain(..).collect();
+            drop(wq); // release queue lock while doing I/O
+
+            let result = self.write_batch_group(&batch_group);
+
+            // Signal followers for this batch
+            let mut wq_inner = self.write_queue.lock();
+            for &rp in &batch_group[1..] {
+                let r = unsafe { &mut *rp };
+                if r.result.is_none() {
+                    r.result = match &result {
+                        Ok(()) => Some(Ok(())),
+                        Err(e) => {
+                            Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))))
+                        }
+                    };
+                }
+                r.done = true;
+            }
+            self.write_cv.notify_all();
+
+            // Leader's own result (batch_group[0])
+            if leader_result.is_ok()
+                && let Err(e) = &result
+                && batch_group
+                    .first()
+                    .is_some_and(|&p| std::ptr::eq(p, req_ptr))
+            {
+                leader_result = Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
+            }
+
+            // Check for stragglers
+            if wq_inner.queue.is_empty() {
+                wq_inner.leader_active = false;
+                self.write_cv.notify_all(); // wake stragglers to compete for leadership
+                drop(wq_inner);
+                break;
+            }
+            // More work arrived — loop as leader
+            wq = wq_inner;
+        }
+
+        leader_result
+    }
+
+    /// Process a batch group: write WAL, apply to memtable, sync, flush if needed.
+    /// Returns Ok(()) if all batches succeeded. On WAL add_record failure,
+    /// sets result on each request (Ok for succeeded, Err for failed+later).
+    fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<()> {
         let mut need_sync = false;
         let mut inner = self.inner.lock();
         let mut wal_add_error: Option<(Box<dyn ruc::RucError>, usize)> = None;
 
         for (batch_idx, &req_ptr) in batch_group.iter().enumerate() {
-            // SAFETY: we hold the only references; other threads are blocked on write_cv
             let r = unsafe { &mut *req_ptr };
             let first_seq = self
                 .sequence
@@ -1196,7 +1268,6 @@ impl DB {
                 }
             }
 
-            // Apply to memtable
             let mut batch_bytes = 0u64;
             for (i, entry) in r.batch.entries.iter().enumerate() {
                 let seq = first_seq + i as u64;
@@ -1212,34 +1283,20 @@ impl DB {
             self.stats.record_write(batch_bytes);
         }
 
-        // Handle WAL add_record error outside the loop to avoid lock ordering
-        // inversion (write_queue → inner is the correct order; acquiring
-        // write_queue while holding inner would risk deadlock with flush/compact).
         if let Some((e, fail_idx)) = wal_add_error {
-            drop(inner);
-            let _queue = self.write_queue.lock();
-            // Batches 0..fail_idx succeeded in both WAL and memtable — report Ok.
+            // Mark succeeded batches as Ok, failed as Err
             for &rp in &batch_group[..fail_idx] {
                 let rr = unsafe { &mut *rp };
                 rr.result = Some(Ok(()));
-                rr.done = true;
             }
-            // Batch fail_idx and later never completed — report Err.
             for &rp in &batch_group[fail_idx..] {
                 let rr = unsafe { &mut *rp };
                 rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
-                rr.done = true;
-            }
-            self.write_cv.notify_all();
-            // Leader is batch_group[0]. If fail_idx > 0, the leader's own
-            // batch succeeded in WAL + memtable — return Ok, not Err.
-            if fail_idx > 0 {
-                return Ok(());
             }
             return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
         }
 
-        // Single fsync for all batches that wrote to WAL
+        // Single fsync for all batches
         let any_wal = batch_group.iter().any(|&p| !unsafe { &*p }.disable_wal);
         let wal_sync_err = if any_wal {
             match inner.wal_writer {
@@ -1253,23 +1310,15 @@ impl DB {
             None
         };
         if let Some(e) = wal_sync_err {
-            // Set DB to error state — reject all future operations.
             *self.bg_error.lock() = Some(format!("WAL sync failed: {}", e));
-            // Drop inner lock first to maintain consistent lock ordering
-            // (write_queue → inner), preventing deadlock with flush/compact.
-            drop(inner);
-            let _queue = self.write_queue.lock();
-            for &req_ptr in &batch_group[1..] {
-                let r = unsafe { &mut *req_ptr };
-                r.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
-                r.done = true;
+            for &rp in batch_group {
+                let rr = unsafe { &mut *rp };
+                rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
             }
-            self.write_cv.notify_all();
             return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
         }
 
-        // Check memtable size threshold — data is already in WAL so a flush
-        // failure here is not fatal, just log it.
+        // Check memtable size threshold
         let mut did_flush = false;
         if inner.active_memtable.approximate_size() >= self.options.write_buffer_size {
             match self.freeze_and_flush(&mut inner) {
@@ -1280,22 +1329,9 @@ impl DB {
 
         drop(inner);
 
-        // Signal background compaction after successful flush
         if did_flush {
             self.signal_compaction();
         }
-
-        // Notify all followers
-        let queue = self.write_queue.lock();
-        for &req_ptr in &batch_group[1..] {
-            let r = unsafe { &mut *req_ptr };
-            if r.result.is_none() {
-                r.result = Some(Ok(()));
-            }
-            r.done = true;
-        }
-        self.write_cv.notify_all();
-        drop(queue);
 
         Ok(())
     }
