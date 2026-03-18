@@ -371,6 +371,12 @@ impl IterSource {
         self.has_peeked = self.reverse_advance_into_buffers();
         self.has_peeked
     }
+
+    /// Discard the current peeked entry so the next peek() will advance.
+    #[inline]
+    pub fn skip_peeked(&mut self) {
+        self.has_peeked = false;
+    }
 }
 
 /// Direction of iteration for MergingIterator.
@@ -656,6 +662,111 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.current_key.clear();
         self.initialized = false;
         self.init_heap();
+    }
+
+    /// Peek the current minimum entry without transferring ownership.
+    /// Returns references to the key and value of the smallest entry.
+    /// For the single-source fast path, this is a direct reference to the source's buffer.
+    pub fn peek_entry(&mut self) -> Option<(&[u8], &[u8])> {
+        if self.direction != Direction::Forward {
+            self.switch_to_forward();
+        }
+
+        if self.single_source {
+            if !self.initialized {
+                self.initialized = true;
+                let _ = self.sources[0].peek();
+            }
+            return self.sources[0].peek();
+        }
+
+        self.init_heap();
+        if self.heap_size == 0 {
+            return None;
+        }
+        let min_idx = self.heap[0];
+        self.sources[min_idx].peek()
+    }
+
+    /// Advance past the current minimum entry (discard it).
+    /// For single-source: clears peeked flag and re-peeks (reuses buffer capacity).
+    /// For multi-source: pops heap top, advances source, sifts down.
+    pub fn advance_entry(&mut self) {
+        if self.single_source {
+            // Copy current key for direction switching before discarding
+            if self.sources[0].has_peeked {
+                self.current_key.clear();
+                self.current_key
+                    .extend_from_slice(&self.sources[0].peeked_key);
+            }
+            self.sources[0].skip_peeked();
+            // Re-peek: advance_into_buffers overwrites buffers in-place, reusing capacity
+            let _ = self.sources[0].peek();
+            return;
+        }
+
+        if self.heap_size == 0 {
+            return;
+        }
+
+        let min_idx = self.heap[0];
+        // Track current key for direction switching
+        if self.sources[min_idx].has_peeked {
+            self.current_key.clear();
+            self.current_key
+                .extend_from_slice(&self.sources[min_idx].peeked_key);
+        }
+
+        // Discard peeked and advance
+        self.sources[min_idx].skip_peeked();
+        let _ = self.sources[min_idx].peek();
+
+        if self.sources[min_idx].has_peeked {
+            self.sift_down(0);
+        } else {
+            self.heap_size -= 1;
+            if self.heap_size > 0 {
+                self.heap.swap(0, self.heap_size);
+                self.sift_down(0);
+            }
+        }
+    }
+
+    /// Take ownership of the current minimum entry.
+    /// Uses take_peeked (which resets buffer capacity to 0 for the source).
+    /// Only call this for entries that will actually be returned to the caller.
+    pub fn take_entry(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.single_source {
+            let entry = self.sources[0].take_peeked()?;
+            self.current_key.clear();
+            self.current_key.extend_from_slice(&entry.0);
+            let _ = self.sources[0].peek();
+            return Some(entry);
+        }
+
+        if self.heap_size == 0 {
+            return None;
+        }
+
+        let min_idx = self.heap[0];
+        let entry = self.sources[min_idx].take_peeked()?;
+
+        self.current_key.clear();
+        self.current_key.extend_from_slice(&entry.0);
+
+        let _ = self.sources[min_idx].peek();
+
+        if self.sources[min_idx].has_peeked {
+            self.sift_down(0);
+        } else {
+            self.heap_size -= 1;
+            if self.heap_size > 0 {
+                self.heap.swap(0, self.heap_size);
+                self.sift_down(0);
+            }
+        }
+
+        Some(entry)
     }
 
     /// Seek all sources to first, rebuild the min-heap.

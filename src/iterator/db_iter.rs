@@ -154,6 +154,9 @@ impl DBIterator {
     }
 
     /// Advance the streaming iterator to the next visible (user_key, value) pair.
+    ///
+    /// Uses peek_entry/advance_entry/take_entry to avoid heap allocations for
+    /// skipped entries. Only the one returned entry pays the allocation cost.
     fn next_visible(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         // After a backward operation (prev/seek_to_last), the merger is in backward mode.
         // Re-seek forward past the last user key so forward iteration resumes correctly.
@@ -162,78 +165,98 @@ impl DBIterator {
             self.prev_overshoot = None;
             if self.has_last_key {
                 use crate::types::InternalKey;
-                // Seek past all entries for last_user_key. In compare_internal_key order,
-                // (user_key, 0, Deletion) is the last entry for a user_key, so seeking
-                // there positions us at or past it.
                 let seek_key = InternalKey::new(&self.last_user_key, 0, ValueType::Deletion);
                 self.merger.seek(seek_key.as_bytes());
-                // has_last_key stays true so next_visible deduplicates correctly
             }
         }
+        // Decisions extracted from peek_entry() to avoid borrow conflicts.
+        // peek_entry() borrows self.merger; we need self.is_range_deleted() etc.
+        enum Action {
+            Skip,
+            Take { uk_len: usize },
+        }
         loop {
-            let (mut ikey, value) = self.merger.next_entry()?;
-            if ikey.len() < 8 {
-                continue;
-            }
-            let ikr = InternalKeyRef::new(&ikey);
-            let seq = ikr.sequence();
-            let vt = ikr.value_type();
+            let action = {
+                let (ikey_ref, _value_ref) = self.merger.peek_entry()?;
+                if ikey_ref.len() < 8 {
+                    Action::Skip
+                } else {
+                    let ikr = InternalKeyRef::new(ikey_ref);
+                    let seq = ikr.sequence();
+                    let vt = ikr.value_type();
 
-            // Skip entries newer than our snapshot
-            if seq > self.sequence {
-                continue;
-            }
+                    if seq > self.sequence {
+                        Action::Skip
+                    } else {
+                        let uk_len = ikey_ref.len() - 8;
 
-            let uk_len = ikey.len() - 8;
+                        // Prefix boundary check
+                        if let Some(ref pfx) = self.prefix
+                            && !ikey_ref[..uk_len].starts_with(pfx)
+                        {
+                            return None;
+                        }
 
-            // Prefix boundary check — stop immediately when prefix changes
-            if let Some(ref pfx) = self.prefix
-                && !ikey[..uk_len].starts_with(pfx)
-            {
-                return None;
-            }
+                        // Upper bound check
+                        if let Some(ref ub) = self.iterate_upper_bound
+                            && ikey_ref[..uk_len] >= **ub
+                        {
+                            return None;
+                        }
 
-            // Upper bound check — stop when user key >= upper bound (exclusive)
-            if let Some(ref ub) = self.iterate_upper_bound
-                && ikey[..uk_len] >= **ub
-            {
-                return None;
-            }
+                        if vt == ValueType::RangeDeletion {
+                            if !(self.has_last_key
+                                && self.last_user_key.as_slice() == &ikey_ref[..uk_len])
+                            {
+                                self.last_user_key.clear();
+                                self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
+                                self.has_last_key = true;
+                            }
+                            Action::Skip
+                        } else if self.has_last_key
+                            && self.last_user_key.as_slice() == &ikey_ref[..uk_len]
+                        {
+                            // Duplicate user key — already saw newest version
+                            Action::Skip
+                        } else {
+                            // New user key — update dedup state
+                            self.last_user_key.clear();
+                            self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
+                            self.has_last_key = true;
 
-            // Skip range deletion entries in the data stream — tombstones are
-            // pre-loaded into the fragmented list, so we don't collect inline.
-            if vt == ValueType::RangeDeletion {
-                if self.has_last_key && self.last_user_key.as_slice() == &ikey[..uk_len] {
+                            if vt == ValueType::Deletion {
+                                Action::Skip
+                            } else if self.range_tombstones.is_empty() {
+                                Action::Take { uk_len }
+                            } else {
+                                // Must check range tombstones — inline the check
+                                // since is_range_deleted needs &self but merger is borrowed.
+                                let covered = self
+                                    .range_tombstones
+                                    .max_covering_tombstone_seq(&ikey_ref[..uk_len], self.sequence)
+                                    > seq;
+                                if covered {
+                                    Action::Skip
+                                } else {
+                                    Action::Take { uk_len }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            match action {
+                Action::Skip => {
+                    self.merger.advance_entry();
                     continue;
                 }
-                self.last_user_key.clear();
-                self.last_user_key.extend_from_slice(&ikey[..uk_len]);
-                self.has_last_key = true;
-                continue;
+                Action::Take { uk_len } => {
+                    let (mut ikey, value) = self.merger.take_entry()?;
+                    ikey.truncate(uk_len);
+                    return Some((ikey, value));
+                }
             }
-
-            // Skip duplicate user keys (we already saw the newest version)
-            if self.has_last_key && self.last_user_key.as_slice() == &ikey[..uk_len] {
-                continue;
-            }
-
-            self.last_user_key.clear();
-            self.last_user_key.extend_from_slice(&ikey[..uk_len]);
-            self.has_last_key = true;
-
-            // Skip tombstones
-            if vt == ValueType::Deletion {
-                continue;
-            }
-
-            // Skip entries covered by range tombstones
-            if self.is_range_deleted(&ikey[..uk_len], seq) {
-                continue;
-            }
-
-            // Truncate internal key to user key in-place (zero allocation).
-            ikey.truncate(uk_len);
-            return Some((ikey, value));
         }
     }
 
@@ -544,6 +567,16 @@ impl DBIterator {
 
         // Use inline backward resolution to find the last visible key
         self.resolve_prev_user_key(&upper_bound);
+    }
+
+    /// Return the last user key seen by next_visible(), if any.
+    /// Used by BidiIterator for re-seeking on direction change.
+    pub fn last_user_key(&self) -> Option<&[u8]> {
+        if self.has_last_key {
+            Some(&self.last_user_key)
+        } else {
+            None
+        }
     }
 
     pub fn collect_remaining(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {

@@ -29,14 +29,13 @@ enum BidiInner {
         forward_only: bool,
         /// Number of entries consumed via next() (for correct front cursor on materialize).
         fwd_count: usize,
-        /// Last key returned by next(), used for re-seeking on direction change.
-        last_fwd_key: Option<Vec<u8>>,
     },
     /// After first next_back() via seek_to_last(), subsequent next_back() calls
     /// use db_iter.prev() for O(1) memory streaming backward.
     LazyBackStarted {
         db_iter: Box<DBIterator>,
-        /// Last key returned by next() before backward mode started.
+        /// Snapshot of db_iter.last_user_key() at the Lazy→LazyBackStarted transition.
+        /// Used for re-seeking forward on direction change.
         last_fwd_key: Option<Vec<u8>>,
         /// Last key returned by next_back(), used as forward stop boundary.
         last_back_key: Option<Vec<u8>>,
@@ -63,7 +62,6 @@ impl BidiIterator {
                 db_iter: Box::new(db_iter),
                 forward_only: false,
                 fwd_count: 0,
-                last_fwd_key: None,
             },
         }
     }
@@ -76,7 +74,6 @@ impl BidiIterator {
                 db_iter: Box::new(db_iter),
                 forward_only: true,
                 fwd_count: 0,
-                last_fwd_key: None,
             },
         }
     }
@@ -117,14 +114,10 @@ impl Iterator for BidiIterator {
                 }
             }
             BidiInner::Lazy {
-                db_iter,
-                fwd_count,
-                last_fwd_key,
-                ..
+                db_iter, fwd_count, ..
             } => {
                 let entry = db_iter.next()?;
                 *fwd_count += 1;
-                *last_fwd_key = Some(entry.0.clone());
                 Some(entry)
             }
             BidiInner::LazyBackStarted { .. } => {
@@ -216,14 +209,12 @@ impl DoubleEndedIterator for BidiIterator {
                     back: 0,
                 };
                 let old = std::mem::replace(&mut self.inner, placeholder);
-                let BidiInner::Lazy {
-                    mut db_iter,
-                    last_fwd_key,
-                    ..
-                } = old
-                else {
+                let BidiInner::Lazy { mut db_iter, .. } = old else {
                     unreachable!()
                 };
+
+                // Snapshot last_user_key before seek_to_last destroys it
+                let last_fwd_key = db_iter.last_user_key().map(|k| k.to_vec());
 
                 db_iter.seek_to_last();
                 if !db_iter.valid() {
