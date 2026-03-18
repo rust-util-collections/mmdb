@@ -110,6 +110,9 @@ impl DBIterator {
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
     pub fn set_upper_bound(&mut self, bound: Vec<u8>) {
         self.iterate_upper_bound = Some(bound);
+        // Invalidate any buffered entry — it may now be beyond the new bound.
+        self.current = None;
+        self.needs_advance = true;
     }
 
     /// Check if a user key is covered by any range tombstone visible at our snapshot.
@@ -304,10 +307,10 @@ impl DBIterator {
                 // Prefix guard: if we've left the prefix, stop immediately.
                 // In a decreasing key sequence, once we leave the prefix we
                 // can never re-enter it.
-                if let Some(ref pfx) = self.prefix {
-                    if !uk.starts_with(pfx) {
-                        break;
-                    }
+                if let Some(ref pfx) = self.prefix
+                    && !uk.starts_with(pfx)
+                {
+                    break;
                 }
 
                 if uk < current_bound.as_slice() {

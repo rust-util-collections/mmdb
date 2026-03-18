@@ -877,6 +877,11 @@ impl DB {
                 None => break,
             }
         }
+        // Update cached L0 count and install new SuperVersion so readers
+        // see the compacted state immediately.
+        self.l0_file_count
+            .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+        self.install_super_version(&inner);
         Ok(())
     }
 
