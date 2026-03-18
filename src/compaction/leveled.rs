@@ -14,6 +14,7 @@ use ruc::*;
 use crate::cache::table_cache::TableCache;
 use crate::error::Result;
 use crate::iterator::merge::{IterSource, MergingIterator};
+use crate::iterator::range_del::RangeTombstoneTracker;
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
@@ -244,9 +245,8 @@ impl LeveledCompaction {
         let mut current_file_number = 0u64;
         let mut current_size = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
-        // Collect range tombstones with sequence numbers to filter covered keys.
-        // A range tombstone only deletes entries with seq < tombstone_seq.
-        let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> = Vec::new();
+        // Sweep-line range tombstone tracker for O(1) amortized coverage checks.
+        let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
             if ikey.len() < 8 {
@@ -257,7 +257,8 @@ impl LeveledCompaction {
 
             // Collect range tombstones for filtering
             if ikr.value_type() == ValueType::RangeDeletion {
-                range_tombstones.push((user_key.to_vec(), value.clone(), ikr.sequence()));
+                range_tombstones.add(user_key.to_vec(), value.clone(), ikr.sequence());
+                range_tombstones.reset();
                 // Skip older versions of the begin key
                 if let Some(ref last) = last_user_key
                     && last.as_slice() == user_key
@@ -285,15 +286,12 @@ impl LeveledCompaction {
                     continue;
                 }
 
-                // Skip keys covered by range tombstones
-                if ikr.value_type() == ValueType::Value {
+                // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
+                if ikr.value_type() == ValueType::Value
+                    && !range_tombstones.is_empty()
+                {
                     let entry_seq = ikr.sequence();
-                    let covered = range_tombstones.iter().any(|(begin, end, tomb_seq)| {
-                        user_key >= begin.as_slice()
-                            && user_key < end.as_slice()
-                            && *tomb_seq > entry_seq
-                    });
-                    if covered {
+                    if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
                         continue;
                     }
                 }
@@ -453,7 +451,7 @@ impl LeveledCompaction {
         let mut current_file_number = 0u64;
         let mut current_size = 0usize;
         let mut last_user_key: Option<Vec<u8>> = None;
-        let mut range_tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> = Vec::new();
+        let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
             if ikey.len() < 8 {
@@ -463,7 +461,8 @@ impl LeveledCompaction {
             let user_key = ikr.user_key();
 
             if ikr.value_type() == ValueType::RangeDeletion {
-                range_tombstones.push((user_key.to_vec(), value.clone(), ikr.sequence()));
+                range_tombstones.add(user_key.to_vec(), value.clone(), ikr.sequence());
+                range_tombstones.reset();
                 if let Some(ref last) = last_user_key
                     && last.as_slice() == user_key
                 {
@@ -485,14 +484,12 @@ impl LeveledCompaction {
                     continue;
                 }
 
-                if ikr.value_type() == ValueType::Value {
+                // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
+                if ikr.value_type() == ValueType::Value
+                    && !range_tombstones.is_empty()
+                {
                     let entry_seq = ikr.sequence();
-                    let covered = range_tombstones.iter().any(|(begin, end, tomb_seq)| {
-                        user_key >= begin.as_slice()
-                            && user_key < end.as_slice()
-                            && *tomb_seq > entry_seq
-                    });
-                    if covered {
+                    if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
                         continue;
                     }
                 }
