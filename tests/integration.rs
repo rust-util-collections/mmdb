@@ -1892,3 +1892,209 @@ fn test_stats_cache_hit_rate() {
         "cache hit rate should be > 0 after repeated reads"
     );
 }
+
+// ── vsdb-style seek_to_last + valid/key/prev pattern ─────────────────
+
+#[test]
+fn test_vsdb_seek_to_last_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    // Insert 20 keys
+    for i in 0..20u64 {
+        let key = format!("k_{:04}", i);
+        db.put(key.as_bytes(), format!("v{}", i).as_bytes())
+            .unwrap();
+    }
+
+    // Pattern 1: memtable only (no flush)
+    {
+        let mut iter = db
+            .iter_with_range(&ReadOptions::default(), None, None)
+            .unwrap();
+        iter.seek_to_last();
+        assert!(iter.valid(), "seek_to_last should be valid (memtable)");
+        assert_eq!(iter.key(), b"k_0019");
+        // Walk backward
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"k_0018");
+    }
+
+    // Pattern 2: after flush (SST)
+    db.flush().unwrap();
+    {
+        let mut iter = db
+            .iter_with_range(&ReadOptions::default(), None, None)
+            .unwrap();
+        iter.seek_to_last();
+        assert!(iter.valid(), "seek_to_last should be valid (SST)");
+        assert_eq!(iter.key(), b"k_0019");
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"k_0018");
+    }
+
+    // Pattern 3: with range hints (mimics vsdb prefix_successor)
+    {
+        let start = b"k_".as_slice();
+        let end = b"k`".as_slice(); // 'k' + 1 = 'l', but '_' + 1 = '`'
+        let mut iter = db
+            .iter_with_range(&ReadOptions::default(), Some(start), Some(end))
+            .unwrap();
+        iter.seek_to_last();
+        assert!(
+            iter.valid(),
+            "seek_to_last should be valid (range-bounded)"
+        );
+        assert_eq!(iter.key(), b"k_0019");
+    }
+}
+
+// ====================================================================
+// Tests from the audit report / backward iteration correctness plan
+// ====================================================================
+
+/// Range tombstone + backward iteration correctness: deleted keys must
+/// not "resurrect" when iterating backward.
+#[test]
+fn test_range_tombstone_backward_no_resurrection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for c in b'a'..=b'f' {
+        db.put(&[c], &[c]).unwrap();
+    }
+    db.delete_range(b"c", b"e").unwrap();
+
+    let mut iter = db.iter().unwrap();
+    let fwd: Vec<Vec<u8>> = std::iter::from_fn(|| iter.next().map(|(k, _)| k)).collect();
+    assert_eq!(fwd, vec![b"a", b"b", b"e", b"f"]);
+
+    let bidi = db.iter_bidi().unwrap();
+    let rev: Vec<Vec<u8>> = bidi.rev().map(|(k, _)| k).collect();
+    assert_eq!(
+        rev,
+        vec![b"f".to_vec(), b"e".to_vec(), b"b".to_vec(), b"a".to_vec()]
+    );
+}
+
+/// Range tombstone backward after flush: tombstones survive to SST.
+#[test]
+fn test_range_tombstone_backward_after_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for c in b'a'..=b'f' {
+        db.put(&[c], &[c]).unwrap();
+    }
+    db.delete_range(b"b", b"e").unwrap();
+    db.flush().unwrap();
+
+    let bidi = db.iter_bidi().unwrap();
+    let rev: Vec<Vec<u8>> = bidi.rev().map(|(k, _)| k).collect();
+    assert_eq!(rev, vec![b"f".to_vec(), b"e".to_vec(), b"a".to_vec()]);
+}
+
+/// BidiIterator streaming next_back: multiple calls should work without OOM.
+#[test]
+fn test_bidi_streaming_next_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    let count = 200;
+    for i in 0..count {
+        let key = format!("key_{:06}", i);
+        let val = format!("val_{}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
+
+    let bidi = db.iter_bidi().unwrap();
+    let rev: Vec<Vec<u8>> = bidi.rev().map(|(k, _)| k).collect();
+    assert_eq!(rev.len(), count);
+    for i in 0..count {
+        let expected = format!("key_{:06}", count - 1 - i);
+        assert_eq!(rev[i], expected.as_bytes(), "mismatch at position {}", i);
+    }
+}
+
+/// prev() with multiple versions and tombstones.
+#[test]
+fn test_prev_multi_version_tombstones() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    db.put(b"a", b"a1").unwrap();
+    db.put(b"b", b"b1").unwrap();
+    db.put(b"c", b"c1").unwrap();
+    db.put(b"d", b"d1").unwrap();
+    db.delete(b"b").unwrap();
+    db.put(b"c", b"c2").unwrap();
+
+    let mut iter = db.iter().unwrap();
+    iter.seek(b"d");
+    assert!(iter.valid());
+    assert_eq!(iter.key(), b"d");
+
+    iter.prev();
+    assert!(iter.valid());
+    assert_eq!(iter.key(), b"c");
+    assert_eq!(iter.value(), b"c2");
+
+    iter.prev();
+    assert!(iter.valid());
+    assert_eq!(iter.key(), b"a");
+
+    iter.prev();
+    assert!(!iter.valid());
+}
+
+/// seek_for_prev then advance then prev round-trip.
+#[test]
+fn test_seek_for_prev_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0..10 {
+        let key = format!("key_{:02}", i);
+        let val = format!("val_{}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    let mut iter = db.iter().unwrap();
+    iter.seek_for_prev(b"key_04x");
+    assert!(iter.valid());
+    assert_eq!(iter.key(), b"key_04");
+
+    iter.advance();
+    assert!(iter.valid());
+    assert_eq!(iter.key(), b"key_05");
+
+    iter.prev();
+    assert!(iter.valid());
+    assert_eq!(iter.key(), b"key_04");
+}
+
+/// compact_range followed by immediate iter() should see compacted state.
+#[test]
+fn test_compact_range_then_iter() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0..50 {
+        let key = format!("key_{:04}", i);
+        db.put(key.as_bytes(), key.as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(Some(b"key_0000"), Some(b"key_0050"))
+        .unwrap();
+
+    let mut iter = db.iter().unwrap();
+    let entries: Vec<Vec<u8>> = std::iter::from_fn(|| iter.next().map(|(k, _)| k)).collect();
+    assert_eq!(entries.len(), 50);
+    for i in 0..50 {
+        let expected = format!("key_{:04}", i);
+        assert_eq!(entries[i], expected.as_bytes());
+    }
+}

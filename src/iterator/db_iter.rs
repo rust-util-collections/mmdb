@@ -39,6 +39,11 @@ pub struct DBIterator {
     /// On the next forward iteration (next_visible), the merger must be re-seeked
     /// past the current user key to resume forward scanning correctly.
     backward_positioned: bool,
+    /// Whether range tombstones have been preloaded from all sources.
+    /// In backward iteration, range deletion entries are encountered AFTER the
+    /// keys they cover (since begin_key < covered keys). Preloading ensures all
+    /// tombstones are in the tracker before any backward visibility check.
+    range_tombstones_preloaded: bool,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -67,6 +72,7 @@ impl DBIterator {
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
+            range_tombstones_preloaded: false,
         }
     }
 
@@ -89,6 +95,7 @@ impl DBIterator {
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
+            range_tombstones_preloaded: false,
         }
     }
 
@@ -116,6 +123,7 @@ impl DBIterator {
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
+            range_tombstones_preloaded: false,
         }
     }
 
@@ -127,6 +135,38 @@ impl DBIterator {
         // Invalidate any buffered entry — it may now be beyond the new bound.
         self.current = None;
         self.needs_advance = true;
+    }
+
+    /// Scan all merger entries to collect RangeDeletion entries into the tracker.
+    /// Called once before the first backward operation to ensure all range tombstones
+    /// are available for visibility checks. In backward order, range deletion entries
+    /// are encountered AFTER the keys they cover.
+    fn preload_range_tombstones(&mut self) {
+        if self.range_tombstones_preloaded {
+            return;
+        }
+        self.range_tombstones_preloaded = true;
+
+        // Save merger state, scan from beginning for all range tombstones
+        self.merger.seek_to_first();
+        loop {
+            let entry = self.merger.next_entry();
+            match entry {
+                Some((ikey, value)) => {
+                    if ikey.len() < 8 {
+                        continue;
+                    }
+                    let ikr = InternalKeyRef::new(&ikey);
+                    if ikr.value_type() == ValueType::RangeDeletion {
+                        let uk_len = ikey.len() - 8;
+                        self.range_tombstones
+                            .add(ikey[..uk_len].to_vec(), value, ikr.sequence());
+                    }
+                }
+                None => break,
+            }
+        }
+        self.range_tombstones.reset();
     }
 
     /// Check if a user key is covered by any range tombstone visible at our snapshot.
@@ -305,6 +345,10 @@ impl DBIterator {
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
 
+        // Preload range tombstones (one-time scan) so backward resolution can
+        // correctly filter deleted keys.
+        self.preload_range_tombstones();
+
         // Use merger backward seek to find the last internal key <= target
         let seek_key = InternalKey::new(target, 0, ValueType::Deletion);
         self.merger.seek_for_prev(seek_key.as_bytes());
@@ -472,6 +516,9 @@ impl DBIterator {
     ///
     /// Uses inline backward resolution: O(1) amortized per call.
     pub fn prev(&mut self) {
+        // Preload range tombstones if not yet done (one-time cost).
+        self.preload_range_tombstones();
+
         // Ensure we have a current entry to move backwards from
         self.ensure_current();
         let saved_key = match &self.current {
@@ -492,6 +539,10 @@ impl DBIterator {
     /// then resolves visibility inline (no forward re-seek).
     pub fn seek_to_last(&mut self) {
         use crate::types::InternalKey;
+
+        // Preload range tombstones (one-time scan) so backward resolution can
+        // correctly filter deleted keys.
+        self.preload_range_tombstones();
 
         // Determine the effective upper bound for backward seek.
         // Priority: prefix upper bound > iterate_upper_bound > seek_to_last_merge.
