@@ -534,11 +534,17 @@ pub struct TableIterator {
     /// The index position for deferred materialization.
     deferred_index_pos: usize,
 
-    // --- Backward iteration (materialized) ---
-    /// Materialized block entries — only populated by seek_for_prev/prev.
+    // --- Backward iteration (windowed segment decoding) ---
+    /// Materialized entries from a restart segment — only populated by seek_for_prev/prev.
     current_block_entries: Vec<(Vec<u8>, Vec<u8>)>,
-    /// Position within materialized block.
+    /// Position within materialized block segment.
     block_pos: usize,
+    /// Current restart index within the backward-iteration block (for windowed segment loading).
+    current_restart_index: u32,
+    /// Block used for backward iteration (kept for segment decoding).
+    backward_block: Option<Block>,
+    /// Index of the block used for backward iteration.
+    backward_block_index: usize,
 }
 
 impl TableIterator {
@@ -557,6 +563,9 @@ impl TableIterator {
             deferred_index_pos: 0,
             current_block_entries: Vec::new(),
             block_pos: 0,
+            current_restart_index: 0,
+            backward_block: None,
+            backward_block_index: usize::MAX,
         }
     }
 
@@ -763,6 +772,9 @@ impl TableIterator {
     /// Seek to the last entry <= target using compare_internal_key ordering.
     /// After this call, the iterator is positioned on the found entry (or exhausted
     /// if no entry <= target exists).
+    ///
+    /// Uses windowed segment decoding: only decodes the restart segment containing
+    /// the target entry, not the entire block.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::compare_internal_key;
 
@@ -791,23 +803,34 @@ impl TableIterator {
             if let Ok(data) = self.reader.read_block_cached(&handle)
                 && let Ok(block) = Block::new(data)
             {
-                let entries: Vec<(Vec<u8>, Vec<u8>)> = block.iter().collect();
-                // Find the last entry <= target in this block
-                let pos = entries.partition_point(|(k, _)| {
-                    compare_internal_key(k, target) != std::cmp::Ordering::Greater
-                });
+                // Use seek_for_prev_by to find the target entry efficiently
+                match block.seek_for_prev_by(target, compare_internal_key) {
+                    Some((found_key, _found_val)) => {
+                        // Determine which restart segment this entry belongs to
+                        // and decode only that segment for backward iteration.
+                        let restart_idx = self.find_restart_for_key(&block, &found_key, compare_internal_key);
+                        let segment = block.iter_restart_segment(restart_idx);
+                        // Find position of found entry within segment
+                        let pos_in_segment = segment
+                            .iter()
+                            .rposition(|(k, _)| compare_internal_key(k, target) != std::cmp::Ordering::Greater)
+                            .unwrap_or(0);
 
-                if pos > 0 {
-                    // Found an entry <= target in this block
-                    self.index_pos = try_idx + 1; // next block to load on forward iteration
-                    self.current_block_entries = entries;
-                    self.block_pos = pos - 1;
-                    found = true;
-                    break;
+                        self.index_pos = try_idx + 1;
+                        self.current_block_entries = segment;
+                        self.block_pos = pos_in_segment;
+                        self.current_restart_index = restart_idx;
+                        self.backward_block = Some(block);
+                        self.backward_block_index = try_idx;
+                        found = true;
+                        break;
+                    }
+                    None => {
+                        // No entry <= target in this block; try previous
+                    }
                 }
             }
 
-            // No entry <= target in this block; try the previous block
             if try_idx == 0 {
                 break;
             }
@@ -815,36 +838,79 @@ impl TableIterator {
         }
 
         if !found {
-            // No entry <= target in the entire table
             self.index_pos = index_entries.len();
             self.current_block_entries.clear();
             self.block_pos = 0;
+            self.backward_block = None;
         }
+    }
+
+    /// Find the restart index that contains a given key.
+    fn find_restart_for_key<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+        &self,
+        block: &Block,
+        key: &[u8],
+        compare: F,
+    ) -> u32 {
+        let num = block.num_restarts();
+        if num <= 1 {
+            return 0;
+        }
+        // Binary search: find last restart point whose first key <= key
+        let mut left = 0u32;
+        let mut right = num;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let entries = block.iter_restart_segment(mid);
+            if let Some((first_key, _)) = entries.first() {
+                if compare(first_key, key) != std::cmp::Ordering::Greater {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            } else {
+                right = mid;
+            }
+        }
+        left.saturating_sub(1)
     }
 
     /// Move to the previous entry. Returns the entry at the new position,
     /// or None if we've moved before the first entry.
+    ///
+    /// Uses windowed segment decoding: when crossing restart segment boundaries,
+    /// only loads the previous segment (not the entire block).
     pub fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        // If we have a previous entry in the current block, just decrement
+        // If we have a previous entry in the current segment, just decrement
         if self.block_pos > 0 {
             self.block_pos -= 1;
             return Some(self.current_block_entries[self.block_pos].clone());
         }
 
-        // Need to load the previous block.
-        // index_pos points to the *next* block to load for forward iteration.
-        // The current block is at index_pos - 1. The previous block is index_pos - 2.
-        // But we need to be careful: after seek_for_prev, index_pos = try_idx + 1,
-        // so the current block index is index_pos - 1.
-        // We want the block *before* the current one.
-        let current_block_index = if self.index_pos > 0 {
+        // Try loading the previous restart segment within the same block
+        if self.current_restart_index > 0 {
+            if let Some(ref block) = self.backward_block {
+                self.current_restart_index -= 1;
+                self.current_block_entries =
+                    block.iter_restart_segment(self.current_restart_index);
+                if !self.current_block_entries.is_empty() {
+                    self.block_pos = self.current_block_entries.len() - 1;
+                    return Some(self.current_block_entries[self.block_pos].clone());
+                }
+            }
+        }
+
+        // Need to load the previous block's last segment.
+        let current_block_index = if self.backward_block_index < usize::MAX {
+            self.backward_block_index
+        } else if self.index_pos > 0 {
             self.index_pos - 1
         } else {
-            return None; // Already at or before the first block
+            return None;
         };
 
         if current_block_index == 0 {
-            return None; // Current block is the first block, no previous
+            return None; // Already at first block
         }
 
         let prev_block_index = current_block_index - 1;
@@ -854,12 +920,17 @@ impl TableIterator {
         if let Ok(data) = self.reader.read_block_cached(&handle)
             && let Ok(block) = Block::new(data)
         {
-            self.current_block_entries = block.iter().collect();
+            // Load only the last restart segment of the previous block
+            let last_restart = block.num_restarts().saturating_sub(1);
+            self.current_block_entries = block.iter_restart_segment(last_restart);
             if self.current_block_entries.is_empty() {
                 return None;
             }
             self.block_pos = self.current_block_entries.len() - 1;
             self.index_pos = prev_block_index + 1;
+            self.current_restart_index = last_restart;
+            self.backward_block = Some(block);
+            self.backward_block_index = prev_block_index;
             return Some(self.current_block_entries[self.block_pos].clone());
         }
 
@@ -995,16 +1066,20 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         if index_entries.is_empty() {
             return;
         }
-        // Load the last block and position at its last entry
+        // Load only the last restart segment of the last block
         let last_idx = index_entries.len() - 1;
         let handle = index_entries[last_idx].handle;
         if let Ok(data) = self.reader.read_block_cached(&handle)
             && let Ok(block) = Block::new(data)
         {
-            self.current_block_entries = block.iter().collect();
+            let last_restart = block.num_restarts().saturating_sub(1);
+            self.current_block_entries = block.iter_restart_segment(last_restart);
             if !self.current_block_entries.is_empty() {
                 self.block_pos = self.current_block_entries.len() - 1;
                 self.index_pos = last_idx + 1;
+                self.current_restart_index = last_restart;
+                self.backward_block = Some(block);
+                self.backward_block_index = last_idx;
             }
         }
         self.current_block = None;

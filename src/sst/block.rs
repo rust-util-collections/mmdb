@@ -253,6 +253,55 @@ impl Block {
         entries
     }
 
+    /// Decode entries from the given restart point index to the next restart point.
+    /// Returns only entries within this single segment (not the rest of the block).
+    pub fn iter_restart_segment(&self, restart_index: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        if restart_index >= self.num_restarts {
+            return Vec::new();
+        }
+
+        let start = self.restart_point(restart_index) as usize;
+        let end = if restart_index + 1 < self.num_restarts {
+            self.restart_point(restart_index + 1) as usize
+        } else {
+            self.restart_offset
+        };
+
+        let mut offset = start;
+        let mut current_key = Vec::new();
+        let mut entries = Vec::new();
+
+        while offset < end {
+            match decode_entry_at(&self.data, offset, &current_key) {
+                Some((key, value, next_off)) => {
+                    entries.push((key.clone(), value));
+                    current_key = key;
+                    offset = next_off;
+                }
+                None => break,
+            }
+        }
+
+        entries
+    }
+
+    /// Find which restart segment contains a given byte offset in the block data.
+    /// Returns the restart index whose restart point is <= offset.
+    pub fn restart_index_for_offset(&self, offset: usize) -> u32 {
+        let offset = offset as u32;
+        let mut left = 0u32;
+        let mut right = self.num_restarts;
+        while left < right {
+            let mid = left + (right - left) / 2;
+            if self.restart_point(mid) <= offset {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left.saturating_sub(1)
+    }
+
     /// Return the number of restart points in this block.
     pub fn num_restarts(&self) -> u32 {
         self.num_restarts

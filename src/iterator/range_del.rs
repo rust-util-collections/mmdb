@@ -110,6 +110,18 @@ impl RangeTombstoneTracker {
         false
     }
 
+    /// Check if `user_key` at `seq` is deleted by any range tombstone visible
+    /// at `snapshot`, using a linear scan. Works for any key order (no sweep state).
+    /// Suitable for backward iteration where keys are not monotonically increasing.
+    pub fn check_any_direction(
+        &self,
+        user_key: &[u8],
+        seq: SequenceNumber,
+        snapshot: SequenceNumber,
+    ) -> bool {
+        self.linear_check(user_key, seq, snapshot)
+    }
+
     /// Whether any tombstones have been collected.
     pub fn is_empty(&self) -> bool {
         self.tombstones.is_empty()
