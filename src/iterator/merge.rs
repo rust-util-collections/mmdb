@@ -686,6 +686,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Peek the current minimum entry without transferring ownership.
     /// Returns references to the key and value of the smallest entry.
     /// For the single-source fast path, this is a direct reference to the source's buffer.
+    #[inline]
     pub fn peek_entry(&mut self) -> Option<(&[u8], &[u8])> {
         if self.direction != Direction::Forward {
             self.switch_to_forward();
@@ -710,13 +711,13 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Advance past the current minimum entry (discard it).
     /// For single-source: clears peeked flag and re-peeks (reuses buffer capacity).
     /// For multi-source: pops heap top, advances source, sifts down.
+    ///
+    /// Does NOT update current_key — only take_entry() and next_entry()/prev_entry()
+    /// do that. Direction switching always uses explicit seek (seek_for_prev, seek)
+    /// which re-positions independently of current_key.
+    #[inline]
     pub fn advance_entry(&mut self) {
         if self.single_source {
-            if self.sources[0].has_peeked {
-                self.current_key.clear();
-                self.current_key
-                    .extend_from_slice(&self.sources[0].peeked_key);
-            }
             self.sources[0].skip_peeked();
             let _ = self.sources[0].peek();
             return;
@@ -727,11 +728,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
 
         let min_idx = self.heap[0];
-        if self.sources[min_idx].has_peeked {
-            self.current_key.clear();
-            self.current_key
-                .extend_from_slice(&self.sources[min_idx].peeked_key);
-        }
         self.sources[min_idx].skip_peeked();
         let _ = self.sources[min_idx].peek();
 
