@@ -396,10 +396,10 @@ impl DBIterator {
             }
             let uk = &ikey[..ikey.len() - 8];
             // Check prefix boundary
-            if let Some(ref pfx) = self.prefix {
-                if !uk.starts_with(pfx) {
-                    continue;
-                }
+            if let Some(ref pfx) = self.prefix
+                && !uk.starts_with(pfx)
+            {
+                continue;
             }
             last_uk = Some(uk.to_vec());
             break;

@@ -114,7 +114,7 @@ impl BidiIterator {
             // Reset iterator state and collect everything from scratch.
             db_iter.reset_and_seek_to_first();
             let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            while let Some(entry) = db_iter.next() {
+            for entry in db_iter.by_ref() {
                 entries.push(entry);
             }
             let len = entries.len();
