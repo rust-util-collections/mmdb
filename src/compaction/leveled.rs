@@ -9,6 +9,8 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use ruc::*;
+
 use crate::cache::table_cache::TableCache;
 use crate::error::Result;
 use crate::iterator::merge::{IterSource, MergingIterator};
@@ -199,7 +201,7 @@ impl LeveledCompaction {
             edit.delete_file(task.level as u32, tf.meta.number);
             edit.add_file(target_level as u32, tf.meta.clone());
             edit.set_next_file_number(versions.next_file_number());
-            versions.log_and_apply(edit)?;
+            versions.log_and_apply(edit).c(d!())?;
             if let Some(s) = stats {
                 s.record_compaction_completed();
             }
@@ -316,12 +318,12 @@ impl LeveledCompaction {
             if builder.is_none() {
                 current_file_number = versions.new_file_number();
                 let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
-                builder = Some(TableBuilder::new(&sst_path, build_opts.clone())?);
+                builder = Some(TableBuilder::new(&sst_path, build_opts.clone()).c(d!())?);
                 current_size = 0;
             }
 
             let entry_bytes = ikey.len() + final_value.len();
-            builder.as_mut().unwrap().add(&ikey, &final_value)?;
+            builder.as_mut().unwrap().add(&ikey, &final_value).c(d!())?;
             current_size += entry_bytes;
 
             // Rate-limit compaction writes
@@ -331,7 +333,7 @@ impl LeveledCompaction {
 
             // Split output file if target size reached
             if current_size >= options.target_file_size_base as usize {
-                let result = builder.take().unwrap().finish()?;
+                let result = builder.take().unwrap().finish().c(d!())?;
                 if let Some(s) = stats {
                     s.record_compaction_bytes(result.file_size);
                 }
@@ -350,7 +352,7 @@ impl LeveledCompaction {
 
         // Flush remaining builder
         if let Some(b) = builder {
-            let result = b.finish()?;
+            let result = b.finish().c(d!())?;
             if let Some(s) = stats {
                 s.record_compaction_bytes(result.file_size);
             }
@@ -382,7 +384,7 @@ impl LeveledCompaction {
         }
 
         edit.set_next_file_number(versions.next_file_number());
-        versions.log_and_apply(edit)?;
+        versions.log_and_apply(edit).c(d!())?;
 
         // Evict from table cache before deleting SST files
         if let Some(cache) = table_cache {
@@ -499,11 +501,11 @@ impl LeveledCompaction {
             if builder.is_none() {
                 current_file_number = versions.new_file_number();
                 let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
-                builder = Some(TableBuilder::new(&sst_path, build_opts.clone())?);
+                builder = Some(TableBuilder::new(&sst_path, build_opts.clone()).c(d!())?);
                 current_size = 0;
             }
 
-            builder.as_mut().unwrap().add(&ikey, &value)?;
+            builder.as_mut().unwrap().add(&ikey, &value).c(d!())?;
             current_size += ikey.len() + value.len();
 
             // Rate-limit compaction writes
@@ -512,7 +514,7 @@ impl LeveledCompaction {
             }
 
             if current_size >= options.target_file_size_base as usize {
-                let result = builder.take().unwrap().finish()?;
+                let result = builder.take().unwrap().finish().c(d!())?;
                 if let Some(s) = stats {
                     s.record_compaction_bytes(result.file_size);
                 }
@@ -530,7 +532,7 @@ impl LeveledCompaction {
         }
 
         if let Some(b) = builder {
-            let result = b.finish()?;
+            let result = b.finish().c(d!())?;
             if let Some(s) = stats {
                 s.record_compaction_bytes(result.file_size);
             }
@@ -552,7 +554,7 @@ impl LeveledCompaction {
         }
 
         edit.set_next_file_number(versions.next_file_number());
-        versions.log_and_apply(edit)?;
+        versions.log_and_apply(edit).c(d!())?;
 
         if let Some(cache) = table_cache {
             for num in &input_file_numbers {

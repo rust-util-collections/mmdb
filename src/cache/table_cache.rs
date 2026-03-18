@@ -7,6 +7,7 @@ use crate::cache::block_cache::BlockCache;
 use crate::error::Result;
 use crate::sst::table_reader::TableReader;
 use crate::stats::DbStats;
+use ruc::*;
 
 /// Cache for open TableReader instances.
 pub struct TableCache {
@@ -47,12 +48,15 @@ impl TableCache {
         }
 
         let path = self.db_path.join(format!("{:06}.sst", file_number));
-        let reader = Arc::new(TableReader::open_with_all(
-            &path,
-            file_number,
-            self.block_cache.clone(),
-            self.stats.clone(),
-        )?);
+        let reader = Arc::new(
+            TableReader::open_with_all(
+                &path,
+                file_number,
+                self.block_cache.clone(),
+                self.stats.clone(),
+            )
+            .c(d!())?,
+        );
         self.inner.insert(file_number, reader.clone());
         Ok(reader)
     }

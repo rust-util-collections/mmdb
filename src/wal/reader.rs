@@ -4,6 +4,8 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use ruc::*;
+
 use crate::error::{Error, Result};
 use crate::wal::record::*;
 
@@ -19,7 +21,7 @@ pub struct WalReader {
 impl WalReader {
     /// Open a WAL file for reading.
     pub fn new(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
+        let file = File::open(path).c(d!())?;
         Ok(Self {
             reader: BufReader::new(file),
             block_offset: 0,
@@ -29,7 +31,7 @@ impl WalReader {
 
     /// Reset to the beginning of the file.
     pub fn reset(&mut self) -> Result<()> {
-        self.reader.seek(SeekFrom::Start(0))?;
+        self.reader.seek(SeekFrom::Start(0)).c(d!())?;
         self.block_offset = 0;
         self.eof = false;
         Ok(())
@@ -56,39 +58,43 @@ impl WalReader {
                 None => {
                     self.eof = true;
                     if in_fragmented_record {
-                        return Err(Error::Corruption("partial record without end".to_string()));
+                        return Err(eg!(Error::Corruption(
+                            "partial record without end".to_string()
+                        )));
                     }
                     return Ok(None);
                 }
                 Some((record_type, data)) => match record_type {
                     RecordType::Full => {
                         if in_fragmented_record {
-                            return Err(Error::Corruption(
+                            return Err(eg!(Error::Corruption(
                                 "full record inside fragment".to_string(),
-                            ));
+                            )));
                         }
                         return Ok(Some(data));
                     }
                     RecordType::First => {
                         if in_fragmented_record {
-                            return Err(Error::Corruption(
+                            return Err(eg!(Error::Corruption(
                                 "first record inside fragment".to_string(),
-                            ));
+                            )));
                         }
                         in_fragmented_record = true;
                         result = data;
                     }
                     RecordType::Middle => {
                         if !in_fragmented_record {
-                            return Err(Error::Corruption(
+                            return Err(eg!(Error::Corruption(
                                 "middle record without first".to_string(),
-                            ));
+                            )));
                         }
                         result.extend_from_slice(&data);
                     }
                     RecordType::Last => {
                         if !in_fragmented_record {
-                            return Err(Error::Corruption("last record without first".to_string()));
+                            return Err(eg!(Error::Corruption(
+                                "last record without first".to_string()
+                            )));
                         }
                         result.extend_from_slice(&data);
                         return Ok(Some(result));
@@ -114,7 +120,7 @@ impl WalReader {
                     match self.reader.read_exact(&mut skip) {
                         Ok(()) => {}
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                        Err(e) => return Err(e.into()),
+                        Err(e) => return Err(eg!(e)),
                     }
                 }
                 self.block_offset = 0;
@@ -126,7 +132,7 @@ impl WalReader {
             match self.reader.read_exact(&mut header_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(eg!(e)),
             }
 
             let (checksum, length, record_type) = decode_header(&header_buf);
@@ -137,9 +143,9 @@ impl WalReader {
             match self.reader.read_exact(&mut data) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Err(Error::Corruption("truncated record data".to_string()));
+                    return Err(eg!(Error::Corruption("truncated record data".to_string())));
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(eg!(e)),
             }
 
             self.block_offset += HEADER_SIZE + length;
@@ -151,10 +157,10 @@ impl WalReader {
             let expected_checksum = hasher.finalize();
 
             if checksum != expected_checksum {
-                return Err(Error::Corruption(format!(
+                return Err(eg!(Error::Corruption(format!(
                     "WAL checksum mismatch: expected {:#x}, got {:#x}",
                     expected_checksum, checksum
-                )));
+                ))));
             }
 
             if record_type == RecordType::Zero && length == 0 {

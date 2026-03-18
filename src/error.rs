@@ -26,4 +26,4 @@ pub enum Error {
     Manifest(String),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = ruc::Result<T>;

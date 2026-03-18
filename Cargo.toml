@@ -1,6 +1,6 @@
 [package]
 name = "mmdb"
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 description = "A modern LSM-Tree storage engine in pure Rust"
 license = "MIT"
@@ -20,6 +20,7 @@ lz4_flex = "0.13"
 zstd = "0.13"
 moka = { version = "0.12", features = ["sync"] }
 parking_lot = "0.12"
+ruc = "9.3.1"
 thiserror = "2"
 tracing = "0.1"
 

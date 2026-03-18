@@ -15,6 +15,7 @@ use crate::sst::format::{
 };
 use crate::stats::DbStats;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType};
+use ruc::*;
 
 /// Parsed index entry: separator key + block handle + optional first key.
 pub struct IndexEntry {
@@ -78,28 +79,28 @@ impl TableReader {
         block_cache: Option<Arc<BlockCache>>,
         stats: Option<Arc<DbStats>>,
     ) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let file_size = file.metadata()?.len();
+        let mut file = File::open(path).c(d!())?;
+        let file_size = file.metadata().c(d!())?.len();
 
         if file_size < FOOTER_SIZE as u64 {
-            return Err(Error::Corruption(format!(
+            return Err(eg!(Error::Corruption(format!(
                 "SST file too small: {} bytes",
                 file_size
-            )));
+            ))));
         }
 
         // Read footer
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))?;
+        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).c(d!())?;
         let mut footer_buf = [0u8; FOOTER_SIZE];
-        file.read_exact(&mut footer_buf)?;
-        let (metaindex_handle, index_handle) = decode_footer(&footer_buf)?;
+        file.read_exact(&mut footer_buf).c(d!())?;
+        let (metaindex_handle, index_handle) = decode_footer(&footer_buf).c(d!())?;
 
         // Read index block
-        let index_data = Self::read_block_data(&mut file, &index_handle)?;
-        let index_block = Block::from_vec(index_data)?;
+        let index_data = Self::read_block_data(&mut file, &index_handle).c(d!())?;
+        let index_block = Block::from_vec(index_data).c(d!())?;
 
         // Read filters from metaindex
-        let filters = Self::read_filters(&mut file, &metaindex_handle)?;
+        let filters = Self::read_filters(&mut file, &metaindex_handle).c(d!())?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -148,14 +149,14 @@ impl TableReader {
         }
 
         // Search index block for the data block that might contain the key
-        let block_handle = match self.find_data_block(key)? {
+        let block_handle = match self.find_data_block(key).c(d!())? {
             Some(h) => h,
             None => return Ok(None),
         };
 
         // Read and search the data block
-        let block_data = self.read_block_cached(&block_handle)?;
-        let block = Block::new(block_data)?;
+        let block_data = self.read_block_cached(&block_handle).c(d!())?;
+        let block = Block::new(block_data).c(d!())?;
 
         match block.seek(key) {
             Some((found_key, value)) if found_key.as_slice() == key => Ok(Some(value)),
@@ -199,8 +200,8 @@ impl TableReader {
             None => return Ok(None),
         };
 
-        let block_data = self.read_block_cached(&handle)?;
-        let block = Block::new(block_data)?;
+        let block_data = self.read_block_cached(&handle).c(d!())?;
+        let block = Block::new(block_data).c(d!())?;
 
         // Seek within the data block. The first entry >= seek_key with matching user_key
         // is our answer (because entries are sorted user_key ASC, seq DESC).
@@ -247,8 +248,8 @@ impl TableReader {
             None => return Ok(None),
         };
 
-        let block_data = self.read_block_cached(&handle)?;
-        let block = Block::new(block_data)?;
+        let block_data = self.read_block_cached(&handle).c(d!())?;
+        let block = Block::new(block_data).c(d!())?;
 
         match block.seek_by(seek_key.as_bytes(), compare_internal_key) {
             Some((encoded_ikey, value)) if encoded_ikey.len() >= 8 => {
@@ -280,8 +281,8 @@ impl TableReader {
 
         for (_, handle_bytes) in self.index_block.iter() {
             let handle = BlockHandle::decode(&handle_bytes);
-            let block_data = self.read_block_cached(&handle)?;
-            let block = Block::new(block_data)?;
+            let block_data = self.read_block_cached(&handle).c(d!())?;
+            let block = Block::new(block_data).c(d!())?;
 
             for (k, v) in block.iter() {
                 if k.len() < 8 {
@@ -312,8 +313,8 @@ impl TableReader {
 
         for (_, handle_bytes) in self.index_block.iter() {
             let handle = BlockHandle::decode(&handle_bytes);
-            let block_data = self.read_block_cached(&handle)?;
-            let block = Block::new(block_data)?;
+            let block_data = self.read_block_cached(&handle).c(d!())?;
+            let block = Block::new(block_data).c(d!())?;
             for entry in block.iter() {
                 result.push(entry);
             }
@@ -334,16 +335,17 @@ impl TableReader {
     }
 
     fn read_block_data(file: &mut File, handle: &BlockHandle) -> Result<Vec<u8>> {
-        file.seek(SeekFrom::Start(handle.offset))?;
+        file.seek(SeekFrom::Start(handle.offset)).c(d!())?;
         let mut data = vec![0u8; handle.size as usize];
-        file.read_exact(&mut data)?;
+        file.read_exact(&mut data).c(d!())?;
 
         // Read and verify trailer
         let mut trailer = [0u8; BLOCK_TRAILER_SIZE];
-        file.read_exact(&mut trailer)?;
+        file.read_exact(&mut trailer).c(d!())?;
 
         let compression_type = CompressionType::from_u8(trailer[0])
-            .ok_or_else(|| Error::Corruption("unknown compression type".to_string()))?;
+            .ok_or_else(|| Error::Corruption("unknown compression type".to_string()))
+            .c(d!())?;
 
         let stored_crc = u32::from_le_bytes(trailer[1..5].try_into().unwrap());
         let mut hasher = crc32fast::Hasher::new();
@@ -352,18 +354,20 @@ impl TableReader {
         let computed_crc = hasher.finalize();
 
         if stored_crc != computed_crc {
-            return Err(Error::Corruption(format!(
+            return Err(eg!(Error::Corruption(format!(
                 "block CRC mismatch: stored {:#x}, computed {:#x}",
                 stored_crc, computed_crc
-            )));
+            ))));
         }
 
         // Decompress if needed
         let data = match compression_type {
             CompressionType::Lz4 => lz4_flex::decompress_size_prepended(&data)
-                .map_err(|e| Error::Corruption(format!("LZ4 decompression error: {}", e)))?,
+                .map_err(|e| Error::Corruption(format!("LZ4 decompression error: {}", e)))
+                .c(d!())?,
             CompressionType::Zstd => zstd::stream::decode_all(data.as_slice())
-                .map_err(|e| Error::Corruption(format!("Zstd decompression error: {}", e)))?,
+                .map_err(|e| Error::Corruption(format!("Zstd decompression error: {}", e)))
+                .c(d!())?,
             CompressionType::None => data,
         };
 
@@ -378,8 +382,8 @@ impl TableReader {
             });
         }
 
-        let metaindex_data = Self::read_block_data(file, metaindex_handle)?;
-        let metaindex = Block::from_vec(metaindex_data)?;
+        let metaindex_data = Self::read_block_data(file, metaindex_handle).c(d!())?;
+        let metaindex = Block::from_vec(metaindex_data).c(d!())?;
 
         let mut bloom = None;
         let mut prefix = None;
@@ -387,10 +391,10 @@ impl TableReader {
         for (key, value) in metaindex.iter() {
             if key == b"filter.bloom" {
                 let handle = BlockHandle::decode(&value);
-                bloom = Some(Self::read_block_data(file, &handle)?);
+                bloom = Some(Self::read_block_data(file, &handle).c(d!())?);
             } else if key == b"filter.prefix" {
                 let handle = BlockHandle::decode(&value);
-                prefix = Some(Self::read_block_data(file, &handle)?);
+                prefix = Some(Self::read_block_data(file, &handle).c(d!())?);
             }
         }
 
@@ -436,8 +440,8 @@ impl TableReader {
             s.record_cache_miss();
         }
 
-        let mut file = self.open_file()?;
-        let data = Self::read_block_data(&mut file, handle)?;
+        let mut file = self.open_file().c(d!())?;
+        let data = Self::read_block_data(&mut file, handle).c(d!())?;
 
         if let Some(ref cache) = self.block_cache {
             return Ok(cache.insert(self.file_number, handle.offset, data));
@@ -490,7 +494,7 @@ impl TableReader {
     fn open_file(&self) -> Result<MutexGuard<'_, File>> {
         self.file
             .lock()
-            .map_err(|_| Error::Corruption("file mutex poisoned".to_string()))
+            .map_err(|_| eg!(Error::Corruption("file mutex poisoned".to_string())))
     }
 }
 

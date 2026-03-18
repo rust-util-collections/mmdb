@@ -30,6 +30,7 @@ use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
 use crate::types::{self, SequenceNumber, ValueType, WriteBatch};
 use crate::wal::{WalReader, WalWriter};
+use ruc::*;
 
 /// A pending write request for group commit.
 struct WriteRequest {
@@ -81,21 +82,21 @@ impl DB {
         let path = path.as_ref().to_path_buf();
 
         if options.create_if_missing {
-            std::fs::create_dir_all(&path)?;
+            std::fs::create_dir_all(&path).c(d!())?;
         } else if !path.exists() {
-            return Err(Error::InvalidArgument(format!(
+            return Err(eg!(Error::InvalidArgument(format!(
                 "DB path does not exist: {}",
                 path.display()
-            )));
+            ))));
         }
 
         if options.error_if_exists {
             let current = path.join("CURRENT");
             if current.exists() {
-                return Err(Error::InvalidArgument(format!(
+                return Err(eg!(Error::InvalidArgument(format!(
                     "DB already exists: {}",
                     path.display()
-                )));
+                ))));
             }
         }
 
@@ -112,14 +113,15 @@ impl DB {
 
         // Open or create VersionSet (handles MANIFEST)
         let mut versions =
-            VersionSet::open_with_cache(&path, options.num_levels, Some(table_cache.clone()))?;
+            VersionSet::open_with_cache(&path, options.num_levels, Some(table_cache.clone()))
+                .c(d!())?;
         let mut max_sequence = versions.last_sequence();
 
         // Recover from any WAL files not yet flushed
         let mut active_memtable = Arc::new(MemTable::new());
         let mut wal_numbers: Vec<u64> = Vec::new();
-        for entry in std::fs::read_dir(&path)? {
-            let entry = entry?;
+        for entry in std::fs::read_dir(&path).c(d!())? {
+            let entry = entry.c(d!())?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if let Some(num_str) = name.strip_suffix(".wal")
@@ -164,11 +166,11 @@ impl DB {
                 compression: options.compression,
                 prefix_len: options.prefix_len,
             };
-            let mut builder = TableBuilder::new(&sst_path, build_opts)?;
+            let mut builder = TableBuilder::new(&sst_path, build_opts).c(d!())?;
             for (key, value) in active_memtable.iter() {
-                builder.add(&key, &value)?;
+                builder.add(&key, &value).c(d!())?;
             }
-            let build_result = builder.finish()?;
+            let build_result = builder.finish().c(d!())?;
 
             let mut edit = VersionEdit::new();
             edit.set_last_sequence(max_sequence);
@@ -183,7 +185,7 @@ impl DB {
                     has_range_deletions: build_result.has_range_deletions,
                 },
             );
-            versions.log_and_apply(edit)?;
+            versions.log_and_apply(edit).c(d!())?;
 
             // Reset the memtable — data is now safely in SST
             active_memtable = Arc::new(MemTable::new());
@@ -192,7 +194,7 @@ impl DB {
         // Create a fresh WAL
         let wal_number = versions.new_file_number();
         let wal_path = path.join(format!("{:06}.wal", wal_number));
-        let wal_writer = WalWriter::new(&wal_path)?;
+        let wal_writer = WalWriter::new(&wal_path).c(d!())?;
 
         // Safe to clean up old WAL files now — data is in SST
         for wal_num in &wal_numbers {
@@ -206,7 +208,7 @@ impl DB {
             edit.set_log_number(wal_number);
             edit.set_next_file_number(versions.next_file_number());
             edit.set_last_sequence(max_sequence);
-            versions.log_and_apply(edit)?;
+            versions.log_and_apply(edit).c(d!())?;
         }
 
         let sequence_start = max_sequence + 1;
@@ -320,14 +322,14 @@ impl DB {
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.put(key, value);
         self.write_batch_inner(batch, write_options)
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.delete(key);
         self.write_batch_inner(batch, &WriteOptions::default())
@@ -335,14 +337,14 @@ impl DB {
 
     /// Delete all keys in the range [begin, end).
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.delete_range(begin, end);
         self.write_batch_inner(batch, &WriteOptions::default())
     }
 
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -350,7 +352,9 @@ impl DB {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let result = self.get_with_options(&ReadOptions::default(), key)?;
+        let result = self
+            .get_with_options(&ReadOptions::default(), key)
+            .c(d!())?;
         if let Some(ref v) = result {
             self.stats.record_read(key.len() as u64 + v.len() as u64);
         }
@@ -358,7 +362,7 @@ impl DB {
     }
 
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
 
         let seq = match options.snapshot {
             Some(s) => s,
@@ -408,10 +412,10 @@ impl DB {
         // Check range tombstones in each file and accumulate max_tomb_seq.
         for tf in version.level_files(0) {
             if tf.meta.has_range_deletions {
-                let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq)?;
+                let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq).c(d!())?;
                 max_tomb_seq = max_tomb_seq.max(file_tomb_seq);
             }
-            if let Some((result, entry_seq)) = tf.reader.get_internal_with_seq(key, seq)? {
+            if let Some((result, entry_seq)) = tf.reader.get_internal_with_seq(key, seq).c(d!())? {
                 if max_tomb_seq > entry_seq {
                     return Ok(None);
                 }
@@ -430,7 +434,7 @@ impl DB {
             // Tombstones can span beyond their containing file's key range.
             for tf in files {
                 if tf.meta.has_range_deletions {
-                    let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq)?;
+                    let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq).c(d!())?;
                     max_tomb_seq = max_tomb_seq.max(file_tomb_seq);
                 }
             }
@@ -459,7 +463,8 @@ impl DB {
                 lk.as_slice()
             };
             if key <= file_largest
-                && let Some((result, entry_seq)) = tf.reader.get_internal_with_seq(key, seq)?
+                && let Some((result, entry_seq)) =
+                    tf.reader.get_internal_with_seq(key, seq).c(d!())?
             {
                 if max_tomb_seq > entry_seq {
                     return Ok(None);
@@ -498,7 +503,7 @@ impl DB {
         start_hint: Option<&[u8]>,
         end_hint: Option<&[u8]>,
     ) -> Result<DBIterator> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
 
         let seq = match options.snapshot {
             Some(s) => s,
@@ -564,7 +569,7 @@ impl DB {
     /// Uses prefix bloom filters to skip SST files that don't contain the prefix,
     /// and stops iteration as soon as the prefix boundary is crossed.
     pub fn iter_with_prefix(&self, prefix: &[u8]) -> Result<DBIterator> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
 
         let seq = self.current_sequence();
 
@@ -654,7 +659,7 @@ impl DB {
     /// Materializes entries at creation time. Supports `DoubleEndedIterator`
     /// for both forward and reverse traversal.
     pub fn iter_bidi(&self) -> Result<BidiIterator> {
-        let entries: Vec<_> = self.iter()?.collect();
+        let entries: Vec<_> = self.iter().c(d!())?.collect();
         Ok(BidiIterator::new(entries))
     }
 
@@ -662,7 +667,8 @@ impl DB {
     pub fn prefix_iterator(&self, prefix: &[u8]) -> Result<BidiIterator> {
         let prefix = prefix.to_vec();
         let entries: Vec<_> = self
-            .iter()?
+            .iter()
+            .c(d!())?
             .filter(|(k, _)| k.starts_with(&prefix))
             .collect();
         Ok(BidiIterator::new(entries))
@@ -672,7 +678,11 @@ impl DB {
     ///
     /// Supports `Included`, `Excluded`, and `Unbounded` bounds.
     pub fn range<R: RangeBounds<Vec<u8>>>(&self, bounds: R) -> Result<BidiIterator> {
-        let entries: Vec<_> = self.iter()?.filter(|(k, _)| bounds.contains(k)).collect();
+        let entries: Vec<_> = self
+            .iter()
+            .c(d!())?
+            .filter(|(k, _)| bounds.contains(k))
+            .collect();
         Ok(BidiIterator::new(entries))
     }
 
@@ -779,21 +789,21 @@ impl DB {
 
     /// Force flush the active MemTable to SST.
     pub fn flush(&self) -> Result<()> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
         let _wg = self.write_queue.lock(); // serialize with writers
         let mut inner = self.inner.lock();
         if inner.active_memtable.is_empty() {
             return Ok(());
         }
-        self.freeze_and_flush(&mut inner)?;
-        self.maybe_compact(&mut inner)?;
+        self.freeze_and_flush(&mut inner).c(d!())?;
+        self.maybe_compact(&mut inner).c(d!())?;
         Ok(())
     }
 
     /// Run compaction if needed (L0 → L1 or Ln → Ln+1).
     /// Runs inline while holding locks for deterministic behavior.
     pub fn compact(&self) -> Result<()> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
         let _wg = self.write_queue.lock();
         let mut inner = self.inner.lock();
         self.do_compaction(&mut inner)
@@ -802,14 +812,14 @@ impl DB {
     /// Compact all keys in the given range across all levels.
     /// If `begin` is None, starts from the beginning. If `end` is None, goes to the end.
     pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
-        self.check_closed()?;
+        self.check_closed().c(d!())?;
 
         // First flush memtable to ensure all data is in SSTs
         {
             let _wg = self.write_queue.lock();
             let mut inner = self.inner.lock();
             if !inner.active_memtable.is_empty() {
-                self.freeze_and_flush(&mut inner)?;
+                self.freeze_and_flush(&mut inner).c(d!())?;
             }
         }
 
@@ -843,7 +853,8 @@ impl DB {
                         Some(&self.table_cache),
                         Some(&self.rate_limiter),
                         Some(&self.stats),
-                    )?;
+                    )
+                    .c(d!())?;
                     for num in &l0_inputs {
                         self.block_cache.unpin_file(*num);
                     }
@@ -867,7 +878,7 @@ impl DB {
         let _wg = self.write_queue.lock();
         let mut inner = self.inner.lock();
 
-        let mut first_error: Option<Error> = None;
+        let mut first_error: Option<Box<dyn ruc::err::RucError>> = None;
 
         if !inner.active_memtable.is_empty()
             && let Err(e) = self.freeze_and_flush(&mut inner)
@@ -946,7 +957,7 @@ impl DB {
 
     fn check_closed(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(Error::DbClosed);
+            return Err(eg!(Error::DbClosed));
         }
         Ok(())
     }
@@ -985,9 +996,9 @@ impl DB {
                 inner.versions.current().l0_file_count()
             };
             if l0_count >= self.options.l0_slowdown_trigger {
-                return Err(Error::InvalidArgument(
+                return Err(eg!(Error::InvalidArgument(
                     "write stalled: no_slowdown is set".to_string(),
-                ));
+                )));
             }
         } else {
             self.maybe_throttle_writes();
@@ -1064,11 +1075,11 @@ impl DB {
             let _queue = self.write_queue.lock();
             for &rp in &batch_group {
                 let rr = unsafe { &mut *rp };
-                rr.result = Some(Err(Error::Io(std::io::Error::other(format!("{}", e)))));
+                rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
                 rr.done = true;
             }
             self.write_cv.notify_all();
-            return Err(Error::Io(std::io::Error::other(format!("{}", e))));
+            return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
         }
 
         // Single fsync for all batches that wrote to WAL
@@ -1091,11 +1102,11 @@ impl DB {
             let _queue = self.write_queue.lock();
             for &req_ptr in &batch_group[1..] {
                 let r = unsafe { &mut *req_ptr };
-                r.result = Some(Err(Error::Io(std::io::Error::other(format!("{}", e)))));
+                r.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
                 r.done = true;
             }
             self.write_cv.notify_all();
-            return Err(Error::Io(std::io::Error::other(format!("{}", e))));
+            return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
         }
 
         // Check memtable size threshold — data is already in WAL so a flush
@@ -1136,7 +1147,7 @@ impl DB {
         // New WAL
         let new_wal_number = inner.versions.new_file_number();
         let new_wal_path = self.path.join(format!("{:06}.wal", new_wal_number));
-        let new_wal = WalWriter::new(&new_wal_path)?;
+        let new_wal = WalWriter::new(&new_wal_path).c(d!())?;
         let old_wal_number = inner.wal_number;
         inner.wal_writer = Some(new_wal);
         inner.wal_number = new_wal_number;
@@ -1146,7 +1157,7 @@ impl DB {
         let sst_path = self.path.join(format!("{:06}.sst", sst_number));
 
         // Flush memtable → SST
-        let build_result = self.write_memtable_to_sst(&old_mem, &sst_path)?;
+        let build_result = self.write_memtable_to_sst(&old_mem, &sst_path).c(d!())?;
 
         // Record in MANIFEST
         let mut edit = VersionEdit::new();
@@ -1163,7 +1174,7 @@ impl DB {
                 has_range_deletions: build_result.has_range_deletions,
             },
         );
-        inner.versions.log_and_apply(edit)?;
+        inner.versions.log_and_apply(edit).c(d!())?;
         self.stats.record_flush();
 
         // Pin new L0 file's index in cache for fast iterator creation
@@ -1187,7 +1198,7 @@ impl DB {
     fn maybe_compact(&self, inner: &mut DBInner) -> Result<()> {
         let version = inner.versions.current();
         if version.l0_file_count() >= self.options.l0_compaction_trigger {
-            self.do_compaction(inner)?;
+            self.do_compaction(inner).c(d!())?;
         }
         Ok(())
     }
@@ -1219,7 +1230,8 @@ impl DB {
                         Some(&self.table_cache),
                         Some(&self.rate_limiter),
                         Some(&self.stats),
-                    )?;
+                    )
+                    .c(d!())?;
                     // Unpin L0 files from block cache after compaction
                     for num in &l0_inputs {
                         self.block_cache.unpin_file(*num);
@@ -1240,7 +1252,8 @@ impl DB {
                 Some(&self.table_cache),
                 Some(&self.rate_limiter),
                 Some(&self.stats),
-            )?;
+            )
+            .c(d!())?;
         }
         Ok(())
     }
@@ -1348,9 +1361,9 @@ impl DB {
             prefix_len: self.options.prefix_len,
         };
 
-        let mut builder = TableBuilder::new(path, opts)?;
+        let mut builder = TableBuilder::new(path, opts).c(d!())?;
         for (key, value) in mem.iter() {
-            builder.add(&key, &value)?;
+            builder.add(&key, &value).c(d!())?;
         }
         builder.finish()
     }

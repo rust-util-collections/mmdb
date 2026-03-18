@@ -20,6 +20,8 @@
 
 use std::sync::Arc;
 
+use ruc::*;
+
 use crate::error::{Error, Result};
 
 /// Decode a varint from the given buffer. Returns (value, bytes_consumed).
@@ -28,7 +30,7 @@ pub fn decode_varint(data: &[u8]) -> Result<(u32, usize)> {
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
         if i >= 5 {
-            return Err(Error::Corruption("varint too long".to_string()));
+            return Err(eg!(Error::Corruption("varint too long".to_string())));
         }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
@@ -36,7 +38,7 @@ pub fn decode_varint(data: &[u8]) -> Result<(u32, usize)> {
         }
         shift += 7;
     }
-    Err(Error::Corruption("unterminated varint".to_string()))
+    Err(eg!(Error::Corruption("unterminated varint".to_string())))
 }
 
 /// Encode a u32 as a varint, return bytes written.
@@ -69,12 +71,12 @@ impl Block {
     /// Parse a data block from shared (Arc) raw bytes — zero-copy from block cache.
     pub fn new(data: Arc<Vec<u8>>) -> Result<Self> {
         if data.len() < 4 {
-            return Err(Error::Corruption("block too short".to_string()));
+            return Err(eg!(Error::Corruption("block too short".to_string())));
         }
         let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
         let restarts_size = (num_restarts as usize) * 4 + 4; // restart array + count
         if restarts_size > data.len() {
-            return Err(Error::Corruption("bad restart count".to_string()));
+            return Err(eg!(Error::Corruption("bad restart count".to_string())));
         }
         let restart_offset = data.len() - restarts_size;
 

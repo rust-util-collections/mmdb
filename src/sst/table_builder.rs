@@ -17,6 +17,7 @@ use crate::error::Result;
 use crate::sst::block_builder::BlockBuilder;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::*;
+use ruc::*;
 
 /// Options for building an SST table.
 #[derive(Clone)]
@@ -82,7 +83,7 @@ pub struct TableBuilder {
 impl TableBuilder {
     /// Create a new table builder writing to the given path.
     pub fn new(path: &Path, options: TableBuildOptions) -> Result<Self> {
-        let file = File::create(path)?;
+        let file = File::create(path).c(d!())?;
         Ok(Self {
             writer: BufWriter::new(file),
             data_block: BlockBuilder::new(options.block_restart_interval),
@@ -149,7 +150,7 @@ impl TableBuilder {
         if self.data_block.estimated_size() >= self.options.block_size
             && !self.data_block.is_empty()
         {
-            self.flush_data_block()?;
+            self.flush_data_block().c(d!())?;
         }
 
         // Record first key of a new data block
@@ -168,28 +169,30 @@ impl TableBuilder {
     pub fn finish(mut self) -> Result<TableBuildResult> {
         // Flush remaining data block
         if !self.data_block.is_empty() {
-            self.flush_data_block()?;
+            self.flush_data_block().c(d!())?;
         }
 
         // Write meta block (bloom filter)
-        let filter_handle = self.write_filter_block()?;
+        let filter_handle = self.write_filter_block().c(d!())?;
 
         // Write prefix filter block
-        let prefix_filter_handle = self.write_prefix_filter_block()?;
+        let prefix_filter_handle = self.write_prefix_filter_block().c(d!())?;
 
         // Write meta index block
-        let metaindex_handle = self.write_metaindex_block(&filter_handle, &prefix_filter_handle)?;
+        let metaindex_handle = self
+            .write_metaindex_block(&filter_handle, &prefix_filter_handle)
+            .c(d!())?;
 
         // Write index block
-        let index_handle = self.write_index_block()?;
+        let index_handle = self.write_index_block().c(d!())?;
 
         // Write footer
         let footer = encode_footer(&metaindex_handle, &index_handle);
-        self.writer.write_all(&footer)?;
+        self.writer.write_all(&footer).c(d!())?;
         self.offset += FOOTER_SIZE as u64;
 
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer.flush().c(d!())?;
+        self.writer.get_ref().sync_all().c(d!())?;
         self.finished = true;
 
         Ok(TableBuildResult {
@@ -212,7 +215,7 @@ impl TableBuilder {
         );
         let block_data = builder.finish();
 
-        let handle = self.write_raw_block(&block_data)?;
+        let handle = self.write_raw_block(&block_data).c(d!())?;
         self.index_entries.push((last_key, handle, first_key));
 
         Ok(())
@@ -242,7 +245,7 @@ impl TableBuilder {
 
         let handle = BlockHandle::new(self.offset, block_data.len() as u64);
 
-        self.writer.write_all(&block_data)?;
+        self.writer.write_all(&block_data).c(d!())?;
 
         // Write block trailer: compression_type(1) + crc32(4)
         let mut hasher = crc32fast::Hasher::new();
@@ -250,8 +253,8 @@ impl TableBuilder {
         hasher.update(&[compression_type as u8]);
         let crc = hasher.finalize();
 
-        self.writer.write_all(&[compression_type as u8])?;
-        self.writer.write_all(&crc.to_le_bytes())?;
+        self.writer.write_all(&[compression_type as u8]).c(d!())?;
+        self.writer.write_all(&crc.to_le_bytes()).c(d!())?;
 
         self.offset += block_data.len() as u64 + BLOCK_TRAILER_SIZE as u64;
 
@@ -268,7 +271,7 @@ impl TableBuilder {
         let key_refs: Vec<&[u8]> = self.filter_keys.iter().map(|k| k.as_slice()).collect();
         let filter_data = bf.create_filter(&key_refs);
 
-        self.write_raw_block(&filter_data)
+        self.write_raw_block(&filter_data).c(d!())
     }
 
     fn write_prefix_filter_block(&mut self) -> Result<BlockHandle> {
@@ -285,7 +288,7 @@ impl TableBuilder {
         let bf = BloomFilter::new(self.options.bloom_bits_per_key);
         let filter_data = bf.create_filter(&prefixes);
 
-        self.write_raw_block(&filter_data)
+        self.write_raw_block(&filter_data).c(d!())
     }
 
     fn write_metaindex_block(
@@ -306,7 +309,7 @@ impl TableBuilder {
         }
 
         let data = builder.finish();
-        self.write_raw_block(&data)
+        self.write_raw_block(&data).c(d!())
     }
 
     fn write_index_block(&mut self) -> Result<BlockHandle> {
@@ -318,7 +321,7 @@ impl TableBuilder {
         }
 
         let data = builder.finish();
-        self.write_raw_block(&data)
+        self.write_raw_block(&data).c(d!())
     }
 }
 

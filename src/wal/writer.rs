@@ -4,6 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use ruc::*;
+
 use crate::error::Result;
 use crate::wal::record::*;
 
@@ -21,7 +23,8 @@ impl WalWriter {
             .create(true)
             .truncate(true)
             .write(true)
-            .open(path)?;
+            .open(path)
+            .c(d!())?;
         Ok(Self {
             writer: BufWriter::new(file),
             block_offset: 0,
@@ -30,8 +33,12 @@ impl WalWriter {
 
     /// Append an existing WAL file (for recovery writing).
     pub fn open_append(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let len = file.metadata()?.len() as usize;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .c(d!())?;
+        let len = file.metadata().c(d!())?.len() as usize;
         let block_offset = len % BLOCK_SIZE;
         Ok(Self {
             writer: BufWriter::new(file),
@@ -53,7 +60,7 @@ impl WalWriter {
                 // Not enough space for a header, fill remainder with zeros
                 if leftover > 0 {
                     let zeros = vec![0u8; leftover];
-                    self.writer.write_all(&zeros)?;
+                    self.writer.write_all(&zeros).c(d!())?;
                 }
                 self.block_offset = 0;
                 continue;
@@ -86,14 +93,14 @@ impl WalWriter {
 
     /// Flush and fsync the WAL file.
     pub fn sync(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer.flush().c(d!())?;
+        self.writer.get_ref().sync_all().c(d!())?;
         Ok(())
     }
 
     /// Flush the WAL buffer (without fsync).
     pub fn flush(&mut self) -> Result<()> {
-        self.writer.flush()?;
+        self.writer.flush().c(d!())?;
         Ok(())
     }
 
@@ -108,8 +115,8 @@ impl WalWriter {
         let mut header = [0u8; HEADER_SIZE];
         encode_header(&mut header, checksum, length, record_type);
 
-        self.writer.write_all(&header)?;
-        self.writer.write_all(data)?;
+        self.writer.write_all(&header).c(d!())?;
+        self.writer.write_all(data).c(d!())?;
         self.block_offset += HEADER_SIZE + data.len();
 
         Ok(())

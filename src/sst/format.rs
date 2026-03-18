@@ -10,6 +10,8 @@
 //! └───────────────────────────────┘
 //! ```
 
+use ruc::*;
+
 /// Magic number identifying MMDB SST files.
 pub const TABLE_MAGIC: u64 = 0x4D4D_4442_5353_5400; // "MMDBSST\0"
 
@@ -93,10 +95,10 @@ pub fn encode_footer(
 pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> crate::error::Result<(BlockHandle, BlockHandle)> {
     let magic = u64::from_le_bytes(data[40..48].try_into().unwrap());
     if magic != TABLE_MAGIC {
-        return Err(crate::error::Error::Corruption(format!(
+        return Err(eg!(crate::error::Error::Corruption(format!(
             "invalid SST magic: {:#x}",
             magic
-        )));
+        ))));
     }
     let metaindex_handle = BlockHandle::decode(&data[0..16]);
     let index_handle = BlockHandle::decode(&data[16..32]);

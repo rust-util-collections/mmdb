@@ -9,6 +9,7 @@ use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::VersionEdit;
 use crate::types::{SequenceNumber, compare_internal_key};
 use crate::wal::{WalReader, WalWriter};
+use ruc::*;
 
 /// Manages the MANIFEST file and the current Version.
 pub struct VersionSet {
@@ -48,10 +49,10 @@ impl VersionSet {
     ) -> Result<Self> {
         let manifest_number = 1;
         let manifest_path = db_path.join(format!("MANIFEST-{:06}", manifest_number));
-        let manifest_writer = WalWriter::new(&manifest_path)?;
+        let manifest_writer = WalWriter::new(&manifest_path).c(d!())?;
 
         // Write CURRENT file
-        Self::set_current_file(db_path, manifest_number)?;
+        Self::set_current_file(db_path, manifest_number).c(d!())?;
 
         let mut vs = Self {
             db_path: db_path.to_path_buf(),
@@ -70,7 +71,7 @@ impl VersionSet {
         let mut edit = VersionEdit::new();
         edit.set_next_file_number(vs.next_file_number);
         edit.set_last_sequence(vs.last_sequence);
-        vs.log_and_apply(edit)?;
+        vs.log_and_apply(edit).c(d!())?;
 
         Ok(vs)
     }
@@ -89,7 +90,8 @@ impl VersionSet {
         // Read CURRENT to find manifest file
         let current_path = db_path.join("CURRENT");
         let manifest_name = std::fs::read_to_string(&current_path)
-            .map_err(|e| Error::Corruption(format!("cannot read CURRENT: {}", e)))?;
+            .map_err(|e| eg!(Error::Corruption(format!("cannot read CURRENT: {}", e))))
+            .c(d!())?;
         let manifest_name = manifest_name.trim();
         let manifest_path = db_path.join(manifest_name);
 
@@ -100,15 +102,15 @@ impl VersionSet {
             .unwrap_or(1);
 
         // Replay MANIFEST records
-        let mut reader = WalReader::new(&manifest_path)?;
+        let mut reader = WalReader::new(&manifest_path).c(d!())?;
         let mut version = Version::new(num_levels);
         let mut next_file_number = 2u64;
         let mut log_number = 0u64;
         let mut last_sequence = 0u64;
 
         for record in reader.iter() {
-            let data = record?;
-            let edit = VersionEdit::decode(&data)?;
+            let data = record.c(d!())?;
+            let edit = VersionEdit::decode(&data).c(d!())?;
 
             if let Some(n) = edit.next_file_number {
                 next_file_number = n;
@@ -161,7 +163,7 @@ impl VersionSet {
         version.files[0].sort_by(|a, b| b.meta.number.cmp(&a.meta.number));
 
         // Reopen manifest for appending
-        let manifest_writer = WalWriter::open_append(&manifest_path)?;
+        let manifest_writer = WalWriter::open_append(&manifest_path).c(d!())?;
 
         Ok(Self {
             db_path: db_path.to_path_buf(),
@@ -201,8 +203,8 @@ impl VersionSet {
         // Write edit to MANIFEST
         let encoded = edit.encode();
         if let Some(ref mut writer) = self.manifest_writer {
-            writer.add_record(&encoded)?;
-            writer.sync()?;
+            writer.add_record(&encoded).c(d!())?;
+            writer.sync().c(d!())?;
         }
 
         // Update bookkeeping
@@ -268,7 +270,7 @@ impl VersionSet {
         self.edits_since_snapshot += 1;
 
         // Check if MANIFEST needs compaction
-        self.maybe_compact_manifest()?;
+        self.maybe_compact_manifest().c(d!())?;
 
         Ok(())
     }
@@ -324,15 +326,15 @@ impl VersionSet {
         let new_manifest_path = self
             .db_path
             .join(format!("MANIFEST-{:06}", new_manifest_number));
-        let mut new_writer = WalWriter::new(&new_manifest_path)?;
+        let mut new_writer = WalWriter::new(&new_manifest_path).c(d!())?;
 
         // Write the snapshot edit
         let encoded = snapshot_edit.encode();
-        new_writer.add_record(&encoded)?;
-        new_writer.sync()?;
+        new_writer.add_record(&encoded).c(d!())?;
+        new_writer.sync().c(d!())?;
 
         // Update CURRENT to point to new manifest
-        Self::set_current_file(&self.db_path, new_manifest_number)?;
+        Self::set_current_file(&self.db_path, new_manifest_number).c(d!())?;
 
         // Delete old manifest
         let old_manifest_path = self
@@ -350,8 +352,8 @@ impl VersionSet {
     fn set_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {
         let contents = format!("MANIFEST-{:06}\n", manifest_number);
         let tmp_path = db_path.join("CURRENT.tmp");
-        std::fs::write(&tmp_path, &contents)?;
-        std::fs::rename(&tmp_path, db_path.join("CURRENT"))?;
+        std::fs::write(&tmp_path, &contents).c(d!())?;
+        std::fs::rename(&tmp_path, db_path.join("CURRENT")).c(d!())?;
         Ok(())
     }
 }
