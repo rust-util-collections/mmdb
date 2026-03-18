@@ -380,6 +380,7 @@ mod tests {
                     file_size: 4096,
                     smallest_key: b"aaa".to_vec(),
                     largest_key: b"zzz".to_vec(),
+                    has_range_deletions: false,
                 },
             );
             // We need to create the SST file for the reader to open.

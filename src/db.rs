@@ -24,8 +24,10 @@ use crate::manifest::version_set::VersionSet;
 use crate::memtable::MemTable;
 use crate::memtable::skiplist::MemTableCursorIter;
 use crate::options::{DbOptions, ReadOptions, WriteOptions};
+use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
+use crate::stats::DbStats;
 use crate::types::{self, SequenceNumber, ValueType, WriteBatch};
 use crate::wal::{WalReader, WalWriter};
 
@@ -51,6 +53,8 @@ pub struct DB {
     closed: AtomicBool,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
+    rate_limiter: Arc<RateLimiter>,
+    stats: Arc<DbStats>,
     /// Shutdown flag for compaction threads.
     compaction_shutdown: Arc<AtomicBool>,
     /// Notification condvar for compaction threads: (has_work, condvar).
@@ -95,12 +99,15 @@ impl DB {
             }
         }
 
-        // Create caches
+        // Create caches and infra
         let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity));
-        let table_cache = Arc::new(TableCache::new(
+        let rate_limiter = Arc::new(RateLimiter::new(options.rate_limiter_bytes_per_sec));
+        let stats = Arc::new(DbStats::new());
+        let table_cache = Arc::new(TableCache::new_with_stats(
             &path,
             options.max_open_files,
             Some(block_cache.clone()),
+            Some(stats.clone()),
         ));
 
         // Open or create VersionSet (handles MANIFEST)
@@ -173,6 +180,7 @@ impl DB {
                     file_size: build_result.file_size,
                     smallest_key: build_result.smallest_key.unwrap_or_default(),
                     largest_key: build_result.largest_key.unwrap_or_default(),
+                    has_range_deletions: build_result.has_range_deletions,
                 },
             );
             versions.log_and_apply(edit)?;
@@ -222,6 +230,9 @@ impl DB {
             let bg_path = path.clone();
             let bg_options = options.clone();
             let bg_table_cache = table_cache.clone();
+            let bg_block_cache = block_cache.clone();
+            let bg_rate_limiter = rate_limiter.clone();
+            let bg_stats = stats.clone();
             let shutdown = compaction_shutdown.clone();
             let notify = compaction_notify.clone();
 
@@ -247,13 +258,28 @@ impl DB {
                             let version = inner.versions.current();
                             match LeveledCompaction::pick_compaction(&version, &bg_options) {
                                 Some(task) => {
+                                    // Collect L0 input file numbers for cache unpinning
+                                    let l0_inputs: Vec<u64> = if task.level == 0 {
+                                        task.input_files_level
+                                            .iter()
+                                            .map(|f| f.meta.number)
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    };
                                     let _ = LeveledCompaction::execute_compaction_with_cache(
                                         &task,
                                         &mut inner.versions,
                                         &bg_path,
                                         &bg_options,
                                         Some(&bg_table_cache),
+                                        Some(&bg_rate_limiter),
+                                        Some(&bg_stats),
                                     );
+                                    // Unpin L0 files from block cache after compaction
+                                    for num in &l0_inputs {
+                                        bg_block_cache.unpin_file(*num);
+                                    }
                                 }
                                 None => break,
                             }
@@ -274,6 +300,8 @@ impl DB {
             closed: AtomicBool::new(false),
             block_cache,
             table_cache,
+            rate_limiter,
+            stats,
             compaction_shutdown,
             compaction_notify,
             compaction_handles: Mutex::new(compaction_handles),
@@ -322,7 +350,11 @@ impl DB {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.get_with_options(&ReadOptions::default(), key)
+        let result = self.get_with_options(&ReadOptions::default(), key)?;
+        if let Some(ref v) = result {
+            self.stats.record_read(key.len() as u64 + v.len() as u64);
+        }
+        Ok(result)
     }
 
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -345,12 +377,12 @@ impl DB {
 
         // Find the highest-seq range tombstone covering this key (across all memtables).
         // This is needed to compare against any point entry we find.
-        let tombstone_seq = self.max_covering_tombstone_seq(key, seq, &active_mem, &imm_mems);
+        let mut max_tomb_seq = self.max_covering_tombstone_seq(key, seq, &active_mem, &imm_mems);
 
         // 1. Active MemTable
         if let Some((result, entry_seq)) = active_mem.get_with_seq(key, seq) {
             // If a range tombstone with higher seq exists, it deletes this entry
-            if tombstone_seq > entry_seq {
+            if max_tomb_seq > entry_seq {
                 return Ok(None);
             }
             return Ok(result);
@@ -359,7 +391,7 @@ impl DB {
         // 2. Immutable MemTables (newest first)
         for imm in &imm_mems {
             if let Some((result, entry_seq)) = imm.get_with_seq(key, seq) {
-                if tombstone_seq > entry_seq {
+                if max_tomb_seq > entry_seq {
                     return Ok(None);
                 }
                 return Ok(result);
@@ -368,16 +400,21 @@ impl DB {
 
         // 3. If no point entry in memtables but a tombstone covers the key,
         // the key is deleted (tombstone covers entries in older SSTs too).
-        if tombstone_seq > 0 {
+        if max_tomb_seq > 0 {
             return Ok(None);
         }
 
         // 4. L0 SST files (newest first, may overlap)
-        // TODO: SST-level range tombstone checking requires scanning SST tombstones.
-        // Currently range tombstones in SSTs are handled by the iterator/compaction paths.
-        // Point get from SSTs does not yet check cross-SST range tombstones.
+        // Check range tombstones in each file and accumulate max_tomb_seq.
         for tf in version.level_files(0) {
-            if let Some(result) = tf.reader.get_internal(key, seq)? {
+            if tf.meta.has_range_deletions {
+                let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq)?;
+                max_tomb_seq = max_tomb_seq.max(file_tomb_seq);
+            }
+            if let Some((result, entry_seq)) = tf.reader.get_internal_with_seq(key, seq)? {
+                if max_tomb_seq > entry_seq {
+                    return Ok(None);
+                }
                 return Ok(result);
             }
         }
@@ -387,6 +424,15 @@ impl DB {
             let files = version.level_files(level);
             if files.is_empty() {
                 continue;
+            }
+
+            // Check range tombstones in all files at this level that have them.
+            // Tombstones can span beyond their containing file's key range.
+            for tf in files {
+                if tf.meta.has_range_deletions {
+                    let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq)?;
+                    max_tomb_seq = max_tomb_seq.max(file_tomb_seq);
+                }
             }
 
             // Binary search: find the latest file whose smallest user_key <= key.
@@ -413,10 +459,18 @@ impl DB {
                 lk.as_slice()
             };
             if key <= file_largest
-                && let Some(result) = tf.reader.get_internal(key, seq)?
+                && let Some((result, entry_seq)) = tf.reader.get_internal_with_seq(key, seq)?
             {
+                if max_tomb_seq > entry_seq {
+                    return Ok(None);
+                }
                 return Ok(result);
             }
+        }
+
+        // If a range tombstone was found in SSTs but no point entry, key is deleted
+        if max_tomb_seq > 0 {
+            return Ok(None);
         }
 
         Ok(None)
@@ -633,11 +687,18 @@ impl DB {
     /// Get a database property.
     ///
     /// Supported properties:
-    /// - "num-files-at-level{N}" — number of SST files at level N
-    /// - "estimate-num-keys" — estimated number of keys
-    /// - "total-sst-size" — total size of all SST files in bytes
-    /// - "block-cache-usage" — approximate block cache entry count
-    /// - "compaction-pending" — "1" if compaction is needed, "0" otherwise
+    /// - `"num-files-at-level{N}"` — number of SST files at level N
+    /// - `"total-sst-size"` — total size of all SST files in bytes
+    /// - `"block-cache-usage"` — approximate block cache entry count
+    /// - `"compaction-pending"` — "1" if compaction is needed, "0" otherwise
+    /// - `"stats.bytes_written"` — total user bytes written
+    /// - `"stats.bytes_read"` — total user bytes read
+    /// - `"stats.compactions_completed"` — number of compactions completed
+    /// - `"stats.compaction_bytes_written"` — total bytes written during compaction
+    /// - `"stats.flushes_completed"` — number of memtable flushes
+    /// - `"stats.block_cache_hits"` — block cache hit count
+    /// - `"stats.block_cache_misses"` — block cache miss count
+    /// - `"stats.cache_hit_rate"` — block cache hit rate (0.0 to 1.0)
     pub fn get_property(&self, name: &str) -> Option<String> {
         let inner = self.inner.lock();
 
@@ -667,6 +728,50 @@ impl DB {
                 let version = inner.versions.current();
                 let needed = LeveledCompaction::pick_compaction(&version, &self.options).is_some();
                 Some(if needed { "1" } else { "0" }.to_string())
+            }
+            "stats.bytes_written" => {
+                Some(self.stats.bytes_written.load(Ordering::Relaxed).to_string())
+            }
+            "stats.bytes_read" => Some(self.stats.bytes_read.load(Ordering::Relaxed).to_string()),
+            "stats.compactions_completed" => Some(
+                self.stats
+                    .compactions_completed
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            "stats.compaction_bytes_written" => Some(
+                self.stats
+                    .compaction_bytes_written
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            "stats.flushes_completed" => Some(
+                self.stats
+                    .flushes_completed
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            "stats.block_cache_hits" => Some(
+                self.stats
+                    .block_cache_hits
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            "stats.block_cache_misses" => Some(
+                self.stats
+                    .block_cache_misses
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            "stats.cache_hit_rate" => {
+                let hits = self.stats.block_cache_hits.load(Ordering::Relaxed) as f64;
+                let misses = self.stats.block_cache_misses.load(Ordering::Relaxed) as f64;
+                let total = hits + misses;
+                if total > 0.0 {
+                    Some(format!("{:.4}", hits / total))
+                } else {
+                    Some("0.0000".to_string())
+                }
             }
             _ => None,
         }
@@ -708,11 +813,34 @@ impl DB {
             }
         }
 
-        // Then compact all levels
+        // Compact files overlapping the specified range
         let _wg = self.write_queue.lock();
         let mut inner = self.inner.lock();
-        let _ = (begin, end); // Range filtering is implicit through leveled compaction
-        self.do_compaction(&mut inner)
+
+        // If no range specified, fall back to full compaction
+        if begin.is_none() && end.is_none() {
+            return self.do_compaction(&mut inner);
+        }
+
+        // Range-filtered compaction: compact files overlapping [begin, end)
+        loop {
+            let version = inner.versions.current();
+            match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
+                Some(task) => {
+                    LeveledCompaction::execute_compaction_with_cache(
+                        &task,
+                        &mut inner.versions,
+                        &self.path,
+                        &self.options,
+                        Some(&self.table_cache),
+                        Some(&self.rate_limiter),
+                        Some(&self.stats),
+                    )?;
+                }
+                None => break,
+            }
+        }
+        Ok(())
     }
 
     /// Close the database.
@@ -895,7 +1023,9 @@ impl DB {
                 if let Some(ref mut wal) = inner.wal_writer
                     && let Err(e) = wal.add_record(&wal_record)
                 {
-                    // Mark all remaining as failed
+                    // Acquire queue lock before writing done/result to synchronize
+                    // with followers waiting on write_cv.
+                    let _queue = self.write_queue.lock();
                     for &rp in &batch_group {
                         let rr = unsafe { &mut *rp };
                         rr.result = Some(Err(Error::Io(std::io::Error::other(format!("{}", e)))));
@@ -907,6 +1037,7 @@ impl DB {
             }
 
             // Apply to memtable
+            let mut batch_bytes = 0u64;
             for (i, entry) in r.batch.entries.iter().enumerate() {
                 let seq = first_seq + i as u64;
                 inner.active_memtable.put(
@@ -915,7 +1046,10 @@ impl DB {
                     seq,
                     entry.value_type,
                 );
+                batch_bytes +=
+                    entry.key.len() as u64 + entry.value.as_ref().map_or(0, |v| v.len()) as u64;
             }
+            self.stats.record_write(batch_bytes);
         }
 
         // Single fsync for all batches that wrote to WAL
@@ -999,9 +1133,11 @@ impl DB {
                 file_size: build_result.file_size,
                 smallest_key: build_result.smallest_key.unwrap_or_default(),
                 largest_key: build_result.largest_key.unwrap_or_default(),
+                has_range_deletions: build_result.has_range_deletions,
             },
         );
         inner.versions.log_and_apply(edit)?;
+        self.stats.record_flush();
 
         // Pin new L0 file's index in cache for fast iterator creation
         if self.options.pin_l0_filter_and_index_blocks_in_cache {
@@ -1045,6 +1181,8 @@ impl DB {
                         &self.path,
                         &self.options,
                         Some(&self.table_cache),
+                        Some(&self.rate_limiter),
+                        Some(&self.stats),
                     )?;
                 }
                 None => break,

@@ -1536,3 +1536,306 @@ fn test_range_delete_survives_flush() {
         "d should be deleted in iter"
     );
 }
+
+// ---- Step 1: SST range tombstone visibility in point-get ----
+
+#[test]
+fn test_sst_range_tombstone_in_get_after_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 64 * 1024 * 1024, // large to control flush manually
+        l0_compaction_trigger: 100,          // don't auto-compact
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    // Put key d, then delete_range [c, f), then flush both to SST
+    db.put(b"d", b"v1").unwrap();
+    db.delete_range(b"c", b"f").unwrap();
+    db.flush().unwrap();
+
+    // After flush, get(d) must return None — the range tombstone in SST covers it
+    assert_eq!(
+        db.get(b"d").unwrap(),
+        None,
+        "d should be deleted by range tombstone in SST"
+    );
+
+    // Keys outside the range should not be affected
+    db.put(b"a", b"alive").unwrap();
+    db.put(b"z", b"alive").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get(b"a").unwrap(), Some(b"alive".to_vec()));
+    assert_eq!(db.get(b"z").unwrap(), Some(b"alive".to_vec()));
+}
+
+#[test]
+fn test_sst_range_tombstone_in_get_after_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 64 * 1024 * 1024,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    db.put(b"d", b"v1").unwrap();
+    db.delete_range(b"c", b"f").unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+
+    assert_eq!(
+        db.get(b"d").unwrap(),
+        None,
+        "d should be deleted by range tombstone after compaction"
+    );
+}
+
+#[test]
+fn test_sst_range_tombstone_overridden_by_newer_put() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 64 * 1024 * 1024,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    // Put, delete_range, flush to SST
+    db.put(b"d", b"v1").unwrap();
+    db.delete_range(b"c", b"f").unwrap();
+    db.flush().unwrap();
+
+    // New put after flush should override the tombstone
+    db.put(b"d", b"v2").unwrap();
+    assert_eq!(
+        db.get(b"d").unwrap(),
+        Some(b"v2".to_vec()),
+        "newer put should override range tombstone"
+    );
+
+    // Even after flush + compact, the newer put should survive
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(
+        db.get(b"d").unwrap(),
+        Some(b"v2".to_vec()),
+        "newer put should survive compaction"
+    );
+}
+
+#[test]
+fn test_sst_range_tombstone_cross_l0_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 64 * 1024 * 1024,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    // Flush point entry to L0 file 1
+    db.put(b"d", b"v1").unwrap();
+    db.flush().unwrap();
+
+    // Flush range tombstone to L0 file 2 (newer)
+    db.delete_range(b"c", b"f").unwrap();
+    db.flush().unwrap();
+
+    // The range tombstone in the newer L0 file should shadow the point entry
+    assert_eq!(
+        db.get(b"d").unwrap(),
+        None,
+        "range tombstone in newer L0 file should shadow older point entry"
+    );
+}
+
+// ---- Step 4: compact_range with range filtering ----
+
+#[test]
+fn test_compact_range_filters_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 512,
+        l0_compaction_trigger: 100, // don't auto-compact
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    // Write keys in different ranges and flush separately
+    for i in 0..50 {
+        let key = format!("a_{:04}", i);
+        db.put(key.as_bytes(), b"val").unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..50 {
+        let key = format!("m_{:04}", i);
+        db.put(key.as_bytes(), b"val").unwrap();
+    }
+    db.flush().unwrap();
+
+    for i in 0..50 {
+        let key = format!("z_{:04}", i);
+        db.put(key.as_bytes(), b"val").unwrap();
+    }
+    db.flush().unwrap();
+
+    // compact_range only the "m" range
+    db.compact_range(Some(b"m_0000"), Some(b"m_9999")).unwrap();
+
+    // All data should still be readable
+    for i in 0..50 {
+        let key = format!("a_{:04}", i);
+        assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"val".to_vec()));
+    }
+    for i in 0..50 {
+        let key = format!("m_{:04}", i);
+        assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"val".to_vec()));
+    }
+    for i in 0..50 {
+        let key = format!("z_{:04}", i);
+        assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"val".to_vec()));
+    }
+}
+
+#[test]
+fn test_compact_range_none_does_full_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 512,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    for i in 0..100 {
+        let key = format!("key_{:04}", i);
+        db.put(key.as_bytes(), b"val").unwrap();
+    }
+    db.flush().unwrap();
+
+    // None/None should compact everything
+    db.compact_range(None, None).unwrap();
+
+    for i in 0..100 {
+        let key = format!("key_{:04}", i);
+        assert_eq!(db.get(key.as_bytes()).unwrap(), Some(b"val".to_vec()));
+    }
+}
+
+// ---- Steps 5-6: Stats integration ----
+
+#[test]
+fn test_stats_bytes_written_and_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0..100 {
+        let key = format!("key_{:06}", i);
+        let val = format!("value_{:06}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+
+    let bytes_written: u64 = db
+        .get_property("stats.bytes_written")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        bytes_written > 0,
+        "bytes_written should be > 0 after writes"
+    );
+
+    // Read some entries
+    for i in 0..50 {
+        let key = format!("key_{:06}", i);
+        let _ = db.get(key.as_bytes()).unwrap();
+    }
+
+    let bytes_read: u64 = db
+        .get_property("stats.bytes_read")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(bytes_read > 0, "bytes_read should be > 0 after reads");
+}
+
+#[test]
+fn test_stats_flush_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 512,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    for i in 0..50 {
+        let key = format!("key_{:04}", i);
+        db.put(key.as_bytes(), b"val").unwrap();
+    }
+    db.flush().unwrap();
+
+    let flushes: u64 = db
+        .get_property("stats.flushes_completed")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(flushes >= 1, "should have at least 1 flush");
+
+    db.compact().unwrap();
+
+    let compactions: u64 = db
+        .get_property("stats.compactions_completed")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(compactions >= 1, "should have at least 1 compaction");
+
+    let compaction_bytes: u64 = db
+        .get_property("stats.compaction_bytes_written")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        compaction_bytes > 0,
+        "compaction_bytes_written should be > 0"
+    );
+}
+
+#[test]
+fn test_stats_cache_hit_rate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0..100 {
+        let key = format!("key_{:06}", i);
+        db.put(key.as_bytes(), b"value").unwrap();
+    }
+    db.flush().unwrap();
+
+    // Read same keys twice — second read should hit cache
+    for i in 0..100 {
+        let key = format!("key_{:06}", i);
+        let _ = db.get(key.as_bytes()).unwrap();
+    }
+    for i in 0..100 {
+        let key = format!("key_{:06}", i);
+        let _ = db.get(key.as_bytes()).unwrap();
+    }
+
+    let hit_rate = db.get_property("stats.cache_hit_rate").unwrap();
+    let rate: f64 = hit_rate.parse().unwrap();
+    assert!(
+        rate > 0.0,
+        "cache hit rate should be > 0 after repeated reads"
+    );
+}

@@ -5,7 +5,7 @@
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-210_passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-220_passing-brightgreen.svg)]()
 
 A pure-Rust, synchronous LSM-Tree key-value storage engine. Designed as a native Rust alternative to RocksDB with competitive performance — **scan throughput matches or exceeds RocksDB** on equivalent configurations.
 
@@ -34,7 +34,7 @@ Benchmarked via [vsdb](https://github.com/rust-util-collections/vsdb) (500K entr
 | WAL with group commit & crash recovery | Implemented |
 | SST files with prefix-compressed blocks | Implemented |
 | Bloom filters (per-key + prefix bloom) | Implemented |
-| Block cache (moka LRU) with L0 pinning | Implemented |
+| Block cache (moka LRU) with L0 pinning (insert_pinned) | Implemented |
 | Table cache (open file handles) | Implemented |
 | MANIFEST version tracking + compaction | Implemented |
 | Leveled compaction with trivial move | Implemented |
@@ -45,10 +45,10 @@ Benchmarked via [vsdb](https://github.com/rust-util-collections/vsdb) (500K entr
 | Compression: None, LZ4, Zstd (per-level) | Implemented |
 | Write backpressure (slowdown/stop) | Implemented |
 | DeleteRange (range tombstones) | Implemented |
-| CompactRange API | Implemented |
+| CompactRange API (with range filtering) | Implemented |
 | Compaction filter | Implemented |
-| Rate limiter (token bucket) | Implemented |
-| DB properties/statistics | Implemented |
+| Rate limiter (token bucket, wired to compaction) | Implemented |
+| DB properties/statistics (wired to all paths) | Implemented |
 | Configurable options (RocksDB parity) | Implemented |
 
 ---
@@ -114,7 +114,7 @@ Key optimizations that match/exceed RocksDB:
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
 - **Buffer reuse**: `IterSource` reuses key/value buffers; `next_into()` decodes directly into caller buffers
 - **Sequential readahead**: `posix_fadvise(WILLNEED)` after detecting sequential block access
-- **L0 metadata pinning**: Index entries and first data blocks pre-cached for L0 files
+- **L0 metadata pinning**: Index entries and first data blocks pinned (non-evictable) for L0 files via `insert_pinned`; unpinned on compaction
 - **Sweep-line range tombstone tracking**: O(1) amortized instead of O(T) per key
 - **Lazy index loading**: `TableIterator::new()` is O(1) — index parsed on first use
 
@@ -225,7 +225,7 @@ let opts = DbOptions::read_heavy();   // large cache, 14 bits/key bloom
 
 ```bash
 cargo build
-cargo test               # 210 tests (unit + integration + e2e + proptest)
+cargo test               # 220+ tests (unit + integration + e2e + proptest)
 make all                 # fmt + lint + check + test
 make bench               # criterion benchmarks (warm + cold cache scenarios)
 cargo bench -- "cold"    # cold-cache benchmarks only

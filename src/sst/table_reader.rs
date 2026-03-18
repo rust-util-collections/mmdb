@@ -13,6 +13,7 @@ use crate::sst::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, decode_footer,
     decode_index_value,
 };
+use crate::stats::DbStats;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType};
 
 /// Parsed index entry: separator key + block handle + optional first key.
@@ -44,6 +45,7 @@ pub struct TableReader {
     prefix_filter_data: Option<Vec<u8>>,
     file: Mutex<File>,
     block_cache: Option<Arc<BlockCache>>,
+    stats: Option<Arc<DbStats>>,
     /// Cached index entries, shared across all TableIterators for this file.
     /// Populated once on first access, then reused (Arc for zero-copy sharing).
     index_entry_cache: OnceLock<IndexEntries>,
@@ -52,12 +54,12 @@ pub struct TableReader {
 impl TableReader {
     /// Open an SST file for reading.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_full(path, 0, None)
+        Self::open_with_all(path, 0, None, None)
     }
 
     /// Open an SST file for reading with a known file number (for cache keying).
     pub fn open_with_number(path: &Path, file_number: u64) -> Result<Self> {
-        Self::open_full(path, file_number, None)
+        Self::open_with_all(path, file_number, None, None)
     }
 
     /// Open with file number and optional block cache.
@@ -65,6 +67,16 @@ impl TableReader {
         path: &Path,
         file_number: u64,
         block_cache: Option<Arc<BlockCache>>,
+    ) -> Result<Self> {
+        Self::open_with_all(path, file_number, block_cache, None)
+    }
+
+    /// Open with file number, optional block cache, and optional stats.
+    pub fn open_with_all(
+        path: &Path,
+        file_number: u64,
+        block_cache: Option<Arc<BlockCache>>,
+        stats: Option<Arc<DbStats>>,
     ) -> Result<Self> {
         let mut file = File::open(path)?;
         let file_size = file.metadata()?.len();
@@ -98,6 +110,7 @@ impl TableReader {
             prefix_filter_data: filters.prefix,
             file: Mutex::new(file),
             block_cache,
+            stats,
             index_entry_cache: OnceLock::new(),
         })
     }
@@ -204,6 +217,93 @@ impl TableReader {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Like `get_internal` but also returns the sequence number of the found entry.
+    /// Returns `Some((result, entry_seq))` if found, `None` if key not in this table.
+    pub fn get_internal_with_seq(
+        &self,
+        user_key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<Option<(Option<Vec<u8>>, SequenceNumber)>> {
+        use crate::types::InternalKey;
+
+        // Check bloom filter with user key
+        if let Some(ref filter) = self.filter_data
+            && !BloomFilter::key_may_match(user_key, filter)
+        {
+            return Ok(None);
+        }
+
+        let seek_key = InternalKey::new(user_key, sequence, ValueType::Value);
+
+        use crate::types::compare_internal_key;
+
+        let handle = match self
+            .index_block
+            .seek_by(seek_key.as_bytes(), compare_internal_key)
+        {
+            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes),
+            None => return Ok(None),
+        };
+
+        let block_data = self.read_block_cached(&handle)?;
+        let block = Block::new(block_data)?;
+
+        match block.seek_by(seek_key.as_bytes(), compare_internal_key) {
+            Some((encoded_ikey, value)) if encoded_ikey.len() >= 8 => {
+                let ik = InternalKeyRef::new(&encoded_ikey);
+                if ik.user_key() == user_key {
+                    let entry_seq = ik.sequence();
+                    return Ok(Some((
+                        match ik.value_type() {
+                            ValueType::Value => Some(value),
+                            ValueType::Deletion | ValueType::RangeDeletion => None,
+                        },
+                        entry_seq,
+                    )));
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Find the highest-seq range tombstone covering `user_key` with seq <= `read_seq`.
+    /// Returns 0 if none found. Only meaningful for SSTs that contain range deletions.
+    pub fn max_covering_tombstone_seq(
+        &self,
+        user_key: &[u8],
+        read_seq: SequenceNumber,
+    ) -> Result<SequenceNumber> {
+        let mut max_seq: SequenceNumber = 0;
+
+        for (_, handle_bytes) in self.index_block.iter() {
+            let handle = BlockHandle::decode(&handle_bytes);
+            let block_data = self.read_block_cached(&handle)?;
+            let block = Block::new(block_data)?;
+
+            for (k, v) in block.iter() {
+                if k.len() < 8 {
+                    continue;
+                }
+                let ikr = InternalKeyRef::new(&k);
+                if ikr.value_type() != ValueType::RangeDeletion {
+                    continue;
+                }
+                let tomb_seq = ikr.sequence();
+                if tomb_seq > read_seq {
+                    continue;
+                }
+                let begin = ikr.user_key();
+                let end = &v;
+                if user_key >= begin && user_key < end.as_slice() && tomb_seq > max_seq {
+                    max_seq = tomb_seq;
+                }
+            }
+        }
+
+        Ok(max_seq)
     }
 
     /// Iterate over all key-value pairs in the table.
@@ -324,7 +424,16 @@ impl TableReader {
         if let Some(ref cache) = self.block_cache
             && let Some(cached) = cache.get(self.file_number, handle.offset)
         {
+            if let Some(ref s) = self.stats {
+                s.record_cache_hit();
+            }
             return Ok(cached);
+        }
+
+        if let Some(ref s) = self.stats
+            && self.block_cache.is_some()
+        {
+            s.record_cache_miss();
         }
 
         let mut file = self.open_file()?;
@@ -337,15 +446,20 @@ impl TableReader {
         Ok(Arc::new(data))
     }
 
-    /// Pin this file's index block data and first data block in cache (for L0 files).
-    /// Pre-populates the index entry cache and pre-reads the first data block
-    /// so that init_heap's first peek() hits the block cache.
+    /// Pin this file's first data block in cache as non-evictable (for L0 files).
+    /// Pre-populates the index entry cache and pins the first data block
+    /// so that init_heap's first peek() always hits cache.
     pub fn pin_metadata_in_cache(&self) {
         // Populate the OnceLock index entry cache eagerly
         let entries = self.cached_index_entries();
-        // Also pre-read first data block into cache
-        if let Some(entry) = entries.first() {
-            let _ = self.read_block_cached(&entry.handle);
+        // Pin first data block in cache (non-evictable)
+        if let Some(entry) = entries.first()
+            && let Some(ref cache) = self.block_cache
+            && cache.get(self.file_number, entry.handle.offset).is_none()
+            && let Ok(mut file) = self.open_file()
+            && let Ok(data) = Self::read_block_data(&mut file, &entry.handle)
+        {
+            cache.insert_pinned(self.file_number, entry.handle.offset, data);
         }
     }
 

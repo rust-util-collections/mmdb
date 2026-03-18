@@ -10,6 +10,8 @@ pub struct FileMetaData {
     pub file_size: u64,
     pub smallest_key: Vec<u8>,
     pub largest_key: Vec<u8>,
+    /// Whether this SST file contains any range deletion entries.
+    pub has_range_deletions: bool,
 }
 
 /// A VersionEdit describes a set of changes to apply to a Version.
@@ -59,10 +61,11 @@ impl VersionEdit {
     ///   1 = log_number(u64 LE)
     ///   2 = next_file_number(u64 LE)
     ///   3 = last_sequence(u64 LE)
-    ///   4 = new_file: level(u32 LE) + number(u64 LE) + file_size(u64 LE)
+    ///   4 = new_file (legacy): level(u32 LE) + number(u64 LE) + file_size(u64 LE)
     ///       + smallest_key_len(u32 LE) + smallest_key
     ///       + largest_key_len(u32 LE) + largest_key
     ///   5 = deleted_file: level(u32 LE) + number(u64 LE)
+    ///   6 = new_file_v2: same as 4 + has_range_deletions(u8)
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -79,7 +82,7 @@ impl VersionEdit {
             buf.extend_from_slice(&s.to_le_bytes());
         }
         for (level, meta) in &self.new_files {
-            buf.push(4);
+            buf.push(6); // v2 format with has_range_deletions
             buf.extend_from_slice(&level.to_le_bytes());
             buf.extend_from_slice(&meta.number.to_le_bytes());
             buf.extend_from_slice(&meta.file_size.to_le_bytes());
@@ -87,6 +90,7 @@ impl VersionEdit {
             buf.extend_from_slice(&meta.smallest_key);
             buf.extend_from_slice(&(meta.largest_key.len() as u32).to_le_bytes());
             buf.extend_from_slice(&meta.largest_key);
+            buf.push(meta.has_range_deletions as u8);
         }
         for (level, number) in &self.deleted_files {
             buf.push(5);
@@ -131,8 +135,8 @@ impl VersionEdit {
                         Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
                     pos += 8;
                 }
-                4 => {
-                    // new_file
+                4 | 6 => {
+                    // new_file (tag 4 = legacy, tag 6 = v2 with has_range_deletions)
                     if pos + 4 + 8 + 8 > data.len() {
                         return Err(Error::Corruption("truncated new_file header".into()));
                     }
@@ -167,6 +171,17 @@ impl VersionEdit {
                     let largest_key = data[pos..pos + lk_len].to_vec();
                     pos += lk_len;
 
+                    let has_range_deletions = if tag == 6 {
+                        if pos >= data.len() {
+                            return Err(Error::Corruption("truncated has_range_deletions".into()));
+                        }
+                        let v = data[pos] != 0;
+                        pos += 1;
+                        v
+                    } else {
+                        false
+                    };
+
                     edit.new_files.push((
                         level,
                         FileMetaData {
@@ -174,6 +189,7 @@ impl VersionEdit {
                             file_size,
                             smallest_key,
                             largest_key,
+                            has_range_deletions,
                         },
                     ));
                 }
@@ -251,6 +267,7 @@ mod tests {
                 file_size: 4096,
                 smallest_key: b"aaa".to_vec(),
                 largest_key: b"zzz".to_vec(),
+                has_range_deletions: false,
             },
         );
         edit.add_file(
@@ -260,6 +277,7 @@ mod tests {
                 file_size: 8192,
                 smallest_key: b"bbb".to_vec(),
                 largest_key: b"yyy".to_vec(),
+                has_range_deletions: false,
             },
         );
         edit.delete_file(0, 5);
@@ -298,6 +316,7 @@ mod tests {
                 file_size: 0,                 // edge case: zero size
                 smallest_key: vec![],         // empty key
                 largest_key: vec![0xFF; 256], // binary key
+                has_range_deletions: true,
             },
         );
         edit.add_file(
@@ -307,6 +326,7 @@ mod tests {
                 file_size: u64::MAX,
                 smallest_key: b"start".to_vec(),
                 largest_key: b"stop".to_vec(),
+                has_range_deletions: false,
             },
         );
 
@@ -331,6 +351,7 @@ mod tests {
         assert_eq!(meta0.file_size, 0);
         assert!(meta0.smallest_key.is_empty());
         assert_eq!(meta0.largest_key, vec![0xFF; 256]);
+        assert!(meta0.has_range_deletions);
 
         let (level6, ref meta6) = decoded.new_files[1];
         assert_eq!(level6, 6);
@@ -361,6 +382,7 @@ mod tests {
                     file_size: (i as u64 + 1) * 4096,
                     smallest_key: format!("s_{:04}", i).into_bytes(),
                     largest_key: format!("l_{:04}", i).into_bytes(),
+                    has_range_deletions: i % 3 == 0,
                 },
             );
         }

@@ -105,6 +105,69 @@ impl LeveledCompaction {
         })
     }
 
+    /// Pick compaction for a specific key range. Collects files overlapping
+    /// [begin, end) at each level and compacts them.
+    pub fn pick_compaction_for_range(
+        version: &Version,
+        begin: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Option<CompactionTask> {
+        // Check L0 first: collect L0 files overlapping the range
+        let l0_files = version.level_files(0);
+        let mut input_l0: Vec<TableFile> = Vec::new();
+        for tf in l0_files {
+            let file_smallest = crate::types::user_key(&tf.meta.smallest_key);
+            let file_largest = crate::types::user_key(&tf.meta.largest_key);
+            let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
+            let overlaps_end = end.is_none_or(|e| file_smallest < e);
+            if overlaps_begin && overlaps_end {
+                input_l0.push(tf.clone());
+            }
+        }
+
+        if !input_l0.is_empty() {
+            let (smallest, largest) = Self::total_key_range(&input_l0);
+            let input_l1 = Self::overlapping_files(version.level_files(1), &smallest, &largest);
+            return Some(CompactionTask {
+                level: 0,
+                input_files_level: input_l0,
+                input_files_next: input_l1,
+            });
+        }
+
+        // Check L1+ levels
+        for level in 1..version.num_levels - 1 {
+            let files = version.level_files(level);
+            let mut input_level: Vec<TableFile> = Vec::new();
+            for tf in files {
+                let file_smallest = crate::types::user_key(&tf.meta.smallest_key);
+                let file_largest = crate::types::user_key(&tf.meta.largest_key);
+                let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
+                let overlaps_end = end.is_none_or(|e| file_smallest < e);
+                if overlaps_begin && overlaps_end {
+                    input_level.push(tf.clone());
+                }
+            }
+
+            if !input_level.is_empty() {
+                let (smallest, largest) = Self::total_key_range(&input_level);
+                let next_level = level + 1;
+                let input_next = if next_level < version.num_levels {
+                    Self::overlapping_files(version.level_files(next_level), &smallest, &largest)
+                } else {
+                    Vec::new()
+                };
+                return Some(CompactionTask {
+                    level,
+                    input_files_level: input_level,
+                    input_files_next: input_next,
+                });
+            }
+        }
+
+        None
+    }
+
     /// Execute a compaction: stream-merge input files and produce new SST files.
     /// Memory usage: O(input_files × block_size) instead of O(total_data).
     pub fn execute_compaction(
@@ -113,16 +176,18 @@ impl LeveledCompaction {
         db_path: &Path,
         options: &DbOptions,
     ) -> Result<()> {
-        Self::execute_compaction_with_cache(task, versions, db_path, options, None)
+        Self::execute_compaction_with_cache(task, versions, db_path, options, None, None, None)
     }
 
-    /// Execute compaction with optional table cache for eviction.
+    /// Execute compaction with optional table cache for eviction and rate limiter.
     pub fn execute_compaction_with_cache(
         task: &CompactionTask,
         versions: &mut VersionSet,
         db_path: &Path,
         options: &DbOptions,
         table_cache: Option<&Arc<TableCache>>,
+        rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
+        stats: Option<&Arc<crate::stats::DbStats>>,
     ) -> Result<()> {
         let target_level = task.level + 1;
 
@@ -252,12 +317,21 @@ impl LeveledCompaction {
                 current_size = 0;
             }
 
+            let entry_bytes = ikey.len() + final_value.len();
             builder.as_mut().unwrap().add(&ikey, &final_value)?;
-            current_size += ikey.len() + final_value.len();
+            current_size += entry_bytes;
+
+            // Rate-limit compaction writes
+            if let Some(rl) = rate_limiter {
+                rl.request(entry_bytes);
+            }
 
             // Split output file if target size reached
             if current_size >= options.target_file_size_base as usize {
                 let result = builder.take().unwrap().finish()?;
+                if let Some(s) = stats {
+                    s.record_compaction(result.file_size);
+                }
                 edit.add_file(
                     target_level as u32,
                     FileMetaData {
@@ -265,6 +339,7 @@ impl LeveledCompaction {
                         file_size: result.file_size,
                         smallest_key: result.smallest_key.unwrap_or_default(),
                         largest_key: result.largest_key.unwrap_or_default(),
+                        has_range_deletions: result.has_range_deletions,
                     },
                 );
             }
@@ -273,6 +348,9 @@ impl LeveledCompaction {
         // Flush remaining builder
         if let Some(b) = builder {
             let result = b.finish()?;
+            if let Some(s) = stats {
+                s.record_compaction(result.file_size);
+            }
             edit.add_file(
                 target_level as u32,
                 FileMetaData {
@@ -280,6 +358,7 @@ impl LeveledCompaction {
                     file_size: result.file_size,
                     smallest_key: result.smallest_key.unwrap_or_default(),
                     largest_key: result.largest_key.unwrap_or_default(),
+                    has_range_deletions: result.has_range_deletions,
                 },
             );
         }
@@ -427,6 +506,7 @@ impl LeveledCompaction {
                         file_size: result.file_size,
                         smallest_key: result.smallest_key.unwrap_or_default(),
                         largest_key: result.largest_key.unwrap_or_default(),
+                        has_range_deletions: result.has_range_deletions,
                     },
                 );
             }
@@ -441,6 +521,7 @@ impl LeveledCompaction {
                     file_size: result.file_size,
                     smallest_key: result.smallest_key.unwrap_or_default(),
                     largest_key: result.largest_key.unwrap_or_default(),
+                    has_range_deletions: result.has_range_deletions,
                 },
             );
         }

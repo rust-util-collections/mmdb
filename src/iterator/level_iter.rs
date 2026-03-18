@@ -207,6 +207,7 @@ mod tests {
                 file_size: reader.file_size(),
                 smallest_key: smallest,
                 largest_key: largest,
+                has_range_deletions: false,
             },
             reader,
         }
@@ -254,6 +255,7 @@ mod tests {
                 file_size: reader.file_size(),
                 smallest_key: smallest,
                 largest_key: largest,
+                has_range_deletions: false,
             },
             reader,
         }

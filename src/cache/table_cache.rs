@@ -6,24 +6,37 @@ use std::sync::Arc;
 use crate::cache::block_cache::BlockCache;
 use crate::error::Result;
 use crate::sst::table_reader::TableReader;
+use crate::stats::DbStats;
 
 /// Cache for open TableReader instances.
 pub struct TableCache {
     db_path: PathBuf,
     inner: moka::sync::Cache<u64, Arc<TableReader>>,
     block_cache: Option<Arc<BlockCache>>,
+    stats: Option<Arc<DbStats>>,
 }
 
 impl TableCache {
     /// Create a new table cache.
     /// `max_open_files` is the maximum number of SST files to keep open.
     pub fn new(db_path: &Path, max_open_files: u64, block_cache: Option<Arc<BlockCache>>) -> Self {
+        Self::new_with_stats(db_path, max_open_files, block_cache, None)
+    }
+
+    /// Create a new table cache with optional stats.
+    pub fn new_with_stats(
+        db_path: &Path,
+        max_open_files: u64,
+        block_cache: Option<Arc<BlockCache>>,
+        stats: Option<Arc<DbStats>>,
+    ) -> Self {
         Self {
             db_path: db_path.to_path_buf(),
             inner: moka::sync::Cache::builder()
                 .max_capacity(max_open_files)
                 .build(),
             block_cache,
+            stats,
         }
     }
 
@@ -34,10 +47,11 @@ impl TableCache {
         }
 
         let path = self.db_path.join(format!("{:06}.sst", file_number));
-        let reader = Arc::new(TableReader::open_full(
+        let reader = Arc::new(TableReader::open_with_all(
             &path,
             file_number,
             self.block_cache.clone(),
+            self.stats.clone(),
         )?);
         self.inner.insert(file_number, reader.clone());
         Ok(reader)

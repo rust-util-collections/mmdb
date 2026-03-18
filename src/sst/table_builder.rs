@@ -73,6 +73,9 @@ pub struct TableBuilder {
     // Prefix bloom: collected unique prefixes
     prefix_set: HashSet<Vec<u8>>,
 
+    // Whether any RangeDeletion entry was added
+    has_range_deletions: bool,
+
     finished: bool,
 }
 
@@ -93,6 +96,7 @@ impl TableBuilder {
             smallest_key: None,
             largest_key: None,
             prefix_set: HashSet::new(),
+            has_range_deletions: false,
             finished: false,
         })
     }
@@ -118,6 +122,14 @@ impl TableBuilder {
             self.smallest_key = Some(key.to_vec());
         }
         self.largest_key = Some(key.to_vec());
+
+        // Track range deletions
+        if self.options.internal_keys && key.len() >= 8 {
+            let ikr = crate::types::InternalKeyRef::new(key);
+            if ikr.value_type() == crate::types::ValueType::RangeDeletion {
+                self.has_range_deletions = true;
+            }
+        }
 
         // Collect key for bloom filter (use user key if internal_keys mode)
         let user_key_for_bloom = if self.options.internal_keys && key.len() >= 8 {
@@ -185,6 +197,7 @@ impl TableBuilder {
             num_entries: self.num_entries,
             smallest_key: self.smallest_key,
             largest_key: self.largest_key,
+            has_range_deletions: self.has_range_deletions,
         })
     }
 
@@ -316,6 +329,8 @@ pub struct TableBuildResult {
     pub num_entries: u64,
     pub smallest_key: Option<Vec<u8>>,
     pub largest_key: Option<Vec<u8>>,
+    /// Whether any range deletion entry was written to this table.
+    pub has_range_deletions: bool,
 }
 
 #[cfg(test)]
