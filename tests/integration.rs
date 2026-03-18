@@ -1943,10 +1943,7 @@ fn test_vsdb_seek_to_last_pattern() {
             .iter_with_range(&ReadOptions::default(), Some(start), Some(end))
             .unwrap();
         iter.seek_to_last();
-        assert!(
-            iter.valid(),
-            "seek_to_last should be valid (range-bounded)"
-        );
+        assert!(iter.valid(), "seek_to_last should be valid (range-bounded)");
         assert_eq!(iter.key(), b"k_0019");
     }
 }
@@ -2013,9 +2010,9 @@ fn test_bidi_streaming_next_back() {
     let bidi = db.iter_bidi().unwrap();
     let rev: Vec<Vec<u8>> = bidi.rev().map(|(k, _)| k).collect();
     assert_eq!(rev.len(), count);
-    for i in 0..count {
+    for (i, entry) in rev.iter().enumerate() {
         let expected = format!("key_{:06}", count - 1 - i);
-        assert_eq!(rev[i], expected.as_bytes(), "mismatch at position {}", i);
+        assert_eq!(entry, expected.as_bytes(), "mismatch at position {}", i);
     }
 }
 
@@ -2093,8 +2090,8 @@ fn test_compact_range_then_iter() {
     let mut iter = db.iter().unwrap();
     let entries: Vec<Vec<u8>> = std::iter::from_fn(|| iter.next().map(|(k, _)| k)).collect();
     assert_eq!(entries.len(), 50);
-    for i in 0..50 {
+    for (i, entry) in entries.iter().enumerate() {
         let expected = format!("key_{:04}", i);
-        assert_eq!(entries[i], expected.as_bytes());
+        assert_eq!(entry, expected.as_bytes());
     }
 }

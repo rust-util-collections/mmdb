@@ -133,10 +133,7 @@ impl MemTable {
             if rt.seq > read_seq {
                 continue;
             }
-            if user_key >= rt.begin.as_slice()
-                && user_key < rt.end.as_slice()
-                && rt.seq > max_seq
-            {
+            if user_key >= rt.begin.as_slice() && user_key < rt.end.as_slice() && rt.seq > max_seq {
                 max_seq = rt.seq;
             }
         }

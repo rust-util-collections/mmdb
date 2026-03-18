@@ -233,10 +233,7 @@ impl DoubleEndedIterator for BidiIterator {
                 let k = db_iter.key().to_vec();
                 let v = db_iter.value().to_vec();
 
-                self.inner = BidiInner::LazyBackStarted {
-                    db_iter,
-                    fwd_count,
-                };
+                self.inner = BidiInner::LazyBackStarted { db_iter, fwd_count };
 
                 Some((k, v))
             }

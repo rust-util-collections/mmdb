@@ -299,10 +299,7 @@ impl TableReader {
             if rt.seq > read_seq {
                 continue;
             }
-            if user_key >= rt.begin.as_slice()
-                && user_key < rt.end.as_slice()
-                && rt.seq > max_seq
-            {
+            if user_key >= rt.begin.as_slice() && user_key < rt.end.as_slice() && rt.seq > max_seq {
                 max_seq = rt.seq;
             }
         }
@@ -830,12 +827,15 @@ impl TableIterator {
                     Some((found_key, _found_val)) => {
                         // Determine which restart segment this entry belongs to
                         // and decode only that segment for backward iteration.
-                        let restart_idx = self.find_restart_for_key(&block, &found_key, compare_internal_key);
+                        let restart_idx =
+                            self.find_restart_for_key(&block, &found_key, compare_internal_key);
                         let segment = block.iter_restart_segment(restart_idx);
                         // Find position of found entry within segment
                         let pos_in_segment = segment
                             .iter()
-                            .rposition(|(k, _)| compare_internal_key(k, target) != std::cmp::Ordering::Greater)
+                            .rposition(|(k, _)| {
+                                compare_internal_key(k, target) != std::cmp::Ordering::Greater
+                            })
                             .unwrap_or(0);
 
                         self.index_pos = try_idx + 1;
@@ -910,15 +910,14 @@ impl TableIterator {
         }
 
         // Try loading the previous restart segment within the same block
-        if self.current_restart_index > 0 {
-            if let Some(ref block) = self.backward_block {
-                self.current_restart_index -= 1;
-                self.current_block_entries =
-                    block.iter_restart_segment(self.current_restart_index);
-                if !self.current_block_entries.is_empty() {
-                    self.block_pos = self.current_block_entries.len() - 1;
-                    return Some(self.current_block_entries[self.block_pos].clone());
-                }
+        if self.current_restart_index > 0
+            && let Some(ref block) = self.backward_block
+        {
+            self.current_restart_index -= 1;
+            self.current_block_entries = block.iter_restart_segment(self.current_restart_index);
+            if !self.current_block_entries.is_empty() {
+                self.block_pos = self.current_block_entries.len() - 1;
+                return Some(self.current_block_entries[self.block_pos].clone());
             }
         }
 

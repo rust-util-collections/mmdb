@@ -190,8 +190,7 @@ impl DBIterator {
                 // Seek past all entries for last_user_key. In compare_internal_key order,
                 // (user_key, 0, Deletion) is the last entry for a user_key, so seeking
                 // there positions us at or past it.
-                let seek_key =
-                    InternalKey::new(&self.last_user_key, 0, ValueType::Deletion);
+                let seek_key = InternalKey::new(&self.last_user_key, 0, ValueType::Deletion);
                 self.merger.seek(seek_key.as_bytes());
                 // has_last_key stays true so next_visible deduplicates correctly
             }
@@ -388,16 +387,14 @@ impl DBIterator {
             let mut best_is_deletion = false;
 
             // First, consume any overshoot entry saved from a previous backward walk
-            let first_entry = self.prev_overshoot.take().or_else(|| self.merger.prev_entry());
+            let first_entry = self
+                .prev_overshoot
+                .take()
+                .or_else(|| self.merger.prev_entry());
 
             let mut iter_entry = first_entry;
 
-            loop {
-                let (ikey, value) = match iter_entry.take() {
-                    Some(e) => e,
-                    None => break, // merger exhausted
-                };
-
+            while let Some((ikey, value)) = iter_entry.take() {
                 if ikey.len() < 8 {
                     iter_entry = self.merger.prev_entry();
                     continue;
@@ -440,8 +437,7 @@ impl DBIterator {
 
                 // Collect range deletions into tracker
                 if vt == ValueType::RangeDeletion {
-                    self.range_tombstones
-                        .add(uk.to_vec(), value.clone(), seq);
+                    self.range_tombstones.add(uk.to_vec(), value.clone(), seq);
                     iter_entry = self.merger.prev_entry();
                     continue;
                 }

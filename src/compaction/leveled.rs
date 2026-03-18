@@ -287,9 +287,7 @@ impl LeveledCompaction {
                 }
 
                 // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
-                if ikr.value_type() == ValueType::Value
-                    && !range_tombstones.is_empty()
-                {
+                if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
                     let entry_seq = ikr.sequence();
                     if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
                         continue;
@@ -485,9 +483,7 @@ impl LeveledCompaction {
                 }
 
                 // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
-                if ikr.value_type() == ValueType::Value
-                    && !range_tombstones.is_empty()
-                {
+                if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
                     let entry_seq = ikr.sequence();
                     if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
                         continue;
