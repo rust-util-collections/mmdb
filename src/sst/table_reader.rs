@@ -714,12 +714,17 @@ impl TableIterator {
             0
         };
 
-        // Scan entries, tracking the offset of each entry
+        // Scan entries, saving key state before each decode so we can restore
+        // the prefix-compressed key buffer without a second scan.
         self.block_cursor_key.clear();
+        let mut prev_key_snapshot: Vec<u8> = Vec::new();
         let mut offset = start;
         while offset < data_end {
-            // Save state before decoding — if this entry >= target, we want cursor here
             let entry_offset = offset;
+            // Save key buffer state before decoding this entry
+            prev_key_snapshot.clear();
+            prev_key_snapshot.extend_from_slice(&self.block_cursor_key);
+
             match crate::sst::block::decode_entry_reuse(
                 block_data,
                 offset,
@@ -728,30 +733,10 @@ impl TableIterator {
                 Some((_, _, next_off)) => {
                     if compare(&self.block_cursor_key, target) != std::cmp::Ordering::Less {
                         // Found first entry >= target.
-                        // block_cursor_key already contains this entry's key.
-                        // Set cursor_offset to NEXT entry so cursor_next() advances past it.
-                        // But we need to return THIS entry on the next cursor_next() call.
-                        // Solution: store the current decoded state and use a "pending" entry.
-                        // Simpler: set offset to entry_offset and clear key to prev state.
-                        // Actually simplest: we already decoded this entry into key_buf.
-                        // We'll store the entry offset and re-scan from start to rebuild
-                        // key_buf to the state *before* this entry, then cursor_next()
-                        // will re-decode it.
-
-                        // Re-scan from start to entry_offset to rebuild prefix state
+                        // Restore key buffer to pre-decode state so cursor_next()
+                        // will re-decode this entry correctly.
                         self.block_cursor_key.clear();
-                        let mut scan = start;
-                        while scan < entry_offset {
-                            if let Some((_, _, n)) = crate::sst::block::decode_entry_reuse(
-                                block_data,
-                                scan,
-                                &mut self.block_cursor_key,
-                            ) {
-                                scan = n;
-                            } else {
-                                break;
-                            }
-                        }
+                        self.block_cursor_key.extend_from_slice(&prev_key_snapshot);
                         self.block_cursor_offset = entry_offset;
                         self.block_data_end = data_end;
                         self.current_block = Some(block);
