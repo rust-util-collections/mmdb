@@ -868,6 +868,7 @@ impl TableIterator {
     }
 
     /// Find the restart index that contains a given key.
+    /// Uses O(log R) binary search with O(1) per probe (single entry decode).
     fn find_restart_for_key<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
         &self,
         block: &Block,
@@ -883,9 +884,8 @@ impl TableIterator {
         let mut right = num;
         while left < right {
             let mid = left + (right - left) / 2;
-            let entries = block.iter_restart_segment(mid);
-            if let Some((first_key, _)) = entries.first() {
-                if compare(first_key, key) != std::cmp::Ordering::Greater {
+            if let Some(first_key) = block.first_key_at_restart(mid) {
+                if compare(&first_key, key) != std::cmp::Ordering::Greater {
                     left = mid + 1;
                 } else {
                     right = mid;

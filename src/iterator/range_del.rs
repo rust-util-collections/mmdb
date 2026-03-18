@@ -88,7 +88,7 @@ impl RangeTombstoneTracker {
 
         for &idx in &self.active {
             let rt = &self.tombstones[idx];
-            if rt.seq <= snapshot && rt.seq >= seq {
+            if rt.seq <= snapshot && rt.seq > seq {
                 return true;
             }
         }
@@ -102,7 +102,7 @@ impl RangeTombstoneTracker {
             if rt.seq <= snapshot
                 && user_key >= rt.begin.as_slice()
                 && user_key < rt.end.as_slice()
-                && rt.seq >= seq
+                && rt.seq > seq
             {
                 return true;
             }
@@ -155,6 +155,23 @@ mod tests {
         assert!(tracker.is_deleted(b"bbb", 3, 10));
         assert!(!tracker.is_deleted(b"bbb", 6, 10)); // seq > tombstone seq
         assert!(!tracker.is_deleted(b"000", 3, 10)); // before range
+    }
+
+    #[test]
+    fn test_same_seq_not_deleted() {
+        // A range tombstone at seq=5 must NOT delete entries also at seq=5.
+        // This preserves atomicity for WriteBatch (delete_range + put at same seq).
+        let mut tracker = RangeTombstoneTracker::new();
+        tracker.add(b"a".to_vec(), b"z".to_vec(), 5);
+        tracker.reset();
+
+        // Same seq as tombstone: should NOT be deleted (strict >)
+        assert!(!tracker.is_deleted(b"m", 5, 10));
+        // Lower seq: should be deleted
+        assert!(tracker.is_deleted(b"m", 4, 10));
+        // Also test check_any_direction
+        assert!(!tracker.check_any_direction(b"m", 5, 10));
+        assert!(tracker.check_any_direction(b"m", 4, 10));
     }
 
     #[test]

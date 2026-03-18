@@ -302,6 +302,17 @@ impl Block {
         left.saturating_sub(1)
     }
 
+    /// Decode only the first key at the given restart point (zero shared prefix).
+    /// O(1) — decodes a single entry, no segment walk needed.
+    pub fn first_key_at_restart(&self, restart_index: u32) -> Option<Vec<u8>> {
+        if restart_index >= self.num_restarts {
+            return None;
+        }
+        let offset = self.restart_point(restart_index) as usize;
+        // At a restart point, shared_len is always 0, so prev_key can be empty.
+        decode_entry_at(&self.data, offset, &[]).map(|(key, _, _)| key)
+    }
+
     /// Return the number of restart points in this block.
     pub fn num_restarts(&self) -> u32 {
         self.num_restarts

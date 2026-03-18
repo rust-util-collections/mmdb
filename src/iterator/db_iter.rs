@@ -333,6 +333,7 @@ impl DBIterator {
         self.range_tombstones.clear();
         self.prev_overshoot = None;
         self.backward_positioned = false;
+        self.range_tombstones_preloaded = false;
         self.current = None;
         self.needs_advance = true;
         self.seek_to_first();
