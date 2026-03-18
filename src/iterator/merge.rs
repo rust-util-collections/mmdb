@@ -498,20 +498,27 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Get the next (key, value) pair from the merged stream (forward direction).
     pub fn next_entry(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        // Direction check must come before single-source fast path:
+        // after prev_entry() sets direction=Backward, the source is
+        // backward-positioned and must be re-seeked forward.
+        if self.direction != Direction::Forward {
+            self.switch_to_forward();
+        }
+
         // Single-source fast path: bypass heap entirely.
         if self.single_source {
             if !self.initialized {
                 self.initialized = true;
                 let _ = self.sources[0].peek();
             }
-            return self.sources[0].take_peeked().inspect(|_| {
+            return self.sources[0].take_peeked().inspect(|entry| {
+                // Track current key for direction switching (same as multi-source path).
+                self.current_key.clear();
+                self.current_key.extend_from_slice(&entry.0);
                 let _ = self.sources[0].peek();
             });
         }
 
-        if self.direction != Direction::Forward {
-            self.switch_to_forward();
-        }
         self.init_heap();
 
         if self.heap_size == 0 {
@@ -802,5 +809,40 @@ mod tests {
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].0, b"c");
         assert_eq!(result[1].0, b"d");
+    }
+
+    #[test]
+    fn test_single_source_direction_switch() {
+        // Bug 2 regression: single_source fast path must respect direction changes.
+        // After prev_entry() sets direction=Backward, next_entry() must re-seek forward.
+        let s1 = IterSource::new(vec![
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"b".to_vec(), b"2".to_vec()),
+            (b"c".to_vec(), b"3".to_vec()),
+            (b"d".to_vec(), b"4".to_vec()),
+        ]);
+
+        let mut merger = MergingIterator::new(vec![s1], |a, b| a.cmp(b));
+
+        // Forward: get "a", "b", "c"
+        assert_eq!(merger.next_entry().unwrap().0, b"a");
+        assert_eq!(merger.next_entry().unwrap().0, b"b");
+        assert_eq!(merger.next_entry().unwrap().0, b"c");
+        // current_key = "c"
+
+        // Backward: switch_to_backward re-seeks to "c" (seek_for_prev),
+        // peeked = "c", prev_entry returns "c"
+        assert_eq!(merger.prev_entry().unwrap().0, b"c");
+        // prev_advance moves to "b"
+        assert_eq!(merger.prev_entry().unwrap().0, b"b");
+        // current_key = "b"
+
+        // Forward again: switch_to_forward re-seeks to "b",
+        // stream resumes from "b" forward.
+        // Without the fix, direction wouldn't be switched and this would fail.
+        assert_eq!(merger.next_entry().unwrap().0, b"b");
+        assert_eq!(merger.next_entry().unwrap().0, b"c");
+        assert_eq!(merger.next_entry().unwrap().0, b"d");
+        assert!(merger.next_entry().is_none());
     }
 }

@@ -307,6 +307,19 @@ impl TableReader {
         Ok(max_seq)
     }
 
+    /// Return all range tombstones as (begin, end, seq) triples.
+    /// Delegates to `cached_range_tombstones()` — no extra I/O after first call.
+    #[allow(clippy::type_complexity)]
+    pub fn get_range_tombstones(
+        &self,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, crate::types::SequenceNumber)>> {
+        let cached = self.cached_range_tombstones().c(d!())?;
+        Ok(cached
+            .iter()
+            .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq))
+            .collect())
+    }
+
     /// Get cached range tombstones (populated once on first access).
     fn cached_range_tombstones(&self) -> Result<Arc<Vec<CachedRangeTombstone>>> {
         if let Some(cached) = self.range_tombstone_cache.get() {

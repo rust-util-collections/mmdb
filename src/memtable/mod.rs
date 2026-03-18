@@ -140,6 +140,19 @@ impl MemTable {
         max_seq
     }
 
+    /// Return all range tombstones as (begin, end, seq) triples.
+    /// Used by DBIterator for upfront tombstone loading at creation time.
+    pub fn get_range_tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
+        if !self.has_range_deletions() {
+            return Vec::new();
+        }
+        let tombstones = self.range_tombstones.lock();
+        tombstones
+            .iter()
+            .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq))
+            .collect()
+    }
+
     /// Return true if empty.
     pub fn is_empty(&self) -> bool {
         self.approximate_size.load(Ordering::Relaxed) == 0

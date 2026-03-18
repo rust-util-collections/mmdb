@@ -615,8 +615,39 @@ impl DB {
         if let Some(end) = end_hint {
             db_iter.set_upper_bound(end.to_vec());
         }
-        if !any_range_deletions {
-            db_iter.set_no_range_deletions();
+
+        // Collect all range tombstones upfront from per-source caches.
+        // This enables O(log T) binary search for any key in any direction,
+        // replacing the old inline-collection + full-scan preload approach.
+        if any_range_deletions {
+            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+            if active_mem.has_range_deletions() {
+                all_tombstones.extend(active_mem.get_range_tombstones());
+            }
+            for imm in imm_mems {
+                if imm.has_range_deletions() {
+                    all_tombstones.extend(imm.get_range_tombstones());
+                }
+            }
+            for tf in version.level_files(0) {
+                if tf.meta.has_range_deletions
+                    && let Ok(ts) = tf.reader.get_range_tombstones()
+                {
+                    all_tombstones.extend(ts);
+                }
+            }
+            for level in 1..version.num_levels {
+                for tf in version.level_files(level) {
+                    if tf.meta.has_range_deletions
+                        && let Ok(ts) = tf.reader.get_range_tombstones()
+                    {
+                        all_tombstones.extend(ts);
+                    }
+                }
+            }
+            if !all_tombstones.is_empty() {
+                db_iter.set_range_tombstones(all_tombstones);
+            }
         }
         Ok(db_iter)
     }
@@ -720,9 +751,39 @@ impl DB {
         }
 
         let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix.to_vec());
-        if !any_range_deletions {
-            iter.set_no_range_deletions();
+
+        // Collect all range tombstones upfront (same pattern as iter_with_range).
+        if any_range_deletions {
+            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+            if active_mem.has_range_deletions() {
+                all_tombstones.extend(active_mem.get_range_tombstones());
+            }
+            for imm in imm_mems {
+                if imm.has_range_deletions() {
+                    all_tombstones.extend(imm.get_range_tombstones());
+                }
+            }
+            for tf in version.level_files(0) {
+                if tf.meta.has_range_deletions
+                    && let Ok(ts) = tf.reader.get_range_tombstones()
+                {
+                    all_tombstones.extend(ts);
+                }
+            }
+            for level in 1..version.num_levels {
+                for tf in version.level_files(level) {
+                    if tf.meta.has_range_deletions
+                        && let Ok(ts) = tf.reader.get_range_tombstones()
+                    {
+                        all_tombstones.extend(ts);
+                    }
+                }
+            }
+            if !all_tombstones.is_empty() {
+                iter.set_range_tombstones(all_tombstones);
+            }
         }
+
         // Seek to the prefix start
         iter.seek(prefix);
 

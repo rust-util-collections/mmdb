@@ -2,7 +2,7 @@
 //! sequence numbers, and skips tombstones.
 
 use crate::iterator::merge::{IterSource, MergingIterator};
-use crate::iterator::range_del::RangeTombstoneTracker;
+use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
 
 type IKeyCompareFn = fn(&[u8], &[u8]) -> std::cmp::Ordering;
@@ -24,8 +24,10 @@ pub struct DBIterator {
     current: Option<(Vec<u8>, Vec<u8>)>,
     /// Whether we've already consumed current via advance().
     needs_advance: bool,
-    /// Efficient range tombstone tracker with sweep-line algorithm.
-    range_tombstones: RangeTombstoneTracker,
+    /// Pre-fragmented, immutable range tombstone index for O(log T) coverage
+    /// checks in any direction. Loaded upfront at creation time from all
+    /// sources' cached tombstones — no inline collection or full-scan preload.
+    range_tombstones: FragmentedRangeTombstoneList,
     /// If set, iteration stops when user key no longer starts with this prefix.
     prefix: Option<Vec<u8>>,
     /// If set, iteration stops when user key >= this bound (exclusive upper bound).
@@ -39,14 +41,6 @@ pub struct DBIterator {
     /// On the next forward iteration (next_visible), the merger must be re-seeked
     /// past the current user key to resume forward scanning correctly.
     backward_positioned: bool,
-    /// Whether range tombstones have been preloaded from all sources.
-    /// In backward iteration, range deletion entries are encountered AFTER the
-    /// keys they cover (since begin_key < covered keys). Preloading ensures all
-    /// tombstones are in the tracker before any backward visibility check.
-    range_tombstones_preloaded: bool,
-    /// Hint: if false, no source contains range deletions, so preload can be skipped.
-    /// Set by DB layer which knows per-file and per-memtable range deletion status.
-    may_have_range_deletions: bool,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -70,13 +64,11 @@ impl DBIterator {
             has_last_key: false,
             current: None,
             needs_advance: true,
-            range_tombstones: RangeTombstoneTracker::new(),
+            range_tombstones: FragmentedRangeTombstoneList::empty(),
             prefix: None,
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
-            range_tombstones_preloaded: false,
-            may_have_range_deletions: true,
         }
     }
 
@@ -94,13 +86,11 @@ impl DBIterator {
             has_last_key: false,
             current: None,
             needs_advance: true,
-            range_tombstones: RangeTombstoneTracker::new(),
+            range_tombstones: FragmentedRangeTombstoneList::empty(),
             prefix: None,
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
-            range_tombstones_preloaded: false,
-            may_have_range_deletions: true,
         }
     }
 
@@ -123,21 +113,23 @@ impl DBIterator {
             has_last_key: false,
             current: None,
             needs_advance: true,
-            range_tombstones: RangeTombstoneTracker::new(),
+            range_tombstones: FragmentedRangeTombstoneList::empty(),
             prefix: Some(prefix),
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
-            range_tombstones_preloaded: false,
-            may_have_range_deletions: true,
         }
     }
 
-    /// Hint that no source contains range deletions, so the expensive
-    /// preload scan can be skipped entirely on backward iteration.
+    /// Set pre-collected range tombstones. Called by the DB layer after
+    /// collecting tombstones from all memtables and SST files.
+    pub fn set_range_tombstones(&mut self, tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) {
+        self.range_tombstones = FragmentedRangeTombstoneList::new(tombstones);
+    }
+
+    /// No-op: tombstones are loaded upfront; emptiness is checked via is_empty().
     pub fn set_no_range_deletions(&mut self) {
-        self.may_have_range_deletions = false;
-        self.range_tombstones_preloaded = true; // nothing to preload
+        // Tombstones list is already empty by default.
     }
 
     /// Set an exclusive upper bound on user keys.
@@ -150,45 +142,15 @@ impl DBIterator {
         self.needs_advance = true;
     }
 
-    /// Scan all merger entries to collect RangeDeletion entries into the tracker.
-    /// Called once before the first backward operation to ensure all range tombstones
-    /// are available for visibility checks. In backward order, range deletion entries
-    /// are encountered AFTER the keys they cover.
-    fn preload_range_tombstones(&mut self) {
-        if self.range_tombstones_preloaded {
-            return;
-        }
-        self.range_tombstones_preloaded = true;
-
-        // Save merger state, scan from beginning for all range tombstones
-        self.merger.seek_to_first();
-        loop {
-            let entry = self.merger.next_entry();
-            match entry {
-                Some((ikey, value)) => {
-                    if ikey.len() < 8 {
-                        continue;
-                    }
-                    let ikr = InternalKeyRef::new(&ikey);
-                    if ikr.value_type() == ValueType::RangeDeletion {
-                        let uk_len = ikey.len() - 8;
-                        self.range_tombstones
-                            .add(ikey[..uk_len].to_vec(), value, ikr.sequence());
-                    }
-                }
-                None => break,
-            }
-        }
-        self.range_tombstones.reset();
-    }
-
     /// Check if a user key is covered by any range tombstone visible at our snapshot.
-    fn is_range_deleted(&mut self, user_key: &[u8], seq: SequenceNumber) -> bool {
+    /// O(log T) binary search on pre-fragmented tombstone index.
+    fn is_range_deleted(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
         if self.range_tombstones.is_empty() {
             return false;
         }
         self.range_tombstones
-            .is_deleted(user_key, seq, self.sequence)
+            .max_covering_tombstone_seq(user_key, self.sequence)
+            > seq
     }
 
     /// Advance the streaming iterator to the next visible (user_key, value) pair.
@@ -238,11 +200,9 @@ impl DBIterator {
                 return None;
             }
 
-            // Collect range tombstones
+            // Skip range deletion entries in the data stream — tombstones are
+            // pre-loaded into the fragmented list, so we don't collect inline.
             if vt == ValueType::RangeDeletion {
-                self.range_tombstones
-                    .add(ikey[..uk_len].to_vec(), value.clone(), seq);
-                self.range_tombstones.reset();
                 if self.has_last_key && self.last_user_key.as_slice() == &ikey[..uk_len] {
                     continue;
                 }
@@ -343,10 +303,9 @@ impl DBIterator {
     pub fn reset_and_seek_to_first(&mut self) {
         self.has_last_key = false;
         self.last_user_key.clear();
-        self.range_tombstones.clear();
+        // range_tombstones is immutable — no reset needed.
         self.prev_overshoot = None;
         self.backward_positioned = false;
-        self.range_tombstones_preloaded = false;
         self.current = None;
         self.needs_advance = true;
         self.seek_to_first();
@@ -357,10 +316,6 @@ impl DBIterator {
     /// Uses a single backward seek + inline resolution. No redundant forward seek.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
-
-        // Preload range tombstones (one-time scan) so backward resolution can
-        // correctly filter deleted keys.
-        self.preload_range_tombstones();
 
         // Use merger backward seek to find the last internal key <= target
         let seek_key = InternalKey::new(target, 0, ValueType::Deletion);
@@ -449,9 +404,8 @@ impl DBIterator {
                     }
                 }
 
-                // Collect range deletions into tracker
+                // Skip range deletion entries — tombstones are pre-loaded.
                 if vt == ValueType::RangeDeletion {
-                    self.range_tombstones.add(uk.to_vec(), value.clone(), seq);
                     iter_entry = self.merger.prev_entry();
                     continue;
                 }
@@ -483,14 +437,8 @@ impl DBIterator {
                     }
                     match best_entry {
                         Some((uk, val)) => {
-                            // Check range tombstone coverage
-                            if !self.range_tombstones.is_empty()
-                                && self.range_tombstones.check_any_direction(
-                                    &uk,
-                                    best_seq,
-                                    self.sequence,
-                                )
-                            {
+                            // Check range tombstone coverage (O(log T) binary search)
+                            if self.is_range_deleted(&uk, best_seq) {
                                 // Covered by range tombstone — skip
                                 current_bound = cuk;
                                 continue;
@@ -526,9 +474,6 @@ impl DBIterator {
     ///
     /// Uses inline backward resolution: O(1) amortized per call.
     pub fn prev(&mut self) {
-        // Preload range tombstones if not yet done (one-time cost).
-        self.preload_range_tombstones();
-
         // Ensure we have a current entry to move backwards from
         self.ensure_current();
         let saved_key = match &self.current {
@@ -549,10 +494,6 @@ impl DBIterator {
     /// then resolves visibility inline (no forward re-seek).
     pub fn seek_to_last(&mut self) {
         use crate::types::InternalKey;
-
-        // Preload range tombstones (one-time scan) so backward resolution can
-        // correctly filter deleted keys.
-        self.preload_range_tombstones();
 
         // Determine the effective upper bound for backward seek.
         // Priority: prefix upper bound > iterate_upper_bound > seek_to_last_merge.
@@ -590,7 +531,6 @@ impl DBIterator {
         }
 
         self.has_last_key = false;
-        self.range_tombstones.reset();
         self.prev_overshoot = None;
 
         // Compute an effective upper bound for resolve_prev_user_key.
@@ -942,6 +882,67 @@ mod tests {
 
         iter.prev();
         assert!(iter.valid());
+        assert_eq!(iter.key(), b"a");
+
+        iter.prev();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_seek_past_range_tombstone_begin() {
+        // Bug 1 regression: seek(target) where target is inside a range tombstone
+        // [b, e) must still hide keys in that range.
+        // With old inline collection, seeking past "b" would miss the tombstone.
+        let source = sort_lex(vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 5, ValueType::RangeDeletion, b"e"), // [b, e) @ seq 5
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+            make_entry(b"d", 4, ValueType::Value, b"4"),
+            make_entry(b"e", 6, ValueType::Value, b"6"),
+        ]);
+
+        // Pre-load tombstones the way the DB layer would.
+        let mut iter = DBIterator::new(vec![source], 10);
+        iter.set_range_tombstones(vec![(b"b".to_vec(), b"e".to_vec(), 5)]);
+
+        // Seek to "c" — inside the tombstone range. "c"@3 should be hidden.
+        iter.seek(b"c");
+        assert!(iter.valid());
+        // Next visible key should be "e" (first key outside tombstone range)
+        assert_eq!(iter.key(), b"e");
+        assert_eq!(iter.value(), b"6");
+    }
+
+    #[test]
+    fn test_backward_range_tombstones_no_preload() {
+        // Bug 3 fix: backward iteration with range tombstones should work
+        // without requiring a full forward scan (preload_range_tombstones removed).
+        let source = sort_lex(vec![
+            make_entry(b"a", 1, ValueType::Value, b"1"),
+            make_entry(b"b", 5, ValueType::RangeDeletion, b"d"), // [b, d) @ seq 5
+            make_entry(b"b", 2, ValueType::Value, b"2"),
+            make_entry(b"c", 3, ValueType::Value, b"3"),
+            make_entry(b"d", 4, ValueType::Value, b"4"),
+            make_entry(b"e", 6, ValueType::Value, b"6"),
+        ]);
+
+        let mut iter = DBIterator::new(vec![source], 10);
+        iter.set_range_tombstones(vec![(b"b".to_vec(), b"d".to_vec(), 5)]);
+
+        // seek_to_last should find "e", then prev should skip "d" (not deleted),
+        // skip "c" (deleted by tombstone), skip "b" (deleted), land on "a".
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"e");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key(), b"d");
+
+        iter.prev();
+        assert!(iter.valid());
+        // "c"@3 and "b"@2 are both deleted by [b,d)@5, so prev should reach "a"
         assert_eq!(iter.key(), b"a");
 
         iter.prev();
