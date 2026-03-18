@@ -271,7 +271,8 @@ impl DoubleEndedIterator for BidiIterator {
                     *last_back_key = Some(k.clone());
                     Some((k, v))
                 } else {
-                    *last_back_key = None;
+                    // Keep last_back_key — it's the correct upper bound for a
+                    // subsequent next() so it won't re-stream consumed entries.
                     None
                 }
             }
