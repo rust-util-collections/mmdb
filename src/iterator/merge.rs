@@ -568,6 +568,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 self.initialized = true;
                 let _ = self.sources[0].peek();
             }
+            // Check has_peeked directly — do NOT call take_peeked() which
+            // would trigger forward advance_into_buffers when source is exhausted backward.
+            if !self.sources[0].has_peeked {
+                return None;
+            }
             return self.sources[0].take_peeked().inspect(|entry| {
                 self.current_key.clear();
                 self.current_key.extend_from_slice(&entry.0);
@@ -705,12 +710,13 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Advance past the current minimum entry (discard it).
     /// For single-source: clears peeked flag and re-peeks (reuses buffer capacity).
     /// For multi-source: pops heap top, advances source, sifts down.
-    ///
-    /// Does NOT update current_key (unlike take_entry). current_key is only
-    /// needed for direction switching; callers that need it call take_entry
-    /// for the one entry they return. This avoids a memcpy per skipped entry.
     pub fn advance_entry(&mut self) {
         if self.single_source {
+            if self.sources[0].has_peeked {
+                self.current_key.clear();
+                self.current_key
+                    .extend_from_slice(&self.sources[0].peeked_key);
+            }
             self.sources[0].skip_peeked();
             let _ = self.sources[0].peek();
             return;
@@ -721,6 +727,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
 
         let min_idx = self.heap[0];
+        if self.sources[min_idx].has_peeked {
+            self.current_key.clear();
+            self.current_key
+                .extend_from_slice(&self.sources[min_idx].peeked_key);
+        }
         self.sources[min_idx].skip_peeked();
         let _ = self.sources[min_idx].peek();
 

@@ -242,11 +242,12 @@ impl DoubleEndedIterator for BidiIterator {
                 if db_iter.valid() {
                     let k = db_iter.key().to_vec();
                     let v = db_iter.value().to_vec();
-                    // Stop if backward cursor has crossed the forward frontier
+                    // Stop if backward cursor has crossed the forward frontier.
+                    // Keep last_back_key unchanged — it's the correct upper bound
+                    // for a subsequent next() materialization.
                     if let Some(fk) = last_fwd_key.as_deref()
                         && k.as_slice() <= fk
                     {
-                        *last_back_key = None;
                         return None;
                     }
                     *last_back_key = Some(k.clone());

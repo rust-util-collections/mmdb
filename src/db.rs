@@ -1210,6 +1210,11 @@ impl DB {
                 rr.done = true;
             }
             self.write_cv.notify_all();
+            // Leader is batch_group[0]. If fail_idx > 0, the leader's own
+            // batch succeeded in WAL + memtable — return Ok, not Err.
+            if fail_idx > 0 {
+                return Ok(());
+            }
             return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
         }
 
