@@ -146,7 +146,7 @@ src/
 +-- stats.rs                # Database statistics
 +-- memtable/
 |   +-- mod.rs              # MemTable (put/get/iter with approximate_size tracking)
-|   +-- skiplist.rs         # OrdInternalKey + crossbeam-skiplist (O(1) iteration)
+|   +-- skiplist.rs         # OrdInternalKey + skiplist (O(1) iteration)
 +-- wal/
 |   +-- writer.rs           # WAL append with block-based fragmentation
 |   +-- reader.rs           # WAL replay for crash recovery

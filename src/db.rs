@@ -343,51 +343,46 @@ impl DB {
             )
         };
 
+        // Find the highest-seq range tombstone covering this key (across all memtables).
+        // This is needed to compare against any point entry we find.
+        let tombstone_seq = self.max_covering_tombstone_seq(key, seq, &active_mem, &imm_mems);
+
         // 1. Active MemTable
-        if let Some(result) = active_mem.get(key, seq) {
-            // Found a point entry. Check if a newer range tombstone covers it.
-            // Point entry's seq is the highest for this user key <= our read seq.
-            // If there's a range tombstone with seq between the point entry's seq
-            // and our read seq, the point entry is deleted.
-            // But since memtable.get() returns the HIGHEST seq entry for this key,
-            // and range tombstones with higher seq would have been written AFTER,
-            // we only need to check if any range tombstone covers this key.
-            // However, if the point entry exists, it was written at some seq.
-            // A range tombstone only deletes entries with seq <= tombstone.seq.
-            // Since the iterator guarantees user_key ASC + seq DESC ordering,
-            // the point entry we found has the highest seq for this key.
-            // A range tombstone with LOWER seq should NOT delete it.
-            //
-            // The correct check: only consider range tombstones with seq > point_entry_seq.
-            // For simplicity (matching RocksDB behavior), if we found a point value,
-            // it wins over any older range tombstone. Range tombstones are applied
-            // during iteration and compaction, not during point get when a newer
-            // point entry exists.
+        if let Some((result, entry_seq)) = active_mem.get_with_seq(key, seq) {
+            // If a range tombstone with higher seq exists, it deletes this entry
+            if tombstone_seq > entry_seq {
+                return Ok(None);
+            }
             return Ok(result);
         }
 
         // 2. Immutable MemTables (newest first)
         for imm in &imm_mems {
-            if let Some(result) = imm.get(key, seq) {
+            if let Some((result, entry_seq)) = imm.get_with_seq(key, seq) {
+                if tombstone_seq > entry_seq {
+                    return Ok(None);
+                }
                 return Ok(result);
             }
         }
 
-        // 3. Check range tombstones in memtables ONLY if no point entry was found.
-        // This ensures that put(d) after delete_range(c,f) correctly returns the put value,
-        // because the point entry (higher seq) takes precedence.
-        if self.is_key_range_deleted(key, seq, &active_mem, &imm_mems) {
+        // 3. If no point entry in memtables but a tombstone covers the key,
+        // the key is deleted (tombstone covers entries in older SSTs too).
+        if tombstone_seq > 0 {
             return Ok(None);
         }
 
-        // 3. L0 SST files (newest first, may overlap)
+        // 4. L0 SST files (newest first, may overlap)
+        // TODO: SST-level range tombstone checking requires scanning SST tombstones.
+        // Currently range tombstones in SSTs are handled by the iterator/compaction paths.
+        // Point get from SSTs does not yet check cross-SST range tombstones.
         for tf in version.level_files(0) {
             if let Some(result) = tf.reader.get_internal(key, seq)? {
                 return Ok(result);
             }
         }
 
-        // 4. L1+ SST files (sorted by smallest_key, no overlap within level)
+        // 5. L1+ SST files (sorted by smallest_key, no overlap within level)
         for level in 1..version.num_levels {
             let files = version.level_files(level);
             if files.is_empty() {
@@ -765,21 +760,23 @@ impl DB {
         }
     }
 
-    /// Check if a key is covered by any range tombstone visible at the given sequence.
-    /// Only scans memtables that actually contain RangeDeletion entries (O(1) skip
-    /// for the common case where delete_range() was never called).
-    fn is_key_range_deleted(
+    /// Find the highest sequence number among range tombstones covering `key`
+    /// that are visible at the given read sequence.
+    /// Returns 0 if no covering tombstone exists.
+    fn max_covering_tombstone_seq(
         &self,
         key: &[u8],
         seq: SequenceNumber,
         active_mem: &MemTable,
         imm_mems: &[Arc<MemTable>],
-    ) -> bool {
+    ) -> SequenceNumber {
         use crate::types::InternalKeyRef;
 
-        let check_memtable = |mem: &MemTable| -> bool {
+        let mut max_seq: SequenceNumber = 0;
+
+        let check_memtable = |mem: &MemTable, max: &mut SequenceNumber| {
             if !mem.has_range_deletions() {
-                return false;
+                return;
             }
             for (ikey, value) in mem.iter() {
                 if ikey.len() < 8 {
@@ -789,27 +786,23 @@ impl DB {
                 if ikr.value_type() != ValueType::RangeDeletion {
                     continue;
                 }
-                if ikr.sequence() > seq {
-                    continue;
+                let tomb_seq = ikr.sequence();
+                if tomb_seq > seq {
+                    continue; // not visible at our read sequence
                 }
                 let begin = ikr.user_key();
                 let end = &value;
-                if key >= begin && key < end.as_slice() {
-                    return true;
+                if key >= begin && key < end.as_slice() && tomb_seq > *max {
+                    *max = tomb_seq;
                 }
             }
-            false
         };
 
-        if check_memtable(active_mem) {
-            return true;
-        }
+        check_memtable(active_mem, &mut max_seq);
         for imm in imm_mems {
-            if check_memtable(imm) {
-                return true;
-            }
+            check_memtable(imm, &mut max_seq);
         }
-        false
+        max_seq
     }
 
     fn check_closed(&self) -> Result<()> {

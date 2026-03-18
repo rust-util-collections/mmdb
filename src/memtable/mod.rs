@@ -54,13 +54,17 @@ impl MemTable {
     /// Returns `Some(Some(value))` for a found value, `Some(None)` for a deletion tombstone,
     /// or `None` if the key is not in this MemTable.
     pub fn get(&self, key: &[u8], sequence: SequenceNumber) -> Option<Option<Vec<u8>>> {
-        // We need to find the entry with the highest sequence number <= `sequence`
-        // for the given user key.
-        //
-        // We create a search key with the given sequence and Value type (highest type),
-        // which will land us at or just before the newest relevant entry.
+        self.get_with_seq(key, sequence).map(|(result, _)| result)
+    }
+
+    /// Like `get`, but also returns the sequence number of the found entry.
+    pub fn get_with_seq(
+        &self,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<(Option<Vec<u8>>, SequenceNumber)> {
         let search_key = InternalKey::new(key, sequence, ValueType::Value);
-        self.inner.get(search_key.as_bytes(), key)
+        self.inner.get_with_seq(search_key.as_bytes(), key)
     }
 
     /// Approximate memory usage in bytes.

@@ -76,14 +76,18 @@ impl SkipListMemTable {
     /// - `Some(None)` if a Deletion entry is found
     /// - `None` if no entry for this user key exists at or below the search sequence
     pub fn get(&self, search_key: &[u8], user_key: &[u8]) -> Option<Option<Vec<u8>>> {
-        // With OrdInternalKey, the skip list is sorted by (user_key ASC, seq DESC).
-        // Use O(log N) lower_bound to find the first entry >= search_key,
-        // then check a few entries at level 0 for the matching user_key.
-        let search = OrdInternalKey(search_key.to_vec());
+        self.get_with_seq(search_key, user_key)
+            .map(|(result, _seq)| result)
+    }
 
-        // lower_bound gives us the first entry >= search_key.
-        // For the same user_key, higher seq comes first, so the first match
-        // is the best (newest version <= target seq).
+    /// Like `get`, but also returns the sequence number of the found entry.
+    /// Needed for range tombstone vs point entry sequence comparison.
+    pub fn get_with_seq(
+        &self,
+        search_key: &[u8],
+        user_key: &[u8],
+    ) -> Option<(Option<Vec<u8>>, crate::types::SequenceNumber)> {
+        let search = OrdInternalKey(search_key.to_vec());
         let (k, v) = self.map.lower_bound(&search)?;
         let kb = k.as_bytes();
         if kb.len() < 8 {
@@ -92,12 +96,15 @@ impl SkipListMemTable {
         let entry_uk = &kb[..kb.len() - 8];
         if entry_uk == user_key {
             let entry_ref = InternalKeyRef::new(kb);
-            return Some(match entry_ref.value_type() {
-                ValueType::Value => Some(v),
-                ValueType::Deletion | ValueType::RangeDeletion => None,
-            });
+            let seq = entry_ref.sequence();
+            return Some((
+                match entry_ref.value_type() {
+                    ValueType::Value => Some(v),
+                    ValueType::Deletion | ValueType::RangeDeletion => None,
+                },
+                seq,
+            ));
         }
-        // The first entry >= search has a different user_key → not found.
         None
     }
 
