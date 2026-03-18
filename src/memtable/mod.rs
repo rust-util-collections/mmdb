@@ -44,7 +44,7 @@ impl MemTable {
                 value.to_vec()
             }
         };
-        let entry_size = ikey.encoded_len() + val.len() + 16; // overhead estimate
+        let entry_size = ikey.encoded_len() + val.len() + 160; // Node struct overhead (inline [AtomicPtr; 12] + Vec headers)
         self.inner.insert(ikey.into_bytes(), val);
         self.approximate_size
             .fetch_add(entry_size, Ordering::Relaxed);

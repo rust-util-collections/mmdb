@@ -1,4 +1,4 @@
-//! A write-serialized, read-concurrent skip list.
+//! A write-serialized, read-concurrent skip list with arena allocation.
 //!
 //! The DB's group commit model guarantees a single leader writes to the memtable
 //! at any time (under write_queue lock), while reads happen concurrently via
@@ -6,9 +6,9 @@
 //! - **Single-writer**: `&self` insert, serialized externally by the DB write_queue lock
 //! - **Concurrent readers**: `&self` iter/get/range, lock-free via atomic pointers
 //!
-//! Each node is individually heap-allocated (via `Box`), so node pointers are
-//! stable — no arena reallocation invalidation. Readers follow `AtomicPtr`
-//! chains with Acquire ordering; the single writer publishes via Release.
+//! Nodes are arena-allocated in contiguous blocks for cache-friendly level-0
+//! traversal. Each node carries an inline `[AtomicPtr; MAX_HEIGHT]` array,
+//! eliminating a separate heap allocation for next-pointers.
 //!
 //! Max height 12, probability p = 0.25.
 
@@ -20,23 +20,110 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 /// Maximum height of the skip list.
 const MAX_HEIGHT: usize = 12;
 
+/// Initial arena block size.
+const ARENA_INITIAL_BLOCK: usize = 4096;
+
+/// Maximum arena block size (blocks double up to this cap).
+const ARENA_MAX_BLOCK: usize = 1 << 20; // 1MB
+
+// ---------------------------------------------------------------------------
+// Arena
+// ---------------------------------------------------------------------------
+
+/// Bump-pointer arena that allocates from doubling blocks (4KB → 1MB cap).
+///
+/// Only mutated during `insert()` (single-writer); readers follow published
+/// pointers. No per-allocation free — memory is released when the Arena drops.
+struct Arena {
+    blocks: UnsafeCell<Vec<Vec<u8>>>,
+    current_offset: UnsafeCell<usize>,
+    bytes_allocated: AtomicUsize,
+}
+
+impl Arena {
+    fn new() -> Self {
+        Self {
+            blocks: UnsafeCell::new(Vec::new()),
+            current_offset: UnsafeCell::new(0),
+            bytes_allocated: AtomicUsize::new(0),
+        }
+    }
+
+    /// Allocate `size` bytes with given alignment from the arena.
+    ///
+    /// # Safety
+    /// Must be called under external write serialization (single-writer).
+    unsafe fn alloc(&self, size: usize, align: usize) -> *mut u8 {
+        unsafe {
+            let blocks = &mut *self.blocks.get();
+            let offset = &mut *self.current_offset.get();
+
+            // Try current block.
+            if let Some(block) = blocks.last() {
+                let base = block.as_ptr() as usize;
+                let aligned = (base + *offset + align - 1) & !(align - 1);
+                let new_offset = aligned - base + size;
+                if new_offset <= block.capacity() {
+                    *offset = new_offset;
+                    self.bytes_allocated.fetch_add(size, Ordering::Relaxed);
+                    return aligned as *mut u8;
+                }
+            }
+
+            // New block with doubling growth.
+            let prev_cap = blocks.last().map_or(0, Vec::capacity);
+            let block_size = if prev_cap == 0 {
+                ARENA_INITIAL_BLOCK
+            } else {
+                (prev_cap * 2).min(ARENA_MAX_BLOCK)
+            }
+            .max(size + align);
+
+            let block = Vec::<u8>::with_capacity(block_size);
+            let base = block.as_ptr() as usize;
+            let aligned = (base + align - 1) & !(align - 1);
+            *offset = aligned - base + size;
+            self.bytes_allocated.fetch_add(size, Ordering::Relaxed);
+            blocks.push(block);
+            aligned as *mut u8
+        }
+    }
+
+    /// Allocate space for one `Node<K, V>`.
+    ///
+    /// # Safety
+    /// Same single-writer requirement as `alloc`.
+    unsafe fn alloc_node<K, V>(&self) -> *mut Node<K, V> {
+        unsafe {
+            self.alloc(
+                std::mem::size_of::<Node<K, V>>(),
+                std::mem::align_of::<Node<K, V>>(),
+            ) as *mut Node<K, V>
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Node
+// ---------------------------------------------------------------------------
+
 /// A node in the skip list.
+///
+/// `#[repr(C)]` ensures key+value are laid out first (cache-hot during
+/// level-0 traversal), followed by the fixed-size pointer tower.
+#[repr(C)]
 struct Node<K, V> {
     key: K,
     value: V,
+    height: u8,
     /// next[i] is the pointer to the next node at level i.
-    next: Vec<AtomicPtr<Node<K, V>>>,
+    /// Levels `height..MAX_HEIGHT` are unused (always null).
+    next: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
 }
 
-impl<K, V> Node<K, V> {
-    fn new(key: K, value: V, height: usize) -> Self {
-        let mut next = Vec::with_capacity(height);
-        for _ in 0..height {
-            next.push(AtomicPtr::new(ptr::null_mut()));
-        }
-        Self { key, value, next }
-    }
-}
+// ---------------------------------------------------------------------------
+// ConcurrentSkipList
+// ---------------------------------------------------------------------------
 
 /// A concurrent skip list with single-writer / multi-reader semantics.
 ///
@@ -44,16 +131,19 @@ impl<K, V> Node<K, V> {
 /// Get / iter / range are `&self` (lock-free).
 pub struct ConcurrentSkipList<K: Ord + Clone, V: Clone> {
     /// Head pointers for each level.
-    head: Vec<AtomicPtr<Node<K, V>>>,
+    head: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
     /// Number of entries.
     len: AtomicUsize,
     /// Current maximum height in the list.
     max_height: AtomicUsize,
-    /// All allocated nodes for cleanup. Only mutated under writer serialization.
+    /// All allocated node pointers — needed to run destructors (K, V may own
+    /// heap data). Only mutated under writer serialization.
     all_nodes: UnsafeCell<Vec<*mut Node<K, V>>>,
+    /// Arena backing store for all nodes.
+    arena: Arena,
 }
 
-// SAFETY: Node pointers are stable (individually heap-allocated via Box).
+// SAFETY: Node pointers are stable (arena-allocated, never moved).
 // Single-writer guarantee ensures no concurrent mutations. Readers only follow
 // AtomicPtr chains that are fully initialized before publication (Release/Acquire).
 unsafe impl<K: Ord + Clone + Send, V: Clone + Send> Send for ConcurrentSkipList<K, V> {}
@@ -64,15 +154,12 @@ unsafe impl<K: Ord + Clone + Send + Sync, V: Clone + Send + Sync> Sync
 
 impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     pub fn new() -> Self {
-        let mut head = Vec::with_capacity(MAX_HEIGHT);
-        for _ in 0..MAX_HEIGHT {
-            head.push(AtomicPtr::new(ptr::null_mut()));
-        }
         Self {
-            head,
+            head: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
             len: AtomicUsize::new(0),
             max_height: AtomicUsize::new(1),
             all_nodes: UnsafeCell::new(Vec::new()),
+            arena: Arena::new(),
         }
     }
 
@@ -126,10 +213,21 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             }
         }
 
-        // Heap-allocate the new node.
-        let new_node = Box::into_raw(Box::new(Node::new(key, value, height)));
+        // Arena-allocate and initialize the new node.
+        let new_node: *mut Node<K, V> = unsafe { self.arena.alloc_node() };
+        unsafe {
+            ptr::write(
+                new_node,
+                Node {
+                    key,
+                    value,
+                    height: height as u8,
+                    next: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+                },
+            );
+        }
 
-        // Track for cleanup.
+        // Track for destructor.
         // SAFETY: single-writer — no concurrent mutation of all_nodes.
         unsafe {
             (*self.all_nodes.get()).push(new_node);
@@ -499,12 +597,12 @@ impl<K: Ord + Clone, V: Clone> Default for ConcurrentSkipList<K, V> {
 
 impl<K: Ord + Clone, V: Clone> Drop for ConcurrentSkipList<K, V> {
     fn drop(&mut self) {
-        // SAFETY: we have exclusive access during Drop.
+        // Run destructors for K and V (they may own heap data, e.g. Vec<u8>).
+        // Arena frees the node memory itself when it drops.
         let nodes = self.all_nodes.get_mut();
         for &node_ptr in nodes.iter() {
-            // SAFETY: each pointer was created via Box::into_raw and is unique.
             unsafe {
-                drop(Box::from_raw(node_ptr));
+                ptr::drop_in_place(node_ptr);
             }
         }
     }
