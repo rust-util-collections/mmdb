@@ -50,6 +50,17 @@ pub struct TableReader {
     /// Cached index entries, shared across all TableIterators for this file.
     /// Populated once on first access, then reused (Arc for zero-copy sharing).
     index_entry_cache: OnceLock<IndexEntries>,
+    /// Cached range tombstones for this SST file. Populated once on first
+    /// max_covering_tombstone_seq call, then reused. Avoids re-reading all
+    /// data blocks on every get() call.
+    range_tombstone_cache: OnceLock<Arc<Vec<CachedRangeTombstone>>>,
+}
+
+/// A cached range tombstone entry extracted from an SST file.
+struct CachedRangeTombstone {
+    begin: Vec<u8>,
+    end: Vec<u8>,
+    seq: SequenceNumber,
 }
 
 impl TableReader {
@@ -113,6 +124,7 @@ impl TableReader {
             block_cache,
             stats,
             index_entry_cache: OnceLock::new(),
+            range_tombstone_cache: OnceLock::new(),
         })
     }
 
@@ -272,13 +284,39 @@ impl TableReader {
 
     /// Find the highest-seq range tombstone covering `user_key` with seq <= `read_seq`.
     /// Returns 0 if none found. Only meaningful for SSTs that contain range deletions.
+    ///
+    /// Range tombstones are cached per-SST on first access, so subsequent calls
+    /// are O(T) in the number of tombstones rather than O(blocks * entries).
     pub fn max_covering_tombstone_seq(
         &self,
         user_key: &[u8],
         read_seq: SequenceNumber,
     ) -> Result<SequenceNumber> {
+        let tombstones = self.cached_range_tombstones().c(d!())?;
         let mut max_seq: SequenceNumber = 0;
 
+        for rt in tombstones.iter() {
+            if rt.seq > read_seq {
+                continue;
+            }
+            if user_key >= rt.begin.as_slice()
+                && user_key < rt.end.as_slice()
+                && rt.seq > max_seq
+            {
+                max_seq = rt.seq;
+            }
+        }
+
+        Ok(max_seq)
+    }
+
+    /// Get cached range tombstones (populated once on first access).
+    fn cached_range_tombstones(&self) -> Result<Arc<Vec<CachedRangeTombstone>>> {
+        if let Some(cached) = self.range_tombstone_cache.get() {
+            return Ok(cached.clone());
+        }
+
+        let mut tombstones = Vec::new();
         for (_, handle_bytes) in self.index_block.iter() {
             let handle = BlockHandle::decode(&handle_bytes);
             let block_data = self.read_block_cached(&handle).c(d!())?;
@@ -292,19 +330,18 @@ impl TableReader {
                 if ikr.value_type() != ValueType::RangeDeletion {
                     continue;
                 }
-                let tomb_seq = ikr.sequence();
-                if tomb_seq > read_seq {
-                    continue;
-                }
-                let begin = ikr.user_key();
-                let end = &v;
-                if user_key >= begin && user_key < end.as_slice() && tomb_seq > max_seq {
-                    max_seq = tomb_seq;
-                }
+                tombstones.push(CachedRangeTombstone {
+                    begin: ikr.user_key().to_vec(),
+                    end: v,
+                    seq: ikr.sequence(),
+                });
             }
         }
 
-        Ok(max_seq)
+        let cached = Arc::new(tombstones);
+        // Race is benign — worst case we scan twice
+        let _ = self.range_tombstone_cache.set(cached.clone());
+        Ok(cached)
     }
 
     /// Iterate over all key-value pairs in the table.
