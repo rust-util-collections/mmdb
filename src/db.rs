@@ -827,6 +827,14 @@ impl DB {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
                 Some(task) => {
+                    let l0_inputs: Vec<u64> = if task.level == 0 {
+                        task.input_files_level
+                            .iter()
+                            .map(|f| f.meta.number)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     LeveledCompaction::execute_compaction_with_cache(
                         &task,
                         &mut inner.versions,
@@ -836,6 +844,9 @@ impl DB {
                         Some(&self.rate_limiter),
                         Some(&self.stats),
                     )?;
+                    for num in &l0_inputs {
+                        self.block_cache.unpin_file(*num);
+                    }
                 }
                 None => break,
             }
@@ -1009,6 +1020,7 @@ impl DB {
         // Allocate sequences and write WAL for all batches
         let mut need_sync = false;
         let mut inner = self.inner.lock();
+        let mut wal_add_error = None;
 
         for &req_ptr in &batch_group {
             // SAFETY: we hold the only references; other threads are blocked on write_cv
@@ -1023,16 +1035,8 @@ impl DB {
                 if let Some(ref mut wal) = inner.wal_writer
                     && let Err(e) = wal.add_record(&wal_record)
                 {
-                    // Acquire queue lock before writing done/result to synchronize
-                    // with followers waiting on write_cv.
-                    let _queue = self.write_queue.lock();
-                    for &rp in &batch_group {
-                        let rr = unsafe { &mut *rp };
-                        rr.result = Some(Err(Error::Io(std::io::Error::other(format!("{}", e)))));
-                        rr.done = true;
-                    }
-                    self.write_cv.notify_all();
-                    return Err(e);
+                    wal_add_error = Some(e);
+                    break;
                 }
             }
 
@@ -1052,23 +1056,46 @@ impl DB {
             self.stats.record_write(batch_bytes);
         }
 
+        // Handle WAL add_record error outside the loop to avoid lock ordering
+        // inversion (write_queue → inner is the correct order; acquiring
+        // write_queue while holding inner would risk deadlock with flush/compact).
+        if let Some(e) = wal_add_error {
+            drop(inner);
+            let _queue = self.write_queue.lock();
+            for &rp in &batch_group {
+                let rr = unsafe { &mut *rp };
+                rr.result = Some(Err(Error::Io(std::io::Error::other(format!("{}", e)))));
+                rr.done = true;
+            }
+            self.write_cv.notify_all();
+            return Err(Error::Io(std::io::Error::other(format!("{}", e))));
+        }
+
         // Single fsync for all batches that wrote to WAL
         let any_wal = batch_group.iter().any(|&p| !unsafe { &*p }.disable_wal);
-        if any_wal && let Some(ref mut wal) = inner.wal_writer {
-            let wal_result = if need_sync { wal.sync() } else { wal.flush() };
-            if let Err(e) = wal_result {
-                // WAL sync/flush failed — data may not be durable.
-                // Notify all followers of the failure.
-                let queue = self.write_queue.lock();
-                for &req_ptr in &batch_group[1..] {
-                    let r = unsafe { &mut *req_ptr };
-                    r.result = Some(Err(Error::Io(std::io::Error::other(format!("{}", e)))));
-                    r.done = true;
+        let wal_sync_err = if any_wal {
+            match inner.wal_writer {
+                Some(ref mut wal) => {
+                    let r = if need_sync { wal.sync() } else { wal.flush() };
+                    r.err()
                 }
-                self.write_cv.notify_all();
-                drop(queue);
-                return Err(e);
+                None => None,
             }
+        } else {
+            None
+        };
+        if let Some(e) = wal_sync_err {
+            // Drop inner lock first to maintain consistent lock ordering
+            // (write_queue → inner), preventing deadlock with flush/compact.
+            drop(inner);
+            let _queue = self.write_queue.lock();
+            for &req_ptr in &batch_group[1..] {
+                let r = unsafe { &mut *req_ptr };
+                r.result = Some(Err(Error::Io(std::io::Error::other(format!("{}", e)))));
+                r.done = true;
+            }
+            self.write_cv.notify_all();
+            return Err(Error::Io(std::io::Error::other(format!("{}", e))));
         }
 
         // Check memtable size threshold — data is already in WAL so a flush
@@ -1175,6 +1202,15 @@ impl DB {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction(&version, &force_opts) {
                 Some(task) => {
+                    // Collect L0 input files for cache unpinning after compaction
+                    let l0_inputs: Vec<u64> = if task.level == 0 {
+                        task.input_files_level
+                            .iter()
+                            .map(|f| f.meta.number)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     LeveledCompaction::execute_compaction_with_cache(
                         &task,
                         &mut inner.versions,
@@ -1184,6 +1220,10 @@ impl DB {
                         Some(&self.rate_limiter),
                         Some(&self.stats),
                     )?;
+                    // Unpin L0 files from block cache after compaction
+                    for num in &l0_inputs {
+                        self.block_cache.unpin_file(*num);
+                    }
                 }
                 None => break,
             }
@@ -1192,14 +1232,14 @@ impl DB {
         // With background compaction, tombstones may end up in separate files
         // from the data they cover. Merging fixes this.
         for level in 1..self.options.num_levels {
-            let is_bottommost = level >= self.options.num_levels - 1;
             LeveledCompaction::force_merge_level(
                 level,
-                is_bottommost,
                 &mut inner.versions,
                 &self.path,
                 &self.options,
                 Some(&self.table_cache),
+                Some(&self.rate_limiter),
+                Some(&self.stats),
             )?;
         }
         Ok(())

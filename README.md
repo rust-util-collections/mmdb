@@ -5,7 +5,7 @@
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-220_passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-221_passing-brightgreen.svg)]()
 
 A pure-Rust, synchronous LSM-Tree key-value storage engine. Designed as a native Rust alternative to RocksDB with competitive performance — **scan throughput matches or exceeds RocksDB** on equivalent configurations.
 

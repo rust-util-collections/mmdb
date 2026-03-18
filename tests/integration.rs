@@ -1519,9 +1519,22 @@ fn test_range_delete_survives_flush() {
         Some(b"5".to_vec()),
         "e should survive"
     );
-    // b, c, d should be deleted by range tombstone
-    // Note: SST-level range tombstone checking for point get is a known limitation.
-    // The iterator correctly filters these out.
+    // b, c, d should be deleted by range tombstone (both point-get and iterator)
+    assert_eq!(
+        db.get(b"b").unwrap(),
+        None,
+        "b should be deleted by range tombstone"
+    );
+    assert_eq!(
+        db.get(b"c").unwrap(),
+        None,
+        "c should be deleted by range tombstone"
+    );
+    assert_eq!(
+        db.get(b"d").unwrap(),
+        None,
+        "d should be deleted by range tombstone"
+    );
     let keys: Vec<_> = db.iter().unwrap().map(|(k, _)| k).collect();
     assert!(
         !keys.contains(&b"b".to_vec()),

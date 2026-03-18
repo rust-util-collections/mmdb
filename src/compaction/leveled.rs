@@ -200,6 +200,9 @@ impl LeveledCompaction {
             edit.add_file(target_level as u32, tf.meta.clone());
             edit.set_next_file_number(versions.next_file_number());
             versions.log_and_apply(edit)?;
+            if let Some(s) = stats {
+                s.record_compaction_completed();
+            }
             return Ok(());
         }
 
@@ -330,7 +333,7 @@ impl LeveledCompaction {
             if current_size >= options.target_file_size_base as usize {
                 let result = builder.take().unwrap().finish()?;
                 if let Some(s) = stats {
-                    s.record_compaction(result.file_size);
+                    s.record_compaction_bytes(result.file_size);
                 }
                 edit.add_file(
                     target_level as u32,
@@ -349,7 +352,7 @@ impl LeveledCompaction {
         if let Some(b) = builder {
             let result = b.finish()?;
             if let Some(s) = stats {
-                s.record_compaction(result.file_size);
+                s.record_compaction_bytes(result.file_size);
             }
             edit.add_file(
                 target_level as u32,
@@ -394,19 +397,25 @@ impl LeveledCompaction {
             let _ = std::fs::remove_file(old_path);
         }
 
+        if let Some(s) = stats {
+            s.record_compaction_completed();
+        }
+
         Ok(())
     }
 
     /// Force-merge all files at a given level into one output at the same level.
-    /// Drops tombstones if `is_bottommost` is true.
+    /// Drops tombstones if this is the bottommost level.
     pub fn force_merge_level(
         level: usize,
-        is_bottommost: bool,
         versions: &mut VersionSet,
         db_path: &Path,
         options: &DbOptions,
         table_cache: Option<&Arc<TableCache>>,
+        rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
+        stats: Option<&Arc<crate::stats::DbStats>>,
     ) -> Result<()> {
+        let is_bottommost = level >= options.num_levels - 1;
         let version = versions.current();
         let files = version.level_files(level);
         if files.len() <= 1 {
@@ -497,8 +506,16 @@ impl LeveledCompaction {
             builder.as_mut().unwrap().add(&ikey, &value)?;
             current_size += ikey.len() + value.len();
 
+            // Rate-limit compaction writes
+            if let Some(rl) = rate_limiter {
+                rl.request(ikey.len() + value.len());
+            }
+
             if current_size >= options.target_file_size_base as usize {
                 let result = builder.take().unwrap().finish()?;
+                if let Some(s) = stats {
+                    s.record_compaction_bytes(result.file_size);
+                }
                 edit.add_file(
                     level as u32,
                     FileMetaData {
@@ -514,6 +531,9 @@ impl LeveledCompaction {
 
         if let Some(b) = builder {
             let result = b.finish()?;
+            if let Some(s) = stats {
+                s.record_compaction_bytes(result.file_size);
+            }
             edit.add_file(
                 level as u32,
                 FileMetaData {
@@ -543,6 +563,10 @@ impl LeveledCompaction {
         for num in &input_file_numbers {
             let old_path = db_path.join(format!("{:06}.sst", num));
             let _ = std::fs::remove_file(old_path);
+        }
+
+        if let Some(s) = stats {
+            s.record_compaction_completed();
         }
 
         Ok(())

@@ -41,10 +41,13 @@ impl DbStats {
         self.bytes_read.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    pub fn record_compaction(&self, bytes_written: u64) {
-        self.compactions_completed.fetch_add(1, Ordering::Relaxed);
+    pub fn record_compaction_bytes(&self, bytes_written: u64) {
         self.compaction_bytes_written
             .fetch_add(bytes_written, Ordering::Relaxed);
+    }
+
+    pub fn record_compaction_completed(&self) {
+        self.compactions_completed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_flush(&self) {
@@ -77,7 +80,9 @@ mod tests {
         stats.record_write(200);
         assert_eq!(stats.bytes_written.load(Ordering::Relaxed), 300);
 
-        stats.record_compaction(1000);
+        stats.record_compaction_bytes(1000);
+        stats.record_compaction_completed();
         assert_eq!(stats.compactions_completed.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.compaction_bytes_written.load(Ordering::Relaxed), 1000);
     }
 }
