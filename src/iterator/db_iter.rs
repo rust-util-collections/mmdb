@@ -301,26 +301,21 @@ impl DBIterator {
 
     /// Seek to the last visible user key <= target.
     ///
-    /// Uses merger seek_for_prev to efficiently position near target, then
-    /// inline backward resolution to find the visible entry.
+    /// Uses a single backward seek + inline resolution. No redundant forward seek.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
-
-        // First try forward seek — if exact match or equal, done
-        self.seek(target);
-        if self.valid() && self.key() <= target {
-            return;
-        }
 
         // Use merger backward seek to find the last internal key <= target
         let seek_key = InternalKey::new(target, 0, ValueType::Deletion);
         self.merger.seek_for_prev(seek_key.as_bytes());
         self.prev_overshoot = None;
+        self.has_last_key = false;
 
-        // Walk backward with inline resolution
-        // We need to include target itself in the search, so use a bound just past it
+        // Walk backward with inline resolution.
+        // Use bound = target + \0 so that target itself is included in the search
+        // (resolve_prev_user_key looks for user keys strictly < bound).
         let mut bound = target.to_vec();
-        bound.push(0x00); // target + \0 is > target
+        bound.push(0x00);
         self.resolve_prev_user_key(&bound);
     }
 
