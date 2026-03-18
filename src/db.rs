@@ -656,21 +656,17 @@ impl DB {
 
     /// Create a bidirectional iterator over all visible entries.
     ///
-    /// Materializes entries at creation time. Supports `DoubleEndedIterator`
-    /// for both forward and reverse traversal.
+    /// Uses lazy streaming: forward iteration (`next()`) is streamed without
+    /// materializing all entries. On first backward access (`next_back()`),
+    /// remaining entries are collected into memory.
     pub fn iter_bidi(&self) -> Result<BidiIterator> {
-        let entries: Vec<_> = self.iter().c(d!())?.collect();
-        Ok(BidiIterator::new(entries))
+        let db_iter = self.iter().c(d!())?;
+        Ok(BidiIterator::lazy(db_iter))
     }
 
     /// Create a bidirectional iterator over entries whose keys start with `prefix`.
     pub fn prefix_iterator(&self, prefix: &[u8]) -> Result<BidiIterator> {
-        let prefix = prefix.to_vec();
-        let entries: Vec<_> = self
-            .iter()
-            .c(d!())?
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .collect();
+        let entries: Vec<_> = self.iter_with_prefix(prefix).c(d!())?.collect();
         Ok(BidiIterator::new(entries))
     }
 
@@ -678,8 +674,21 @@ impl DB {
     ///
     /// Supports `Included`, `Excluded`, and `Unbounded` bounds.
     pub fn range<R: RangeBounds<Vec<u8>>>(&self, bounds: R) -> Result<BidiIterator> {
+        use std::ops::Bound;
+        let start_hint = match bounds.start_bound() {
+            Bound::Included(k) | Bound::Excluded(k) => Some(k.clone()),
+            Bound::Unbounded => None,
+        };
+        let end_hint = match bounds.end_bound() {
+            Bound::Included(k) | Bound::Excluded(k) => Some(k.clone()),
+            Bound::Unbounded => None,
+        };
         let entries: Vec<_> = self
-            .iter()
+            .iter_with_range(
+                &ReadOptions::default(),
+                start_hint.as_deref(),
+                end_hint.as_deref(),
+            )
             .c(d!())?
             .filter(|(k, _)| bounds.contains(k))
             .collect();

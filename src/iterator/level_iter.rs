@@ -141,6 +141,80 @@ impl super::merge::SeekableIterator for LevelIterator {
         self.seek_impl(target);
     }
 
+    fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        // Try prev within current table iterator
+        if let Some(ref mut iter) = self.current_iter
+            && let Some(entry) = iter.prev()
+        {
+            return Some(entry);
+        }
+        // Current table exhausted backward — move to previous file
+        loop {
+            if self.file_index == 0 {
+                self.current_iter = None;
+                return None;
+            }
+            self.file_index -= 1;
+            let tf = &self.files[self.file_index];
+            if !self.file_passes_filters(tf) {
+                continue;
+            }
+            let mut table_iter = TableIterator::new(tf.reader.clone());
+            table_iter.seek_to_last();
+            // The seek_to_last positions on the last entry; next() returns it
+            if let Some(entry) = table_iter.next() {
+                self.current_iter = Some(table_iter);
+                return Some(entry);
+            }
+        }
+    }
+
+    fn seek_for_prev(&mut self, target: &[u8]) {
+        // Binary search: find last file whose smallest_key <= target.
+        let idx = self.files.partition_point(|tf| {
+            compare_internal_key(&tf.meta.smallest_key, target) != std::cmp::Ordering::Greater
+        });
+        // Try blocks starting from idx-1 backward until we find a valid entry
+        let start = if idx > 0 { idx - 1 } else { 0 };
+        for try_idx in (0..=start).rev() {
+            let tf = &self.files[try_idx];
+            if !self.file_passes_filters(tf) {
+                continue;
+            }
+            let mut table_iter = TableIterator::new(tf.reader.clone());
+            table_iter.seek_for_prev(target);
+            if table_iter.current().is_some() {
+                self.file_index = try_idx;
+                self.current_iter = Some(table_iter);
+                return;
+            }
+        }
+        self.file_index = 0;
+        self.current_iter = None;
+    }
+
+    fn seek_to_first(&mut self) {
+        self.file_index = 0;
+        self.current_iter = None;
+        self.open_file_and_seek(None);
+    }
+
+    fn seek_to_last(&mut self) {
+        self.current_iter = None;
+        // Start from the last file and work backward
+        for idx in (0..self.files.len()).rev() {
+            let tf = &self.files[idx];
+            if !self.file_passes_filters(tf) {
+                continue;
+            }
+            let mut table_iter = TableIterator::new(tf.reader.clone());
+            table_iter.seek_to_last();
+            self.file_index = idx;
+            self.current_iter = Some(table_iter);
+            return;
+        }
+    }
+
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
         loop {
             if self.current_iter.is_none() && self.file_index < self.files.len() {

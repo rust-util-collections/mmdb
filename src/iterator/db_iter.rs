@@ -234,64 +234,66 @@ impl DBIterator {
 
     /// Seek to the last visible user key <= target.
     ///
-    /// Strategy: seek to >= target. If exact match, done.
-    /// If the found key > target or no key >= target exists, use seek_to_last
-    /// and prev-scan approach to find the last key <= target.
+    /// Uses merger seek_for_prev to efficiently position near target, then
+    /// forward-scans to resolve visibility correctly.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
-        self.seek(target);
-        if self.valid() && self.key() <= target {
-            return; // Exact match or equal
-        }
-        // Either no entry >= target (iterator exhausted), or the found entry > target.
-        // Need to find the last visible entry <= target by scanning from the beginning.
-        self.seek_for_prev_scan(target);
-    }
-
-    /// Internal: scan from the beginning to find the last visible entry <= target.
-    fn seek_for_prev_scan(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
 
-        let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
-        self.merger.seek_to(first_key.as_bytes());
-        self.has_last_key = false;
-        self.range_tombstones.clear();
+        // First try forward seek — if exact match or equal, done
+        self.seek(target);
+        if self.valid() && self.key() <= target {
+            return;
+        }
 
-        let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
+        // Use merger backward seek to find the last internal key <= target
+        let seek_key = InternalKey::new(target, 0, ValueType::Deletion);
+        self.merger.seek_for_prev(seek_key.as_bytes());
 
-        loop {
-            let visible = self.next_visible();
-            match visible {
-                Some((uk, val)) => {
-                    if uk.as_slice() > target {
-                        break; // Past target, stop
-                    }
-                    best = Some((uk, val));
-                }
-                None => break,
+        // Walk backward to find a user key < target, then forward-resolve visibility
+        self.resolve_prev_user_key(target);
+    }
+
+    /// Internal: given the merger positioned backward at or before target,
+    /// find the previous visible user key and position on it.
+    fn resolve_prev_user_key(&mut self, skip_bound: &[u8]) {
+        use crate::types::InternalKey;
+
+        // Walk backward through prev_entry() to find the first user key < skip_bound
+        let mut prev_uk: Option<Vec<u8>> = None;
+        while let Some((ikey, _value)) = self.merger.prev_entry() {
+            if ikey.len() < 8 {
+                continue;
+            }
+            let uk = &ikey[..ikey.len() - 8];
+            if uk < skip_bound {
+                prev_uk = Some(uk.to_vec());
+                break;
             }
         }
 
-        match best {
-            Some((uk, val)) => {
-                // Re-position the merger on this key for future next()/prev() calls.
+        match prev_uk {
+            Some(uk) => {
+                // Forward-seek to this user key and resolve visibility
                 let reseek_key =
                     InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
                 self.merger.seek_to(reseek_key.as_bytes());
                 self.has_last_key = false;
                 self.range_tombstones.clear();
 
-                // Consume through to our key
-                loop {
-                    let visible = self.next_visible();
-                    match visible {
-                        Some((found_uk, _)) if found_uk == uk => break,
-                        Some(_) => continue,
-                        None => break,
+                // next_visible() finds the newest visible version
+                let visible = self.next_visible();
+                match visible {
+                    Some((found_uk, val)) if found_uk == uk => {
+                        self.current = Some((found_uk, val));
+                        self.needs_advance = false;
+                    }
+                    _ => {
+                        // The found key was deleted/tombstoned; try the next earlier key
+                        self.current = None;
+                        self.needs_advance = false;
+                        self.resolve_prev_user_key(&uk);
                     }
                 }
-
-                self.current = Some((uk, val));
-                self.needs_advance = false;
             }
             None => {
                 self.current = None;
@@ -302,12 +304,9 @@ impl DBIterator {
 
     /// Move to the previous visible user key.
     ///
-    /// Uses the re-seek approach: saves the current user key, seeks to just before it,
-    /// then scans forward collecting visible entries to find the last one before the
-    /// saved key. This is O(log N) per call (same as RocksDB's approach for prev).
+    /// O(K·log N) per call: uses merger backward seek to find the previous user key,
+    /// then forward-seeks there and resolves visibility via next_visible().
     pub fn prev(&mut self) {
-        use crate::types::InternalKey;
-
         // Ensure we have a current entry to move backwards from
         self.ensure_current();
         let saved_key = match &self.current {
@@ -318,112 +317,54 @@ impl DBIterator {
             }
         };
 
-        // Re-seek the merger to the very beginning and scan forward to find
-        // the last visible entry before saved_key.
-        let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
-        self.merger.seek_to(first_key.as_bytes());
-        self.has_last_key = false;
-        self.range_tombstones.clear();
-
-        // Scan forward, collecting the last visible entry before saved_key
-        let mut prev_entry: Option<(Vec<u8>, Vec<u8>)> = None;
-
-        loop {
-            let visible = self.next_visible();
-            match visible {
-                Some((uk, val)) => {
-                    if uk >= saved_key {
-                        // We've reached or passed the saved key; stop
-                        break;
-                    }
-                    prev_entry = Some((uk, val));
-                }
-                None => break,
-            }
-        }
-
-        // Now we need to re-position the iterator.
-        // If we found a previous entry, position on it.
-        // We also need to ensure the merger is positioned correctly for future calls.
-        match prev_entry {
-            Some((uk, val)) => {
-                // Re-seek the merger to the found key so future next()/prev() work correctly.
-                let reseek_key =
-                    InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
-                self.merger.seek_to(reseek_key.as_bytes());
-                self.has_last_key = false;
-                self.range_tombstones.clear();
-
-                // Advance the merger past this key so next() gives the right entry
-                // by consuming the current key's entries.
-                loop {
-                    let visible = self.next_visible();
-                    match visible {
-                        Some((found_uk, _)) if found_uk == uk => {
-                            // Found our key, stop
-                            break;
-                        }
-                        Some(_) => {
-                            // Different key before ours, keep going
-                            continue;
-                        }
-                        None => break,
-                    }
-                }
-
-                self.current = Some((uk, val));
-                self.needs_advance = false;
-            }
-            None => {
-                // No previous entry exists
-                self.current = None;
-                self.needs_advance = false;
-            }
-        }
+        self.resolve_prev_user_key(&saved_key);
     }
 
     /// Seek to the last visible key. Positions the iterator on the very last entry.
+    ///
+    /// Uses merger backward seek to find the last user key efficiently,
+    /// then resolves visibility via forward scan.
     pub fn seek_to_last(&mut self) {
         use crate::types::InternalKey;
-        // Seek to the beginning and scan to find the last visible entry
-        let first_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
-        self.merger.seek_to(first_key.as_bytes());
+
+        // Seek merger to last entry (backward direction)
+        self.merger.seek_to_last_merge();
         self.has_last_key = false;
         self.range_tombstones.clear();
 
-        let mut last_entry: Option<(Vec<u8>, Vec<u8>)> = None;
-        loop {
-            let visible = self.next_visible();
-            match visible {
-                Some(entry) => {
-                    last_entry = Some(entry);
-                }
-                None => break,
+        // Walk backward to find the last user key, then forward-resolve visibility
+        let mut last_uk: Option<Vec<u8>> = None;
+        while let Some((ikey, _value)) = self.merger.prev_entry() {
+            if ikey.len() < 8 {
+                continue;
             }
+            let uk = &ikey[..ikey.len() - 8];
+            last_uk = Some(uk.to_vec());
+            break;
         }
 
-        match last_entry {
-            Some((uk, val)) => {
-                // Re-seek so future prev() calls work
-                use crate::types::InternalKey;
+        match last_uk {
+            Some(uk) => {
+                // Forward-seek and resolve visibility
                 let reseek_key =
                     InternalKey::new(&uk, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
                 self.merger.seek_to(reseek_key.as_bytes());
                 self.has_last_key = false;
                 self.range_tombstones.clear();
 
-                // Consume through to our key
-                loop {
-                    let visible = self.next_visible();
-                    match visible {
-                        Some((found_uk, _)) if found_uk == uk => break,
-                        Some(_) => continue,
-                        None => break,
+                let visible = self.next_visible();
+                match visible {
+                    Some((found_uk, val)) if found_uk == uk => {
+                        self.current = Some((found_uk, val));
+                        self.needs_advance = false;
+                    }
+                    _ => {
+                        // Last key is deleted; try previous
+                        self.current = None;
+                        self.needs_advance = false;
+                        self.resolve_prev_user_key(&uk);
                     }
                 }
-
-                self.current = Some((uk, val));
-                self.needs_advance = false;
             }
             None => {
                 self.current = None;

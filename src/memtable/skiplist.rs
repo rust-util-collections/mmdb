@@ -189,6 +189,56 @@ impl SeekableIterator for MemTableCursorIter {
     fn seek_to(&mut self, target: &[u8]) {
         self.seek_internal(target);
     }
+
+    fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.cursor.is_null() {
+            // Exhausted forward — seek to last for backward iteration
+            let ptr = self.sl().tail_ptr();
+            if ptr.is_null() {
+                return None;
+            }
+            let (k, v) = unsafe { self.sl().node_kv(ptr) };
+            let result = (k.as_bytes().to_vec(), v.clone());
+            // Find the entry before this one for the next prev() call
+            let search = OrdInternalKey(k.as_bytes().to_vec());
+            let prev_ptr = self.sl().seek_lt_raw(&search);
+            self.cursor = prev_ptr; // may be null if this was the first entry
+            return Some(result);
+        }
+        // We have a current cursor position. Find the entry before it.
+        let (k, _) = unsafe { self.sl().node_kv(self.cursor) };
+        let search = OrdInternalKey(k.as_bytes().to_vec());
+        let prev_ptr = self.sl().seek_lt_raw(&search);
+        if prev_ptr.is_null() {
+            self.cursor = std::ptr::null();
+            return None;
+        }
+        let (pk, pv) = unsafe { self.sl().node_kv(prev_ptr) };
+        let result = (pk.as_bytes().to_vec(), pv.clone());
+        self.cursor = prev_ptr;
+        Some(result)
+    }
+
+    fn seek_for_prev(&mut self, target: &[u8]) {
+        let search = OrdInternalKey(target.to_vec());
+        // seek_le_raw: find last entry <= target
+        let ptr = self.sl().seek_le_raw(&search);
+        if ptr.is_null() {
+            self.cursor = std::ptr::null();
+        } else {
+            // Position on this entry — next call to next() returns it
+            self.cursor = ptr;
+        }
+    }
+
+    fn seek_to_first(&mut self) {
+        self.cursor = self.sl().head_ptr();
+    }
+
+    fn seek_to_last(&mut self) {
+        let ptr = self.sl().tail_ptr();
+        self.cursor = ptr;
+    }
 }
 
 #[cfg(test)]

@@ -967,6 +967,46 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.seek(target);
     }
 
+    fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        TableIterator::prev(self)
+    }
+
+    fn seek_for_prev(&mut self, target: &[u8]) {
+        TableIterator::seek_for_prev(self, target);
+    }
+
+    fn seek_to_first(&mut self) {
+        // Reset to the beginning of the table
+        self.ensure_index();
+        self.index_pos = 0;
+        self.current_block_entries.clear();
+        self.block_pos = 0;
+        self.current_block = None;
+        self.at_first_key_from_index = false;
+    }
+
+    fn seek_to_last(&mut self) {
+        self.ensure_index();
+        let index_entries = self.index_entries.as_ref().unwrap();
+        if index_entries.is_empty() {
+            return;
+        }
+        // Load the last block and position at its last entry
+        let last_idx = index_entries.len() - 1;
+        let handle = index_entries[last_idx].handle;
+        if let Ok(data) = self.reader.read_block_cached(&handle)
+            && let Ok(block) = Block::new(data)
+        {
+            self.current_block_entries = block.iter().collect();
+            if !self.current_block_entries.is_empty() {
+                self.block_pos = self.current_block_entries.len() - 1;
+                self.index_pos = last_idx + 1;
+            }
+        }
+        self.current_block = None;
+        self.at_first_key_from_index = false;
+    }
+
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
         // Handle deferred block read
         if self.at_first_key_from_index {

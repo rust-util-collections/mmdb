@@ -27,7 +27,10 @@ enum IterSourceInner {
     },
 }
 
-/// Trait for iterators that support seeking (e.g., TableIterator).
+/// Trait for iterators that support seeking and bidirectional traversal.
+///
+/// Modeled after RocksDB's `InternalIterator` for production-quality
+/// bidirectional iteration through the LSM stack.
 pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
     /// Seek to the first entry >= target.
     fn seek_to(&mut self, target: &[u8]);
@@ -46,6 +49,33 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
             None => false,
         }
     }
+
+    /// Move to the previous entry. Returns the entry at the new position,
+    /// or None if we've moved before the first entry.
+    fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        None
+    }
+
+    /// Decode previous entry directly into caller-provided buffers.
+    fn prev_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
+        match self.prev() {
+            Some((k, v)) => {
+                *key_buf = k;
+                *value_buf = v;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Seek to the last entry <= target.
+    fn seek_for_prev(&mut self, target: &[u8]);
+
+    /// Seek to the first entry.
+    fn seek_to_first(&mut self);
+
+    /// Seek to the last entry.
+    fn seek_to_last(&mut self);
 }
 
 impl IterSource {
@@ -135,6 +165,35 @@ impl IterSource {
         }
     }
 
+    /// Advance the inner iterator backward and store the result in reusable buffers.
+    /// Returns true if a new entry was loaded.
+    fn reverse_advance_into_buffers(&mut self) -> bool {
+        match &mut self.inner {
+            IterSourceInner::Vec { entries, pos } => {
+                // pos points to the entry AFTER the last consumed one.
+                // The current entry is at pos - 1. The previous entry is at pos - 2.
+                // But in peek mode, the peeked entry is entries[pos-1].
+                // For prev, we want the entry before the peeked one.
+                if *pos >= 2 {
+                    *pos -= 2;
+                    let (ref k, ref v) = entries[*pos];
+                    self.peeked_key.clear();
+                    self.peeked_key.extend_from_slice(k);
+                    self.peeked_value.clear();
+                    self.peeked_value.extend_from_slice(v);
+                    *pos += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            IterSourceInner::Boxed(_) => false, // Plain iterators cannot go backward
+            IterSourceInner::SeekableBoxed { iter } => {
+                iter.prev_into(&mut self.peeked_key, &mut self.peeked_value)
+            }
+        }
+    }
+
     pub fn is_exhausted(&mut self) -> bool {
         self.peek().is_none()
     }
@@ -196,18 +255,136 @@ impl IterSource {
             }
         }
     }
+
+    /// Seek to the last key <= target (for backward iteration).
+    pub fn seek_for_prev_to<F: Fn(&[u8], &[u8]) -> Ordering>(
+        &mut self,
+        target: &[u8],
+        _compare: &F,
+    ) {
+        self.has_peeked = false;
+        match &mut self.inner {
+            IterSourceInner::Vec { entries, pos } => {
+                // partition_point returns first idx where key > target
+                let idx = entries.partition_point(|(k, _)| k.as_slice() <= target);
+                if idx > 0 {
+                    *pos = idx - 1;
+                    let (ref k, ref v) = entries[*pos];
+                    self.peeked_key.clear();
+                    self.peeked_key.extend_from_slice(k);
+                    self.peeked_value.clear();
+                    self.peeked_value.extend_from_slice(v);
+                    self.has_peeked = true;
+                    *pos += 1;
+                }
+            }
+            IterSourceInner::SeekableBoxed { iter } => {
+                iter.seek_for_prev(target);
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k;
+                    self.peeked_value = v;
+                    self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Boxed(_) => {
+                // Cannot seek backward on plain iterator
+            }
+        }
+    }
+
+    /// Seek to the first entry (for forward iteration from beginning).
+    pub fn seek_to_first_impl(&mut self) {
+        self.has_peeked = false;
+        match &mut self.inner {
+            IterSourceInner::Vec { entries, pos } => {
+                *pos = 0;
+                if !entries.is_empty() {
+                    let (ref k, ref v) = entries[0];
+                    self.peeked_key.clear();
+                    self.peeked_key.extend_from_slice(k);
+                    self.peeked_value.clear();
+                    self.peeked_value.extend_from_slice(v);
+                    self.has_peeked = true;
+                    *pos = 1;
+                }
+            }
+            IterSourceInner::SeekableBoxed { iter } => {
+                iter.seek_to_first();
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k;
+                    self.peeked_value = v;
+                    self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Boxed(_) => {
+                // Cannot reset a plain iterator
+            }
+        }
+    }
+
+    /// Seek to the last entry (for backward iteration from end).
+    pub fn seek_to_last_impl(&mut self) {
+        self.has_peeked = false;
+        match &mut self.inner {
+            IterSourceInner::Vec { entries, pos } => {
+                if !entries.is_empty() {
+                    *pos = entries.len() - 1;
+                    let (ref k, ref v) = entries[*pos];
+                    self.peeked_key.clear();
+                    self.peeked_key.extend_from_slice(k);
+                    self.peeked_value.clear();
+                    self.peeked_value.extend_from_slice(v);
+                    self.has_peeked = true;
+                    *pos += 1;
+                }
+            }
+            IterSourceInner::SeekableBoxed { iter } => {
+                iter.seek_to_last();
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k;
+                    self.peeked_value = v;
+                    self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Boxed(_) => {
+                // Cannot seek to last on plain iterator
+            }
+        }
+    }
+
+    /// Advance backward: load the previous entry into the peek buffers.
+    pub fn prev_advance(&mut self) -> bool {
+        self.has_peeked = false;
+        self.has_peeked = self.reverse_advance_into_buffers();
+        self.has_peeked
+    }
 }
 
-/// Merges multiple sorted iterators using a min-heap for O(N·log K) performance.
+/// Direction of iteration for MergingIterator.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Forward,
+    Backward,
+}
+
+/// Merges multiple sorted iterators using a heap for O(N·log K) performance.
+///
+/// Supports bidirectional iteration:
+/// - Forward: min-heap (smallest key at top)
+/// - Backward: max-heap (largest key at top)
 pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
     sources: Vec<IterSource>,
     compare: F,
-    /// Min-heap of source indices. heap[0] is the source with the smallest current key.
+    /// Heap of source indices.
     heap: Vec<usize>,
     /// Number of valid entries in the heap.
     heap_size: usize,
     /// Whether the heap has been built.
     initialized: bool,
+    /// Current direction of iteration.
+    direction: Direction,
+    /// Current key (for direction switching).
+    current_key: Vec<u8>,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
@@ -219,6 +396,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             heap: (0..n).collect(),
             heap_size: 0,
             initialized: false,
+            direction: Direction::Forward,
+            current_key: Vec::new(),
         }
     }
 
@@ -257,14 +436,20 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
     }
 
-    /// Compare two sources by their peeked key.
+    /// Compare two sources by their peeked key (direction-aware).
+    /// In Forward mode: true if a < b (min-heap).
+    /// In Backward mode: true if a > b (max-heap).
     #[inline]
     fn source_less(&self, a: usize, b: usize) -> bool {
         let sa = &self.sources[a];
         let sb = &self.sources[b];
         match (sa.has_peeked, sb.has_peeked) {
             (true, true) => {
-                (self.compare)(sa.peeked_key.as_slice(), sb.peeked_key.as_slice()) == Ordering::Less
+                let cmp = (self.compare)(sa.peeked_key.as_slice(), sb.peeked_key.as_slice());
+                match self.direction {
+                    Direction::Forward => cmp == Ordering::Less,
+                    Direction::Backward => cmp == Ordering::Greater,
+                }
             }
             (true, false) => true,
             (false, true) => false,
@@ -293,8 +478,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
     }
 
-    /// Get the next (key, value) pair from the merged stream.
+    /// Get the next (key, value) pair from the merged stream (forward direction).
     pub fn next_entry(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.direction != Direction::Forward {
+            self.switch_to_forward();
+        }
         self.init_heap();
 
         if self.heap_size == 0 {
@@ -304,6 +492,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         // The minimum is at heap[0]
         let min_idx = self.heap[0];
         let entry = self.sources[min_idx].take_peeked()?;
+
+        self.current_key.clear();
+        self.current_key.extend_from_slice(&entry.0);
 
         // Advance the source and peek its next entry
         let _ = self.sources[min_idx].peek();
@@ -323,6 +514,76 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         Some(entry)
     }
 
+    /// Get the previous (key, value) pair from the merged stream (backward direction).
+    pub fn prev_entry(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.direction != Direction::Backward {
+            self.switch_to_backward();
+        }
+        self.init_heap();
+
+        if self.heap_size == 0 {
+            return None;
+        }
+
+        // In backward mode, heap[0] is the source with the LARGEST key (max-heap)
+        let max_idx = self.heap[0];
+        let entry = self.sources[max_idx].take_peeked()?;
+
+        self.current_key.clear();
+        self.current_key.extend_from_slice(&entry.0);
+
+        // Move this source backward
+        if self.sources[max_idx].prev_advance() {
+            // Source still has entries backward — sift down to maintain heap
+            self.sift_down(0);
+        } else {
+            // Source exhausted backward — remove from heap
+            self.heap_size -= 1;
+            if self.heap_size > 0 {
+                self.heap.swap(0, self.heap_size);
+                self.sift_down(0);
+            }
+        }
+
+        Some(entry)
+    }
+
+    /// Switch from backward to forward direction.
+    /// Re-seeks all sources to current_key (forward), then rebuilds min-heap.
+    fn switch_to_forward(&mut self) {
+        self.direction = Direction::Forward;
+        if self.current_key.is_empty() {
+            // No current position — just seek to first
+            for source in self.sources.iter_mut() {
+                source.seek_to_first_impl();
+            }
+        } else {
+            for source in self.sources.iter_mut() {
+                source.seek_to(&self.current_key, &self.compare);
+            }
+        }
+        self.initialized = false;
+        self.init_heap();
+    }
+
+    /// Switch from forward to backward direction.
+    /// Re-seeks all sources to current_key (backward: seek_for_prev), then rebuilds max-heap.
+    fn switch_to_backward(&mut self) {
+        self.direction = Direction::Backward;
+        if self.current_key.is_empty() {
+            // No current position — seek to last
+            for source in self.sources.iter_mut() {
+                source.seek_to_last_impl();
+            }
+        } else {
+            for source in self.sources.iter_mut() {
+                source.seek_for_prev_to(&self.current_key, &self.compare);
+            }
+        }
+        self.initialized = false;
+        self.init_heap();
+    }
+
     /// Collect all entries.
     pub fn collect_all(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut result = Vec::new();
@@ -336,9 +597,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Uses `seek_to` for seekable sources (O(log N) binary search)
     /// instead of forward-only linear scan.
     pub fn seek(&mut self, target: &[u8]) {
+        self.direction = Direction::Forward;
         for source in self.sources.iter_mut() {
             source.seek_to(target, &self.compare);
         }
+        self.current_key.clear();
         // Rebuild heap
         self.initialized = false;
         self.init_heap();
@@ -347,10 +610,45 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Seek all sources to a target key with backward support, then rebuild the heap.
     /// Unlike `seek()`, this can move sources backward (for Vec and SeekableBoxed sources).
     pub fn seek_to(&mut self, target: &[u8]) {
+        self.direction = Direction::Forward;
         for source in self.sources.iter_mut() {
             source.seek_to(target, &self.compare);
         }
+        self.current_key.clear();
         // Rebuild heap
+        self.initialized = false;
+        self.init_heap();
+    }
+
+    /// Seek all sources for prev to a target key, then rebuild the max-heap.
+    pub fn seek_for_prev(&mut self, target: &[u8]) {
+        self.direction = Direction::Backward;
+        for source in self.sources.iter_mut() {
+            source.seek_for_prev_to(target, &self.compare);
+        }
+        self.current_key.clear();
+        self.initialized = false;
+        self.init_heap();
+    }
+
+    /// Seek all sources to first, rebuild the min-heap.
+    pub fn seek_to_first(&mut self) {
+        self.direction = Direction::Forward;
+        for source in self.sources.iter_mut() {
+            source.seek_to_first_impl();
+        }
+        self.current_key.clear();
+        self.initialized = false;
+        self.init_heap();
+    }
+
+    /// Seek all sources to last, rebuild the max-heap.
+    pub fn seek_to_last_merge(&mut self) {
+        self.direction = Direction::Backward;
+        for source in self.sources.iter_mut() {
+            source.seek_to_last_impl();
+        }
+        self.current_key.clear();
         self.initialized = false;
         self.init_heap();
     }

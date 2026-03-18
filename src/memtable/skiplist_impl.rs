@@ -381,6 +381,91 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         ptr::null()
     }
 
+    /// Seek to last entry < target, returning raw node pointer. O(log N).
+    ///
+    /// Returns null if no entry < target exists (i.e. target <= first key).
+    pub fn seek_lt_raw(&self, target: &K) -> *const () {
+        let max_h = self.max_height.load(Ordering::Acquire);
+        if max_h == 0 {
+            return ptr::null();
+        }
+
+        // `current` tracks the last node at each level with key < target.
+        // After descending all levels, `current` is the answer.
+        let mut current: *const Node<K, V> = ptr::null();
+
+        for level in (0..max_h).rev() {
+            let mut next = if current.is_null() {
+                self.head[level].load(Ordering::Acquire)
+            } else {
+                unsafe { &*current }.next[level].load(Ordering::Acquire)
+            };
+
+            while !next.is_null() {
+                let n = unsafe { &*next };
+                if n.key < *target {
+                    current = next;
+                    next = n.next[level].load(Ordering::Acquire);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if current.is_null() {
+            ptr::null()
+        } else {
+            current as *const ()
+        }
+    }
+
+    /// Seek to last entry <= target, returning raw node pointer. O(log N).
+    ///
+    /// Returns null if no entry <= target exists (i.e. target < first key).
+    pub fn seek_le_raw(&self, target: &K) -> *const () {
+        // First try exact seek_ge
+        let ge_ptr = self.seek_ge_raw(target);
+        if !ge_ptr.is_null() {
+            let (k, _) = unsafe { self.node_kv(ge_ptr) };
+            if k == target {
+                return ge_ptr;
+            }
+        }
+        // No exact match; fall back to largest key < target
+        self.seek_lt_raw(target)
+    }
+
+    /// Return a raw pointer to the last level-0 node. O(log N).
+    ///
+    /// Returns null if the skip list is empty.
+    pub fn tail_ptr(&self) -> *const () {
+        let max_h = self.max_height.load(Ordering::Acquire);
+        if max_h == 0 {
+            return ptr::null();
+        }
+
+        let mut current: *const Node<K, V> = ptr::null();
+
+        for level in (0..max_h).rev() {
+            let mut next = if current.is_null() {
+                self.head[level].load(Ordering::Acquire)
+            } else {
+                unsafe { &*current }.next[level].load(Ordering::Acquire)
+            };
+
+            while !next.is_null() {
+                current = next;
+                next = unsafe { &*current }.next[level].load(Ordering::Acquire);
+            }
+        }
+
+        if current.is_null() {
+            ptr::null()
+        } else {
+            current as *const ()
+        }
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
@@ -659,5 +744,108 @@ mod tests {
         assert_eq!(items[2].0, b"cherry");
 
         assert_eq!(sl.get(b"banana".as_slice()), Some(b"yellow".to_vec()));
+    }
+
+    #[test]
+    fn test_seek_lt_raw() {
+        let sl = ConcurrentSkipList::new();
+        for i in [10, 20, 30, 40, 50] {
+            sl.insert(i, i * 10);
+        }
+
+        // seek_lt(30) should return 20
+        let ptr = sl.seek_lt_raw(&30);
+        assert!(!ptr.is_null());
+        let (k, v) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 20);
+        assert_eq!(*v, 200);
+
+        // seek_lt(10) should return null (nothing less than first entry)
+        let ptr = sl.seek_lt_raw(&10);
+        assert!(ptr.is_null());
+
+        // seek_lt(11) should return 10
+        let ptr = sl.seek_lt_raw(&11);
+        assert!(!ptr.is_null());
+        let (k, _) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 10);
+
+        // seek_lt(51) should return 50
+        let ptr = sl.seek_lt_raw(&51);
+        assert!(!ptr.is_null());
+        let (k, _) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 50);
+
+        // seek_lt(0) should return null
+        let ptr = sl.seek_lt_raw(&0);
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn test_seek_le_raw() {
+        let sl = ConcurrentSkipList::new();
+        for i in [10, 20, 30, 40, 50] {
+            sl.insert(i, i);
+        }
+
+        // seek_le(30) should return 30 (exact match)
+        let ptr = sl.seek_le_raw(&30);
+        assert!(!ptr.is_null());
+        let (k, _) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 30);
+
+        // seek_le(25) should return 20 (no exact, falls back to lt)
+        let ptr = sl.seek_le_raw(&25);
+        assert!(!ptr.is_null());
+        let (k, _) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 20);
+
+        // seek_le(9) should return null (nothing <= 9)
+        let ptr = sl.seek_le_raw(&9);
+        assert!(ptr.is_null());
+    }
+
+    #[test]
+    fn test_tail_ptr() {
+        let sl = ConcurrentSkipList::new();
+
+        // Empty skiplist
+        assert!(sl.tail_ptr().is_null());
+
+        sl.insert(10, 100);
+        sl.insert(5, 50);
+        sl.insert(20, 200);
+
+        let ptr = sl.tail_ptr();
+        assert!(!ptr.is_null());
+        let (k, v) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 20);
+        assert_eq!(*v, 200);
+    }
+
+    #[test]
+    fn test_seek_lt_raw_large() {
+        let sl = ConcurrentSkipList::new();
+        for i in (0..1000).rev() {
+            sl.insert(i * 2, i); // even numbers 0,2,4,...,1998
+        }
+
+        // seek_lt(500) should return 498
+        let ptr = sl.seek_lt_raw(&500);
+        assert!(!ptr.is_null());
+        let (k, _) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 498);
+
+        // seek_lt(1) should return 0
+        let ptr = sl.seek_lt_raw(&1);
+        assert!(!ptr.is_null());
+        let (k, _) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 0);
+
+        // seek_lt(1999) should return 1998
+        let ptr = sl.seek_lt_raw(&1999);
+        assert!(!ptr.is_null());
+        let (k, _) = unsafe { sl.node_kv(ptr) };
+        assert_eq!(*k, 1998);
     }
 }
