@@ -593,7 +593,11 @@ impl DB {
             sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
-        Ok(DBIterator::from_sources(sources, seq))
+        let mut db_iter = DBIterator::from_sources(sources, seq);
+        if let Some(end) = end_hint {
+            db_iter.set_upper_bound(end.to_vec());
+        }
+        Ok(db_iter)
     }
 
     /// Create a prefix-bounded iterator.
@@ -933,6 +937,8 @@ impl DB {
     /// Find the highest sequence number among range tombstones covering `key`
     /// that are visible at the given read sequence.
     /// Returns 0 if no covering tombstone exists.
+    /// Uses the dedicated range tombstone collection for O(T) lookup instead
+    /// of O(N) full memtable scan.
     fn max_covering_tombstone_seq(
         &self,
         key: &[u8],
@@ -940,37 +946,17 @@ impl DB {
         active_mem: &MemTable,
         imm_mems: &[Arc<MemTable>],
     ) -> SequenceNumber {
-        use crate::types::InternalKeyRef;
-
         let mut max_seq: SequenceNumber = 0;
 
-        let check_memtable = |mem: &MemTable, max: &mut SequenceNumber| {
-            if !mem.has_range_deletions() {
-                return;
-            }
-            for (ikey, value) in mem.iter() {
-                if ikey.len() < 8 {
-                    continue;
-                }
-                let ikr = InternalKeyRef::new(&ikey);
-                if ikr.value_type() != ValueType::RangeDeletion {
-                    continue;
-                }
-                let tomb_seq = ikr.sequence();
-                if tomb_seq > seq {
-                    continue; // not visible at our read sequence
-                }
-                let begin = ikr.user_key();
-                let end = &value;
-                if key >= begin && key < end.as_slice() && tomb_seq > *max {
-                    *max = tomb_seq;
-                }
-            }
-        };
-
-        check_memtable(active_mem, &mut max_seq);
+        let s = active_mem.max_covering_tombstone_seq(key, seq);
+        if s > max_seq {
+            max_seq = s;
+        }
         for imm in imm_mems {
-            check_memtable(imm, &mut max_seq);
+            let s = imm.max_covering_tombstone_seq(key, seq);
+            if s > max_seq {
+                max_seq = s;
+            }
         }
         max_seq
     }

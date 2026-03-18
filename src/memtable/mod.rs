@@ -9,6 +9,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::types::{InternalKey, SequenceNumber, ValueType};
 
+/// A cached range tombstone from a memtable.
+pub struct MemRangeTombstone {
+    pub begin: Vec<u8>,
+    pub end: Vec<u8>,
+    pub seq: SequenceNumber,
+}
+
 /// A MemTable stores recent writes in memory before they are flushed to SST.
 ///
 /// Keys are InternalKey-encoded (user_key + seq + type), values are raw bytes.
@@ -20,6 +27,10 @@ pub struct MemTable {
     /// Whether this memtable contains any RangeDeletion entries.
     /// Used to skip the expensive O(N) range tombstone scan in get().
     has_range_deletions: AtomicBool,
+    /// Dedicated collection of range tombstones for O(T) coverage checks
+    /// instead of O(N) full memtable scan. Protected by Mutex since writes
+    /// are single-writer (group commit model).
+    range_tombstones: parking_lot::Mutex<Vec<MemRangeTombstone>>,
 }
 
 impl MemTable {
@@ -28,6 +39,7 @@ impl MemTable {
             inner: SkipListMemTable::new(),
             approximate_size: AtomicUsize::new(0),
             has_range_deletions: AtomicBool::new(false),
+            range_tombstones: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -38,6 +50,12 @@ impl MemTable {
             ValueType::Value => value.to_vec(),
             ValueType::Deletion => Vec::new(),
             ValueType::RangeDeletion => {
+                // Add to dedicated range tombstone collection for O(T) lookup
+                self.range_tombstones.lock().push(MemRangeTombstone {
+                    begin: key.to_vec(),
+                    end: value.to_vec(),
+                    seq: sequence,
+                });
                 // Release: ensures this flag is visible to any reader that
                 // subsequently Acquires skiplist entries via atomic pointers.
                 self.has_range_deletions.store(true, Ordering::Release);
@@ -96,6 +114,33 @@ impl MemTable {
         // Acquire: pairs with the Release store in put() to ensure
         // visibility across cores on weakly-ordered architectures (ARM/RISC-V).
         self.has_range_deletions.load(Ordering::Acquire)
+    }
+
+    /// Find the highest-seq range tombstone covering `user_key` with seq <= `read_seq`.
+    /// Returns 0 if no covering tombstone exists.
+    /// O(T) where T = number of range tombstones, instead of O(N) full memtable scan.
+    pub fn max_covering_tombstone_seq(
+        &self,
+        user_key: &[u8],
+        read_seq: SequenceNumber,
+    ) -> SequenceNumber {
+        if !self.has_range_deletions() {
+            return 0;
+        }
+        let tombstones = self.range_tombstones.lock();
+        let mut max_seq: SequenceNumber = 0;
+        for rt in tombstones.iter() {
+            if rt.seq > read_seq {
+                continue;
+            }
+            if user_key >= rt.begin.as_slice()
+                && user_key < rt.end.as_slice()
+                && rt.seq > max_seq
+            {
+                max_seq = rt.seq;
+            }
+        }
+        max_seq
     }
 
     /// Return true if empty.
