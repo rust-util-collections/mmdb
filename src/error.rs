@@ -24,6 +24,9 @@ pub enum Error {
 
     #[error("Manifest error: {0}")]
     Manifest(String),
+
+    #[error("Background error: {0}")]
+    BackgroundError(String),
 }
 
 pub type Result<T> = ruc::Result<T>;

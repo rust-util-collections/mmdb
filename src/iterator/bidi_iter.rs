@@ -40,6 +40,10 @@ enum BidiInner {
         /// Last key returned by next_back(), used as forward stop boundary.
         last_back_key: Option<Vec<u8>>,
     },
+    /// After calling next() while in LazyBackStarted, the db_iter is re-seeked
+    /// forward with upper_bound set. Streams forward with O(1) memory.
+    /// next_back() returns None (forward-only after direction switch).
+    LazyFwdResumed { db_iter: Box<DBIterator> },
 }
 
 impl BidiIterator {
@@ -121,9 +125,7 @@ impl Iterator for BidiIterator {
                 Some(entry)
             }
             BidiInner::LazyBackStarted { .. } => {
-                // Mixed forward+backward: collect only the remaining window
-                // between the forward and backward cursors into memory.
-                // This is bounded by the unconsumed portion, NOT the entire DB.
+                // Switch to streaming forward — O(1) memory, no collect().
                 let placeholder = BidiInner::Materialized {
                     entries: Vec::new(),
                     front: 0,
@@ -157,19 +159,14 @@ impl Iterator for BidiIterator {
                         db_iter.set_upper_bound(back_key.clone());
                     }
 
-                    // Collect only the bounded window into memory.
-                    let entries: Vec<(Vec<u8>, Vec<u8>)> = db_iter.by_ref().collect();
-                    let len = entries.len();
-                    self.inner = BidiInner::Materialized {
-                        entries,
-                        front: 0,
-                        back: len,
-                    };
+                    // Stream forward — no materialization needed.
+                    self.inner = BidiInner::LazyFwdResumed { db_iter };
                     self.next()
                 } else {
                     unreachable!()
                 }
             }
+            BidiInner::LazyFwdResumed { db_iter } => db_iter.next(),
         }
     }
 
@@ -230,6 +227,27 @@ impl DoubleEndedIterator for BidiIterator {
                 };
 
                 Some((k, v))
+            }
+            BidiInner::LazyFwdResumed { .. } => {
+                // Need backward access — materialize remaining forward window
+                // (bounded by upper_bound already set on db_iter).
+                let placeholder = BidiInner::Materialized {
+                    entries: Vec::new(),
+                    front: 0,
+                    back: 0,
+                };
+                let old = std::mem::replace(&mut self.inner, placeholder);
+                let BidiInner::LazyFwdResumed { mut db_iter } = old else {
+                    unreachable!()
+                };
+                let entries: Vec<(Vec<u8>, Vec<u8>)> = db_iter.by_ref().collect();
+                let len = entries.len();
+                self.inner = BidiInner::Materialized {
+                    entries,
+                    front: 0,
+                    back: len,
+                };
+                self.next_back()
             }
             BidiInner::LazyBackStarted {
                 db_iter,

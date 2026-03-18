@@ -51,6 +51,9 @@ pub struct DB {
     write_queue: Mutex<VecDeque<*mut WriteRequest>>,
     write_cv: Condvar,
     closed: AtomicBool,
+    /// Background error (e.g. WAL sync failure). Once set, all subsequent
+    /// operations are rejected. Models RocksDB's background error state.
+    bg_error: Mutex<Option<String>>,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
     rate_limiter: Arc<RateLimiter>,
@@ -339,6 +342,7 @@ impl DB {
             write_queue: Mutex::new(VecDeque::new()),
             write_cv: Condvar::new(),
             closed: AtomicBool::new(false),
+            bg_error: Mutex::new(None),
             block_cache,
             table_cache,
             rate_limiter,
@@ -363,14 +367,14 @@ impl DB {
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.put(key, value);
         self.write_batch_inner(batch, write_options)
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.delete(key);
         self.write_batch_inner(batch, &WriteOptions::default())
@@ -378,14 +382,14 @@ impl DB {
 
     /// Delete all keys in the range [begin, end).
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.delete_range(begin, end);
         self.write_batch_inner(batch, &WriteOptions::default())
     }
 
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -403,7 +407,7 @@ impl DB {
     }
 
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
 
         let seq = match options.snapshot {
             Some(s) => s,
@@ -539,7 +543,7 @@ impl DB {
         start_hint: Option<&[u8]>,
         end_hint: Option<&[u8]>,
     ) -> Result<DBIterator> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
 
         let seq = match options.snapshot {
             Some(s) => s,
@@ -657,9 +661,12 @@ impl DB {
     /// Uses prefix bloom filters to skip SST files that don't contain the prefix,
     /// and stops iteration as soon as the prefix boundary is crossed.
     pub fn iter_with_prefix(&self, prefix: &[u8]) -> Result<DBIterator> {
-        self.check_closed().c(d!())?;
+        self.iter_with_prefix_seq(prefix, self.current_sequence())
+    }
 
-        let seq = self.current_sequence();
+    /// Create a prefix-bounded iterator at a specific sequence number.
+    fn iter_with_prefix_seq(&self, prefix: &[u8], seq: SequenceNumber) -> Result<DBIterator> {
+        self.check_usable().c(d!())?;
 
         // Lock-free read via SuperVersion.
         let sv = self.get_super_version();
@@ -808,6 +815,17 @@ impl DB {
         Ok(BidiIterator::lazy(db_iter))
     }
 
+    /// Create a prefix iterator with options (supports snapshot for historical reads).
+    pub fn prefix_iterator_with_options(
+        &self,
+        prefix: &[u8],
+        options: &ReadOptions,
+    ) -> Result<BidiIterator> {
+        let seq = options.snapshot.unwrap_or_else(|| self.current_sequence());
+        let db_iter = self.iter_with_prefix_seq(prefix, seq).c(d!())?;
+        Ok(BidiIterator::lazy(db_iter))
+    }
+
     pub fn snapshot_seq(&self) -> SequenceNumber {
         self.current_sequence()
     }
@@ -911,7 +929,7 @@ impl DB {
 
     /// Force flush the active MemTable to SST.
     pub fn flush(&self) -> Result<()> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
         let _wg = self.write_queue.lock(); // serialize with writers
         let mut inner = self.inner.lock();
         if inner.active_memtable.is_empty() {
@@ -925,7 +943,7 @@ impl DB {
     /// Run compaction if needed (L0 → L1 or Ln → Ln+1).
     /// Runs inline while holding locks for deterministic behavior.
     pub fn compact(&self) -> Result<()> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
         let _wg = self.write_queue.lock();
         let mut inner = self.inner.lock();
         self.do_compaction(&mut inner)
@@ -934,7 +952,7 @@ impl DB {
     /// Compact all keys in the given range across all levels.
     /// If `begin` is None, starts from the beginning. If `end` is None, goes to the end.
     pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
-        self.check_closed().c(d!())?;
+        self.check_usable().c(d!())?;
 
         // First flush memtable to ensure all data is in SSTs
         {
@@ -1082,9 +1100,12 @@ impl DB {
         *self.super_version.write() = sv;
     }
 
-    fn check_closed(&self) -> Result<()> {
+    fn check_usable(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(eg!(Error::DbClosed));
+        }
+        if let Some(ref msg) = *self.bg_error.lock() {
+            return Err(eg!(Error::BackgroundError(msg.clone())));
         }
         Ok(())
     }
@@ -1232,6 +1253,8 @@ impl DB {
             None
         };
         if let Some(e) = wal_sync_err {
+            // Set DB to error state — reject all future operations.
+            *self.bg_error.lock() = Some(format!("WAL sync failed: {}", e));
             // Drop inner lock first to maintain consistent lock ordering
             // (write_queue → inner), preventing deadlock with flush/compact.
             drop(inner);
