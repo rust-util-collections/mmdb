@@ -640,21 +640,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.init_heap();
     }
 
-    /// Seek all sources to a target key with backward support, then rebuild the heap.
-    pub fn seek_to(&mut self, target: &[u8]) {
-        self.direction = Direction::Forward;
-        for source in self.sources.iter_mut() {
-            source.seek_to(target, &self.compare);
-        }
-        self.current_key.clear();
-        if self.single_source {
-            self.initialized = true;
-            return;
-        }
-        self.initialized = false;
-        self.init_heap();
-    }
-
     /// Seek all sources for prev to a target key, then rebuild the max-heap.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.direction = Direction::Backward;
