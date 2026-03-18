@@ -73,14 +73,48 @@ impl BloomFilter {
     }
 }
 
-/// Hash function for bloom filter (same as LevelDB's BloomHash).
+/// Hash function for bloom filter based on MurmurHash2.
+/// Matches LevelDB/RocksDB's BloomHash for compatibility and quality.
 fn bloom_hash(key: &[u8]) -> u32 {
-    // Simple hash based on murmur-like mixing
-    let mut h: u32 = 0;
-    for &b in key {
-        h = h.wrapping_mul(0x5bd1e995).wrapping_add(b as u32);
-        h ^= h >> 13;
+    let seed: u32 = 0xbc9f1d34;
+    let m: u32 = 0x5bd1e995;
+    let r: u32 = 24;
+
+    let len = key.len() as u32;
+    // Initialize with seed XOR'd with length (anti-length-extension)
+    let mut h: u32 = seed ^ len;
+
+    // Process 4-byte chunks
+    let mut i = 0;
+    while i + 4 <= key.len() {
+        let mut k = u32::from_le_bytes(key[i..i + 4].try_into().unwrap());
+        k = k.wrapping_mul(m);
+        k ^= k >> r;
+        k = k.wrapping_mul(m);
+
+        h = h.wrapping_mul(m);
+        h ^= k;
+        i += 4;
     }
+
+    // Process remaining bytes
+    let remaining = key.len() - i;
+    if remaining >= 3 {
+        h ^= (key[i + 2] as u32) << 16;
+    }
+    if remaining >= 2 {
+        h ^= (key[i + 1] as u32) << 8;
+    }
+    if remaining >= 1 {
+        h ^= key[i] as u32;
+        h = h.wrapping_mul(m);
+    }
+
+    // Final avalanche mixing
+    h ^= h >> 13;
+    h = h.wrapping_mul(m);
+    h ^= h >> 15;
+
     h
 }
 
