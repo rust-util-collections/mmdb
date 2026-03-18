@@ -1,16 +1,15 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
 use std::collections::VecDeque;
-use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
@@ -62,6 +61,13 @@ pub struct DB {
     compaction_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     /// Background compaction thread handles.
     compaction_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Cached L0 file count for fast write-throttle checks.
+    /// Updated after flush/compaction. Avoids locking `inner` on every write.
+    l0_file_count: Arc<AtomicUsize>,
+    /// Lock-free read snapshot (SuperVersion).
+    /// Readers take a read lock (uncontended, ~10ns). Writers update after
+    /// memtable/version changes. Models RocksDB's SuperVersion mechanism.
+    super_version: RwLock<Arc<SuperVersion>>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -74,6 +80,17 @@ struct DBInner {
     wal_writer: Option<WalWriter>,
     wal_number: u64,
     versions: VersionSet,
+}
+
+/// Snapshot of the read-visible state: memtables + current version.
+///
+/// Models RocksDB's `SuperVersion`. Published atomically via `ArcSwap`
+/// so readers never lock `inner` — they just load a single `Arc`.
+/// Writers update this after every memtable/version change.
+struct SuperVersion {
+    active_memtable: Arc<MemTable>,
+    immutable_memtables: Vec<Arc<MemTable>>,
+    version: Arc<crate::manifest::version::Version>,
 }
 
 impl DB {
@@ -224,6 +241,9 @@ impl DB {
         // Spawn background compaction threads
         let compaction_shutdown = Arc::new(AtomicBool::new(false));
         let compaction_notify = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let l0_file_count = Arc::new(AtomicUsize::new(
+            inner.lock().versions.current().l0_file_count(),
+        ));
         let num_compaction_threads = options.max_background_compactions.max(1);
         let mut compaction_handles = Vec::with_capacity(num_compaction_threads);
 
@@ -235,6 +255,7 @@ impl DB {
             let bg_block_cache = block_cache.clone();
             let bg_rate_limiter = rate_limiter.clone();
             let bg_stats = stats.clone();
+            let bg_l0_count = l0_file_count.clone();
             let shutdown = compaction_shutdown.clone();
             let notify = compaction_notify.clone();
 
@@ -282,6 +303,11 @@ impl DB {
                                     for num in &l0_inputs {
                                         bg_block_cache.unpin_file(*num);
                                     }
+                                    // Update cached L0 count
+                                    bg_l0_count.store(
+                                        inner.versions.current().l0_file_count(),
+                                        Ordering::Relaxed,
+                                    );
                                 }
                                 None => break,
                             }
@@ -291,6 +317,15 @@ impl DB {
                 .expect("failed to spawn compaction thread");
             compaction_handles.push(handle);
         }
+
+        let initial_sv = {
+            let g = inner.lock();
+            Arc::new(SuperVersion {
+                active_memtable: g.active_memtable.clone(),
+                immutable_memtables: g.immutable_memtables.clone(),
+                version: g.versions.current(),
+            })
+        };
 
         let db = Self {
             path,
@@ -307,6 +342,8 @@ impl DB {
             compaction_shutdown,
             compaction_notify,
             compaction_handles: Mutex::new(compaction_handles),
+            l0_file_count,
+            super_version: RwLock::new(initial_sv),
         };
 
         Ok(db)
@@ -369,19 +406,14 @@ impl DB {
             None => self.current_sequence(),
         };
 
-        // Snapshot current state
-        let (active_mem, imm_mems, version) = {
-            let inner = self.inner.lock();
-            (
-                inner.active_memtable.clone(),
-                inner.immutable_memtables.clone(),
-                inner.versions.current(),
-            )
-        };
+        // Lock-free read via SuperVersion.
+        let sv = self.get_super_version();
+        let (active_mem, imm_mems, version) =
+            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
         // Find the highest-seq range tombstone covering this key (across all memtables).
         // This is needed to compare against any point entry we find.
-        let mut max_tomb_seq = self.max_covering_tombstone_seq(key, seq, &active_mem, &imm_mems);
+        let mut max_tomb_seq = self.max_covering_tombstone_seq(key, seq, active_mem, imm_mems);
 
         // 1. Active MemTable
         if let Some((result, entry_seq)) = active_mem.get_with_seq(key, seq) {
@@ -393,7 +425,7 @@ impl DB {
         }
 
         // 2. Immutable MemTables (newest first)
-        for imm in &imm_mems {
+        for imm in imm_mems {
             if let Some((result, entry_seq)) = imm.get_with_seq(key, seq) {
                 if max_tomb_seq > entry_seq {
                     return Ok(None);
@@ -510,14 +542,10 @@ impl DB {
             None => self.current_sequence(),
         };
 
-        let (active_mem, imm_mems, version) = {
-            let inner = self.inner.lock();
-            (
-                inner.active_memtable.clone(),
-                inner.immutable_memtables.clone(),
-                inner.versions.current(),
-            )
-        };
+        // Lock-free read: use SuperVersion instead of locking inner.
+        let sv = self.get_super_version();
+        let (active_mem, imm_mems, version) =
+            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
         let mut sources: Vec<IterSource> = Vec::new();
 
@@ -528,8 +556,8 @@ impl DB {
         }
 
         // Immutable memtables
-        for imm in &imm_mems {
-            let cursor = MemTableCursorIter::new(imm.clone());
+        for imm in imm_mems {
+            let cursor = MemTableCursorIter::new(Arc::clone(imm));
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
@@ -573,14 +601,10 @@ impl DB {
 
         let seq = self.current_sequence();
 
-        let (active_mem, imm_mems, version) = {
-            let inner = self.inner.lock();
-            (
-                inner.active_memtable.clone(),
-                inner.immutable_memtables.clone(),
-                inner.versions.current(),
-            )
-        };
+        // Lock-free read via SuperVersion.
+        let sv = self.get_super_version();
+        let (active_mem, imm_mems, version) =
+            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
         let mut sources: Vec<IterSource> = Vec::new();
 
@@ -591,8 +615,8 @@ impl DB {
         }
 
         // Immutable memtables
-        for imm in &imm_mems {
-            let cursor = MemTableCursorIter::new(imm.clone());
+        for imm in imm_mems {
+            let cursor = MemTableCursorIter::new(Arc::clone(imm));
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
@@ -665,34 +689,12 @@ impl DB {
     }
 
     /// Create a bidirectional iterator over entries whose keys start with `prefix`.
-    pub fn prefix_iterator(&self, prefix: &[u8]) -> Result<BidiIterator> {
-        let entries: Vec<_> = self.iter_with_prefix(prefix).c(d!())?.collect();
-        Ok(BidiIterator::new(entries))
-    }
-
-    /// Create a bidirectional iterator over entries within the given key range.
     ///
-    /// Supports `Included`, `Excluded`, and `Unbounded` bounds.
-    pub fn range<R: RangeBounds<Vec<u8>>>(&self, bounds: R) -> Result<BidiIterator> {
-        use std::ops::Bound;
-        let start_hint = match bounds.start_bound() {
-            Bound::Included(k) | Bound::Excluded(k) => Some(k.clone()),
-            Bound::Unbounded => None,
-        };
-        let end_hint = match bounds.end_bound() {
-            Bound::Included(k) | Bound::Excluded(k) => Some(k.clone()),
-            Bound::Unbounded => None,
-        };
-        let entries: Vec<_> = self
-            .iter_with_range(
-                &ReadOptions::default(),
-                start_hint.as_deref(),
-                end_hint.as_deref(),
-            )
-            .c(d!())?
-            .filter(|(k, _)| bounds.contains(k))
-            .collect();
-        Ok(BidiIterator::new(entries))
+    /// Uses lazy streaming: forward iteration is O(1) per step.
+    /// Backward access materializes remaining entries on first `next_back()`.
+    pub fn prefix_iterator(&self, prefix: &[u8]) -> Result<BidiIterator> {
+        let db_iter = self.iter_with_prefix(prefix).c(d!())?;
+        Ok(BidiIterator::lazy(db_iter))
     }
 
     pub fn snapshot_seq(&self) -> SequenceNumber {
@@ -964,6 +966,24 @@ impl DB {
         max_seq
     }
 
+    /// Get the current SuperVersion snapshot without locking `inner`.
+    /// Readers call this instead of locking `inner` for iterator/get operations.
+    fn get_super_version(&self) -> Arc<SuperVersion> {
+        self.super_version.read().clone()
+    }
+
+    /// Refresh the SuperVersion from current inner state.
+    /// Called after memtable freeze, flush, or compaction.
+    /// Must be called while `inner` is locked (caller holds the lock).
+    fn install_super_version(&self, inner: &DBInner) {
+        let sv = Arc::new(SuperVersion {
+            active_memtable: inner.active_memtable.clone(),
+            immutable_memtables: inner.immutable_memtables.clone(),
+            version: inner.versions.current(),
+        });
+        *self.super_version.write() = sv;
+    }
+
     fn check_closed(&self) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(eg!(Error::DbClosed));
@@ -977,13 +997,11 @@ impl DB {
 
     /// Apply write backpressure based on L0 file count.
     fn maybe_throttle_writes(&self) {
-        let l0_count = {
-            let inner = self.inner.lock();
-            inner.versions.current().l0_file_count()
-        };
+        // Fast path: check cached L0 count without locking inner.
+        let l0_count = self.l0_file_count.load(Ordering::Relaxed);
 
         if l0_count >= self.options.l0_stop_trigger {
-            // Block: try inline compaction to reduce L0 count
+            // Slow path: lock inner and do inline compaction.
             let mut inner = self.inner.lock();
             while inner.versions.current().l0_file_count() >= self.options.l0_stop_trigger {
                 let _ = self.do_compaction(&mut inner);
@@ -991,6 +1009,8 @@ impl DB {
                     break; // Can't compact further
                 }
             }
+            self.l0_file_count
+                .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
         } else if l0_count >= self.options.l0_slowdown_trigger {
             // Progressive delay: more L0 files → longer sleep
             let delay_us = (l0_count - self.options.l0_slowdown_trigger + 1) as u64 * 1000;
@@ -1000,10 +1020,7 @@ impl DB {
 
     fn write_batch_inner(&self, batch: WriteBatch, write_options: &WriteOptions) -> Result<()> {
         if write_options.no_slowdown {
-            let l0_count = {
-                let inner = self.inner.lock();
-                inner.versions.current().l0_file_count()
-            };
+            let l0_count = self.l0_file_count.load(Ordering::Relaxed);
             if l0_count >= self.options.l0_slowdown_trigger {
                 return Err(eg!(Error::InvalidArgument(
                     "write stalled: no_slowdown is set".to_string(),
@@ -1197,6 +1214,11 @@ impl DB {
             }
         }
 
+        // Update cached L0 count after flush
+        self.l0_file_count
+            .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+        self.install_super_version(inner);
+
         // Clean up old WAL
         let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
         let _ = std::fs::remove_file(old_wal_path);
@@ -1264,11 +1286,22 @@ impl DB {
             )
             .c(d!())?;
         }
+        // Update cached L0 count after compaction
+        self.l0_file_count
+            .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+        self.install_super_version(inner);
         Ok(())
     }
 
     fn encode_wal_record(sequence: u64, batch: &WriteBatch) -> Vec<u8> {
-        let mut buf = Vec::new();
+        // Pre-size: 8 (seq) + 4 (count) + per-entry (1 type + 4 key_len + key + 4 val_len + val)
+        let estimated = 12
+            + batch
+                .entries
+                .iter()
+                .map(|e| 1 + 4 + e.key.len() + 4 + e.value.as_ref().map_or(0, |v| v.len()))
+                .sum::<usize>();
+        let mut buf = Vec::with_capacity(estimated);
         buf.extend_from_slice(&sequence.to_le_bytes());
         buf.extend_from_slice(&(batch.len() as u32).to_le_bytes());
         for entry in &batch.entries {

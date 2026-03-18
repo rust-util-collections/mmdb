@@ -28,6 +28,9 @@ pub struct DBIterator {
     range_tombstones: RangeTombstoneTracker,
     /// If set, iteration stops when user key no longer starts with this prefix.
     prefix: Option<Vec<u8>>,
+    /// If set, iteration stops when user key >= this bound (exclusive upper bound).
+    /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
+    iterate_upper_bound: Option<Vec<u8>>,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -53,6 +56,7 @@ impl DBIterator {
             needs_advance: true,
             range_tombstones: RangeTombstoneTracker::new(),
             prefix: None,
+            iterate_upper_bound: None,
         }
     }
 
@@ -72,6 +76,7 @@ impl DBIterator {
             needs_advance: true,
             range_tombstones: RangeTombstoneTracker::new(),
             prefix: None,
+            iterate_upper_bound: None,
         }
     }
 
@@ -96,7 +101,15 @@ impl DBIterator {
             needs_advance: true,
             range_tombstones: RangeTombstoneTracker::new(),
             prefix: Some(prefix),
+            iterate_upper_bound: None,
         }
+    }
+
+    /// Set an exclusive upper bound on user keys.
+    /// Iteration stops when user key >= this bound.
+    /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
+    pub fn set_upper_bound(&mut self, bound: Vec<u8>) {
+        self.iterate_upper_bound = Some(bound);
     }
 
     /// Check if a user key is covered by any range tombstone visible at our snapshot.
@@ -132,6 +145,13 @@ impl DBIterator {
             // Prefix boundary check — stop immediately when prefix changes
             if let Some(ref pfx) = self.prefix
                 && !user_key.starts_with(pfx)
+            {
+                return None;
+            }
+
+            // Upper bound check — stop when user key >= upper bound (exclusive)
+            if let Some(ref ub) = self.iterate_upper_bound
+                && user_key >= ub.as_slice()
             {
                 return None;
             }

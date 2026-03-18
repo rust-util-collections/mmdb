@@ -1143,33 +1143,63 @@ fn test_range_iterator_bounds() {
         db.put(key.as_bytes(), val.as_bytes()).unwrap();
     }
 
-    // Included..Excluded: [key_0005, key_0010)
-    let entries: Vec<_> = db
-        .range(b"key_0005".to_vec()..b"key_0010".to_vec())
-        .unwrap()
-        .collect();
-    assert_eq!(entries.len(), 5, "range [5,10) should have 5 entries");
-    assert_eq!(entries[0].0, b"key_0005");
-    assert_eq!(entries[4].0, b"key_0009");
+    // [key_0005, key_0010) — seek + upper bound, same as RocksDB pattern
+    {
+        let mut iter = db
+            .iter_with_range(
+                &mmdb::ReadOptions::default(),
+                Some(b"key_0005"),
+                Some(b"key_0010"),
+            )
+            .unwrap();
+        iter.seek(b"key_0005");
+        iter.set_upper_bound(b"key_0010".to_vec());
+        let entries: Vec<_> = iter.collect();
+        assert_eq!(entries.len(), 5, "range [5,10) should have 5 entries");
+        assert_eq!(entries[0].0, b"key_0005");
+        assert_eq!(entries[4].0, b"key_0009");
+    }
 
-    // Included..=Included: [key_0005, key_0010]
-    let entries: Vec<_> = db
-        .range(b"key_0005".to_vec()..=b"key_0010".to_vec())
-        .unwrap()
-        .collect();
-    assert_eq!(entries.len(), 6, "range [5,10] should have 6 entries");
+    // [key_0005, key_0010] — inclusive upper: use successor of key_0010
+    {
+        let mut iter = db
+            .iter_with_range(
+                &mmdb::ReadOptions::default(),
+                Some(b"key_0005"),
+                Some(b"key_0011"),
+            )
+            .unwrap();
+        iter.seek(b"key_0005");
+        iter.set_upper_bound(b"key_0011".to_vec());
+        let entries: Vec<_> = iter.collect();
+        assert_eq!(entries.len(), 6, "range [5,10] should have 6 entries");
+    }
 
-    // Unbounded..Excluded: [.., key_0003)
-    let entries: Vec<_> = db.range(..b"key_0003".to_vec()).unwrap().collect();
-    assert_eq!(entries.len(), 3, "range [..,3) should have 3 entries");
+    // [.., key_0003)
+    {
+        let mut iter = db
+            .iter_with_range(&mmdb::ReadOptions::default(), None, Some(b"key_0003"))
+            .unwrap();
+        iter.set_upper_bound(b"key_0003".to_vec());
+        let entries: Vec<_> = iter.collect();
+        assert_eq!(entries.len(), 3, "range [..,3) should have 3 entries");
+    }
 
-    // Included..Unbounded: [key_0018, ..]
-    let entries: Vec<_> = db.range(b"key_0018".to_vec()..).unwrap().collect();
-    assert_eq!(entries.len(), 2, "range [18,..] should have 2 entries");
+    // [key_0018, ..]
+    {
+        let mut iter = db
+            .iter_with_range(&mmdb::ReadOptions::default(), Some(b"key_0018"), None)
+            .unwrap();
+        iter.seek(b"key_0018");
+        let entries: Vec<_> = iter.collect();
+        assert_eq!(entries.len(), 2, "range [18,..] should have 2 entries");
+    }
 
     // Full range
-    let entries: Vec<_> = db.range::<std::ops::RangeFull>(..).unwrap().collect();
-    assert_eq!(entries.len(), 20, "full range should have 20 entries");
+    {
+        let entries: Vec<_> = db.iter().unwrap().collect();
+        assert_eq!(entries.len(), 20, "full range should have 20 entries");
+    }
 }
 
 #[test]
@@ -1233,12 +1263,22 @@ fn test_bidi_range_reverse() {
         db.put(key.as_bytes(), b"v").unwrap();
     }
 
-    // Range [r_0005, r_0015) reversed
-    let reverse: Vec<_> = db
-        .range(b"r_0005".to_vec()..b"r_0015".to_vec())
-        .unwrap()
-        .rev()
-        .collect();
+    // Range [r_0005, r_0015) — use iter_with_range + seek + upper bound
+    let mut iter = db
+        .iter_with_range(
+            &mmdb::ReadOptions::default(),
+            Some(b"r_0005"),
+            Some(b"r_0015"),
+        )
+        .unwrap();
+    iter.seek(b"r_0005");
+    iter.set_upper_bound(b"r_0015".to_vec());
+    let entries: Vec<_> = iter.collect();
+    assert_eq!(entries.len(), 10);
+
+    // Reverse via BidiIterator
+    let mut bidi = mmdb::BidiIterator::new(entries);
+    let reverse: Vec<_> = std::iter::from_fn(|| bidi.next_back()).collect();
     assert_eq!(reverse.len(), 10);
     assert_eq!(reverse[0].0, b"r_0014");
     assert_eq!(reverse[9].0, b"r_0005");
