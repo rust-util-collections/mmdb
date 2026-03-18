@@ -179,8 +179,14 @@ impl super::merge::SeekableIterator for LevelIterator {
         let idx = self.files.partition_point(|tf| {
             compare_internal_key(&tf.meta.smallest_key, target) != std::cmp::Ordering::Greater
         });
-        // Try blocks starting from idx-1 backward until we find a valid entry
-        let start = if idx > 0 { idx - 1 } else { 0 };
+        // Try blocks starting from idx-1 backward until we find a valid entry.
+        // If idx == 0, no file has smallest_key <= target — nothing to try.
+        if idx == 0 {
+            self.file_index = 0;
+            self.current_iter = None;
+            return;
+        }
+        let start = idx - 1;
         for try_idx in (0..=start).rev() {
             let tf = &self.files[try_idx];
             if !self.file_passes_filters(tf) {

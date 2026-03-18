@@ -561,6 +561,20 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if self.direction != Direction::Backward {
             self.switch_to_backward();
         }
+
+        // Single-source fast path: bypass heap entirely (mirrors next_entry).
+        if self.single_source {
+            if !self.initialized {
+                self.initialized = true;
+                let _ = self.sources[0].peek();
+            }
+            return self.sources[0].take_peeked().inspect(|entry| {
+                self.current_key.clear();
+                self.current_key.extend_from_slice(&entry.0);
+                self.sources[0].prev_advance();
+            });
+        }
+
         self.init_heap();
 
         if self.heap_size == 0 {
@@ -691,16 +705,13 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Advance past the current minimum entry (discard it).
     /// For single-source: clears peeked flag and re-peeks (reuses buffer capacity).
     /// For multi-source: pops heap top, advances source, sifts down.
+    ///
+    /// Does NOT update current_key (unlike take_entry). current_key is only
+    /// needed for direction switching; callers that need it call take_entry
+    /// for the one entry they return. This avoids a memcpy per skipped entry.
     pub fn advance_entry(&mut self) {
         if self.single_source {
-            // Copy current key for direction switching before discarding
-            if self.sources[0].has_peeked {
-                self.current_key.clear();
-                self.current_key
-                    .extend_from_slice(&self.sources[0].peeked_key);
-            }
             self.sources[0].skip_peeked();
-            // Re-peek: advance_into_buffers overwrites buffers in-place, reusing capacity
             let _ = self.sources[0].peek();
             return;
         }
@@ -710,14 +721,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
 
         let min_idx = self.heap[0];
-        // Track current key for direction switching
-        if self.sources[min_idx].has_peeked {
-            self.current_key.clear();
-            self.current_key
-                .extend_from_slice(&self.sources[min_idx].peeked_key);
-        }
-
-        // Discard peeked and advance
         self.sources[min_idx].skip_peeked();
         let _ = self.sources[min_idx].peek();
 

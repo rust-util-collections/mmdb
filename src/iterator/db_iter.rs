@@ -205,13 +205,11 @@ impl DBIterator {
                         }
 
                         if vt == ValueType::RangeDeletion {
-                            if !(self.has_last_key
-                                && self.last_user_key.as_slice() == &ikey_ref[..uk_len])
-                            {
-                                self.last_user_key.clear();
-                                self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
-                                self.has_last_key = true;
-                            }
+                            // Skip RangeDeletion entries — tombstones are pre-loaded.
+                            // Do NOT update last_user_key: RangeDeletion is not a point
+                            // mutation for this user key. Updating it would suppress a
+                            // same-key Value via dedup instead of the proper range
+                            // tombstone coverage check (which uses strict >).
                             Action::Skip
                         } else if self.has_last_key
                             && self.last_user_key.as_slice() == &ikey_ref[..uk_len]

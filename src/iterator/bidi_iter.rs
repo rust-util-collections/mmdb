@@ -233,8 +233,8 @@ impl DoubleEndedIterator for BidiIterator {
             }
             BidiInner::LazyBackStarted {
                 db_iter,
+                last_fwd_key,
                 last_back_key,
-                ..
             } => {
                 // Second+ next_back(): stream backward via db_iter.prev().
                 // O(1) memory — no materialization needed.
@@ -242,6 +242,13 @@ impl DoubleEndedIterator for BidiIterator {
                 if db_iter.valid() {
                     let k = db_iter.key().to_vec();
                     let v = db_iter.value().to_vec();
+                    // Stop if backward cursor has crossed the forward frontier
+                    if let Some(fk) = last_fwd_key.as_deref()
+                        && k.as_slice() <= fk
+                    {
+                        *last_back_key = None;
+                        return None;
+                    }
                     *last_back_key = Some(k.clone());
                     Some((k, v))
                 } else {

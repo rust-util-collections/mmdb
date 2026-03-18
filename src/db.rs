@@ -1155,9 +1155,9 @@ impl DB {
         // Allocate sequences and write WAL for all batches
         let mut need_sync = false;
         let mut inner = self.inner.lock();
-        let mut wal_add_error = None;
+        let mut wal_add_error: Option<(Box<dyn ruc::RucError>, usize)> = None;
 
-        for &req_ptr in &batch_group {
+        for (batch_idx, &req_ptr) in batch_group.iter().enumerate() {
             // SAFETY: we hold the only references; other threads are blocked on write_cv
             let r = unsafe { &mut *req_ptr };
             let first_seq = self
@@ -1170,7 +1170,7 @@ impl DB {
                 if let Some(ref mut wal) = inner.wal_writer
                     && let Err(e) = wal.add_record(&wal_record)
                 {
-                    wal_add_error = Some(e);
+                    wal_add_error = Some((e, batch_idx));
                     break;
                 }
             }
@@ -1194,10 +1194,17 @@ impl DB {
         // Handle WAL add_record error outside the loop to avoid lock ordering
         // inversion (write_queue → inner is the correct order; acquiring
         // write_queue while holding inner would risk deadlock with flush/compact).
-        if let Some(e) = wal_add_error {
+        if let Some((e, fail_idx)) = wal_add_error {
             drop(inner);
             let _queue = self.write_queue.lock();
-            for &rp in &batch_group {
+            // Batches 0..fail_idx succeeded in both WAL and memtable — report Ok.
+            for &rp in &batch_group[..fail_idx] {
+                let rr = unsafe { &mut *rp };
+                rr.result = Some(Ok(()));
+                rr.done = true;
+            }
+            // Batch fail_idx and later never completed — report Err.
+            for &rp in &batch_group[fail_idx..] {
                 let rr = unsafe { &mut *rp };
                 rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
                 rr.done = true;

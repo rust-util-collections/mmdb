@@ -839,12 +839,15 @@ impl TableIterator {
                 match block.seek_for_prev_by(target, compare_internal_key) {
                     Some((found_key, _found_val)) => {
                         // Determine which restart segment this entry belongs to
-                        // and decode only that segment for backward iteration.
+                        // and decode all entries from that segment to end of block.
+                        // Using iter_from_restart (not iter_restart_segment) ensures
+                        // that a subsequent next() will see all remaining entries in
+                        // this block before advancing to the next block.
                         let restart_idx =
                             self.find_restart_for_key(&block, &found_key, compare_internal_key);
-                        let segment = block.iter_restart_segment(restart_idx);
-                        // Find position of found entry within segment
-                        let pos_in_segment = segment
+                        let entries_from_restart = block.iter_from_restart(restart_idx);
+                        // Find position of found entry within the decoded range
+                        let pos_in_entries = entries_from_restart
                             .iter()
                             .rposition(|(k, _)| {
                                 compare_internal_key(k, target) != std::cmp::Ordering::Greater
@@ -852,8 +855,8 @@ impl TableIterator {
                             .unwrap_or(0);
 
                         self.index_pos = try_idx + 1;
-                        self.current_block_entries = segment;
-                        self.block_pos = pos_in_segment;
+                        self.current_block_entries = entries_from_restart;
+                        self.block_pos = pos_in_entries;
                         self.current_restart_index = restart_idx;
                         self.backward_block = Some(block);
                         self.backward_block_index = try_idx;
