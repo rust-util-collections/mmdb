@@ -1187,25 +1187,16 @@ impl DB {
         // Become the leader. The flag ensures only one thread reaches here.
         debug_assert!(!wq.leader_active);
         wq.leader_active = true;
-        let mut leader_result: Result<()> = Ok(());
 
         loop {
-            if wq.queue.is_empty() {
-                // Queue was drained by previous leader while we were waking.
-                // Our request must have been processed (done=true checked above).
-                wq.leader_active = false;
-                self.write_cv.notify_all();
-                drop(wq);
-                break;
-            }
             let batch_group: Vec<*mut WriteRequest> = wq.queue.drain(..).collect();
             drop(wq); // release queue lock while doing I/O
 
             let result = self.write_batch_group(&batch_group);
 
-            // Signal followers for this batch
+            // Signal everyone in this batch
             let mut wq_inner = self.write_queue.lock();
-            for &rp in &batch_group[1..] {
+            for &rp in &batch_group {
                 let r = unsafe { &mut *rp };
                 if r.result.is_none() {
                     r.result = match &result {
@@ -1219,16 +1210,6 @@ impl DB {
             }
             self.write_cv.notify_all();
 
-            // Leader's own result (batch_group[0])
-            if leader_result.is_ok()
-                && let Err(e) = &result
-                && batch_group
-                    .first()
-                    .is_some_and(|&p| std::ptr::eq(p, req_ptr))
-            {
-                leader_result = Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
-            }
-
             // Check for stragglers
             if wq_inner.queue.is_empty() {
                 wq_inner.leader_active = false;
@@ -1240,7 +1221,7 @@ impl DB {
             wq = wq_inner;
         }
 
-        leader_result
+        req.result.take().unwrap_or(Ok(()))
     }
 
     /// Process a batch group: write WAL, apply to memtable, sync, flush if needed.
