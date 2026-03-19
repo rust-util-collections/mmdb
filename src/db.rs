@@ -1,5 +1,6 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -32,6 +33,29 @@ use crate::stats::DbStats;
 use crate::types::{self, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex};
 use crate::wal::{WalReader, WalWriter};
 use ruc::*;
+
+/// Thread-local pool of reusable DBIterator objects.
+/// Avoids heap allocation overhead when creating iterators in tight loops.
+const ITER_POOL_CAP: usize = 8;
+
+thread_local! {
+    static ITER_POOL: RefCell<Vec<DBIterator>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Take a DBIterator from the thread-local pool, or return None.
+fn pool_take() -> Option<DBIterator> {
+    ITER_POOL.with(|pool| pool.borrow_mut().pop())
+}
+
+/// Return a DBIterator to the thread-local pool for reuse.
+pub fn pool_return(iter: DBIterator) {
+    ITER_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if p.len() < ITER_POOL_CAP {
+            p.push(iter);
+        }
+    });
+}
 
 /// Tracks active snapshots so compaction doesn't delete data still needed by readers.
 struct SnapshotList {
@@ -758,7 +782,13 @@ impl DB {
             sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
-        let mut db_iter = DBIterator::from_sources(sources, seq);
+        let mut db_iter = match pool_take() {
+            Some(mut pooled) => {
+                pooled.reset(sources, seq);
+                pooled
+            }
+            None => DBIterator::from_sources(sources, seq),
+        };
 
         // Apply bounds: merge explicit parameters with ReadOptions bounds, using tighter of the two.
         let effective_lower = match (&options.iterate_lower_bound, lower_bound) {
@@ -940,7 +970,13 @@ impl DB {
             sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
-        let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix_owned.to_vec());
+        let mut iter = match pool_take() {
+            Some(mut pooled) => {
+                pooled.reset_with_prefix(sources, seq, prefix_owned.to_vec());
+                pooled
+            }
+            None => DBIterator::from_sources_with_prefix(sources, seq, prefix_owned.to_vec()),
+        };
 
         // Collect all range tombstones with level info for cross-level pruning.
         if any_range_deletions {

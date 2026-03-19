@@ -157,6 +157,17 @@ impl DBIterator {
         self.last_seek_key = None;
     }
 
+    /// Reset with prefix-bounded iteration, reusing allocated memory.
+    pub fn reset_with_prefix(
+        &mut self,
+        sources: Vec<IterSource>,
+        sequence: SequenceNumber,
+        prefix: Vec<u8>,
+    ) {
+        self.reset(sources, sequence);
+        self.prefix = Some(prefix);
+    }
+
     /// Set pre-collected range tombstones. Called by the DB layer after
     /// collecting tombstones from all memtables and SST files.
     pub fn set_range_tombstones(&mut self, tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) {
