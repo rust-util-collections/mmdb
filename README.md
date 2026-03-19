@@ -5,7 +5,7 @@
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-221_passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-250_passing-brightgreen.svg)]()
 
 A pure-Rust, synchronous LSM-Tree key-value storage engine. Designed as a native Rust alternative to RocksDB with competitive performance — **scan throughput matches or exceeds RocksDB** on equivalent configurations.
 
@@ -194,6 +194,7 @@ impl DB {
     pub fn delete(&self, key: &[u8]) -> Result<()>;
     pub fn delete_with_options(&self, options: &WriteOptions, key: &[u8]) -> Result<()>;
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()>;
+    pub fn delete_range_with_options(&self, options: &WriteOptions, begin: &[u8], end: &[u8]) -> Result<()>;
     pub fn write(&self, batch: WriteBatch) -> Result<()>;
     pub fn write_with_options(&self, batch: WriteBatch, options: &WriteOptions) -> Result<()>;
     pub fn iter(&self) -> Result<DBIterator>;
@@ -227,6 +228,11 @@ impl DBIterator {
     pub fn seek_to_first(&mut self);
     pub fn seek_to_last(&mut self);
     pub fn prev(&mut self);
+}
+
+impl Snapshot<'_> {
+    pub fn sequence(&self) -> SequenceNumber;
+    pub fn read_options(&self) -> ReadOptions;  // pre-configured for this snapshot
 }
 
 struct ReadOptions {
@@ -265,7 +271,7 @@ let opts = DbOptions::read_heavy();   // large cache, 14 bits/key bloom
 
 ```bash
 cargo build
-cargo test               # 220+ tests (unit + integration + e2e + proptest)
+cargo test               # 250+ tests (unit + integration + e2e + proptest)
 make all                 # fmt + lint + check + test
 make bench               # criterion benchmarks (warm + cold cache scenarios)
 cargo bench -- "cold"    # cold-cache benchmarks only
