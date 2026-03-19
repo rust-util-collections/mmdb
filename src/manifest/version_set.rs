@@ -310,6 +310,14 @@ impl VersionSet {
         n
     }
 
+    /// Reserve `count` consecutive file numbers. Returns the first number.
+    /// Used to pre-allocate file numbers before releasing the lock for I/O.
+    pub fn reserve_file_numbers(&mut self, count: u64) -> u64 {
+        let start = self.next_file_number;
+        self.next_file_number += count;
+        start
+    }
+
     /// Get the current version.
     pub fn current(&self) -> Arc<Version> {
         self.current.clone()

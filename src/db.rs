@@ -101,6 +101,17 @@ struct WriteQueueState {
     leader_active: bool,
 }
 
+/// State captured during the freeze phase of a flush.
+/// Holds the frozen memtable and metadata needed to complete the flush
+/// after releasing the lock.
+struct FrozenMemtable {
+    old_mem: Arc<MemTable>,
+    sst_number: u64,
+    sst_path: std::path::PathBuf,
+    old_wal_number: u64,
+    new_wal_number: u64,
+}
+
 /// Atomically install a fresh SuperVersion into the given `ArcSwap`.
 /// Shared between `DB::install_super_version` and compaction threads
 /// (which only hold an `Arc<ArcSwap<…>>`, not `&DB`).
@@ -424,38 +435,132 @@ impl DB {
 
                         // Wrap compaction work in catch_unwind to prevent
                         // thread death from panics in corrupt data paths.
-                        let result = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| -> std::result::Result<(), String> {
-                                // Drain read-compaction hints
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> std::result::Result<(), String> {
+                                // Drain read-compaction hints (lock released during I/O)
                                 {
                                     let hints: Vec<CompactionHint> =
                                         std::mem::take(&mut *bg_hints.lock());
                                     if !hints.is_empty() {
                                         let active_snaps = bg_snapshot_list.as_sorted_vec();
-                                        let mut inner = bg_inner.lock();
                                         for hint in &hints {
-                                            let version = inner.versions.current();
-                                            if let Some(task) =
+                                            // Phase 1: pick + pre-allocate (short lock)
+                                            let pick = {
+                                                let mut inner = bg_inner.lock();
+                                                let version = inner.versions.current();
                                                 LeveledCompaction::pick_compaction_for_hint(
                                                     &version, hint,
                                                 )
-                                                && let Err(e) =
-                                                    LeveledCompaction::execute_compaction_with_cache(
+                                                .map(|task| {
+                                                    let max_out = task.total_input_size()
+                                                        / bg_options.target_file_size_base
+                                                        + 1;
+                                                    let file_start = inner
+                                                        .versions
+                                                        .reserve_file_numbers(max_out);
+                                                    (task, file_start)
+                                                })
+                                            }; // lock released
+
+                                            if let Some((task, file_start)) = pick {
+                                                // Phase 2: I/O (no lock)
+                                                let output =
+                                                    LeveledCompaction::execute_compaction_io(
                                                         &task,
-                                                        &mut inner.versions,
+                                                        file_start,
                                                         &bg_path,
                                                         &bg_options,
-                                                        Some(&bg_table_cache),
                                                         Some(&bg_rate_limiter),
                                                         Some(&bg_stats),
                                                         &active_snaps,
                                                     )
-                                            {
-                                                return Err(format!(
-                                                    "hint compaction error: {}",
-                                                    e
-                                                ));
+                                                    .map_err(|e| {
+                                                        format!("hint compaction error: {}", e)
+                                                    })?;
+
+                                                // Phase 3: install (short lock)
+                                                let mut inner = bg_inner.lock();
+                                                LeveledCompaction::install_compaction(
+                                                    output,
+                                                    &mut inner.versions,
+                                                    Some(&bg_table_cache),
+                                                    &bg_path,
+                                                    Some(&bg_stats),
+                                                )
+                                                .map_err(|e| {
+                                                    format!("hint compaction install error: {}", e)
+                                                })?;
+                                                bg_l0_count.store(
+                                                    inner.versions.current().l0_file_count(),
+                                                    Ordering::Relaxed,
+                                                );
+                                                refresh_super_version(&bg_sv, &inner);
                                             }
+                                        }
+                                    }
+                                }
+
+                                // Run pending compactions (lock released during I/O)
+                                loop {
+                                    let active_snaps = bg_snapshot_list.as_sorted_vec();
+
+                                    // Phase 1: pick + pre-allocate (short lock)
+                                    let pick = {
+                                        let mut inner = bg_inner.lock();
+                                        let version = inner.versions.current();
+                                        match LeveledCompaction::pick_compaction(
+                                            &version,
+                                            &bg_options,
+                                        ) {
+                                            Some(task) => {
+                                                let l0_inputs: Vec<u64> = if task.level == 0 {
+                                                    task.input_files_level
+                                                        .iter()
+                                                        .map(|f| f.meta.number)
+                                                        .collect()
+                                                } else {
+                                                    Vec::new()
+                                                };
+                                                let max_out = task.total_input_size()
+                                                    / bg_options.target_file_size_base
+                                                    + 1;
+                                                let file_start =
+                                                    inner.versions.reserve_file_numbers(max_out);
+                                                Some((task, file_start, l0_inputs))
+                                            }
+                                            None => None,
+                                        }
+                                    }; // lock released
+
+                                    let Some((task, file_start, l0_inputs)) = pick else {
+                                        break;
+                                    };
+
+                                    // Phase 2: I/O (no lock held)
+                                    let output = LeveledCompaction::execute_compaction_io(
+                                        &task,
+                                        file_start,
+                                        &bg_path,
+                                        &bg_options,
+                                        Some(&bg_rate_limiter),
+                                        Some(&bg_stats),
+                                        &active_snaps,
+                                    )
+                                    .map_err(|e| format!("compaction error: {}", e))?;
+
+                                    // Phase 3: install (short lock)
+                                    {
+                                        let mut inner = bg_inner.lock();
+                                        LeveledCompaction::install_compaction(
+                                            output,
+                                            &mut inner.versions,
+                                            Some(&bg_table_cache),
+                                            &bg_path,
+                                            Some(&bg_stats),
+                                        )
+                                        .map_err(|e| format!("compaction install error: {}", e))?;
+                                        for num in &l0_inputs {
+                                            bg_block_cache.unpin_file(*num);
                                         }
                                         bg_l0_count.store(
                                             inner.versions.current().l0_file_count(),
@@ -464,59 +569,9 @@ impl DB {
                                         refresh_super_version(&bg_sv, &inner);
                                     }
                                 }
-
-                                // TODO(perf): The inner lock is held for the entire duration
-                                // of compaction I/O. A production fix would release the lock
-                                // after picking the compaction, perform I/O unlocked, then
-                                // reacquire to install the result.
-
-                                // Run pending compactions
-                                loop {
-                                    let active_snaps = bg_snapshot_list.as_sorted_vec();
-                                    let mut inner = bg_inner.lock();
-                                    let version = inner.versions.current();
-                                    match LeveledCompaction::pick_compaction(
-                                        &version,
-                                        &bg_options,
-                                    ) {
-                                        Some(task) => {
-                                            let l0_inputs: Vec<u64> = if task.level == 0 {
-                                                task.input_files_level
-                                                    .iter()
-                                                    .map(|f| f.meta.number)
-                                                    .collect()
-                                            } else {
-                                                Vec::new()
-                                            };
-                                            if let Err(e) =
-                                                LeveledCompaction::execute_compaction_with_cache(
-                                                    &task,
-                                                    &mut inner.versions,
-                                                    &bg_path,
-                                                    &bg_options,
-                                                    Some(&bg_table_cache),
-                                                    Some(&bg_rate_limiter),
-                                                    Some(&bg_stats),
-                                                    &active_snaps,
-                                                )
-                                            {
-                                                return Err(format!("compaction error: {}", e));
-                                            }
-                                            for num in &l0_inputs {
-                                                bg_block_cache.unpin_file(*num);
-                                            }
-                                            bg_l0_count.store(
-                                                inner.versions.current().l0_file_count(),
-                                                Ordering::Relaxed,
-                                            );
-                                            refresh_super_version(&bg_sv, &inner);
-                                        }
-                                        None => break,
-                                    }
-                                }
                                 Ok(())
-                            }),
-                        );
+                            },
+                        ));
 
                         match result {
                             Ok(Ok(())) => {} // success
@@ -525,15 +580,13 @@ impl DB {
                                 break;
                             }
                             Err(panic_payload) => {
-                                let msg =
-                                    if let Some(s) = panic_payload.downcast_ref::<String>() {
-                                        format!("compaction thread panicked: {}", s)
-                                    } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                                        format!("compaction thread panicked: {}", s)
-                                    } else {
-                                        "compaction thread panicked with unknown payload"
-                                            .to_string()
-                                    };
+                                let msg = if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                    format!("compaction thread panicked: {}", s)
+                                } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                                    format!("compaction thread panicked: {}", s)
+                                } else {
+                                    "compaction thread panicked with unknown payload".to_string()
+                                };
                                 set_error(msg);
                                 break;
                             }
@@ -1343,7 +1396,12 @@ impl DB {
         if inner.active_memtable.is_empty() {
             return Ok(());
         }
-        self.freeze_and_flush(&mut inner).c(d!())?;
+        let frozen = self.freeze_memtable(&mut inner).c(d!())?;
+        drop(inner); // release lock during SST write
+        let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
+        let mut inner = self.inner.lock(); // reacquire
+        self.install_flush(&mut inner, &frozen, build_result)
+            .c(d!())?;
         self.maybe_compact(&mut inner).c(d!())?;
         Ok(())
     }
@@ -1367,7 +1425,12 @@ impl DB {
             let _wg = self.write_queue.lock();
             let mut inner = self.inner.lock();
             if !inner.active_memtable.is_empty() {
-                self.freeze_and_flush(&mut inner).c(d!())?;
+                let frozen = self.freeze_memtable(&mut inner).c(d!())?;
+                drop(inner);
+                let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
+                let mut inner = self.inner.lock();
+                self.install_flush(&mut inner, &frozen, build_result)
+                    .c(d!())?;
             }
         }
 
@@ -1751,16 +1814,34 @@ impl DB {
             return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
         }
 
-        // Check memtable size threshold
+        // Check memtable size threshold — release lock during SST I/O
         let mut did_flush = false;
         if inner.active_memtable.approximate_size() >= self.options.write_buffer_size {
-            match self.freeze_and_flush(&mut inner) {
-                Ok(()) => did_flush = true,
-                Err(e) => tracing::error!("auto-flush failed (data safe in WAL): {}", e),
+            match self.freeze_memtable(&mut inner) {
+                Ok(frozen) => {
+                    drop(inner); // release lock for slow SST write
+                    match self.flush_frozen_memtable(&frozen) {
+                        Ok(build_result) => {
+                            let mut inner = self.inner.lock(); // reacquire
+                            match self.install_flush(&mut inner, &frozen, build_result) {
+                                Ok(()) => did_flush = true,
+                                Err(e) => tracing::error!("flush install failed: {}", e),
+                            }
+                            drop(inner);
+                        }
+                        Err(e) => {
+                            tracing::error!("auto-flush SST write failed (data safe in WAL): {}", e)
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("auto-flush freeze failed: {}", e);
+                    drop(inner);
+                }
             }
+        } else {
+            drop(inner);
         }
-
-        drop(inner);
 
         if did_flush {
             self.signal_compaction();
@@ -1769,18 +1850,20 @@ impl DB {
         Ok(())
     }
 
-    // TODO(perf): freeze_and_flush runs inline under the write lock, blocking
-    // all writers for the duration of the SST build + MANIFEST update. For large
-    // memtables (default 64MB), this can cause hundreds of milliseconds of write
-    // stall. A production-grade fix would use a background flush thread that
-    // picks up frozen (immutable) memtables asynchronously, similar to RocksDB's
-    // FlushJob. This requires careful WAL lifecycle management (must not delete
-    // WAL until flush completes) and write stall logic (pause writes if too many
-    // immutable memtables accumulate).
+    /// Freeze+flush in one call (holds lock throughout).
+    /// Used by `close()` and `do_compaction` where lock is already held
+    /// and releasing it would complicate the caller.
     fn freeze_and_flush(&self, inner: &mut DBInner) -> Result<()> {
+        let frozen = self.freeze_memtable(inner).c(d!())?;
+        let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
+        self.install_flush(inner, &frozen, build_result).c(d!())?;
+        Ok(())
+    }
+
+    /// Phase 1 (under lock, fast): swap memtable, create WAL, allocate SST number.
+    fn freeze_memtable(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
         let old_mem = std::mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
 
-        // New WAL
         let new_wal_number = inner.versions.new_file_number();
         let new_wal_path = self.path.join(format!("{:06}.wal", new_wal_number));
         let new_wal = WalWriter::new(&new_wal_path).c(d!())?;
@@ -1788,22 +1871,41 @@ impl DB {
         inner.wal_writer = Some(new_wal);
         inner.wal_number = new_wal_number;
 
-        // Allocate SST file number
         let sst_number = inner.versions.new_file_number();
         let sst_path = self.path.join(format!("{:06}.sst", sst_number));
 
-        // Flush memtable → SST
-        let build_result = self.write_memtable_to_sst(&old_mem, &sst_path).c(d!())?;
+        Ok(FrozenMemtable {
+            old_mem,
+            sst_number,
+            sst_path,
+            old_wal_number,
+            new_wal_number,
+        })
+    }
 
-        // Record in MANIFEST
+    /// Phase 2 (no lock needed, slow I/O): write SST from frozen memtable.
+    fn flush_frozen_memtable(
+        &self,
+        frozen: &FrozenMemtable,
+    ) -> Result<crate::sst::table_builder::TableBuildResult> {
+        self.write_memtable_to_sst(&frozen.old_mem, &frozen.sst_path)
+    }
+
+    /// Phase 3 (under lock, fast): install flush result into version.
+    fn install_flush(
+        &self,
+        inner: &mut DBInner,
+        frozen: &FrozenMemtable,
+        build_result: crate::sst::table_builder::TableBuildResult,
+    ) -> Result<()> {
         let mut edit = VersionEdit::new();
-        edit.set_log_number(new_wal_number);
+        edit.set_log_number(frozen.new_wal_number);
         edit.set_next_file_number(inner.versions.next_file_number());
         edit.set_last_sequence(self.current_sequence());
         edit.add_file(
             0, // L0
             FileMetaData {
-                number: sst_number,
+                number: frozen.sst_number,
                 file_size: build_result.file_size,
                 smallest_key: build_result.smallest_key.unwrap_or_default(),
                 largest_key: build_result.largest_key.unwrap_or_default(),
@@ -1813,24 +1915,21 @@ impl DB {
         inner.versions.log_and_apply(edit).c(d!())?;
         self.stats.record_flush();
 
-        // Pin new L0 file's index in cache for fast iterator creation
         if self.options.pin_l0_filter_and_index_blocks_in_cache {
             let version = inner.versions.current();
             for tf in version.level_files(0) {
-                if tf.meta.number == sst_number {
+                if tf.meta.number == frozen.sst_number {
                     tf.reader.pin_metadata_in_cache();
                     break;
                 }
             }
         }
 
-        // Update cached L0 count after flush
         self.l0_file_count
             .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
         self.install_super_version(inner);
 
-        // Clean up old WAL
-        let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
+        let old_wal_path = self.path.join(format!("{:06}.wal", frozen.old_wal_number));
         if let Err(e) = std::fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
         }

@@ -45,6 +45,27 @@ pub struct CompactionTask {
     pub input_files_next: Vec<TableFile>,
 }
 
+/// Result of the I/O phase of compaction (no lock needed to produce this).
+pub struct CompactionOutput {
+    /// The version edit with new files added and old files deleted.
+    pub edit: VersionEdit,
+    /// File numbers of all input files (for cache eviction and deletion).
+    pub input_file_numbers: HashSet<u64>,
+    /// The next file number to record in the edit (set during install).
+    pub files_produced: u64,
+}
+
+impl CompactionTask {
+    /// Total size of all input files (both levels).
+    pub fn total_input_size(&self) -> u64 {
+        self.input_files_level
+            .iter()
+            .chain(self.input_files_next.iter())
+            .map(|f| f.meta.file_size)
+            .sum()
+    }
+}
+
 pub struct LeveledCompaction;
 
 /// Collect range tombstones from input files and return them as sorted
@@ -220,6 +241,10 @@ impl LeveledCompaction {
     /// their sequence zeroed (P5.1). At the bottommost level, tombstones
     /// are dropped (P5.2).
     #[allow(clippy::too_many_arguments)]
+    /// Convenience wrapper: runs compaction I/O and installs the result.
+    /// Requires `&mut VersionSet` for the entire duration — use
+    /// `execute_compaction_io` + `install_compaction` separately when
+    /// you want to release the lock during I/O.
     pub fn execute_compaction_with_cache(
         task: &CompactionTask,
         versions: &mut VersionSet,
@@ -231,14 +256,6 @@ impl LeveledCompaction {
         active_snapshots: &[SequenceNumber],
     ) -> Result<()> {
         let target_level = task.level + 1;
-        let is_bottommost = target_level >= options.num_levels - 1;
-        // Sequence numbers below this threshold are not pinned by any
-        // snapshot and can safely be zeroed.
-        let min_unflushed_seq = active_snapshots
-            .iter()
-            .min()
-            .copied()
-            .unwrap_or(SequenceNumber::MAX);
 
         // Trivial move optimization: if there's exactly one input file and no
         // overlap with the next level, just move the metadata without rewriting.
@@ -254,6 +271,45 @@ impl LeveledCompaction {
             }
             return Ok(());
         }
+
+        let max_outputs = task.total_input_size() / options.target_file_size_base + 1;
+        let file_number_start = versions.reserve_file_numbers(max_outputs);
+
+        let output = Self::execute_compaction_io(
+            task,
+            file_number_start,
+            db_path,
+            options,
+            rate_limiter,
+            stats,
+            active_snapshots,
+        )
+        .c(d!())?;
+
+        Self::install_compaction(output, versions, table_cache, db_path, stats).c(d!())
+    }
+
+    /// Pure I/O phase of compaction — does NOT require any lock.
+    ///
+    /// Merges input files, writes output SSTs using pre-allocated file numbers,
+    /// and returns a `CompactionOutput` ready for `install_compaction`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_compaction_io(
+        task: &CompactionTask,
+        file_number_start: u64,
+        db_path: &Path,
+        options: &DbOptions,
+        rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
+        stats: Option<&Arc<crate::stats::DbStats>>,
+        active_snapshots: &[SequenceNumber],
+    ) -> Result<CompactionOutput> {
+        let target_level = task.level + 1;
+        let is_bottommost = target_level >= options.num_levels - 1;
+        let min_unflushed_seq = active_snapshots
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(SequenceNumber::MAX);
 
         // Build streaming merge sources from input files
         let mut sources: Vec<IterSource> = Vec::new();
@@ -291,8 +347,6 @@ impl LeveledCompaction {
         } else {
             options.compression
         };
-        // build_opts is a template; block_property_collectors are created fresh
-        // per output file (via factory functions) to avoid sharing mutable state.
         let build_opts = TableBuildOptions {
             block_size: options.block_size,
             block_restart_interval: options.block_restart_interval,
@@ -306,14 +360,12 @@ impl LeveledCompaction {
         let mut edit = VersionEdit::new();
         let mut builder: Option<TableBuilder> = None;
         let mut current_file_number = 0u64;
+        let mut next_file_idx = 0u64;
         let mut current_size = 0usize;
         let mut last_point_key: Option<Vec<u8>> = None;
         let mut last_range_del_key: Option<Vec<u8>> = None;
-        // Snapshot-aware dedup: track which snapshot boundaries still need
-        // an older version of the current key to be preserved.
         let mut last_written_seq: SequenceNumber = 0;
         let mut snapshot_idx: usize = active_snapshots.len();
-        // Sweep-line range tombstone tracker for O(1) amortized coverage checks.
         let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
@@ -323,62 +375,42 @@ impl LeveledCompaction {
             let ikr = InternalKeyRef::new(&ikey);
             let user_key = ikr.user_key();
 
-            // Collect range tombstones for filtering.
-            // Range-del entries use separate dedup tracking from point keys:
-            // a range-del and a point key can share the same user_key and
-            // both must be preserved.
             if ikr.value_type() == ValueType::RangeDeletion {
                 range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
                 range_tombstones.reset();
-                // Skip older range-del versions of the same begin key
                 if let Some(ref last) = last_range_del_key
                     && last.as_slice() == user_key
                 {
                     continue;
                 }
                 last_range_del_key = Some(user_key.to_vec());
-                // Drop range tombstones at the bottommost level
                 if is_bottommost {
                     continue;
                 }
-                // Keep range tombstone in non-bottommost levels — fall through to write it
-            } else {
-                // Deduplicate point keys (snapshot-aware): keep the newest
-                // version, plus one version per active snapshot boundary.
-                if let Some(ref last) = last_point_key
-                    && last.as_slice() == user_key
-                {
-                    // Same key as previous — check if a snapshot needs this version.
-                    // Skip snapshots already satisfied by last_written_seq.
-                    while snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= last_written_seq
-                    {
-                        snapshot_idx -= 1;
-                    }
-                    // Keep if a snapshot falls in [entry_seq, last_written_seq)
-                    if snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
-                        last_written_seq = ikr.sequence();
-                        // Snapshot-pinned version: write as-is, skip filters below
-                    } else {
-                        continue; // No snapshot needs this older version
-                    }
-                } else {
-                    // New user key — reset snapshot tracking
-                    last_point_key = Some(user_key.to_vec());
+            } else if let Some(ref last) = last_point_key
+                && last.as_slice() == user_key
+            {
+                while snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= last_written_seq {
+                    snapshot_idx -= 1;
+                }
+                if snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
                     last_written_seq = ikr.sequence();
-                    snapshot_idx = active_snapshots.len();
+                } else {
+                    continue;
+                }
+            } else {
+                last_point_key = Some(user_key.to_vec());
+                last_written_seq = ikr.sequence();
+                snapshot_idx = active_snapshots.len();
 
-                    // Drop point tombstones at the bottommost level
-                    // (only the newest version — snapshot-pinned are handled above)
-                    if ikr.value_type() == ValueType::Deletion && is_bottommost {
+                if ikr.value_type() == ValueType::Deletion && is_bottommost {
+                    continue;
+                }
+
+                if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
+                    let entry_seq = ikr.sequence();
+                    if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
                         continue;
-                    }
-
-                    // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
-                    if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
-                        let entry_seq = ikr.sequence();
-                        if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
-                            continue;
-                        }
                     }
                 }
             }
@@ -398,9 +430,10 @@ impl LeveledCompaction {
                 }
             }
 
-            // Create new output file if needed
+            // Create new output file if needed (using pre-allocated numbers)
             if builder.is_none() {
-                current_file_number = versions.new_file_number();
+                current_file_number = file_number_start + next_file_idx;
+                next_file_idx += 1;
                 let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
                 let mut opts = build_opts.clone();
                 opts.block_property_collectors = options
@@ -412,13 +445,6 @@ impl LeveledCompaction {
                 current_size = 0;
             }
 
-            // Sequence zeroing: at the bottommost level, if the entry's
-            // sequence falls below the minimum active snapshot, zero it out.
-            // Only safe at bottommost because tombstones are also dropped
-            // there — a zeroed key (seq=0) at a non-bottommost level could
-            // be falsely covered by a range tombstone that kept its original
-            // sequence.  The dedup logic above ensures only one version per
-            // user key survives.
             let final_ikey;
             let ikey_ref = if is_bottommost
                 && ikr.sequence() > 0
@@ -441,12 +467,10 @@ impl LeveledCompaction {
                 .c(d!())?;
             current_size += entry_bytes;
 
-            // Rate-limit compaction writes
             if let Some(rl) = rate_limiter {
                 rl.request(entry_bytes);
             }
 
-            // Split output file if target size reached
             if current_size >= options.target_file_size_base as usize {
                 let result = builder.take().unwrap().finish().c(d!())?;
                 if let Some(s) = stats {
@@ -483,9 +507,6 @@ impl LeveledCompaction {
             );
         }
 
-        // Abort if the merge iterator encountered an I/O or corruption error.
-        // Without this check, a partial merge (stopped by error → returns None)
-        // would silently proceed to delete the input files, causing data loss.
         if let Some(e) = merger.error() {
             return Err(eg!("compaction merge iterator error: {}", e));
         }
@@ -505,18 +526,37 @@ impl LeveledCompaction {
             edit.delete_file(target_level as u32, tf.meta.number);
         }
 
-        edit.set_next_file_number(versions.next_file_number());
-        versions.log_and_apply(edit).c(d!())?;
+        Ok(CompactionOutput {
+            edit,
+            input_file_numbers,
+            files_produced: next_file_idx,
+        })
+    }
+
+    /// Install the result of a compaction: apply the VersionEdit, evict
+    /// old files from cache, and delete old SST files from disk.
+    /// Requires `&mut VersionSet` (hold the lock for this short phase only).
+    pub fn install_compaction(
+        mut output: CompactionOutput,
+        versions: &mut VersionSet,
+        table_cache: Option<&Arc<TableCache>>,
+        db_path: &Path,
+        stats: Option<&Arc<crate::stats::DbStats>>,
+    ) -> Result<()> {
+        output
+            .edit
+            .set_next_file_number(versions.next_file_number());
+        versions.log_and_apply(output.edit).c(d!())?;
 
         // Evict from table cache before deleting SST files
         if let Some(cache) = table_cache {
-            for num in &input_file_numbers {
+            for num in &output.input_file_numbers {
                 cache.evict(*num);
             }
         }
 
         // Delete old SST files
-        for num in &input_file_numbers {
+        for num in &output.input_file_numbers {
             let old_path = db_path.join(format!("{:06}.sst", num));
             if let Err(e) = std::fs::remove_file(&old_path) {
                 tracing::warn!("failed to remove old SST {}: {}", old_path.display(), e);
