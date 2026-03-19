@@ -347,9 +347,8 @@ impl TableReader {
             }
         }
 
-        let cached = Arc::new(
-            crate::iterator::range_del::FragmentedRangeTombstoneList::new(triples),
-        );
+        let cached =
+            Arc::new(crate::iterator::range_del::FragmentedRangeTombstoneList::new(triples));
         // Race is benign — worst case we build twice
         let _ = self.range_tombstone_cache.set(cached.clone());
         Ok(cached)
@@ -1058,14 +1057,12 @@ impl TableIterator {
                         }
                     }
                     Err(e) => {
-                        self.err =
-                            Some(format!("block decode error at index {block_idx}: {e}"));
+                        self.err = Some(format!("block decode error at index {block_idx}: {e}"));
                         return false;
                     }
                 },
                 Err(e) => {
-                    self.err =
-                        Some(format!("block read error at index {block_idx}: {e}"));
+                    self.err = Some(format!("block read error at index {block_idx}: {e}"));
                     return false;
                 }
             }

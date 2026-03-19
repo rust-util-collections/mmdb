@@ -191,10 +191,7 @@ impl DBIterator {
 
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
     pub fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
-        self.merger.set_bounds(
-            lower.as_deref(),
-            upper.as_deref(),
-        );
+        self.merger.set_bounds(lower.as_deref(), upper.as_deref());
         self.iterate_upper_bound = upper;
         self.current = None;
         self.needs_advance = true;
@@ -221,9 +218,11 @@ impl DBIterator {
         } else {
             None
         };
-        self.range_tombstones
-            .max_covering_tombstone_seq_for_level(user_key, self.sequence, level_filter)
-            > seq
+        self.range_tombstones.max_covering_tombstone_seq_for_level(
+            user_key,
+            self.sequence,
+            level_filter,
+        ) > seq
     }
 
     /// Set a skip-point callback. During iteration, any user key for which

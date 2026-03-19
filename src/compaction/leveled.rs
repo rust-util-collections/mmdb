@@ -21,9 +21,7 @@ use crate::manifest::version_set::VersionSet;
 use crate::options::DbOptions;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
-use crate::types::{
-    InternalKey, InternalKeyRef, SequenceNumber, ValueType, compare_internal_key,
-};
+use crate::types::{InternalKey, InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
 
 /// Description of a compaction to perform.
 pub struct CompactionTask {
@@ -201,9 +199,7 @@ impl LeveledCompaction {
         db_path: &Path,
         options: &DbOptions,
     ) -> Result<()> {
-        Self::execute_compaction_with_cache(
-            task, versions, db_path, options, None, None, None, &[],
-        )
+        Self::execute_compaction_with_cache(task, versions, db_path, options, None, None, None, &[])
     }
 
     /// Execute compaction with optional table cache for eviction and rate limiter.
@@ -332,8 +328,7 @@ impl LeveledCompaction {
                 last_user_key = Some(user_key.to_vec());
 
                 // Drop point tombstones at the bottommost level
-                if ikr.value_type() == ValueType::Deletion && is_bottommost
-                {
+                if ikr.value_type() == ValueType::Deletion && is_bottommost {
                     continue;
                 }
 
@@ -382,15 +377,20 @@ impl LeveledCompaction {
                 && ikr.sequence() < min_unflushed_seq
                 && ikr.value_type() == ValueType::Value
             {
-                final_ikey =
-                    InternalKey::new(user_key, 0, ikr.value_type()).as_bytes().to_vec();
+                final_ikey = InternalKey::new(user_key, 0, ikr.value_type())
+                    .as_bytes()
+                    .to_vec();
                 &final_ikey
             } else {
                 &ikey
             };
 
             let entry_bytes = ikey_ref.len() + final_value.len();
-            builder.as_mut().unwrap().add(ikey_ref, &final_value).c(d!())?;
+            builder
+                .as_mut()
+                .unwrap()
+                .add(ikey_ref, &final_value)
+                .c(d!())?;
             current_size += entry_bytes;
 
             // Rate-limit compaction writes

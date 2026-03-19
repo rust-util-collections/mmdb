@@ -170,9 +170,7 @@ impl FragmentedRangeTombstoneList {
     /// 2. For each consecutive boundary pair `[b_i, b_{i+1})`, find all
     ///    tombstones that cover this interval and record their `(seq, level)`.
     /// 3. Skip intervals with no covering tombstones.
-    pub fn new_with_levels(
-        mut raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
-    ) -> Self {
+    pub fn new_with_levels(mut raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>) -> Self {
         if raw.is_empty() {
             return Self::empty();
         }
@@ -212,10 +210,8 @@ impl FragmentedRangeTombstoneList {
             }
 
             // Collect (seq, level) pairs from active tombstones, sorted by seq descending.
-            let mut seq_levels: Vec<(SequenceNumber, usize)> = active
-                .iter()
-                .map(|&idx| (raw[idx].2, raw[idx].3))
-                .collect();
+            let mut seq_levels: Vec<(SequenceNumber, usize)> =
+                active.iter().map(|&idx| (raw[idx].2, raw[idx].3)).collect();
             seq_levels.sort_unstable_by(|a, b| b.0.cmp(&a.0));
             seq_levels.dedup_by_key(|sl| sl.0);
 

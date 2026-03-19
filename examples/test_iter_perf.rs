@@ -14,8 +14,14 @@ fn main() {
     let start = Instant::now();
     let n = 10_000;
     for i in 0u64..n {
-        db.put_with_options(&wo, &i.to_be_bytes(), &[0u8; 128]).unwrap();
+        db.put_with_options(&wo, &i.to_be_bytes(), &[0u8; 128])
+            .unwrap();
     }
     let elapsed = start.elapsed();
-    println!("{} writes in {:?} ({:.1}µs/write)", n, elapsed, elapsed.as_micros() as f64 / n as f64);
+    println!(
+        "{} writes in {:?} ({:.1}µs/write)",
+        n,
+        elapsed,
+        elapsed.as_micros() as f64 / n as f64
+    );
 }

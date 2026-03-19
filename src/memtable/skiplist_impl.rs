@@ -252,7 +252,9 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 if level == 0 {
                     new_ref.prev0.store(ptr::null_mut(), Ordering::Relaxed);
                     if !old_head.is_null() {
-                        unsafe { &*old_head }.prev0.store(new_node, Ordering::Release);
+                        unsafe { &*old_head }
+                            .prev0
+                            .store(new_node, Ordering::Release);
                     }
                 }
                 self.head[level].store(new_node, Ordering::Release);
@@ -265,7 +267,9 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 if level == 0 {
                     new_ref.prev0.store(prev[level], Ordering::Relaxed);
                     if !old_next.is_null() {
-                        unsafe { &*old_next }.prev0.store(new_node, Ordering::Release);
+                        unsafe { &*old_next }
+                            .prev0
+                            .store(new_node, Ordering::Release);
                     }
                 }
                 p.next[level].store(new_node, Ordering::Release);
