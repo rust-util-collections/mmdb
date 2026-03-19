@@ -1113,7 +1113,10 @@ fn test_prefix_iterator() {
     }
 
     // Prefix iterator for "AAA" should only see AAA* keys
-    let entries: Vec<_> = db.prefix_iterator(b"AAA").unwrap().collect();
+    let entries: Vec<_> = db
+        .iter_with_prefix(b"AAA", &mmdb::ReadOptions::default())
+        .unwrap()
+        .collect();
     assert_eq!(entries.len(), 10, "expected 10 AAA-prefixed keys");
     for (k, v) in &entries {
         assert!(k.starts_with(b"AAA"), "key should start with AAA");
@@ -1121,14 +1124,20 @@ fn test_prefix_iterator() {
     }
 
     // Prefix iterator for "BBB" should only see BBB* keys
-    let entries: Vec<_> = db.prefix_iterator(b"BBB").unwrap().collect();
+    let entries: Vec<_> = db
+        .iter_with_prefix(b"BBB", &mmdb::ReadOptions::default())
+        .unwrap()
+        .collect();
     assert_eq!(entries.len(), 10, "expected 10 BBB-prefixed keys");
     for (k, _) in &entries {
         assert!(k.starts_with(b"BBB"), "key should start with BBB");
     }
 
     // Non-existent prefix should yield empty iterator
-    let entries: Vec<_> = db.prefix_iterator(b"CCC").unwrap().collect();
+    let entries: Vec<_> = db
+        .iter_with_prefix(b"CCC", &mmdb::ReadOptions::default())
+        .unwrap()
+        .collect();
     assert_eq!(entries.len(), 0);
 }
 
@@ -1214,13 +1223,13 @@ fn test_bidi_iterator_forward_reverse() {
     }
 
     // Full forward traversal
-    let forward: Vec<_> = db.iter_bidi().unwrap().collect();
+    let forward: Vec<_> = mmdb::BidiIterator::lazy(db.iter().unwrap()).collect();
     assert_eq!(forward.len(), 10);
     assert_eq!(forward[0].0, b"key_0000");
     assert_eq!(forward[9].0, b"key_0009");
 
     // Full reverse traversal
-    let reverse: Vec<_> = db.iter_bidi().unwrap().rev().collect();
+    let reverse: Vec<_> = mmdb::BidiIterator::lazy(db.iter().unwrap()).rev().collect();
     assert_eq!(reverse.len(), 10);
     assert_eq!(reverse[0].0, b"key_0009");
     assert_eq!(reverse[9].0, b"key_0000");
@@ -1241,7 +1250,7 @@ fn test_bidi_iterator_interleaved() {
         db.put(&[ch], &[ch]).unwrap();
     }
 
-    let mut it = db.iter_bidi().unwrap();
+    let mut it = mmdb::BidiIterator::lazy(db.iter().unwrap());
     assert_eq!(it.next().unwrap().0, vec![b'a']); // front
     assert_eq!(it.next_back().unwrap().0, vec![b'f']); // back
     assert_eq!(it.next().unwrap().0, vec![b'b']); // front
@@ -1307,11 +1316,11 @@ fn test_iter_rev_after_flush_compact() {
     db.compact().unwrap();
 
     // Forward
-    let forward: Vec<_> = db.iter_bidi().unwrap().collect();
+    let forward: Vec<_> = mmdb::BidiIterator::lazy(db.iter().unwrap()).collect();
     assert_eq!(forward.len(), 60);
 
     // Reverse should be exact mirror
-    let reverse: Vec<_> = db.iter_bidi().unwrap().rev().collect();
+    let reverse: Vec<_> = mmdb::BidiIterator::lazy(db.iter().unwrap()).rev().collect();
     assert_eq!(reverse.len(), 60);
     assert_eq!(reverse[0].0, forward[59].0);
     assert_eq!(reverse[59].0, forward[0].0);
@@ -1446,16 +1455,25 @@ fn test_prefix_scan_across_levels() {
     db.compact().unwrap();
 
     // Prefix scan should return exactly the matching prefix
-    let aaa: Vec<_> = db.iter_with_prefix(b"aaa_").unwrap().collect();
+    let aaa: Vec<_> = db
+        .iter_with_prefix(b"aaa_", &mmdb::ReadOptions::default())
+        .unwrap()
+        .collect();
     assert_eq!(aaa.len(), 100, "aaa_ prefix should have 100 entries");
     assert!(aaa[0].0.starts_with(b"aaa_"));
     assert!(aaa[99].0.starts_with(b"aaa_"));
 
-    let bbb: Vec<_> = db.iter_with_prefix(b"bbb_").unwrap().collect();
+    let bbb: Vec<_> = db
+        .iter_with_prefix(b"bbb_", &mmdb::ReadOptions::default())
+        .unwrap()
+        .collect();
     assert_eq!(bbb.len(), 100);
 
     // Non-existent prefix
-    let zzz: Vec<_> = db.iter_with_prefix(b"zzz_").unwrap().collect();
+    let zzz: Vec<_> = db
+        .iter_with_prefix(b"zzz_", &mmdb::ReadOptions::default())
+        .unwrap()
+        .collect();
     assert_eq!(zzz.len(), 0);
 }
 
@@ -1914,11 +1932,11 @@ fn test_vsdb_seek_to_last_pattern() {
             .unwrap();
         iter.seek_to_last();
         assert!(iter.valid(), "seek_to_last should be valid (memtable)");
-        assert_eq!(iter.key(), b"k_0019");
+        assert_eq!(iter.key().unwrap(), b"k_0019");
         // Walk backward
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"k_0018");
+        assert_eq!(iter.key().unwrap(), b"k_0018");
     }
 
     // Pattern 2: after flush (SST)
@@ -1929,10 +1947,10 @@ fn test_vsdb_seek_to_last_pattern() {
             .unwrap();
         iter.seek_to_last();
         assert!(iter.valid(), "seek_to_last should be valid (SST)");
-        assert_eq!(iter.key(), b"k_0019");
+        assert_eq!(iter.key().unwrap(), b"k_0019");
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"k_0018");
+        assert_eq!(iter.key().unwrap(), b"k_0018");
     }
 
     // Pattern 3: with range hints (mimics vsdb prefix_successor)
@@ -1944,7 +1962,7 @@ fn test_vsdb_seek_to_last_pattern() {
             .unwrap();
         iter.seek_to_last();
         assert!(iter.valid(), "seek_to_last should be valid (range-bounded)");
-        assert_eq!(iter.key(), b"k_0019");
+        assert_eq!(iter.key().unwrap(), b"k_0019");
     }
 }
 
@@ -1968,7 +1986,7 @@ fn test_range_tombstone_backward_no_resurrection() {
     let fwd: Vec<Vec<u8>> = std::iter::from_fn(|| iter.next().map(|(k, _)| k)).collect();
     assert_eq!(fwd, vec![b"a", b"b", b"e", b"f"]);
 
-    let bidi = db.iter_bidi().unwrap();
+    let bidi = mmdb::BidiIterator::lazy(db.iter().unwrap());
     let rev: Vec<Vec<u8>> = bidi.rev().map(|(k, _)| k).collect();
     assert_eq!(
         rev,
@@ -1988,7 +2006,7 @@ fn test_range_tombstone_backward_after_flush() {
     db.delete_range(b"b", b"e").unwrap();
     db.flush().unwrap();
 
-    let bidi = db.iter_bidi().unwrap();
+    let bidi = mmdb::BidiIterator::lazy(db.iter().unwrap());
     let rev: Vec<Vec<u8>> = bidi.rev().map(|(k, _)| k).collect();
     assert_eq!(rev, vec![b"f".to_vec(), b"e".to_vec(), b"a".to_vec()]);
 }
@@ -2007,7 +2025,7 @@ fn test_bidi_streaming_next_back() {
     }
     db.flush().unwrap();
 
-    let bidi = db.iter_bidi().unwrap();
+    let bidi = mmdb::BidiIterator::lazy(db.iter().unwrap());
     let rev: Vec<Vec<u8>> = bidi.rev().map(|(k, _)| k).collect();
     assert_eq!(rev.len(), count);
     for (i, entry) in rev.iter().enumerate() {
@@ -2032,16 +2050,16 @@ fn test_prev_multi_version_tombstones() {
     let mut iter = db.iter().unwrap();
     iter.seek(b"d");
     assert!(iter.valid());
-    assert_eq!(iter.key(), b"d");
+    assert_eq!(iter.key().unwrap(), b"d");
 
     iter.prev();
     assert!(iter.valid());
-    assert_eq!(iter.key(), b"c");
-    assert_eq!(iter.value(), b"c2");
+    assert_eq!(iter.key().unwrap(), b"c");
+    assert_eq!(iter.value().unwrap(), b"c2");
 
     iter.prev();
     assert!(iter.valid());
-    assert_eq!(iter.key(), b"a");
+    assert_eq!(iter.key().unwrap(), b"a");
 
     iter.prev();
     assert!(!iter.valid());
@@ -2062,15 +2080,15 @@ fn test_seek_for_prev_round_trip() {
     let mut iter = db.iter().unwrap();
     iter.seek_for_prev(b"key_04x");
     assert!(iter.valid());
-    assert_eq!(iter.key(), b"key_04");
+    assert_eq!(iter.key().unwrap(), b"key_04");
 
     iter.advance();
     assert!(iter.valid());
-    assert_eq!(iter.key(), b"key_05");
+    assert_eq!(iter.key().unwrap(), b"key_05");
 
     iter.prev();
     assert!(iter.valid());
-    assert_eq!(iter.key(), b"key_04");
+    assert_eq!(iter.key().unwrap(), b"key_04");
 }
 
 /// compact_range followed by immediate iter() should see compacted state.

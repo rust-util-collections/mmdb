@@ -17,7 +17,7 @@ fn debug_bidi_reverse() {
     }
 
     // Test pure reverse via iter_bidi
-    let mut it = db.iter_bidi().unwrap();
+    let mut it = mmdb::BidiIterator::lazy(db.iter().unwrap());
     let mut count = 0;
     while let Some((k, _)) = it.next_back() {
         eprintln!("  next_back #{}: {:?}", count, String::from_utf8_lossy(&k));

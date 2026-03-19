@@ -16,9 +16,9 @@ use crate::cache::table_cache::TableCache;
 use crate::compaction::LeveledCompaction;
 use crate::compaction::leveled::CompactionHint;
 use crate::error::{Error, Result};
+use crate::iterator::LevelIterator;
 use crate::iterator::db_iter::DBIterator;
 use crate::iterator::merge::IterSource;
-use crate::iterator::{BidiIterator, LevelIterator};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
 use crate::memtable::MemTable;
@@ -467,10 +467,14 @@ impl DB {
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.delete_with_options(&WriteOptions::default(), key)
+    }
+
+    pub fn delete_with_options(&self, write_options: &WriteOptions, key: &[u8]) -> Result<()> {
         self.check_usable().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.delete(key);
-        self.write_batch_inner(batch, &WriteOptions::default())
+        self.write_batch_inner(batch, write_options)
     }
 
     /// Delete all keys in the range [begin, end).
@@ -482,11 +486,19 @@ impl DB {
     }
 
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
+        self.write_with_options(batch, &WriteOptions::default())
+    }
+
+    pub fn write_with_options(
+        &self,
+        batch: WriteBatch,
+        write_options: &WriteOptions,
+    ) -> Result<()> {
         self.check_usable().c(d!())?;
         if batch.is_empty() {
             return Ok(());
         }
-        self.write_batch_inner(batch, &WriteOptions::default())
+        self.write_batch_inner(batch, write_options)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -632,14 +644,20 @@ impl DB {
         self.iter_with_range(options, None, None)
     }
 
-    /// Create a forward iterator that only includes sources overlapping [start_hint, end_hint].
+    /// Create a forward iterator that only includes sources overlapping [lower_bound, upper_bound].
     /// SST files outside this range are skipped entirely, avoiding costly block reads.
     /// `None` bounds mean unbounded in that direction.
+    ///
+    /// **WARNING**: Does NOT use prefix bloom filters. For prefix-scoped queries,
+    /// prefer `iter_with_prefix()` which is typically 10-100x faster.
+    ///
+    /// Bounds from `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` are
+    /// also applied if set, using the tighter of the two.
     pub fn iter_with_range(
         &self,
         options: &ReadOptions,
-        start_hint: Option<&[u8]>,
-        end_hint: Option<&[u8]>,
+        lower_bound: Option<&[u8]>,
+        upper_bound: Option<&[u8]>,
     ) -> Result<DBIterator> {
         self.check_usable().c(d!())?;
 
@@ -674,18 +692,18 @@ impl DB {
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
-        // SST files — only include files whose key range overlaps [start_hint, end_hint].
+        // SST files — only include files whose key range overlaps [lower_bound, upper_bound].
         // L0 files can overlap each other so we check each individually.
         // L1+ files are sorted and non-overlapping — use a single LevelIterator per level.
         for tf in version.level_files(0) {
-            // Check if this file's key range overlaps the hint range.
-            if let Some(start) = start_hint
-                && types::user_key(&tf.meta.largest_key) < start
+            // Check if this file's key range overlaps the bound range.
+            if let Some(lo) = lower_bound
+                && types::user_key(&tf.meta.largest_key) < lo
             {
                 continue;
             }
-            if let Some(end) = end_hint
-                && types::user_key(&tf.meta.smallest_key) > end
+            if let Some(hi) = upper_bound
+                && types::user_key(&tf.meta.smallest_key) > hi
             {
                 continue;
             }
@@ -713,8 +731,10 @@ impl DB {
                     }
                 }
             }
-            let mut level_iter = LevelIterator::new(files.to_vec())
-                .with_range_hints(start_hint.map(|s| s.to_vec()), end_hint.map(|e| e.to_vec()));
+            let mut level_iter = LevelIterator::new(files.to_vec()).with_range_hints(
+                lower_bound.map(|s| s.to_vec()),
+                upper_bound.map(|e| e.to_vec()),
+            );
             if !options.block_property_filters.is_empty() {
                 level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
             }
@@ -722,8 +742,26 @@ impl DB {
         }
 
         let mut db_iter = DBIterator::from_sources(sources, seq);
-        if let Some(end) = end_hint {
-            db_iter.set_upper_bound(end.to_vec());
+
+        // Apply bounds: merge explicit parameters with ReadOptions bounds, using tighter of the two.
+        let effective_lower = match (&options.iterate_lower_bound, lower_bound) {
+            (Some(opt_lo), Some(param_lo)) => {
+                Some(std::cmp::max(opt_lo.as_slice(), param_lo).to_vec())
+            }
+            (Some(opt_lo), None) => Some(opt_lo.clone()),
+            (None, Some(param_lo)) => Some(param_lo.to_vec()),
+            (None, None) => None,
+        };
+        let effective_upper = match (&options.iterate_upper_bound, upper_bound) {
+            (Some(opt_hi), Some(param_hi)) => {
+                Some(std::cmp::min(opt_hi.as_slice(), param_hi).to_vec())
+            }
+            (Some(opt_hi), None) => Some(opt_hi.clone()),
+            (None, Some(param_hi)) => Some(param_hi.to_vec()),
+            (None, None) => None,
+        };
+        if effective_lower.is_some() || effective_upper.is_some() {
+            db_iter.set_bounds(effective_lower, effective_upper);
         }
 
         // Collect all range tombstones upfront from per-source caches.
@@ -777,16 +815,26 @@ impl DB {
         Ok(db_iter)
     }
 
-    /// Create a prefix-bounded iterator.
+    /// Create a prefix-bounded iterator with full options support.
     ///
     /// Uses prefix bloom filters to skip SST files that don't contain the prefix,
     /// and stops iteration as soon as the prefix boundary is crossed.
-    pub fn iter_with_prefix(&self, prefix: &[u8]) -> Result<DBIterator> {
-        self.iter_with_prefix_seq(prefix, self.current_sequence())
+    /// Typically 10-100x faster than `iter_with_range()` for prefix-scoped queries.
+    ///
+    /// Supports `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` for
+    /// sub-range queries within a prefix, and `snapshot` for historical reads.
+    pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator> {
+        let seq = options.snapshot.unwrap_or_else(|| self.current_sequence());
+        self.iter_with_prefix_inner(prefix, seq, options)
     }
 
     /// Create a prefix-bounded iterator at a specific sequence number.
-    fn iter_with_prefix_seq(&self, prefix: &[u8], seq: SequenceNumber) -> Result<DBIterator> {
+    fn iter_with_prefix_inner(
+        &self,
+        prefix: &[u8],
+        seq: SequenceNumber,
+        options: &ReadOptions,
+    ) -> Result<DBIterator> {
         self.check_usable().c(d!())?;
 
         // Lock-free read via SuperVersion.
@@ -920,20 +968,25 @@ impl DB {
             }
         }
 
-        // Seek to the prefix start
-        iter.seek(prefix);
+        // Apply ReadOptions bounds if set.
+        if options.iterate_lower_bound.is_some() || options.iterate_upper_bound.is_some() {
+            iter.set_bounds(
+                options.iterate_lower_bound.clone(),
+                options.iterate_upper_bound.clone(),
+            );
+        }
+
+        if let Some(ref sp) = options.skip_point {
+            iter.set_skip_point(Arc::clone(sp));
+        }
+
+        // Seek to the prefix start (or lower bound if tighter)
+        match &options.iterate_lower_bound {
+            Some(lb) if lb.as_slice() > prefix => iter.seek(lb),
+            _ => iter.seek(prefix),
+        }
 
         Ok(iter)
-    }
-
-    /// Create a bidirectional iterator over all visible entries.
-    ///
-    /// Uses lazy streaming: forward iteration (`next()`) is streamed without
-    /// materializing all entries. On first backward access (`next_back()`),
-    /// remaining entries are collected into memory.
-    pub fn iter_bidi(&self) -> Result<BidiIterator> {
-        let db_iter = self.iter().c(d!())?;
-        Ok(BidiIterator::lazy(db_iter))
     }
 
     /// Create a forward iterator that merges uncommitted batch writes with the
@@ -1029,28 +1082,16 @@ impl DB {
         Ok(db_iter)
     }
 
-    /// Create a prefix iterator with lazy streaming.
-    ///
-    /// Forward iteration is streamed; backward access materializes on first `next_back()`.
-    pub fn prefix_iterator(&self, prefix: &[u8]) -> Result<BidiIterator> {
-        let db_iter = self.iter_with_prefix(prefix).c(d!())?;
-        Ok(BidiIterator::lazy(db_iter))
-    }
-
-    /// Create a prefix iterator with options (supports snapshot for historical reads).
-    pub fn prefix_iterator_with_options(
-        &self,
-        prefix: &[u8],
-        options: &ReadOptions,
-    ) -> Result<BidiIterator> {
-        let seq = options.snapshot.unwrap_or_else(|| self.current_sequence());
-        let db_iter = self.iter_with_prefix_seq(prefix, seq).c(d!())?;
-        Ok(BidiIterator::lazy(db_iter))
-    }
-
     pub fn snapshot_seq(&self) -> SequenceNumber {
         let seq = self.current_sequence();
         self.snapshot_list.acquire(seq)
+    }
+
+    /// Acquire a snapshot with RAII guard. The snapshot is automatically released
+    /// when the `Snapshot` is dropped — no manual `release_snapshot()` needed.
+    pub fn snapshot(&self) -> Snapshot<'_> {
+        let seq = self.snapshot_seq();
+        Snapshot { db: self, seq }
     }
 
     /// Release a previously acquired snapshot so compaction can reclaim its data.
@@ -1857,6 +1898,29 @@ impl Drop for DB {
     }
 }
 
+/// RAII snapshot guard. Automatically releases the snapshot when dropped.
+///
+/// Use `DB::snapshot()` to create one. The snapshot's sequence number can be
+/// passed to `ReadOptions::snapshot` for consistent reads.
+pub struct Snapshot<'a> {
+    db: &'a DB,
+    seq: SequenceNumber,
+}
+
+impl Snapshot<'_> {
+    /// The sequence number for this snapshot.
+    /// Pass to `ReadOptions { snapshot: Some(seq), .. }` for consistent reads.
+    pub fn sequence(&self) -> SequenceNumber {
+        self.seq
+    }
+}
+
+impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        self.db.release_snapshot(self.seq);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2225,7 +2289,7 @@ mod tests {
         let mut iter = db.iter().unwrap();
         iter.seek(b"key_05");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"key_05");
+        assert_eq!(iter.key().unwrap(), b"key_05");
 
         let remaining: Vec<_> = iter.collect();
         assert_eq!(remaining.len(), 5); // key_05 through key_09

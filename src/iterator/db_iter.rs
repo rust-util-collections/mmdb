@@ -406,22 +406,14 @@ impl DBIterator {
         self.ensure_current()
     }
 
-    pub fn key(&mut self) -> &[u8] {
+    pub fn key(&mut self) -> Option<&[u8]> {
         self.ensure_current();
-        &self
-            .current
-            .as_ref()
-            .expect("called key() on invalid iterator")
-            .0
+        self.current.as_ref().map(|(k, _)| k.as_slice())
     }
 
-    pub fn value(&mut self) -> &[u8] {
+    pub fn value(&mut self) -> Option<&[u8]> {
         self.ensure_current();
-        self.current
-            .as_ref()
-            .expect("called value() on invalid iterator")
-            .1
-            .as_slice()
+        self.current.as_ref().map(|(_, v)| v.as_slice())
     }
 
     pub fn advance(&mut self) {
@@ -852,11 +844,11 @@ mod tests {
         let mut iter = DBIterator::new(vec![source], 10);
         iter.seek(b"banana");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"banana");
+        assert_eq!(iter.key().unwrap(), b"banana");
 
         iter.seek(b"blueberry");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"cherry");
+        assert_eq!(iter.key().unwrap(), b"cherry");
 
         iter.seek(b"zzz");
         assert!(!iter.valid());
@@ -872,18 +864,18 @@ mod tests {
 
         let mut iter = DBIterator::new(vec![source], 10);
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"a");
-        assert_eq!(iter.value(), b"1");
+        assert_eq!(iter.key().unwrap(), b"a");
+        assert_eq!(iter.value().unwrap(), b"1");
 
         iter.advance();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"b");
-        assert_eq!(iter.value(), b"2");
+        assert_eq!(iter.key().unwrap(), b"b");
+        assert_eq!(iter.value().unwrap(), b"2");
 
         iter.advance();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"c");
-        assert_eq!(iter.value(), b"3");
+        assert_eq!(iter.key().unwrap(), b"c");
+        assert_eq!(iter.value().unwrap(), b"3");
 
         iter.advance();
         assert!(!iter.valid());
@@ -903,17 +895,17 @@ mod tests {
         let mut iter = DBIterator::new(vec![source.clone()], 10);
         iter.seek(b"c");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"c");
+        assert_eq!(iter.key().unwrap(), b"c");
 
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"b");
-        assert_eq!(iter.value(), b"2");
+        assert_eq!(iter.key().unwrap(), b"b");
+        assert_eq!(iter.value().unwrap(), b"2");
 
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"a");
-        assert_eq!(iter.value(), b"1");
+        assert_eq!(iter.key().unwrap(), b"a");
+        assert_eq!(iter.value().unwrap(), b"1");
 
         // prev at beginning should invalidate
         iter.prev();
@@ -922,29 +914,29 @@ mod tests {
         // Seek to last, prev through all
         let mut iter = DBIterator::new(vec![source.clone()], 10);
         iter.seek(b"e");
-        assert_eq!(iter.key(), b"e");
+        assert_eq!(iter.key().unwrap(), b"e");
 
         iter.prev();
-        assert_eq!(iter.key(), b"d");
+        assert_eq!(iter.key().unwrap(), b"d");
         iter.prev();
-        assert_eq!(iter.key(), b"c");
+        assert_eq!(iter.key().unwrap(), b"c");
         iter.prev();
-        assert_eq!(iter.key(), b"b");
+        assert_eq!(iter.key().unwrap(), b"b");
         iter.prev();
-        assert_eq!(iter.key(), b"a");
+        assert_eq!(iter.key().unwrap(), b"a");
         iter.prev();
         assert!(!iter.valid());
 
         // prev then next should work
         let mut iter = DBIterator::new(vec![source], 10);
         iter.seek(b"c");
-        assert_eq!(iter.key(), b"c");
+        assert_eq!(iter.key().unwrap(), b"c");
         iter.prev();
-        assert_eq!(iter.key(), b"b");
+        assert_eq!(iter.key().unwrap(), b"b");
         // After prev, advance should move to next entry
         iter.advance();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"c");
+        assert_eq!(iter.key().unwrap(), b"c");
     }
 
     #[test]
@@ -960,13 +952,13 @@ mod tests {
         let mut iter = DBIterator::new(vec![source.clone()], 10);
         iter.seek_for_prev(b"banana");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"banana");
+        assert_eq!(iter.key().unwrap(), b"banana");
 
         // Between entries: blueberry is between banana and cherry
         let mut iter = DBIterator::new(vec![source.clone()], 10);
         iter.seek_for_prev(b"blueberry");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"banana"); // last key <= "blueberry"
+        assert_eq!(iter.key().unwrap(), b"banana"); // last key <= "blueberry"
 
         // Before first key
         let mut iter = DBIterator::new(vec![source.clone()], 10);
@@ -977,13 +969,13 @@ mod tests {
         let mut iter = DBIterator::new(vec![source.clone()], 10);
         iter.seek_for_prev(b"zzz");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"date"); // last key in dataset
+        assert_eq!(iter.key().unwrap(), b"date"); // last key in dataset
 
         // seek_for_prev to first key
         let mut iter = DBIterator::new(vec![source], 10);
         iter.seek_for_prev(b"apple");
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"apple");
+        assert_eq!(iter.key().unwrap(), b"apple");
     }
 
     #[test]
@@ -999,16 +991,16 @@ mod tests {
         // Forward: should see a, c, d (b is deleted)
         let mut iter = DBIterator::new(vec![source.clone()], 10);
         iter.seek(b"d");
-        assert_eq!(iter.key(), b"d");
+        assert_eq!(iter.key().unwrap(), b"d");
 
         // prev should skip deleted "b" and land on "c"
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"c");
+        assert_eq!(iter.key().unwrap(), b"c");
 
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"a");
+        assert_eq!(iter.key().unwrap(), b"a");
     }
 
     #[test]
@@ -1025,19 +1017,19 @@ mod tests {
         // Forward: a, b, c, d
         let mut iter = DBIterator::new(vec![s1, s2], 20);
         iter.seek(b"d");
-        assert_eq!(iter.key(), b"d");
+        assert_eq!(iter.key().unwrap(), b"d");
 
         iter.prev();
-        assert_eq!(iter.key(), b"c");
-        assert_eq!(iter.value(), b"mem_c");
+        assert_eq!(iter.key().unwrap(), b"c");
+        assert_eq!(iter.value().unwrap(), b"mem_c");
 
         iter.prev();
-        assert_eq!(iter.key(), b"b");
-        assert_eq!(iter.value(), b"sst_b");
+        assert_eq!(iter.key().unwrap(), b"b");
+        assert_eq!(iter.value().unwrap(), b"sst_b");
 
         iter.prev();
-        assert_eq!(iter.key(), b"a");
-        assert_eq!(iter.value(), b"mem_a");
+        assert_eq!(iter.key().unwrap(), b"a");
+        assert_eq!(iter.value().unwrap(), b"mem_a");
 
         iter.prev();
         assert!(!iter.valid());
@@ -1054,16 +1046,16 @@ mod tests {
         let mut iter = DBIterator::new(vec![source], 10);
         iter.seek_to_last();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"c");
-        assert_eq!(iter.value(), b"3");
+        assert_eq!(iter.key().unwrap(), b"c");
+        assert_eq!(iter.value().unwrap(), b"3");
 
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"b");
+        assert_eq!(iter.key().unwrap(), b"b");
 
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"a");
+        assert_eq!(iter.key().unwrap(), b"a");
 
         iter.prev();
         assert!(!iter.valid());
@@ -1091,8 +1083,8 @@ mod tests {
         iter.seek(b"c");
         assert!(iter.valid());
         // Next visible key should be "e" (first key outside tombstone range)
-        assert_eq!(iter.key(), b"e");
-        assert_eq!(iter.value(), b"6");
+        assert_eq!(iter.key().unwrap(), b"e");
+        assert_eq!(iter.value().unwrap(), b"6");
     }
 
     #[test]
@@ -1115,16 +1107,16 @@ mod tests {
         // skip "c" (deleted by tombstone), skip "b" (deleted), land on "a".
         iter.seek_to_last();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"e");
+        assert_eq!(iter.key().unwrap(), b"e");
 
         iter.prev();
         assert!(iter.valid());
-        assert_eq!(iter.key(), b"d");
+        assert_eq!(iter.key().unwrap(), b"d");
 
         iter.prev();
         assert!(iter.valid());
         // "c"@3 and "b"@2 are both deleted by [b,d)@5, so prev should reach "a"
-        assert_eq!(iter.key(), b"a");
+        assert_eq!(iter.key().unwrap(), b"a");
 
         iter.prev();
         assert!(!iter.valid());

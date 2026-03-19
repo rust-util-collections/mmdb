@@ -188,17 +188,52 @@ src/
 impl DB {
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self>;
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub fn put_with_options(&self, options: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()>;
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>>;
     pub fn delete(&self, key: &[u8]) -> Result<()>;
+    pub fn delete_with_options(&self, options: &WriteOptions, key: &[u8]) -> Result<()>;
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()>;
     pub fn write(&self, batch: WriteBatch) -> Result<()>;
+    pub fn write_with_options(&self, batch: WriteBatch, options: &WriteOptions) -> Result<()>;
     pub fn iter(&self) -> Result<DBIterator>;
-    pub fn iter_with_prefix(&self, prefix: &[u8]) -> Result<DBIterator>;
+
+    /// Prefix-optimized iteration. Uses prefix bloom filters to skip entire SST
+    /// files that don't contain `prefix`. Supports bounds via ReadOptions.
+    pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator>;
+
+    /// Full-scan iteration with optional key-range bounds.
+    /// WARNING: Does NOT use prefix bloom filters. For prefix-scoped queries,
+    /// prefer `iter_with_prefix()` which is typically 10-100x faster.
+    pub fn iter_with_range(&self, options: &ReadOptions, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<DBIterator>;
+
+    /// RAII snapshot — automatically released on drop.
+    pub fn snapshot(&self) -> Snapshot<'_>;
+
     pub fn flush(&self) -> Result<()>;
     pub fn compact(&self) -> Result<()>;
     pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()>;
     pub fn get_property(&self, name: &str) -> Option<String>;
     pub fn close(&self) -> Result<()>;
+}
+
+impl DBIterator {
+    pub fn valid(&mut self) -> bool;
+    pub fn key(&mut self) -> Option<&[u8]>;     // None if invalid (no panic)
+    pub fn value(&mut self) -> Option<&[u8]>;   // None if invalid (no panic)
+    pub fn advance(&mut self);
+    pub fn seek(&mut self, target: &[u8]);       // first key >= target
+    pub fn seek_for_prev(&mut self, target: &[u8]); // last key <= target
+    pub fn seek_to_first(&mut self);
+    pub fn seek_to_last(&mut self);
+    pub fn prev(&mut self);
+}
+
+struct ReadOptions {
+    pub snapshot: Option<u64>,
+    pub iterate_lower_bound: Option<Vec<u8>>,  // inclusive
+    pub iterate_upper_bound: Option<Vec<u8>>,  // exclusive
+    // ... other options
 }
 ```
 

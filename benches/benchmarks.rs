@@ -374,7 +374,11 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 (dir, db)
             },
             |(_dir, db)| {
-                let n = db.iter_with_prefix(b"pfx_0025").unwrap().take(100).count();
+                let n = db
+                    .iter_with_prefix(b"pfx_0025", &mmdb::ReadOptions::default())
+                    .unwrap()
+                    .take(100)
+                    .count();
                 assert!(n > 0);
             },
         );
@@ -405,7 +409,11 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 (dir, db)
             },
             |(_dir, db)| {
-                let n = db.iter_with_prefix(b"pfx_0025").unwrap().take(100).count();
+                let n = db
+                    .iter_with_prefix(b"pfx_0025", &mmdb::ReadOptions::default())
+                    .unwrap()
+                    .take(100)
+                    .count();
                 assert!(n > 0);
             },
         );

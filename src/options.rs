@@ -255,6 +255,14 @@ pub struct ReadOptions {
     pub skip_point: Option<SkipPointFn>,
     /// Block property filters to skip entire data blocks during iteration.
     pub block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
+    /// Inclusive lower bound on user keys for iteration. Keys < this are skipped.
+    /// Enforced by DBIterator — no manual bound checking needed.
+    /// RocksDB equivalent: `iterate_lower_bound`.
+    pub iterate_lower_bound: Option<Vec<u8>>,
+    /// Exclusive upper bound on user keys for iteration. Keys >= this are skipped.
+    /// Enforced by DBIterator — no manual bound checking needed.
+    /// RocksDB equivalent: `iterate_upper_bound`.
+    pub iterate_upper_bound: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for ReadOptions {
@@ -268,6 +276,8 @@ impl std::fmt::Debug for ReadOptions {
             .field("pin_data", &self.pin_data)
             .field("skip_point", &self.skip_point.as_ref().map(|_| ".."))
             .field("block_property_filters", &self.block_property_filters.len())
+            .field("iterate_lower_bound", &self.iterate_lower_bound)
+            .field("iterate_upper_bound", &self.iterate_upper_bound)
             .finish()
     }
 }
@@ -283,6 +293,8 @@ impl Default for ReadOptions {
             pin_data: false,
             skip_point: None,
             block_property_filters: Vec::new(),
+            iterate_lower_bound: None,
+            iterate_upper_bound: None,
         }
     }
 }

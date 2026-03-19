@@ -82,7 +82,7 @@ fn test_timeseries_scenario() {
 
     let mut count = 0;
     while iter.valid() {
-        let key = iter.key().to_vec();
+        let key = iter.key().unwrap().to_vec();
         let key_str = std::str::from_utf8(&key).unwrap();
         // Ensure we are still in the ts: prefix range.
         if !key_str.starts_with("ts:") {
@@ -296,7 +296,7 @@ fn test_index_scenario() {
             if !iter.valid() {
                 break;
             }
-            scanned.push((iter.key().to_vec(), iter.value().to_vec()));
+            scanned.push((iter.key().unwrap().to_vec(), iter.value().unwrap().to_vec()));
             iter.advance();
         }
 
@@ -586,7 +586,7 @@ fn test_large_dataset() {
     let mut prev_key: Option<Vec<u8>> = None;
     let mut scanned = 0;
     while iter.valid() && scanned < 200 {
-        let k = iter.key().to_vec();
+        let k = iter.key().unwrap().to_vec();
         if let Some(ref pk) = prev_key {
             assert!(k > *pk, "sort violation in large dataset scan");
         }

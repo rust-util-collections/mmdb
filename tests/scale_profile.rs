@@ -23,7 +23,9 @@ fn bench_at_scale(count: u64) {
     // iter_with_prefix + seek + take(10)
     let start = Instant::now();
     for _ in 0..n {
-        let mut iter = db.iter_with_prefix(&prefix).unwrap();
+        let mut iter = db
+            .iter_with_prefix(&prefix, &mmdb::ReadOptions::default())
+            .unwrap();
         // seek to middle
         let mut seek_key = Vec::with_capacity(16);
         seek_key.extend_from_slice(&prefix);

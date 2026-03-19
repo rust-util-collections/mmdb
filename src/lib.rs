@@ -19,6 +19,7 @@ pub mod stats;
 
 // Re-export primary API types
 pub use db::DB;
+pub use db::Snapshot;
 pub use error::{Error, Result};
 pub use iterator::BidiIterator;
 pub use iterator::DBIterator;
