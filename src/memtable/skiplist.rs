@@ -216,6 +216,20 @@ impl SeekableIterator for MemTableCursorIter {
         true
     }
 
+    /// Override default next_lazy to avoid temporary Vec::new() allocation.
+    /// Writes key into caller buffer, returns value as LazyValue directly.
+    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<crate::types::LazyValue> {
+        if self.cursor.is_null() {
+            return None;
+        }
+        let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
+        key_buf.clear();
+        key_buf.extend_from_slice(k.as_bytes());
+        let lv = crate::types::LazyValue::Inline(v.clone());
+        self.cursor = unsafe { self.sl().node_next0(self.cursor) };
+        Some(lv)
+    }
+
     fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         if self.cursor.is_null() {
             // Exhausted forward — seek to last for backward iteration.
