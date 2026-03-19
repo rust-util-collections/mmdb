@@ -174,12 +174,22 @@ impl<'a> InternalKeyRef<'a> {
 /// With the inverted-BE trailer encoding, the trailer bytes already sort
 /// in the correct order (higher seq → smaller bytes → sorts first).
 /// We compare user_key portions first, then trailer bytes.
+///
+/// Defensive: keys shorter than 8 bytes are malformed. They sort before
+/// valid keys so they surface as errors rather than causing panics.
 #[inline]
 pub fn compare_internal_key(a: &[u8], b: &[u8]) -> Ordering {
-    let a_uk = &a[..a.len() - 8];
-    let b_uk = &b[..b.len() - 8];
-    a_uk.cmp(b_uk)
-        .then_with(|| a[a.len() - 8..].cmp(&b[b.len() - 8..]))
+    match (a.len() >= 8, b.len() >= 8) {
+        (true, true) => {
+            let a_uk = &a[..a.len() - 8];
+            let b_uk = &b[..b.len() - 8];
+            a_uk.cmp(b_uk)
+                .then_with(|| a[a.len() - 8..].cmp(&b[b.len() - 8..]))
+        }
+        (false, false) => a.cmp(b),
+        (false, true) => Ordering::Less,
+        (true, false) => Ordering::Greater,
+    }
 }
 
 /// Extract the user key from an internal key by stripping the 8-byte trailer.
@@ -196,8 +206,6 @@ pub fn user_key(internal_key: &[u8]) -> &[u8] {
 /// A write batch groups multiple mutations to be applied atomically.
 pub struct WriteBatch {
     pub(crate) entries: Vec<WriteBatchEntry>,
-    /// Count of entries.
-    pub(crate) count: usize,
 }
 
 /// A single entry in a WriteBatch.
@@ -211,7 +219,6 @@ impl WriteBatch {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            count: 0,
         }
     }
 
@@ -221,7 +228,6 @@ impl WriteBatch {
             key: key.to_vec(),
             value: Some(value.to_vec()),
         });
-        self.count += 1;
     }
 
     pub fn delete(&mut self, key: &[u8]) {
@@ -230,7 +236,6 @@ impl WriteBatch {
             key: key.to_vec(),
             value: None,
         });
-        self.count += 1;
     }
 
     /// Add a range deletion. Deletes all keys in [begin, end).
@@ -241,20 +246,18 @@ impl WriteBatch {
             key: begin.to_vec(),
             value: Some(end.to_vec()),
         });
-        self.count += 1;
     }
 
     pub fn is_empty(&self) -> bool {
-        self.count == 0
+        self.entries.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.count
+        self.entries.len()
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.count = 0;
     }
 }
 
@@ -502,6 +505,24 @@ mod tests {
                 seq_b
             );
         }
+    }
+
+    #[test]
+    fn test_compare_internal_key_short_keys() {
+        // Short keys (< 8 bytes) must not panic
+        let short = b"abc";
+        let valid = InternalKey::new(b"key", 100, ValueType::Value);
+        assert_eq!(
+            compare_internal_key(short, valid.as_bytes()),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_internal_key(valid.as_bytes(), short),
+            Ordering::Greater
+        );
+        assert_eq!(compare_internal_key(short, short), Ordering::Equal);
+        assert_eq!(compare_internal_key(b"a", b"b"), Ordering::Less);
+        assert_eq!(compare_internal_key(b"", b""), Ordering::Equal);
     }
 
     #[test]

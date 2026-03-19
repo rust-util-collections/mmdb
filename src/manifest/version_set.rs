@@ -101,12 +101,20 @@ impl VersionSet {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(1);
 
-        // Replay MANIFEST records
+        // Replay MANIFEST records in two passes:
+        // Pass 1: Collect all edits to determine the final file set.
+        // Pass 2: Open only the files that survive all deletions.
+        // This handles the case where compaction adds + deletes files in
+        // separate edits, and the deleted SST no longer exists on disk.
         let mut reader = WalReader::new(&manifest_path).c(d!())?;
-        let mut version = Version::new(num_levels);
         let mut next_file_number = 2u64;
         let mut log_number = 0u64;
         let mut last_sequence = 0u64;
+
+        // (level, meta) pairs for files that are still live after all edits.
+        use std::collections::HashMap;
+        let mut live_files: HashMap<u64, (usize, crate::manifest::version_edit::FileMetaData)> =
+            HashMap::new();
 
         for record in reader.iter() {
             let data = record.c(d!())?;
@@ -122,45 +130,52 @@ impl VersionSet {
                 last_sequence = s;
             }
 
-            // Apply file additions
+            // Track additions
             for (level, meta) in &edit.new_files {
                 let level = *level as usize;
                 if level < num_levels {
-                    let reader = if let Some(ref tc) = table_cache {
-                        tc.get_reader(meta.number)
-                    } else {
-                        let sst_path = db_path.join(format!("{:06}.sst", meta.number));
-                        crate::sst::table_reader::TableReader::open(&sst_path).map(Arc::new)
-                    };
-                    match reader {
-                        Ok(reader) => {
-                            version.files[level].push(TableFile {
-                                meta: meta.clone(),
-                                reader,
-                            });
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "cannot open SST {} during recovery: {}",
-                                meta.number,
-                                e
-                            );
-                        }
-                    }
+                    live_files.insert(meta.number, (level, meta.clone()));
                 }
             }
 
-            // Apply file deletions
-            for (level, file_number) in &edit.deleted_files {
-                let level = *level as usize;
-                if level < num_levels {
-                    version.files[level].retain(|f| f.meta.number != *file_number);
+            // Track deletions
+            for (_level, file_number) in &edit.deleted_files {
+                live_files.remove(file_number);
+            }
+        }
+
+        // Pass 2: Open only live files
+        let mut version = Version::new(num_levels);
+        for (level, meta) in live_files.values() {
+            let reader_result = if let Some(ref tc) = table_cache {
+                tc.get_reader(meta.number)
+            } else {
+                let sst_path = db_path.join(format!("{:06}.sst", meta.number));
+                crate::sst::table_reader::TableReader::open(&sst_path).map(Arc::new)
+            };
+            match reader_result {
+                Ok(reader) => {
+                    version.files[*level].push(TableFile {
+                        meta: meta.clone(),
+                        reader,
+                    });
+                }
+                Err(e) => {
+                    return Err(eg!(Error::Corruption(format!(
+                        "cannot open SST {} during recovery: {}",
+                        meta.number, e
+                    ))));
                 }
             }
         }
 
         // Sort L0 by file number descending (newest first)
         version.files[0].sort_by(|a, b| b.meta.number.cmp(&a.meta.number));
+        // Sort L1+ by smallest key
+        for level in 1..num_levels {
+            version.files[level]
+                .sort_by(|a, b| compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key));
+        }
 
         // Reopen manifest for appending
         let manifest_writer = WalWriter::open_append(&manifest_path).c(d!())?;
@@ -253,7 +268,10 @@ impl VersionSet {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("failed to open new SST {}: {}", meta.number, e);
+                        return Err(eg!(Error::Corruption(format!(
+                            "failed to open new SST {}: {}",
+                            meta.number, e
+                        ))));
                     }
                 }
             }
@@ -352,8 +370,29 @@ impl VersionSet {
     fn set_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {
         let contents = format!("MANIFEST-{:06}\n", manifest_number);
         let tmp_path = db_path.join("CURRENT.tmp");
-        std::fs::write(&tmp_path, &contents).c(d!())?;
+
+        // Write and fsync the temp file before rename to ensure durability
+        {
+            let file = std::fs::File::create(&tmp_path).c(d!())?;
+            let mut writer = std::io::BufWriter::new(file);
+            std::io::Write::write_all(&mut writer, contents.as_bytes()).c(d!())?;
+            std::io::Write::flush(&mut writer).c(d!())?;
+            writer.get_ref().sync_all().c(d!())?;
+        }
+
+        // Atomic rename
         std::fs::rename(&tmp_path, db_path.join("CURRENT")).c(d!())?;
+
+        // Fsync the directory to persist the rename metadata
+        Self::fsync_directory(db_path).c(d!())?;
+
+        Ok(())
+    }
+
+    /// Fsync a directory to persist metadata changes (renames, creates).
+    fn fsync_directory(dir: &Path) -> Result<()> {
+        let f = std::fs::File::open(dir).c(d!())?;
+        f.sync_all().c(d!())?;
         Ok(())
     }
 }
@@ -369,10 +408,28 @@ mod tests {
 
         // Create
         {
-            let mut vs = VersionSet::create(path, 7).unwrap();
+            let vs = VersionSet::create(path, 7).unwrap();
             assert_eq!(vs.current().total_files(), 0);
+        }
 
-            // Record adding a file
+        // Verify CURRENT file exists
+        assert!(path.join("CURRENT").exists());
+        let current_content = std::fs::read_to_string(path.join("CURRENT")).unwrap();
+        assert!(current_content.trim().starts_with("MANIFEST-"));
+
+        // Recovery should succeed for a clean (empty) DB
+        let vs = VersionSet::recover(path, 7).unwrap();
+        assert_eq!(vs.current().total_files(), 0);
+    }
+
+    #[test]
+    fn test_recovery_fails_on_missing_sst() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // Create and write a MANIFEST edit referencing a non-existent SST
+        {
+            let mut vs = VersionSet::create(path, 7).unwrap();
             let mut edit = VersionEdit::new();
             edit.set_last_sequence(100);
             edit.add_file(
@@ -385,9 +442,6 @@ mod tests {
                     has_range_deletions: false,
                 },
             );
-            // We need to create the SST file for the reader to open.
-            // For this test, let's just verify encode/decode without opening files.
-            // We'll write the edit but expect the file open to fail gracefully.
             let encoded = edit.encode();
             if let Some(ref mut writer) = vs.manifest_writer {
                 writer.add_record(&encoded).unwrap();
@@ -395,10 +449,9 @@ mod tests {
             }
         }
 
-        // Verify CURRENT file exists
-        assert!(path.join("CURRENT").exists());
-        let current_content = std::fs::read_to_string(path.join("CURRENT")).unwrap();
-        assert!(current_content.trim().starts_with("MANIFEST-"));
+        // Recovery must fail because SST file 10 does not exist
+        let result = VersionSet::recover(path, 7);
+        assert!(result.is_err(), "recovery should fail on missing SST");
     }
 
     #[test]

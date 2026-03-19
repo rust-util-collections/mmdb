@@ -34,7 +34,7 @@ fn test_crash_after_single_write() {
         )
         .unwrap();
         // Simulate crash: don't call close()
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Recover
@@ -67,7 +67,7 @@ fn test_crash_after_flush() {
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
         }
         // Crash without close
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Recover
@@ -115,7 +115,7 @@ fn test_crash_after_multiple_flushes() {
             db.flush().unwrap();
         }
 
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     {
@@ -157,7 +157,7 @@ fn test_crash_with_batch_writes() {
         )
         .unwrap();
 
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     {
@@ -251,7 +251,7 @@ fn test_crash_partial_wal_record() {
             b"value2",
         )
         .unwrap();
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Truncate the WAL file mid-record: find the WAL, chop off some bytes
@@ -311,7 +311,7 @@ fn test_crash_during_flush() {
         }
         // Explicit flush to create an SST
         db.flush().unwrap();
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Remove all SST files to simulate a crash where the SST was only
@@ -322,30 +322,32 @@ fn test_crash_during_flush() {
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
         .map(|e| e.path())
         .collect();
+    let has_sst_files = !sst_files.is_empty();
     for sst in &sst_files {
         std::fs::remove_file(sst).unwrap();
     }
 
-    // Phase 2: reopen — even without SSTs, recovery from WAL should restore data
-    // Note: this may succeed fully if the WAL still contains all the data,
-    // or the DB may open with partial data if the WAL was rotated after flush.
-    // The key invariant is that DB::open does not panic or return an error.
-    let db = DB::open(make_opts(), &path).unwrap();
-    // At minimum, the DB opens without error. Check whatever data is available.
-    let mut recovered = 0;
-    for i in 0..50 {
-        let key = format!("flush_key_{:04}", i);
-        if db.get(key.as_bytes()).unwrap().is_some() {
-            recovered += 1;
+    // Phase 2: reopen — with SST files deleted but MANIFEST referencing them,
+    // recovery MUST detect the corruption and return an error. Silently
+    // losing data is worse than failing loudly.
+    if has_sst_files {
+        let result = DB::open(make_opts(), &path);
+        assert!(
+            result.is_err(),
+            "recovery should fail when MANIFEST references missing SST files"
+        );
+    } else {
+        // If no SSTs were created (all data in WAL), recovery should succeed
+        let db = DB::open(make_opts(), &path).unwrap();
+        let mut recovered = 0;
+        for i in 0..50 {
+            let key = format!("flush_key_{:04}", i);
+            if db.get(key.as_bytes()).unwrap().is_some() {
+                recovered += 1;
+            }
         }
+        assert_eq!(recovered, 50);
     }
-    // After a successful flush the WAL is rotated, so recovery may not have
-    // the pre-flush data. Regardless, opening must succeed.
-    assert!(
-        recovered == 0 || recovered == 50,
-        "expected either 0 (WAL rotated) or 50 (WAL still present) recovered keys, got {}",
-        recovered
-    );
 }
 
 #[test]
@@ -375,7 +377,7 @@ fn test_large_data_crash_recovery() {
             )
             .unwrap();
         }
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Phase 2: recover all 500 keys
@@ -415,7 +417,7 @@ fn test_multiple_crash_recover_cycles() {
             )
             .unwrap();
         }
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Cycle 2: recover → write more → crash
@@ -446,7 +448,7 @@ fn test_multiple_crash_recover_cycles() {
             )
             .unwrap();
         }
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Cycle 3: recover → write more → crash
@@ -487,7 +489,7 @@ fn test_multiple_crash_recover_cycles() {
             )
             .unwrap();
         }
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Final recovery: all 30 keys from all 3 cycles must be present
@@ -531,7 +533,7 @@ fn test_sync_guarantees() {
             .unwrap();
         }
         // Simulate crash immediately after synced writes
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Recover — all synced data must survive
@@ -586,7 +588,7 @@ fn test_disable_wal_data_loss() {
         }
 
         // Simulate crash
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Recover — durable key must survive; no-WAL keys may be lost
@@ -653,7 +655,7 @@ fn test_crash_after_compaction() {
         }
 
         // Crash
-        std::mem::forget(db);
+        db.simulate_crash();
     }
 
     // Phase 2: recover — all pre-compaction and post-compaction data must be present

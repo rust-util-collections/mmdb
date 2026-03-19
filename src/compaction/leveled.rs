@@ -291,6 +291,8 @@ impl LeveledCompaction {
         } else {
             options.compression
         };
+        // build_opts is a template; block_property_collectors are created fresh
+        // per output file (via factory functions) to avoid sharing mutable state.
         let build_opts = TableBuildOptions {
             block_size: options.block_size,
             block_restart_interval: options.block_restart_interval,
@@ -298,11 +300,7 @@ impl LeveledCompaction {
             internal_keys: true,
             compression: target_compression,
             prefix_len: options.prefix_len,
-            block_property_collectors: options
-                .block_property_collectors
-                .iter()
-                .map(|f| f())
-                .collect(),
+            block_property_collectors: Vec::new(),
         };
 
         let mut edit = VersionEdit::new();
@@ -404,7 +402,13 @@ impl LeveledCompaction {
             if builder.is_none() {
                 current_file_number = versions.new_file_number();
                 let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
-                builder = Some(TableBuilder::new(&sst_path, build_opts.clone()).c(d!())?);
+                let mut opts = build_opts.clone();
+                opts.block_property_collectors = options
+                    .block_property_collectors
+                    .iter()
+                    .map(|f| f())
+                    .collect();
+                builder = Some(TableBuilder::new(&sst_path, opts).c(d!())?);
                 current_size = 0;
             }
 
@@ -531,6 +535,11 @@ impl LeveledCompaction {
         active_snapshots: &[SequenceNumber],
     ) -> Result<()> {
         let is_bottommost = level >= options.num_levels - 1;
+        let min_unflushed_seq = active_snapshots
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(SequenceNumber::MAX);
         let version = versions.current();
         let files = version.level_files(level);
         if files.len() <= 1 {
@@ -558,6 +567,8 @@ impl LeveledCompaction {
         } else {
             options.compression
         };
+        // build_opts is a template; block_property_collectors are created fresh
+        // per output file (via factory functions) to avoid sharing mutable state.
         let build_opts = TableBuildOptions {
             block_size: options.block_size,
             block_restart_interval: options.block_restart_interval,
@@ -565,11 +576,7 @@ impl LeveledCompaction {
             internal_keys: true,
             compression,
             prefix_len: options.prefix_len,
-            block_property_collectors: options
-                .block_property_collectors
-                .iter()
-                .map(|f| f())
-                .collect(),
+            block_property_collectors: Vec::new(),
         };
 
         let mut edit = VersionEdit::new();
@@ -633,20 +640,43 @@ impl LeveledCompaction {
             if builder.is_none() {
                 current_file_number = versions.new_file_number();
                 let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
-                builder = Some(TableBuilder::new(&sst_path, build_opts.clone()).c(d!())?);
+                let mut opts = build_opts.clone();
+                opts.block_property_collectors = options
+                    .block_property_collectors
+                    .iter()
+                    .map(|f| f())
+                    .collect();
+                builder = Some(TableBuilder::new(&sst_path, opts).c(d!())?);
                 current_size = 0;
             }
+
+            // Sequence zeroing: at the bottommost level, if the entry's
+            // sequence falls below the minimum active snapshot, zero it out.
+            let final_ikey;
+            let ikey_ref = if is_bottommost
+                && ikr.sequence() > 0
+                && ikr.sequence() < min_unflushed_seq
+                && ikr.value_type() == ValueType::Value
+            {
+                final_ikey = InternalKey::new(user_key, 0, ikr.value_type())
+                    .as_bytes()
+                    .to_vec();
+                &final_ikey
+            } else {
+                &ikey
+            };
 
             builder
                 .as_mut()
                 .unwrap()
-                .add(&ikey, value.as_slice())
+                .add(ikey_ref, value.as_slice())
                 .c(d!())?;
-            current_size += ikey.len() + value.len();
+            let entry_bytes = ikey_ref.len() + value.len();
+            current_size += entry_bytes;
 
             // Rate-limit compaction writes
             if let Some(rl) = rate_limiter {
-                rl.request(ikey.len() + value.len());
+                rl.request(entry_bytes);
             }
 
             if current_size >= options.target_file_size_base as usize {

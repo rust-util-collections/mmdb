@@ -2,6 +2,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Maximum number of levels supported for read-level sampling.
+pub(crate) const MAX_LEVELS: usize = 32;
+
 /// Tracks database statistics for monitoring and diagnostics.
 pub struct DbStats {
     /// Total bytes written by the user.
@@ -18,8 +21,8 @@ pub struct DbStats {
     pub block_cache_hits: AtomicU64,
     /// Number of block cache misses.
     pub block_cache_misses: AtomicU64,
-    /// Per-level read sample counters (levels 0..6).
-    pub read_level_samples: [AtomicU64; 7],
+    /// Per-level read sample counters.
+    pub read_level_samples: [AtomicU64; MAX_LEVELS],
     /// Counter for sampling reads (only sample every Nth read).
     pub read_sample_counter: AtomicU64,
 }
@@ -34,15 +37,7 @@ impl DbStats {
             flushes_completed: AtomicU64::new(0),
             block_cache_hits: AtomicU64::new(0),
             block_cache_misses: AtomicU64::new(0),
-            read_level_samples: [
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ],
+            read_level_samples: std::array::from_fn(|_| AtomicU64::new(0)),
             read_sample_counter: AtomicU64::new(0),
         }
     }
@@ -87,8 +82,8 @@ impl DbStats {
     }
 
     /// Atomically take (read and reset) the per-level read samples.
-    pub fn take_read_level_samples(&self) -> [u64; 7] {
-        let mut result = [0u64; 7];
+    pub fn take_read_level_samples(&self) -> [u64; MAX_LEVELS] {
+        let mut result = [0u64; MAX_LEVELS];
         for (i, slot) in result.iter_mut().enumerate() {
             *slot = self.read_level_samples[i].swap(0, Ordering::Relaxed);
         }

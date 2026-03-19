@@ -124,10 +124,10 @@ pub struct DB {
     write_cv: Condvar,
     closed: AtomicBool,
     /// Fast-check flag for background errors (avoids Mutex lock on every read).
-    has_bg_error: AtomicBool,
+    has_bg_error: Arc<AtomicBool>,
     /// Background error (e.g. WAL sync failure). Once set, all subsequent
     /// operations are rejected. Models RocksDB's background error state.
-    bg_error: Mutex<Option<String>>,
+    bg_error: Arc<Mutex<Option<String>>>,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
     rate_limiter: Arc<RateLimiter>,
@@ -151,6 +151,12 @@ pub struct DB {
     read_counter: AtomicU64,
     /// Tracks active snapshots for compaction safety.
     snapshot_list: Arc<SnapshotList>,
+    /// Exclusive directory lock (LOCK file). Prevents concurrent DB access.
+    /// The File handle holds the flock; released automatically when dropped.
+    /// Explicitly taken in `simulate_crash()` to allow re-open in tests.
+    /// The field is "read" via Drop (releases flock) — not dead code.
+    #[allow(dead_code)]
+    lock_file: Option<std::fs::File>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -199,6 +205,32 @@ impl DB {
                 ))));
             }
         }
+
+        // Acquire exclusive directory lock to prevent concurrent DB access
+        let lock_file = {
+            let lock_path = path.join("LOCK");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .c(d!())?;
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if ret != 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(eg!(Error::InvalidArgument(format!(
+                        "failed to lock DB directory {}: {} (is another process using it?)",
+                        path.display(),
+                        err
+                    ))));
+                }
+            }
+            Some(file)
+        };
 
         // Create caches and infra
         let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity));
@@ -329,6 +361,8 @@ impl DB {
         // Spawn background compaction threads
         let compaction_shutdown = Arc::new(AtomicBool::new(false));
         let compaction_notify = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let has_bg_error = Arc::new(AtomicBool::new(false));
+        let bg_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let (l0_file_count, super_version) = {
             let g = inner.lock();
             let l0 = Arc::new(AtomicUsize::new(g.versions.current().l0_file_count()));
@@ -358,10 +392,19 @@ impl DB {
             let notify = compaction_notify.clone();
             let bg_hints = read_compaction_hints.clone();
             let bg_snapshot_list = snapshot_list.clone();
+            let bg_has_error = has_bg_error.clone();
+            let bg_error_msg = bg_error.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
                 .spawn(move || {
+                    // Helper: set background error and log it.
+                    let set_error = |msg: String| {
+                        tracing::error!("{}", msg);
+                        bg_has_error.store(true, Ordering::Release);
+                        *bg_error_msg.lock() = Some(msg);
+                    };
+
                     loop {
                         // Wait for notification
                         {
@@ -375,74 +418,121 @@ impl DB {
                         if shutdown.load(Ordering::Acquire) {
                             break;
                         }
-                        // Drain read-compaction hints before picking compactions.
-                        {
-                            let hints: Vec<CompactionHint> = std::mem::take(&mut *bg_hints.lock());
-                            if !hints.is_empty() {
-                                let active_snaps = bg_snapshot_list.as_sorted_vec();
-                                let mut inner = bg_inner.lock();
-                                for hint in &hints {
-                                    let version = inner.versions.current();
-                                    if let Some(task) =
-                                        LeveledCompaction::pick_compaction_for_hint(&version, hint)
-                                    {
-                                        let _ = LeveledCompaction::execute_compaction_with_cache(
-                                            &task,
-                                            &mut inner.versions,
-                                            &bg_path,
-                                            &bg_options,
-                                            Some(&bg_table_cache),
-                                            Some(&bg_rate_limiter),
-                                            Some(&bg_stats),
-                                            &active_snaps,
+
+                        // Wrap compaction work in catch_unwind to prevent
+                        // thread death from panics in corrupt data paths.
+                        let result = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| -> std::result::Result<(), String> {
+                                // Drain read-compaction hints
+                                {
+                                    let hints: Vec<CompactionHint> =
+                                        std::mem::take(&mut *bg_hints.lock());
+                                    if !hints.is_empty() {
+                                        let active_snaps = bg_snapshot_list.as_sorted_vec();
+                                        let mut inner = bg_inner.lock();
+                                        for hint in &hints {
+                                            let version = inner.versions.current();
+                                            if let Some(task) =
+                                                LeveledCompaction::pick_compaction_for_hint(
+                                                    &version, hint,
+                                                )
+                                                && let Err(e) =
+                                                    LeveledCompaction::execute_compaction_with_cache(
+                                                        &task,
+                                                        &mut inner.versions,
+                                                        &bg_path,
+                                                        &bg_options,
+                                                        Some(&bg_table_cache),
+                                                        Some(&bg_rate_limiter),
+                                                        Some(&bg_stats),
+                                                        &active_snaps,
+                                                    )
+                                            {
+                                                return Err(format!(
+                                                    "hint compaction error: {}",
+                                                    e
+                                                ));
+                                            }
+                                        }
+                                        bg_l0_count.store(
+                                            inner.versions.current().l0_file_count(),
+                                            Ordering::Relaxed,
                                         );
+                                        refresh_super_version(&bg_sv, &inner);
                                     }
                                 }
-                                bg_l0_count.store(
-                                    inner.versions.current().l0_file_count(),
-                                    Ordering::Relaxed,
-                                );
-                                refresh_super_version(&bg_sv, &inner);
-                            }
-                        }
-                        // Run pending compactions
-                        loop {
-                            let active_snaps = bg_snapshot_list.as_sorted_vec();
-                            let mut inner = bg_inner.lock();
-                            let version = inner.versions.current();
-                            match LeveledCompaction::pick_compaction(&version, &bg_options) {
-                                Some(task) => {
-                                    // Collect L0 input file numbers for cache unpinning
-                                    let l0_inputs: Vec<u64> = if task.level == 0 {
-                                        task.input_files_level
-                                            .iter()
-                                            .map(|f| f.meta.number)
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    let _ = LeveledCompaction::execute_compaction_with_cache(
-                                        &task,
-                                        &mut inner.versions,
-                                        &bg_path,
+
+                                // TODO(perf): The inner lock is held for the entire duration
+                                // of compaction I/O. A production fix would release the lock
+                                // after picking the compaction, perform I/O unlocked, then
+                                // reacquire to install the result.
+
+                                // Run pending compactions
+                                loop {
+                                    let active_snaps = bg_snapshot_list.as_sorted_vec();
+                                    let mut inner = bg_inner.lock();
+                                    let version = inner.versions.current();
+                                    match LeveledCompaction::pick_compaction(
+                                        &version,
                                         &bg_options,
-                                        Some(&bg_table_cache),
-                                        Some(&bg_rate_limiter),
-                                        Some(&bg_stats),
-                                        &active_snaps,
-                                    );
-                                    // Unpin L0 files from block cache after compaction
-                                    for num in &l0_inputs {
-                                        bg_block_cache.unpin_file(*num);
+                                    ) {
+                                        Some(task) => {
+                                            let l0_inputs: Vec<u64> = if task.level == 0 {
+                                                task.input_files_level
+                                                    .iter()
+                                                    .map(|f| f.meta.number)
+                                                    .collect()
+                                            } else {
+                                                Vec::new()
+                                            };
+                                            if let Err(e) =
+                                                LeveledCompaction::execute_compaction_with_cache(
+                                                    &task,
+                                                    &mut inner.versions,
+                                                    &bg_path,
+                                                    &bg_options,
+                                                    Some(&bg_table_cache),
+                                                    Some(&bg_rate_limiter),
+                                                    Some(&bg_stats),
+                                                    &active_snaps,
+                                                )
+                                            {
+                                                return Err(format!("compaction error: {}", e));
+                                            }
+                                            for num in &l0_inputs {
+                                                bg_block_cache.unpin_file(*num);
+                                            }
+                                            bg_l0_count.store(
+                                                inner.versions.current().l0_file_count(),
+                                                Ordering::Relaxed,
+                                            );
+                                            refresh_super_version(&bg_sv, &inner);
+                                        }
+                                        None => break,
                                     }
-                                    // Update cached L0 count + SuperVersion
-                                    bg_l0_count.store(
-                                        inner.versions.current().l0_file_count(),
-                                        Ordering::Relaxed,
-                                    );
-                                    refresh_super_version(&bg_sv, &inner);
                                 }
-                                None => break,
+                                Ok(())
+                            }),
+                        );
+
+                        match result {
+                            Ok(Ok(())) => {} // success
+                            Ok(Err(msg)) => {
+                                set_error(msg);
+                                break;
+                            }
+                            Err(panic_payload) => {
+                                let msg =
+                                    if let Some(s) = panic_payload.downcast_ref::<String>() {
+                                        format!("compaction thread panicked: {}", s)
+                                    } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                                        format!("compaction thread panicked: {}", s)
+                                    } else {
+                                        "compaction thread panicked with unknown payload"
+                                            .to_string()
+                                    };
+                                set_error(msg);
+                                break;
                             }
                         }
                     }
@@ -462,8 +552,8 @@ impl DB {
             }),
             write_cv: Condvar::new(),
             closed: AtomicBool::new(false),
-            has_bg_error: AtomicBool::new(false),
-            bg_error: Mutex::new(None),
+            has_bg_error,
+            bg_error,
             block_cache,
             table_cache,
             rate_limiter,
@@ -476,6 +566,7 @@ impl DB {
             read_compaction_hints,
             read_counter: AtomicU64::new(0),
             snapshot_list,
+            lock_file,
         };
 
         Ok(db)
@@ -936,10 +1027,10 @@ impl DB {
             if types::user_key(&tf.meta.largest_key) < prefix {
                 continue;
             }
-            if let Some(ref pu) = prefix_upper {
-                if types::user_key(&tf.meta.smallest_key) >= pu.as_slice() {
-                    continue;
-                }
+            if let Some(ref pu) = prefix_upper
+                && types::user_key(&tf.meta.smallest_key) >= pu.as_slice()
+            {
+                continue;
             }
             if !tf.reader.prefix_may_match(prefix) {
                 continue;
@@ -1454,10 +1545,10 @@ impl DB {
             return Err(eg!(Error::DbClosed));
         }
         // Fast path: only lock if the error flag is set.
-        if self.has_bg_error.load(Ordering::Acquire) {
-            if let Some(ref msg) = *self.bg_error.lock() {
-                return Err(eg!(Error::BackgroundError(msg.clone())));
-            }
+        if self.has_bg_error.load(Ordering::Acquire)
+            && let Some(ref msg) = *self.bg_error.lock()
+        {
+            return Err(eg!(Error::BackgroundError(msg.clone())));
         }
         Ok(())
     }
@@ -1609,15 +1700,30 @@ impl DB {
         if let Some((e, fail_idx)) = wal_add_error {
             // Flush already-buffered WAL records for succeeded batches so
             // their data is durable even though later batches failed.
-            if fail_idx > 0
-                && let Some(ref mut wal) = inner.wal_writer
-            {
-                let _ = wal.flush();
-            }
-            // Mark succeeded batches as Ok, failed as Err
-            for &rp in &batch_group[..fail_idx] {
-                let rr = unsafe { &mut *rp };
-                rr.result = Some(Ok(()));
+            let flush_ok = if fail_idx > 0 {
+                if let Some(ref mut wal) = inner.wal_writer {
+                    wal.flush().is_ok()
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if flush_ok {
+                // Flush succeeded: earlier batches are durable
+                for &rp in &batch_group[..fail_idx] {
+                    let rr = unsafe { &mut *rp };
+                    rr.result = Some(Ok(()));
+                }
+            } else if fail_idx > 0 {
+                // Flush failed: earlier batches are NOT durable either
+                for &rp in &batch_group[..fail_idx] {
+                    let rr = unsafe { &mut *rp };
+                    rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(
+                        "WAL flush failed after partial batch group write"
+                    )))));
+                }
             }
             for &rp in &batch_group[fail_idx..] {
                 let rr = unsafe { &mut *rp };
@@ -1666,6 +1772,14 @@ impl DB {
         Ok(())
     }
 
+    // TODO(perf): freeze_and_flush runs inline under the write lock, blocking
+    // all writers for the duration of the SST build + MANIFEST update. For large
+    // memtables (default 64MB), this can cause hundreds of milliseconds of write
+    // stall. A production-grade fix would use a background flush thread that
+    // picks up frozen (immutable) memtables asynchronously, similar to RocksDB's
+    // FlushJob. This requires careful WAL lifecycle management (must not delete
+    // WAL until flush completes) and write stall logic (pause writes if too many
+    // immutable memtables accumulate).
     fn freeze_and_flush(&self, inner: &mut DBInner) -> Result<()> {
         let old_mem = std::mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
 
@@ -1924,13 +2038,16 @@ impl DB {
 impl DB {
     /// Simulate a crash: shut down background threads without flushing memtable.
     /// Useful for testing WAL recovery without zombie compaction threads.
-    pub fn simulate_crash(self) {
+    pub fn simulate_crash(mut self) {
         self.closed.store(true, Ordering::Release);
         self.compaction_shutdown.store(true, Ordering::Release);
         self.compaction_notify.1.notify_all();
         for handle in self.compaction_handles.lock().drain(..) {
             let _ = handle.join();
         }
+        // Release directory lock before forgetting self, so subsequent
+        // DB::open on the same directory will succeed (e.g., in tests).
+        self.lock_file.take();
         std::mem::forget(self);
     }
 }
@@ -1940,6 +2057,8 @@ impl Drop for DB {
         if !self.closed.load(Ordering::Acquire) {
             self.closed.store(true, Ordering::Release);
             if let Some(ref mut wal) = self.inner.lock().wal_writer {
+                // Note: WAL sync errors in Drop cannot be propagated to the caller.
+                // Users should call db.close() explicitly to detect and handle sync errors.
                 let _ = wal.sync();
             }
         }
@@ -2077,6 +2196,21 @@ mod tests {
         db.put(b"key", b"val").unwrap();
         db.close().unwrap();
         assert!(db.put(b"key2", b"val2").is_err());
+    }
+
+    #[test]
+    fn test_directory_lock_prevents_double_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let _db = open_test_db(dir.path());
+        // Attempting to open the same directory again should fail
+        let result = DB::open(
+            DbOptions {
+                create_if_missing: true,
+                ..Default::default()
+            },
+            dir.path(),
+        );
+        assert!(result.is_err(), "double-open should fail with lock error");
     }
 
     #[test]
