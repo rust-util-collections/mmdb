@@ -9,7 +9,8 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex};
+use arc_swap::ArcSwap;
 
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
@@ -87,6 +88,8 @@ pub struct DB {
     write_queue: Mutex<WriteQueueState>,
     write_cv: Condvar,
     closed: AtomicBool,
+    /// Fast-check flag for background errors (avoids Mutex lock on every read).
+    has_bg_error: AtomicBool,
     /// Background error (e.g. WAL sync failure). Once set, all subsequent
     /// operations are rejected. Models RocksDB's background error state.
     bg_error: Mutex<Option<String>>,
@@ -104,9 +107,9 @@ pub struct DB {
     /// Updated after flush/compaction. Avoids locking `inner` on every write.
     l0_file_count: Arc<AtomicUsize>,
     /// Lock-free read snapshot (SuperVersion).
-    /// Readers take a read lock (uncontended, ~10ns). Writers update after
-    /// memtable/version changes. Models RocksDB's SuperVersion mechanism.
-    super_version: Arc<RwLock<Arc<SuperVersion>>>,
+    /// Readers do a single atomic load (~1ns). Writers swap atomically after
+    /// memtable/version changes. True lock-free — no RwLock contention.
+    super_version: Arc<ArcSwap<SuperVersion>>,
     /// Read-triggered compaction hints accumulated from the get path.
     read_compaction_hints: Arc<Mutex<Vec<CompactionHint>>>,
     /// Counter for periodic read-compaction checks.
@@ -294,11 +297,11 @@ impl DB {
         let (l0_file_count, super_version) = {
             let g = inner.lock();
             let l0 = Arc::new(AtomicUsize::new(g.versions.current().l0_file_count()));
-            let sv = Arc::new(RwLock::new(Arc::new(SuperVersion {
+            let sv = Arc::new(ArcSwap::from_pointee(SuperVersion {
                 active_memtable: g.active_memtable.clone(),
                 immutable_memtables: g.immutable_memtables.clone(),
                 version: g.versions.current(),
-            })));
+            }));
             (l0, sv)
         };
         let num_compaction_threads = options.max_background_compactions.max(1);
@@ -364,11 +367,11 @@ impl DB {
                                     inner.versions.current().l0_file_count(),
                                     Ordering::Relaxed,
                                 );
-                                *bg_sv.write() = Arc::new(SuperVersion {
+                                bg_sv.store(Arc::new(SuperVersion {
                                     active_memtable: inner.active_memtable.clone(),
                                     immutable_memtables: inner.immutable_memtables.clone(),
                                     version: inner.versions.current(),
-                                });
+                                }));
                             }
                         }
                         // Run pending compactions
@@ -406,11 +409,11 @@ impl DB {
                                         inner.versions.current().l0_file_count(),
                                         Ordering::Relaxed,
                                     );
-                                    *bg_sv.write() = Arc::new(SuperVersion {
+                                    bg_sv.store(Arc::new(SuperVersion {
                                         active_memtable: inner.active_memtable.clone(),
                                         immutable_memtables: inner.immutable_memtables.clone(),
                                         version: inner.versions.current(),
-                                    });
+                                    }));
                                 }
                                 None => break,
                             }
@@ -432,6 +435,7 @@ impl DB {
             }),
             write_cv: Condvar::new(),
             closed: AtomicBool::new(false),
+            has_bg_error: AtomicBool::new(false),
             bg_error: Mutex::new(None),
             block_cache,
             table_cache,
@@ -680,7 +684,8 @@ impl DB {
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
-        let mut sources: Vec<IterSource> = Vec::new();
+        let est_sources = 1 + imm_mems.len() + version.level_files(0).len() + version.num_levels;
+        let mut sources: Vec<IterSource> = Vec::with_capacity(est_sources);
         let mut any_range_deletions = false;
 
         // Active memtable — cursor-based streaming iterator.
@@ -851,7 +856,9 @@ impl DB {
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
-        let mut sources: Vec<IterSource> = Vec::new();
+        // Pre-size sources: 1 active + N_imm + N_L0 + N_levels (avoids realloc)
+        let est_sources = 1 + imm_mems.len() + version.level_files(0).len() + version.num_levels;
+        let mut sources: Vec<IterSource> = Vec::with_capacity(est_sources);
         let mut any_range_deletions = false;
 
         // Active memtable
@@ -872,12 +879,12 @@ impl DB {
             sources.push(IterSource::from_seekable(Box::new(cursor)));
         }
 
-        // Compute prefix upper bound for range pruning
-        let mut prefix_upper = prefix.to_vec();
-        // Increment prefix to get exclusive upper bound
-        let has_upper = {
+        // Compute prefix upper bound once, share across all uses.
+        let prefix_owned: Arc<[u8]> = Arc::from(prefix);
+        let prefix_upper = {
+            let mut upper = prefix.to_vec();
             let mut carry = true;
-            for byte in prefix_upper.iter_mut().rev() {
+            for byte in upper.iter_mut().rev() {
                 if carry {
                     if *byte == 0xFF {
                         *byte = 0x00;
@@ -887,7 +894,7 @@ impl DB {
                     }
                 }
             }
-            !carry // false if prefix was all 0xFF (no upper bound)
+            if carry { None } else { Some(upper) }
         };
 
         // SST files — skip files via range pruning + prefix bloom.
@@ -896,8 +903,10 @@ impl DB {
             if types::user_key(&tf.meta.largest_key) < prefix {
                 continue;
             }
-            if has_upper && types::user_key(&tf.meta.smallest_key) >= prefix_upper.as_slice() {
-                continue;
+            if let Some(ref pu) = prefix_upper {
+                if types::user_key(&tf.meta.smallest_key) >= pu.as_slice() {
+                    continue;
+                }
             }
             if !tf.reader.prefix_may_match(prefix) {
                 continue;
@@ -923,19 +932,15 @@ impl DB {
                 }
             }
             let level_iter = LevelIterator::new(files.to_vec())
-                .with_prefix(prefix.to_vec())
+                .with_prefix(prefix_owned.to_vec())
                 .with_range_hints(
-                    Some(prefix.to_vec()),
-                    if has_upper {
-                        Some(prefix_upper.clone())
-                    } else {
-                        None
-                    },
+                    Some(prefix_owned.to_vec()),
+                    prefix_upper.clone(),
                 );
             sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
-        let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix.to_vec());
+        let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix_owned.to_vec());
 
         // Collect all range tombstones with level info for cross-level pruning.
         if any_range_deletions {
@@ -1013,7 +1018,8 @@ impl DB {
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
-        let mut sources: Vec<IterSource> = Vec::new();
+        let est_sources = 2 + imm_mems.len() + version.level_files(0).len() + version.num_levels;
+        let mut sources: Vec<IterSource> = Vec::with_capacity(est_sources);
 
         // Batch source first (highest priority due to higher sequence numbers).
         sources.push(IterSource::new(batch_entries));
@@ -1362,22 +1368,20 @@ impl DB {
         max_seq
     }
 
-    /// Get the current SuperVersion snapshot without locking `inner`.
-    /// Readers call this instead of locking `inner` for iterator/get operations.
-    fn get_super_version(&self) -> Arc<SuperVersion> {
-        self.super_version.read().clone()
+    /// Get the current SuperVersion snapshot — single atomic load, truly lock-free.
+    fn get_super_version(&self) -> arc_swap::Guard<Arc<SuperVersion>> {
+        self.super_version.load()
     }
 
     /// Refresh the SuperVersion from current inner state.
     /// Called after memtable freeze, flush, or compaction.
-    /// Must be called while `inner` is locked (caller holds the lock).
     fn install_super_version(&self, inner: &DBInner) {
         let sv = Arc::new(SuperVersion {
             active_memtable: inner.active_memtable.clone(),
             immutable_memtables: inner.immutable_memtables.clone(),
             version: inner.versions.current(),
         });
-        *self.super_version.write() = sv;
+        self.super_version.store(sv);
     }
 
     /// Periodically check read-level samples and generate compaction hints.
@@ -1411,8 +1415,11 @@ impl DB {
         if self.closed.load(Ordering::Acquire) {
             return Err(eg!(Error::DbClosed));
         }
-        if let Some(ref msg) = *self.bg_error.lock() {
-            return Err(eg!(Error::BackgroundError(msg.clone())));
+        // Fast path: only lock if the error flag is set.
+        if self.has_bg_error.load(Ordering::Acquire) {
+            if let Some(ref msg) = *self.bg_error.lock() {
+                return Err(eg!(Error::BackgroundError(msg.clone())));
+            }
         }
         Ok(())
     }
@@ -1595,6 +1602,7 @@ impl DB {
             None
         };
         if let Some(e) = wal_sync_err {
+            self.has_bg_error.store(true, Ordering::Release);
             *self.bg_error.lock() = Some(format!("WAL sync failed: {}", e));
             for &rp in batch_group {
                 let rr = unsafe { &mut *rp };
