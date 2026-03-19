@@ -51,19 +51,12 @@ pub struct TableReader {
     /// Cached index entries, shared across all TableIterators for this file.
     /// Populated once on first access, then reused (Arc for zero-copy sharing).
     index_entry_cache: OnceLock<IndexEntries>,
-    /// Cached range tombstones for this SST file. Populated once on first
-    /// max_covering_tombstone_seq call, then reused. Avoids re-reading all
-    /// data blocks on every get() call.
-    range_tombstone_cache: OnceLock<Arc<Vec<CachedRangeTombstone>>>,
+    /// Cached range tombstones for this SST file as a pre-fragmented index.
+    /// Populated once on first max_covering_tombstone_seq call, then reused.
+    /// O(log T) binary search instead of O(T) linear scan.
+    range_tombstone_cache: OnceLock<Arc<crate::iterator::range_del::FragmentedRangeTombstoneList>>,
     /// Handle to the range-deletion block (if present in metaindex).
     range_del_handle: Option<BlockHandle>,
-}
-
-/// A cached range tombstone entry extracted from an SST file.
-struct CachedRangeTombstone {
-    begin: Vec<u8>,
-    end: Vec<u8>,
-    seq: SequenceNumber,
 }
 
 impl TableReader {
@@ -297,18 +290,7 @@ impl TableReader {
         read_seq: SequenceNumber,
     ) -> Result<SequenceNumber> {
         let tombstones = self.cached_range_tombstones().c(d!())?;
-        let mut max_seq: SequenceNumber = 0;
-
-        for rt in tombstones.iter() {
-            if rt.seq > read_seq {
-                continue;
-            }
-            if user_key >= rt.begin.as_slice() && user_key < rt.end.as_slice() && rt.seq > max_seq {
-                max_seq = rt.seq;
-            }
-        }
-
-        Ok(max_seq)
+        Ok(tombstones.max_covering_tombstone_seq(user_key, read_seq))
     }
 
     /// Return all range tombstones as (begin, end, seq) triples.
@@ -318,19 +300,19 @@ impl TableReader {
         &self,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>, crate::types::SequenceNumber)>> {
         let cached = self.cached_range_tombstones().c(d!())?;
-        Ok(cached
-            .iter()
-            .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq))
-            .collect())
+        Ok(cached.tombstones())
     }
 
-    /// Get cached range tombstones (populated once on first access).
-    fn cached_range_tombstones(&self) -> Result<Arc<Vec<CachedRangeTombstone>>> {
+    /// Get cached range tombstones as a pre-fragmented index (O(log T) lookup).
+    /// Populated once on first access.
+    fn cached_range_tombstones(
+        &self,
+    ) -> Result<Arc<crate::iterator::range_del::FragmentedRangeTombstoneList>> {
         if let Some(cached) = self.range_tombstone_cache.get() {
             return Ok(cached.clone());
         }
 
-        let mut tombstones = Vec::new();
+        let mut triples = Vec::new();
 
         if let Some(ref handle) = self.range_del_handle {
             // New path: read from dedicated range-del block
@@ -342,11 +324,7 @@ impl TableReader {
                 }
                 let ikr = InternalKeyRef::new(&k);
                 if ikr.value_type() == ValueType::RangeDeletion {
-                    tombstones.push(CachedRangeTombstone {
-                        begin: ikr.user_key().to_vec(),
-                        end: v,
-                        seq: ikr.sequence(),
-                    });
+                    triples.push((ikr.user_key().to_vec(), v, ikr.sequence()));
                 }
             }
         } else {
@@ -364,17 +342,15 @@ impl TableReader {
                     if ikr.value_type() != ValueType::RangeDeletion {
                         continue;
                     }
-                    tombstones.push(CachedRangeTombstone {
-                        begin: ikr.user_key().to_vec(),
-                        end: v,
-                        seq: ikr.sequence(),
-                    });
+                    triples.push((ikr.user_key().to_vec(), v, ikr.sequence()));
                 }
             }
         }
 
-        let cached = Arc::new(tombstones);
-        // Race is benign — worst case we scan twice
+        let cached = Arc::new(
+            crate::iterator::range_del::FragmentedRangeTombstoneList::new(triples),
+        );
+        // Race is benign — worst case we build twice
         let _ = self.range_tombstone_cache.set(cached.clone());
         Ok(cached)
     }
@@ -629,6 +605,11 @@ pub struct TableIterator {
     // --- Error state ---
     /// Last I/O or corruption error encountered during iteration.
     err: Option<String>,
+
+    // --- Bounds ---
+    /// Exclusive upper bound on user keys. When set, entries with
+    /// user_key >= upper_bound are skipped to avoid unnecessary I/O.
+    upper_bound: Option<Vec<u8>>,
 }
 
 impl TableIterator {
@@ -651,6 +632,7 @@ impl TableIterator {
             backward_block: None,
             backward_block_index: usize::MAX,
             err: None,
+            upper_bound: None,
         }
     }
 
@@ -709,6 +691,12 @@ impl TableIterator {
             self.block_cursor_offset,
             &mut self.block_cursor_key,
         )?;
+        // Check upper bound before returning entry
+        if let Some(ref ub) = self.upper_bound {
+            if crate::types::user_key(&self.block_cursor_key) >= ub.as_slice() {
+                return None;
+            }
+        }
         self.block_cursor_offset = next_offset;
         Some((
             self.block_cursor_key.clone(),
@@ -1036,6 +1024,17 @@ impl TableIterator {
         let index_entries = self.index_entries.as_ref().unwrap();
         while self.index_pos < index_entries.len() {
             let block_idx = self.index_pos;
+
+            // Skip blocks whose first_key user key >= upper_bound
+            if let Some(ref ub) = self.upper_bound {
+                if let Some(ref fk) = index_entries[block_idx].first_key {
+                    if crate::types::user_key(fk) >= ub.as_slice() {
+                        self.index_pos = index_entries.len();
+                        return false;
+                    }
+                }
+            }
+
             let handle = index_entries[self.index_pos].handle;
             self.index_pos += 1;
 
@@ -1196,6 +1195,12 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                     self.block_cursor_offset,
                     &mut self.block_cursor_key,
                 ) {
+                    // Check upper bound before returning entry
+                    if let Some(ref ub) = self.upper_bound {
+                        if crate::types::user_key(&self.block_cursor_key) >= ub.as_slice() {
+                            return false;
+                        }
+                    }
                     self.block_cursor_offset = next;
                     key_buf.clear();
                     key_buf.extend_from_slice(&self.block_cursor_key);
@@ -1207,6 +1212,12 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             // Try materialized entries (backward iteration)
             if self.block_pos < self.current_block_entries.len() {
                 let (ref k, ref v) = self.current_block_entries[self.block_pos];
+                // Check upper bound before returning entry
+                if let Some(ref ub) = self.upper_bound {
+                    if crate::types::user_key(k) >= ub.as_slice() {
+                        return false;
+                    }
+                }
                 key_buf.clear();
                 key_buf.extend_from_slice(k);
                 value_buf.clear();
@@ -1230,6 +1241,14 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 entry.handle.size + BLOCK_TRAILER_SIZE as u64,
             );
         }
+    }
+
+    fn set_bounds(&mut self, _lower: Option<&[u8]>, upper: Option<&[u8]>) {
+        self.upper_bound = upper.map(|b| b.to_vec());
+    }
+
+    fn iter_error(&self) -> Option<String> {
+        self.err.clone()
     }
 }
 

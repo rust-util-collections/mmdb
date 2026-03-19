@@ -45,6 +45,10 @@ pub struct DBIterator {
     backward_positioned: bool,
     /// Optional callback: if it returns `true` for a user key, that entry is skipped.
     skip_point: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    /// Last seek target for TrySeekUsingNext optimization. When the next
+    /// seek target >= this, the merger can try stepping forward instead of
+    /// full re-seeking all sources.
+    last_seek_key: Option<Vec<u8>>,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -74,6 +78,7 @@ impl DBIterator {
             prev_overshoot: None,
             backward_positioned: false,
             skip_point: None,
+            last_seek_key: None,
         }
     }
 
@@ -97,6 +102,7 @@ impl DBIterator {
             prev_overshoot: None,
             backward_positioned: false,
             skip_point: None,
+            last_seek_key: None,
         }
     }
 
@@ -125,13 +131,41 @@ impl DBIterator {
             prev_overshoot: None,
             backward_positioned: false,
             skip_point: None,
+            last_seek_key: None,
         }
+    }
+
+    /// Reset the iterator with new sources and sequence, reusing allocated memory.
+    /// Used by the iterator pool to avoid per-iteration allocation overhead.
+    pub fn reset(&mut self, sources: Vec<IterSource>, sequence: SequenceNumber) {
+        self.merger.reset(sources);
+        self.sequence = sequence;
+        self.last_user_key.clear();
+        self.has_last_key = false;
+        self.current = None;
+        self.needs_advance = true;
+        self.range_tombstones = FragmentedRangeTombstoneList::empty();
+        self.prefix = None;
+        self.iterate_upper_bound = None;
+        self.prev_overshoot = None;
+        self.backward_positioned = false;
+        self.skip_point = None;
+        self.last_seek_key = None;
     }
 
     /// Set pre-collected range tombstones. Called by the DB layer after
     /// collecting tombstones from all memtables and SST files.
     pub fn set_range_tombstones(&mut self, tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) {
         self.range_tombstones = FragmentedRangeTombstoneList::new(tombstones);
+    }
+
+    /// Set range tombstones with level info for cross-level pruning.
+    /// A tombstone from level L can only delete keys from levels > L.
+    pub fn set_range_tombstones_with_levels(
+        &mut self,
+        tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
+    ) {
+        self.range_tombstones = FragmentedRangeTombstoneList::new_with_levels(tombstones);
     }
 
     /// No-op: tombstones are loaded upfront; emptiness is checked via is_empty().
@@ -143,6 +177,7 @@ impl DBIterator {
     /// Iteration stops when user key >= this bound.
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
     pub fn set_upper_bound(&mut self, bound: Vec<u8>) {
+        self.merger.set_bounds(None, Some(&bound));
         self.iterate_upper_bound = Some(bound);
         // Invalidate any buffered entry — it may now be beyond the new bound.
         self.current = None;
@@ -151,25 +186,43 @@ impl DBIterator {
 
     /// Set an inclusive lower bound on user keys.
     pub fn set_lower_bound(&mut self, bound: Vec<u8>) {
-        let _ = bound; // bounds filtering handled during iteration
+        self.merger.set_bounds(Some(&bound), None);
     }
 
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
     pub fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
-        let _ = lower; // bounds filtering handled during iteration
+        self.merger.set_bounds(
+            lower.as_deref(),
+            upper.as_deref(),
+        );
         self.iterate_upper_bound = upper;
         self.current = None;
         self.needs_advance = true;
     }
 
+    /// Return the first error from any underlying source iterator.
+    /// Use after iteration returns `None` to distinguish normal exhaustion
+    /// from I/O failures.
+    pub fn error(&self) -> Option<String> {
+        self.merger.error()
+    }
+
     /// Check if a user key is covered by any range tombstone visible at our snapshot.
     /// O(log T) binary search on pre-fragmented tombstone index.
+    /// Uses cross-level pruning: only tombstones from shallower levels can
+    /// delete a key from source_level.
     fn is_range_deleted(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
         if self.range_tombstones.is_empty() {
             return false;
         }
+        let source_level = self.merger.last_source_level();
+        let level_filter = if source_level != usize::MAX {
+            Some(source_level)
+        } else {
+            None
+        };
         self.range_tombstones
-            .max_covering_tombstone_seq(user_key, self.sequence)
+            .max_covering_tombstone_seq_for_level(user_key, self.sequence, level_filter)
             > seq
     }
 
@@ -177,6 +230,47 @@ impl DBIterator {
     /// the callback returns `true` is silently skipped.
     pub fn set_skip_point(&mut self, f: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>) {
         self.skip_point = Some(f);
+    }
+
+    /// Jump to the first key of the next prefix, skipping all remaining keys
+    /// under the current prefix in O(log N) instead of O(keys_in_prefix).
+    /// `prefix_len` is the number of bytes that define a prefix.
+    pub fn next_prefix(&mut self, prefix_len: usize) {
+        // Compute the successor prefix: increment the first `prefix_len` bytes.
+        if let Some((ref key, _)) = self.current {
+            let user_key = crate::types::user_key(key);
+            if user_key.len() >= prefix_len {
+                let mut succ = user_key[..prefix_len].to_vec();
+                // Increment: find rightmost byte < 0xFF and increment it
+                let mut i = succ.len();
+                while i > 0 {
+                    i -= 1;
+                    if succ[i] < 0xFF {
+                        succ[i] += 1;
+                        succ.truncate(i + 1);
+                        // Use seek_opt with try_next=true since succ > current
+                        let seek_key = crate::types::InternalKey::new(
+                            &succ,
+                            crate::types::MAX_SEQUENCE_NUMBER,
+                            ValueType::Value,
+                        );
+                        self.merger.seek_opt(seek_key.as_bytes(), true);
+                        self.has_last_key = false;
+                        self.needs_advance = true;
+                        self.current = None;
+                        self.prev_overshoot = None;
+                        self.backward_positioned = false;
+                        return;
+                    }
+                }
+                // All bytes were 0xFF — no next prefix possible, exhaust iterator
+                self.current = None;
+                self.needs_advance = false;
+                return;
+            }
+        }
+        // No current entry — advance normally
+        self.needs_advance = true;
     }
 
     /// Advance the streaming iterator to the next visible (user_key, value) pair.
@@ -331,7 +425,14 @@ impl DBIterator {
         // Seek the merger to a synthetic internal key with max sequence
         let seek_key =
             InternalKey::new(target, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
-        self.merger.seek(seek_key.as_bytes());
+        // TrySeekUsingNext: if the new target >= the last seek target, use
+        // incremental advancement instead of full re-seek.
+        let try_next = self
+            .last_seek_key
+            .as_ref()
+            .is_some_and(|prev| target >= prev.as_slice());
+        self.merger.seek_opt(seek_key.as_bytes(), try_next);
+        self.last_seek_key = Some(target.to_vec());
         self.has_last_key = false;
         self.needs_advance = true;
         self.current = None;
@@ -340,10 +441,8 @@ impl DBIterator {
     }
 
     pub fn seek_to_first(&mut self) {
-        use crate::types::InternalKey;
-        // Seek to the smallest possible internal key (empty user key, max sequence).
-        let seek_key = InternalKey::new(b"", crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
-        self.merger.seek(seek_key.as_bytes());
+        // Use seek_to_first directly instead of seeking with empty key.
+        self.merger.seek_to_first();
         self.has_last_key = false;
         self.needs_advance = true;
         self.current = None;

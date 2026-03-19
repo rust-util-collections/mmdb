@@ -238,6 +238,15 @@ impl IterSource {
         }
     }
 
+    /// Return the first error from the underlying iterator, if any.
+    pub fn iter_error(&self) -> Option<String> {
+        if let IterSourceInner::SeekableBoxed { ref iter } = self.inner {
+            iter.iter_error()
+        } else {
+            None
+        }
+    }
+
     /// Issue a prefetch hint for the first data block (if backed by a seekable iterator).
     pub fn prefetch_hint(&mut self) {
         if let IterSourceInner::SeekableBoxed { ref mut iter } = self.inner {
@@ -470,6 +479,24 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             upper_bound: None,
             last_source_level: usize::MAX,
         }
+    }
+
+    /// Replace sources and reset state, reusing allocated memory.
+    pub fn reset(&mut self, sources: Vec<IterSource>) {
+        let n = sources.len();
+        self.sources = sources;
+        self.heap.clear();
+        self.heap.extend(0..n);
+        self.heap_size = 0;
+        self.initialized = false;
+        self.direction = Direction::Forward;
+        self.single_source = n == 1;
+        self.current_key.clear();
+        self.in_heap.clear();
+        self.in_heap.resize(n, false);
+        self.lower_bound = None;
+        self.upper_bound = None;
+        self.last_source_level = usize::MAX;
     }
 
     /// Build the initial heap from all non-exhausted sources.
@@ -747,6 +774,94 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.init_heap();
     }
 
+    /// Optimized seek: when `try_next` is true and the current position is <=
+    /// target (forward direction), try advancing sources with up to 4 `next()`
+    /// calls before falling back to a full seek.  This avoids expensive binary
+    /// search + I/O when keys are nearby (e.g. sequential prefix scans).
+    pub fn seek_opt(&mut self, target: &[u8], try_next: bool) {
+        // Fast path: if we can try seek-using-next and we're already forward
+        // with a known position <= target, attempt incremental advancement.
+        if try_next
+            && self.direction == Direction::Forward
+            && !self.current_key.is_empty()
+            && (self.compare)(self.current_key.as_slice(), target) != Ordering::Greater
+        {
+            const MAX_STEPS: usize = 4;
+
+            if self.single_source {
+                // Single-source: just advance until >= target or fallback
+                let src = &mut self.sources[0];
+                let mut stepped = 0;
+                loop {
+                    if let Some((k, _)) = src.peek() {
+                        if (self.compare)(k, target) != Ordering::Less {
+                            break; // already >= target
+                        }
+                    } else {
+                        break; // exhausted
+                    }
+                    src.has_peeked = false;
+                    stepped += 1;
+                    if stepped >= MAX_STEPS {
+                        // Fallback to full seek
+                        src.seek_to(target, &self.compare);
+                        break;
+                    }
+                }
+                self.current_key.clear();
+                return;
+            }
+
+            // Multi-source: advance each source individually
+            self.init_heap();
+            for i in 0..self.sources.len() {
+                if !self.sources[i].has_peeked {
+                    continue;
+                }
+                let key_less = {
+                    let k = self.sources[i].peeked_key.as_slice();
+                    (self.compare)(k, target) == Ordering::Less
+                };
+                if !key_less {
+                    continue; // already >= target
+                }
+                // Try stepping forward
+                let mut stepped = 0;
+                let mut reached = false;
+                loop {
+                    self.sources[i].has_peeked = false;
+                    stepped += 1;
+                    if let Some((k, _)) = self.sources[i].peek() {
+                        if (self.compare)(k, target) != Ordering::Less {
+                            reached = true;
+                            break;
+                        }
+                    } else {
+                        break; // exhausted
+                    }
+                    if stepped >= MAX_STEPS {
+                        break;
+                    }
+                }
+                if !reached && self.sources[i].has_peeked {
+                    // Still behind; fallback to full seek
+                    self.sources[i].seek_to(target, &self.compare);
+                } else if !reached {
+                    // exhausted — seek_to for final positioning
+                    self.sources[i].seek_to(target, &self.compare);
+                }
+            }
+            // Rebuild heap
+            self.initialized = false;
+            self.current_key.clear();
+            self.init_heap();
+            return;
+        }
+
+        // Fallback to full seek
+        self.seek(target);
+    }
+
     /// Seek all sources for prev to a target key, then rebuild the max-heap.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.direction = Direction::Backward;
@@ -890,6 +1005,24 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         for source in self.sources.iter_mut() {
             source.set_bounds(lower, upper);
         }
+    }
+
+    /// Level of the source that produced the last emitted entry.
+    /// Returns `usize::MAX` if no entry has been emitted yet.
+    pub fn last_source_level(&self) -> usize {
+        self.last_source_level
+    }
+
+    /// Return the first error from any source iterator.
+    /// Use after iteration returns `None` to distinguish normal exhaustion
+    /// from I/O failures.
+    pub fn error(&self) -> Option<String> {
+        for source in &self.sources {
+            if let Some(e) = source.iter_error() {
+                return Some(e);
+            }
+        }
+        None
     }
 }
 

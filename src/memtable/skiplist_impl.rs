@@ -119,6 +119,9 @@ struct Node<K, V> {
     /// next[i] is the pointer to the next node at level i.
     /// Levels `height..MAX_HEIGHT` are unused (always null).
     next: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
+    /// Backward pointer at level 0 only. Enables O(1) `prev()` instead
+    /// of O(log N) `seek_lt_raw()`.
+    prev0: AtomicPtr<Node<K, V>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +135,8 @@ struct Node<K, V> {
 pub struct ConcurrentSkipList<K: Ord + Clone, V: Clone> {
     /// Head pointers for each level.
     head: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
+    /// Pointer to the last node at level 0. Enables O(1) `tail_ptr()`.
+    tail: AtomicPtr<Node<K, V>>,
     /// Number of entries.
     len: AtomicUsize,
     /// Current maximum height in the list.
@@ -156,6 +161,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     pub fn new() -> Self {
         Self {
             head: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+            tail: AtomicPtr::new(ptr::null_mut()),
             len: AtomicUsize::new(0),
             max_height: AtomicUsize::new(1),
             all_nodes: UnsafeCell::new(Vec::new()),
@@ -223,6 +229,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                     value,
                     height: height as u8,
                     next: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+                    prev0: AtomicPtr::new(ptr::null_mut()),
                 },
             );
         }
@@ -233,22 +240,42 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             (*self.all_nodes.get()).push(new_node);
         }
 
-        // Link the new node into each level.
+        // Link the new node into each level (and maintain prev0 at level 0).
+        let new_ref = unsafe { &*new_node };
         #[allow(clippy::needless_range_loop)]
         for level in 0..height {
-            let new_ref = unsafe { &*new_node };
             if prev[level].is_null() {
                 // New node becomes the first at this level.
                 let old_head = self.head[level].load(Ordering::Relaxed);
                 new_ref.next[level].store(old_head, Ordering::Relaxed);
+                // Level-0 backward pointer maintenance
+                if level == 0 {
+                    new_ref.prev0.store(ptr::null_mut(), Ordering::Relaxed);
+                    if !old_head.is_null() {
+                        unsafe { &*old_head }.prev0.store(new_node, Ordering::Release);
+                    }
+                }
                 self.head[level].store(new_node, Ordering::Release);
             } else {
                 // SAFETY: prev[level] is a valid node.
                 let p = unsafe { &*prev[level] };
                 let old_next = p.next[level].load(Ordering::Relaxed);
                 new_ref.next[level].store(old_next, Ordering::Relaxed);
+                // Level-0 backward pointer maintenance
+                if level == 0 {
+                    new_ref.prev0.store(prev[level], Ordering::Relaxed);
+                    if !old_next.is_null() {
+                        unsafe { &*old_next }.prev0.store(new_node, Ordering::Release);
+                    }
+                }
                 p.next[level].store(new_node, Ordering::Release);
             }
+        }
+
+        // Update tail pointer: if new node has no level-0 successor, it is the
+        // new tail.
+        if new_ref.next[0].load(Ordering::Relaxed).is_null() {
+            self.tail.store(new_node, Ordering::Release);
         }
 
         self.len.fetch_add(1, Ordering::Relaxed);
@@ -433,6 +460,17 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         }
     }
 
+    /// Follow the level-0 backward pointer. O(1).
+    ///
+    /// # Safety
+    /// `ptr` must be a valid node pointer obtained from this skiplist.
+    pub unsafe fn node_prev0(&self, ptr: *const ()) -> *const () {
+        unsafe {
+            let node = &*(ptr as *const Node<K, V>);
+            node.prev0.load(Ordering::Acquire) as *const ()
+        }
+    }
+
     /// Return a raw pointer to the first level-0 node (for cursor iteration).
     pub fn head_ptr(&self) -> *const () {
         self.head[0].load(Ordering::Acquire) as *const ()
@@ -533,35 +571,11 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         self.seek_lt_raw(target)
     }
 
-    /// Return a raw pointer to the last level-0 node. O(log N).
+    /// Return a raw pointer to the last level-0 node. O(1) via cached tail.
     ///
     /// Returns null if the skip list is empty.
     pub fn tail_ptr(&self) -> *const () {
-        let max_h = self.max_height.load(Ordering::Acquire);
-        if max_h == 0 {
-            return ptr::null();
-        }
-
-        let mut current: *const Node<K, V> = ptr::null();
-
-        for level in (0..max_h).rev() {
-            let mut next = if current.is_null() {
-                self.head[level].load(Ordering::Acquire)
-            } else {
-                unsafe { &*current }.next[level].load(Ordering::Acquire)
-            };
-
-            while !next.is_null() {
-                current = next;
-                next = unsafe { &*current }.next[level].load(Ordering::Acquire);
-            }
-        }
-
-        if current.is_null() {
-            ptr::null()
-        } else {
-            current as *const ()
-        }
+        self.tail.load(Ordering::Acquire) as *const ()
     }
 
     /// Number of entries.

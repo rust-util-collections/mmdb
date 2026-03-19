@@ -4,6 +4,7 @@
 //! and opens one file's TableIterator at a time. This reduces MergingIterator heap size
 //! from O(total_files) to O(L0_count + num_levels).
 
+use crate::iterator::merge::SeekableIterator;
 use crate::manifest::version::TableFile;
 use crate::sst::table_reader::TableIterator;
 use crate::types::compare_internal_key;
@@ -103,7 +104,19 @@ impl LevelIterator {
                 self.file_index += 1;
                 continue;
             }
+            // Skip files whose smallest user key >= upper_bound
+            if let Some(ref ub) = self.upper_bound {
+                let smallest_uk = user_key_from_internal(&tf.meta.smallest_key);
+                if smallest_uk >= ub.as_slice() {
+                    self.file_index = self.files.len();
+                    self.current_iter = None;
+                    return;
+                }
+            }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if let Some(ref ub) = self.upper_bound {
+                table_iter.set_bounds(None, Some(ub));
+            }
             if let Some(t) = target {
                 table_iter.seek(t);
             }
@@ -167,6 +180,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 continue;
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if let Some(ref ub) = self.upper_bound {
+                table_iter.set_bounds(None, Some(ub));
+            }
             table_iter.seek_to_last();
             // Use current() to read without advancing the cursor, so
             // subsequent prev() calls work correctly.
@@ -182,20 +198,26 @@ impl super::merge::SeekableIterator for LevelIterator {
         let idx = self.files.partition_point(|tf| {
             compare_internal_key(&tf.meta.smallest_key, target) != std::cmp::Ordering::Greater
         });
-        // Try blocks starting from idx-1 backward until we find a valid entry.
-        // If idx == 0, no file has smallest_key <= target — nothing to try.
         if idx == 0 {
             self.file_index = 0;
             self.current_iter = None;
             return;
         }
+        // For non-overlapping files, at most 2 candidates need checking:
+        // the file at idx-1 (whose range spans the target), and possibly
+        // idx-2 (if target falls in a gap between files).  The previous
+        // unbounded backward scan was O(files) worst case.
         let start = idx - 1;
-        for try_idx in (0..=start).rev() {
+        let min_try = start.saturating_sub(1);
+        for try_idx in (min_try..=start).rev() {
             let tf = &self.files[try_idx];
             if !self.file_passes_filters(tf) {
                 continue;
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if let Some(ref ub) = self.upper_bound {
+                table_iter.set_bounds(None, Some(ub));
+            }
             table_iter.seek_for_prev(target);
             if table_iter.current().is_some() {
                 self.file_index = try_idx;
@@ -222,6 +244,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 continue;
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if let Some(ref ub) = self.upper_bound {
+                table_iter.set_bounds(None, Some(ub));
+            }
             table_iter.seek_to_last();
             self.file_index = idx;
             self.current_iter = Some(table_iter);
@@ -250,6 +275,17 @@ impl super::merge::SeekableIterator for LevelIterator {
         }
     }
 
+    fn set_bounds(&mut self, _lower: Option<&[u8]>, upper: Option<&[u8]>) {
+        self.upper_bound = upper.map(|b| b.to_vec());
+        // Propagate to the currently open table iterator, if any
+        if let Some(ref mut iter) = self.current_iter {
+            iter.set_bounds(None, upper);
+        }
+    }
+
+    fn iter_error(&self) -> Option<String> {
+        self.current_iter.as_ref().and_then(|it| it.iter_error())
+    }
 }
 
 #[cfg(test)]

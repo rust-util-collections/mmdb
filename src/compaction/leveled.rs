@@ -201,10 +201,17 @@ impl LeveledCompaction {
         db_path: &Path,
         options: &DbOptions,
     ) -> Result<()> {
-        Self::execute_compaction_with_cache(task, versions, db_path, options, None, None, None)
+        Self::execute_compaction_with_cache(
+            task, versions, db_path, options, None, None, None, &[],
+        )
     }
 
     /// Execute compaction with optional table cache for eviction and rate limiter.
+    ///
+    /// `active_snapshots` lists sequence numbers of all open snapshots.
+    /// Keys with sequence numbers below the smallest active snapshot get
+    /// their sequence zeroed (P5.1). At the bottommost level, tombstones
+    /// are dropped (P5.2).
     pub fn execute_compaction_with_cache(
         task: &CompactionTask,
         versions: &mut VersionSet,
@@ -213,8 +220,17 @@ impl LeveledCompaction {
         table_cache: Option<&Arc<TableCache>>,
         rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
         stats: Option<&Arc<crate::stats::DbStats>>,
+        active_snapshots: &[SequenceNumber],
     ) -> Result<()> {
         let target_level = task.level + 1;
+        let is_bottommost = target_level >= options.num_levels - 1;
+        // Sequence numbers below this threshold are not pinned by any
+        // snapshot and can safely be zeroed.
+        let min_unflushed_seq = active_snapshots
+            .iter()
+            .min()
+            .copied()
+            .unwrap_or(SequenceNumber::MAX);
 
         // Trivial move optimization: if there's exactly one input file and no
         // overlap with the next level, just move the metadata without rewriting.
@@ -302,7 +318,7 @@ impl LeveledCompaction {
                 }
                 last_user_key = Some(user_key.to_vec());
                 // Drop range tombstones at the bottommost level
-                if target_level >= options.num_levels - 1 {
+                if is_bottommost {
                     continue;
                 }
                 // Keep range tombstone in non-bottommost levels — fall through to write it
@@ -316,7 +332,7 @@ impl LeveledCompaction {
                 last_user_key = Some(user_key.to_vec());
 
                 // Drop point tombstones at the bottommost level
-                if ikr.value_type() == ValueType::Deletion && target_level >= options.num_levels - 1
+                if ikr.value_type() == ValueType::Deletion && is_bottommost
                 {
                     continue;
                 }
@@ -353,8 +369,28 @@ impl LeveledCompaction {
                 current_size = 0;
             }
 
-            let entry_bytes = ikey.len() + final_value.len();
-            builder.as_mut().unwrap().add(&ikey, &final_value).c(d!())?;
+            // Sequence zeroing: at the bottommost level, if the entry's
+            // sequence falls below the minimum active snapshot, zero it out.
+            // Only safe at bottommost because tombstones are also dropped
+            // there — a zeroed key (seq=0) at a non-bottommost level could
+            // be falsely covered by a range tombstone that kept its original
+            // sequence.  The dedup logic above ensures only one version per
+            // user key survives.
+            let final_ikey;
+            let ikey_ref = if is_bottommost
+                && ikr.sequence() > 0
+                && ikr.sequence() < min_unflushed_seq
+                && ikr.value_type() == ValueType::Value
+            {
+                final_ikey =
+                    InternalKey::new(user_key, 0, ikr.value_type()).as_bytes().to_vec();
+                &final_ikey
+            } else {
+                &ikey
+            };
+
+            let entry_bytes = ikey_ref.len() + final_value.len();
+            builder.as_mut().unwrap().add(ikey_ref, &final_value).c(d!())?;
             current_size += entry_bytes;
 
             // Rate-limit compaction writes

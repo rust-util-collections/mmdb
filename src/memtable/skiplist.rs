@@ -215,23 +215,21 @@ impl SeekableIterator for MemTableCursorIter {
 
     fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
         if self.cursor.is_null() {
-            // Exhausted forward — seek to last for backward iteration
+            // Exhausted forward — seek to last for backward iteration.
+            // O(1) via cached tail pointer.
             let ptr = self.sl().tail_ptr();
             if ptr.is_null() {
                 return None;
             }
             let (k, v) = unsafe { self.sl().node_kv(ptr) };
             let result = (k.as_bytes().to_vec(), v.clone());
-            // Find the entry before this one for the next prev() call
-            let search = OrdInternalKey(k.as_bytes().to_vec());
-            let prev_ptr = self.sl().seek_lt_raw(&search);
-            self.cursor = prev_ptr; // may be null if this was the first entry
+            // Follow prev0 for the next prev() call — O(1).
+            self.cursor = unsafe { self.sl().node_prev0(ptr) };
             return Some(result);
         }
-        // We have a current cursor position. Find the entry before it.
-        let (k, _) = unsafe { self.sl().node_kv(self.cursor) };
-        let search = OrdInternalKey(k.as_bytes().to_vec());
-        let prev_ptr = self.sl().seek_lt_raw(&search);
+        // We have a current cursor position. Follow the backward pointer.
+        // O(1) via prev0 instead of O(log N) seek_lt_raw.
+        let prev_ptr = unsafe { self.sl().node_prev0(self.cursor) };
         if prev_ptr.is_null() {
             self.cursor = std::ptr::null();
             return None;

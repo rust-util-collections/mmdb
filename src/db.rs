@@ -316,6 +316,7 @@ impl DB {
                                         Some(&bg_table_cache),
                                         Some(&bg_rate_limiter),
                                         Some(&bg_stats),
+                                        &[],
                                     );
                                     // Unpin L0 files from block cache after compaction
                                     for num in &l0_inputs {
@@ -634,20 +635,30 @@ impl DB {
         // This enables O(log T) binary search for any key in any direction,
         // replacing the old inline-collection + full-scan preload approach.
         if any_range_deletions {
-            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+            // Collect tombstones with level info for cross-level pruning.
+            // A tombstone from level L can only delete keys from levels > L.
+            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
+            // Memtable tombstones are at level 0 (highest priority).
             if active_mem.has_range_deletions() {
-                all_tombstones.extend(active_mem.get_range_tombstones());
+                for (b, e, s) in active_mem.get_range_tombstones() {
+                    all_tombstones.push((b, e, s, 0));
+                }
             }
             for imm in imm_mems {
                 if imm.has_range_deletions() {
-                    all_tombstones.extend(imm.get_range_tombstones());
+                    for (b, e, s) in imm.get_range_tombstones() {
+                        all_tombstones.push((b, e, s, 0));
+                    }
                 }
             }
+            // L0 files are also at level 0.
             for tf in version.level_files(0) {
                 if tf.meta.has_range_deletions
                     && let Ok(ts) = tf.reader.get_range_tombstones()
                 {
-                    all_tombstones.extend(ts);
+                    for (b, e, s) in ts {
+                        all_tombstones.push((b, e, s, 0));
+                    }
                 }
             }
             for level in 1..version.num_levels {
@@ -655,12 +666,14 @@ impl DB {
                     if tf.meta.has_range_deletions
                         && let Ok(ts) = tf.reader.get_range_tombstones()
                     {
-                        all_tombstones.extend(ts);
+                        for (b, e, s) in ts {
+                            all_tombstones.push((b, e, s, level));
+                        }
                     }
                 }
             }
             if !all_tombstones.is_empty() {
-                db_iter.set_range_tombstones(all_tombstones);
+                db_iter.set_range_tombstones_with_levels(all_tombstones);
             }
         }
         if let Some(ref sp) = options.skip_point {
@@ -772,22 +785,28 @@ impl DB {
 
         let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix.to_vec());
 
-        // Collect all range tombstones upfront (same pattern as iter_with_range).
+        // Collect all range tombstones with level info for cross-level pruning.
         if any_range_deletions {
-            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64)> = Vec::new();
+            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
             if active_mem.has_range_deletions() {
-                all_tombstones.extend(active_mem.get_range_tombstones());
+                for (b, e, s) in active_mem.get_range_tombstones() {
+                    all_tombstones.push((b, e, s, 0));
+                }
             }
             for imm in imm_mems {
                 if imm.has_range_deletions() {
-                    all_tombstones.extend(imm.get_range_tombstones());
+                    for (b, e, s) in imm.get_range_tombstones() {
+                        all_tombstones.push((b, e, s, 0));
+                    }
                 }
             }
             for tf in version.level_files(0) {
                 if tf.meta.has_range_deletions
                     && let Ok(ts) = tf.reader.get_range_tombstones()
                 {
-                    all_tombstones.extend(ts);
+                    for (b, e, s) in ts {
+                        all_tombstones.push((b, e, s, 0));
+                    }
                 }
             }
             for level in 1..version.num_levels {
@@ -795,12 +814,14 @@ impl DB {
                     if tf.meta.has_range_deletions
                         && let Ok(ts) = tf.reader.get_range_tombstones()
                     {
-                        all_tombstones.extend(ts);
+                        for (b, e, s) in ts {
+                            all_tombstones.push((b, e, s, level));
+                        }
                     }
                 }
             }
             if !all_tombstones.is_empty() {
-                iter.set_range_tombstones(all_tombstones);
+                iter.set_range_tombstones_with_levels(all_tombstones);
             }
         }
 
@@ -1006,6 +1027,7 @@ impl DB {
                         Some(&self.table_cache),
                         Some(&self.rate_limiter),
                         Some(&self.stats),
+                        &[],
                     )
                     .c(d!())?;
                     for num in &l0_inputs {
@@ -1414,6 +1436,7 @@ impl DB {
                         Some(&self.table_cache),
                         Some(&self.rate_limiter),
                         Some(&self.stats),
+                        &[],
                     )
                     .c(d!())?;
                     // Unpin L0 files from block cache after compaction

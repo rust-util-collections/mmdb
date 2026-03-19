@@ -125,9 +125,11 @@ impl RangeTombstoneTracker {
 struct TombstoneFragment {
     begin: Vec<u8>,
     end: Vec<u8>,
-    /// Sequence numbers of original tombstones covering this interval,
-    /// stored in **descending** order for efficient max-visible-seq lookup.
-    seqs: Vec<SequenceNumber>,
+    /// `(sequence_number, source_level)` pairs covering this interval,
+    /// stored in **descending seq** order for efficient max-visible-seq lookup.
+    /// The level enables cross-level pruning: a tombstone from level L can only
+    /// delete keys from levels > L.
+    seq_levels: Vec<(SequenceNumber, usize)>,
 }
 
 /// Pre-fragmented, immutable range tombstone index.
@@ -155,20 +157,29 @@ impl FragmentedRangeTombstoneList {
     }
 
     /// Build from raw tombstones: `(begin, end, seq)` triples.
+    /// All tombstones are assigned level 0 (no cross-level pruning).
+    pub fn new(raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) -> Self {
+        let with_levels: Vec<_> = raw.into_iter().map(|(b, e, s)| (b, e, s, 0usize)).collect();
+        Self::new_with_levels(with_levels)
+    }
+
+    /// Build from raw tombstones with level info: `(begin, end, seq, level)`.
     ///
     /// Algorithm (RocksDB-style boundary sweep):
     /// 1. Collect all unique boundary points (begin and end keys), sort & dedup.
     /// 2. For each consecutive boundary pair `[b_i, b_{i+1})`, find all
-    ///    tombstones that cover this interval and record their seqs.
+    ///    tombstones that cover this interval and record their `(seq, level)`.
     /// 3. Skip intervals with no covering tombstones.
-    pub fn new(mut raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) -> Self {
+    pub fn new_with_levels(
+        mut raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
+    ) -> Self {
         if raw.is_empty() {
             return Self::empty();
         }
 
         // Collect and sort unique boundary points.
         let mut boundaries: Vec<Vec<u8>> = Vec::with_capacity(raw.len() * 2);
-        for (begin, end, _) in &raw {
+        for (begin, end, _, _) in &raw {
             boundaries.push(begin.clone());
             boundaries.push(end.clone());
         }
@@ -179,14 +190,8 @@ impl FragmentedRangeTombstoneList {
         raw.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Sweep boundaries left-to-right, tracking active tombstones.
-        // A tombstone is active in interval [b_i, b_{i+1}) if
-        // tombstone.begin <= b_i && tombstone.end >= b_{i+1}
-        // (equivalently, tombstone.begin <= b_i && tombstone.end > b_i).
         let mut fragments = Vec::new();
-        // Index into sorted tombstones: all tombstones before this index
-        // have begin <= current boundary (candidates for activation).
         let mut tomb_idx = 0;
-        // Active tombstones: indices into `raw` that haven't expired.
         let mut active: Vec<usize> = Vec::new();
 
         for w in boundaries.windows(2) {
@@ -206,15 +211,18 @@ impl FragmentedRangeTombstoneList {
                 continue;
             }
 
-            // Collect seqs from active tombstones, sorted descending.
-            let mut seqs: Vec<SequenceNumber> = active.iter().map(|&idx| raw[idx].2).collect();
-            seqs.sort_unstable_by(|a, b| b.cmp(a));
-            seqs.dedup();
+            // Collect (seq, level) pairs from active tombstones, sorted by seq descending.
+            let mut seq_levels: Vec<(SequenceNumber, usize)> = active
+                .iter()
+                .map(|&idx| (raw[idx].2, raw[idx].3))
+                .collect();
+            seq_levels.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            seq_levels.dedup_by_key(|sl| sl.0);
 
             fragments.push(TombstoneFragment {
                 begin: b_start.clone(),
                 end: b_end.clone(),
-                seqs,
+                seq_levels,
             });
         }
 
@@ -228,6 +236,19 @@ impl FragmentedRangeTombstoneList {
         &self,
         user_key: &[u8],
         snapshot: SequenceNumber,
+    ) -> SequenceNumber {
+        self.max_covering_tombstone_seq_for_level(user_key, snapshot, None)
+    }
+
+    /// Level-aware variant: only considers tombstones from levels strictly less
+    /// than `source_level`. A tombstone from level L can only delete keys from
+    /// levels > L (deeper levels hold older data).
+    /// Pass `None` for no level filtering (backward compatible).
+    pub fn max_covering_tombstone_seq_for_level(
+        &self,
+        user_key: &[u8],
+        snapshot: SequenceNumber,
+        source_level: Option<usize>,
     ) -> SequenceNumber {
         if self.fragments.is_empty() {
             return 0;
@@ -247,11 +268,19 @@ impl FragmentedRangeTombstoneList {
             return 0;
         }
 
-        // Seqs are sorted descending; first one <= snapshot is the max visible.
-        for &seq in &frag.seqs {
-            if seq <= snapshot {
-                return seq;
+        // seq_levels are sorted by seq descending; find max visible seq,
+        // optionally filtering by level.
+        for &(seq, level) in &frag.seq_levels {
+            if seq > snapshot {
+                continue;
             }
+            // Only tombstones from shallower levels can delete this key.
+            if let Some(src_lvl) = source_level {
+                if level >= src_lvl {
+                    continue;
+                }
+            }
+            return seq;
         }
         0
     }
@@ -259,6 +288,18 @@ impl FragmentedRangeTombstoneList {
     /// Whether the list contains any tombstones.
     pub fn is_empty(&self) -> bool {
         self.fragments.is_empty()
+    }
+
+    /// Export tombstones as `(begin, end, seq)` triples.
+    /// Each fragment may produce multiple triples (one per seq).
+    pub fn tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
+        let mut result = Vec::new();
+        for frag in &self.fragments {
+            for &(seq, _level) in &frag.seq_levels {
+                result.push((frag.begin.clone(), frag.end.clone(), seq));
+            }
+        }
+        result
     }
 }
 
