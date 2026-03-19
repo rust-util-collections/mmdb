@@ -142,8 +142,8 @@ pub struct DB {
     /// Updated after flush/compaction. Avoids locking `inner` on every write.
     l0_file_count: Arc<AtomicUsize>,
     /// Lock-free read snapshot (SuperVersion).
-    /// Readers do a single atomic load (~1ns). Writers swap atomically after
-    /// memtable/version changes. True lock-free — no RwLock contention.
+    /// Readers do a single atomic load. Writers swap atomically after
+    /// memtable/version changes — no RwLock contention.
     super_version: Arc<ArcSwap<SuperVersion>>,
     /// Read-triggered compaction hints accumulated from the get path.
     read_compaction_hints: Arc<Mutex<Vec<CompactionHint>>>,
@@ -783,7 +783,7 @@ impl DB {
     /// `None` bounds mean unbounded in that direction.
     ///
     /// **WARNING**: Does NOT use prefix bloom filters. For prefix-scoped queries,
-    /// prefer `iter_with_prefix()` which is typically 10-100x faster.
+    /// prefer `iter_with_prefix()` which is significantly faster.
     ///
     /// Bounds from `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` are
     /// also applied if set, using the tighter of the two.
@@ -958,7 +958,7 @@ impl DB {
     ///
     /// Uses prefix bloom filters to skip SST files that don't contain the prefix,
     /// and stops iteration as soon as the prefix boundary is crossed.
-    /// Typically 10-100x faster than `iter_with_range()` for prefix-scoped queries.
+    /// Significantly faster than `iter_with_range()` for prefix-scoped queries.
     ///
     /// Supports `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` for
     /// sub-range queries within a prefix, and `snapshot` for historical reads.

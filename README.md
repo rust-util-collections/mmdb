@@ -7,21 +7,13 @@
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-250_passing-brightgreen.svg)]()
 
-A pure-Rust, synchronous LSM-Tree key-value storage engine. Designed as a native Rust alternative to RocksDB with competitive performance — **scan throughput matches or exceeds RocksDB** on equivalent configurations.
+A pure-Rust, synchronous LSM-Tree key-value storage engine with competitive scan and point-read performance.
 
 ---
 
 ## Performance
 
-Benchmarked via [vsdb](https://github.com/rust-util-collections/vsdb) (500K entries, 128-byte values, 64MB write buffer, 256MB block cache):
-
-| Operation | RocksDB | MMDB | Result |
-|-----------|---------|------|--------|
-| scan 100 entries | 14.1 us | **11.7 us** | MMDB 17% faster |
-| scan 1000 entries | 112 us | **108 us** | MMDB 4% faster |
-| scan 10000 entries | 1.10 ms | **1.09 ms** | MMDB 1% faster |
-| full scan 500K | 54.5 ms | **52.4 ms** | MMDB 4% faster |
-| point read | 405 ns | **168 ns** | MMDB 2.4x faster |
+In typical configurations, MMDB's scan throughput and point-read latency are comparable to RocksDB. The engine uses the same core optimizations (bloom filters, block cache, prefix compression, leveled compaction) and is designed to perform well across both warm-cache and cold-cache workloads. Run `make bench` to evaluate performance under your specific hardware and data profile.
 
 ---
 
@@ -101,27 +93,26 @@ Benchmarked via [vsdb](https://github.com/rust-util-collections/vsdb) (500K entr
 3. L0 SST files (newest first, per-file bloom filter + range check)
 4. L1+ SST files (LevelIterator with lazy file opening, binary search by key range)
 
-### Iterator Architecture (key performance innovation)
+### Iterator Architecture
 
 The scan path uses a **MergingIterator** (min-heap) that merges entries from:
 - MemTable cursors (O(1) per entry via skiplist level-0 chain)
 - L0 TableIterators (one per overlapping SST file)
 - LevelIterators (one per L1+ level — lazy two-level iterator)
 
-Key optimizations that match/exceed RocksDB:
-- **Single-source bypass**: When only one source exists (memtable-only reads), `MergingIterator` bypasses heap machinery entirely — direct delegation with zero overhead (mirrors RocksDB's `MergeIteratorBuilder` n==1 optimization)
-- **SuperVersion lock-free reads**: Read path (get/iter) uses `RwLock<Arc<SuperVersion>>` snapshot instead of locking the inner mutex, similar to RocksDB's SuperVersion mechanism
-- **Buffer-reusing memtable iteration**: `MemTableCursorIter::next_into()` copies directly into caller buffers via `extend_from_slice` — after warm-up, zero heap allocation per entry
-- **In-place key truncation**: `DBIterator::next_visible()` truncates internal keys to user keys in-place instead of allocating a new `Vec`
-- **Zero-copy block cache**: `Block` stores `Arc<Vec<u8>>` — cache hits avoid memcpy
-- **Cursor-based block iteration**: Decodes entries one-at-a-time from raw block data (`decode_entry_reuse`) — no per-block Vec allocation
+Key optimizations:
+- **Single-source bypass**: When only one source exists, `MergingIterator` bypasses heap machinery — direct delegation
+- **Lock-free reads**: Read path uses `ArcSwap<SuperVersion>` snapshot instead of locking the inner mutex
+- **Buffer-reusing iteration**: `next_into()` copies directly into caller buffers — minimizes heap allocation per entry
+- **In-place key truncation**: Truncates internal keys to user keys in-place instead of allocating
+- **Block cache**: `Block` stores `Arc<Vec<u8>>` — cache hits avoid memcpy
+- **Cursor-based block iteration**: Decodes entries one-at-a-time from raw block data — no per-block Vec allocation
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
-- **Buffer reuse**: `IterSource` reuses key/value buffers; `next_into()` decodes directly into caller buffers
 - **Sequential readahead**: `posix_fadvise(WILLNEED)` after detecting sequential block access
-- **L0 metadata pinning**: Index entries and first data blocks pinned (non-evictable) for L0 files via `insert_pinned`; unpinned on compaction
-- **Sweep-line range tombstone tracking**: O(1) amortized instead of O(T) per key
-- **Lazy index loading**: `TableIterator::new()` is O(1) — index parsed on first use
-- **Atomic L0 counter**: Write-throttle checks use an atomic counter instead of locking inner, eliminating mutex contention on every put
+- **L0 metadata pinning**: Index/data blocks pinned for L0 files via `insert_pinned`; unpinned on compaction
+- **Sweep-line range tombstone tracking**: O(1) amortized per key
+- **Lazy index loading**: Index parsed on first use
+- **Atomic L0 counter**: Write-throttle checks use an atomic counter, avoiding mutex contention on writes
 
 ### SST Format
 
@@ -205,7 +196,7 @@ impl DB {
 
     /// Full-scan iteration with optional key-range bounds.
     /// WARNING: Does NOT use prefix bloom filters. For prefix-scoped queries,
-    /// prefer `iter_with_prefix()` which is typically 10-100x faster.
+    /// prefer `iter_with_prefix()` which is significantly faster.
     pub fn iter_with_range(&self, options: &ReadOptions, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<DBIterator>;
 
     /// RAII snapshot — automatically released on drop.
