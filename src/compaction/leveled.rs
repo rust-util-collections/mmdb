@@ -543,6 +543,35 @@ impl LeveledCompaction {
         db_path: &Path,
         stats: Option<&Arc<crate::stats::DbStats>>,
     ) -> Result<()> {
+        // Guard against stale compaction results: if any input file has already
+        // been removed from the current version (e.g. by a concurrent inline
+        // compaction), this output is based on outdated data and must be
+        // discarded.  Delete orphaned output SSTs and return early.
+        {
+            let version = versions.current();
+            let all_file_numbers: HashSet<u64> = (0..version.num_levels)
+                .flat_map(|l| version.level_files(l).iter().map(|f| f.meta.number))
+                .collect();
+            let stale = output
+                .input_file_numbers
+                .iter()
+                .any(|n| !all_file_numbers.contains(n));
+            if stale {
+                // Clean up output SST files that were written during the
+                // (now-invalidated) I/O phase.
+                for (_, meta) in &output.edit.new_files {
+                    let orphan = db_path.join(format!("{:06}.sst", meta.number));
+                    let _ = std::fs::remove_file(&orphan);
+                }
+                if let Some(cache) = table_cache {
+                    for (_, meta) in &output.edit.new_files {
+                        cache.evict(meta.number);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         output
             .edit
             .set_next_file_number(versions.next_file_number());
