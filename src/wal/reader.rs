@@ -136,6 +136,15 @@ impl WalReader {
             }
 
             let (checksum, length, record_type) = decode_header(&header_buf);
+            let record_type = match record_type {
+                Some(rt) => rt,
+                None => {
+                    return Err(eg!(Error::Corruption(format!(
+                        "unknown WAL record type: {}",
+                        header_buf[6]
+                    ))));
+                }
+            };
             let length = length as usize;
 
             // Read the data

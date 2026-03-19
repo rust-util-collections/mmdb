@@ -51,12 +51,11 @@ pub struct LeveledCompaction;
 /// internal-key entries suitable for injection into the merge iterator.
 /// This ensures tombstones from new-format SSTs (which store range
 /// deletions in a separate block) participate in the merge.
-fn collect_range_del_entries(files: &[TableFile]) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn collect_range_del_entries(files: &[TableFile]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut entries = Vec::new();
     for tf in files {
-        if tf.meta.has_range_deletions
-            && let Ok(tombstones) = tf.reader.get_range_tombstones()
-        {
+        if tf.meta.has_range_deletions {
+            let tombstones = tf.reader.get_range_tombstones().c(d!())?;
             for (begin, end, seq) in tombstones {
                 let ikey = InternalKey::new(&begin, seq, ValueType::RangeDeletion);
                 entries.push((ikey.as_bytes().to_vec(), end));
@@ -64,7 +63,7 @@ fn collect_range_del_entries(files: &[TableFile]) -> Vec<(Vec<u8>, Vec<u8>)> {
         }
     }
     entries.sort_by(|a, b| compare_internal_key(&a.0, &b.0));
-    entries
+    Ok(entries)
 }
 
 impl LeveledCompaction {
@@ -276,7 +275,8 @@ impl LeveledCompaction {
                 .chain(task.input_files_next.iter())
                 .cloned()
                 .collect::<Vec<_>>(),
-        );
+        )
+        .c(d!())?;
         if !range_del_entries.is_empty() {
             sources.push(IterSource::new(range_del_entries));
         }
@@ -483,6 +483,13 @@ impl LeveledCompaction {
             );
         }
 
+        // Abort if the merge iterator encountered an I/O or corruption error.
+        // Without this check, a partial merge (stopped by error → returns None)
+        // would silently proceed to delete the input files, causing data loss.
+        if let Some(e) = merger.error() {
+            return Err(eg!("compaction merge iterator error: {}", e));
+        }
+
         // Record deletions
         let input_file_numbers: HashSet<u64> = task
             .input_files_level
@@ -511,7 +518,9 @@ impl LeveledCompaction {
         // Delete old SST files
         for num in &input_file_numbers {
             let old_path = db_path.join(format!("{:06}.sst", num));
-            let _ = std::fs::remove_file(old_path);
+            if let Err(e) = std::fs::remove_file(&old_path) {
+                tracing::warn!("failed to remove old SST {}: {}", old_path.display(), e);
+            }
         }
 
         if let Some(s) = stats {
@@ -553,7 +562,7 @@ impl LeveledCompaction {
         }
 
         // Inject range tombstones from new-format SSTs into the merge stream
-        let range_del_entries = collect_range_del_entries(files);
+        let range_del_entries = collect_range_del_entries(files).c(d!())?;
         if !range_del_entries.is_empty() {
             sources.push(IterSource::new(range_del_entries));
         }
@@ -714,6 +723,11 @@ impl LeveledCompaction {
             );
         }
 
+        // Abort if the merge iterator encountered an I/O or corruption error.
+        if let Some(e) = merger.error() {
+            return Err(eg!("force_merge iterator error: {}", e));
+        }
+
         let input_file_numbers: HashSet<u64> = files.iter().map(|f| f.meta.number).collect();
         for tf in files {
             edit.delete_file(level as u32, tf.meta.number);
@@ -730,7 +744,9 @@ impl LeveledCompaction {
 
         for num in &input_file_numbers {
             let old_path = db_path.join(format!("{:06}.sst", num));
-            let _ = std::fs::remove_file(old_path);
+            if let Err(e) = std::fs::remove_file(&old_path) {
+                tracing::warn!("failed to remove old SST {}: {}", old_path.display(), e);
+            }
         }
 
         if let Some(s) = stats {

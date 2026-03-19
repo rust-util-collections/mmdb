@@ -358,7 +358,13 @@ impl VersionSet {
         let old_manifest_path = self
             .db_path
             .join(format!("MANIFEST-{:06}", self.manifest_number));
-        let _ = std::fs::remove_file(old_manifest_path);
+        if let Err(e) = std::fs::remove_file(&old_manifest_path) {
+            tracing::warn!(
+                "failed to remove old manifest {}: {}",
+                old_manifest_path.display(),
+                e
+            );
+        }
 
         self.manifest_number = new_manifest_number;
         self.manifest_writer = Some(new_writer);

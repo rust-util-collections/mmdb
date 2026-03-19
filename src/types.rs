@@ -44,7 +44,10 @@ pub fn pack_sequence_and_type(seq: SequenceNumber, vt: ValueType) -> u64 {
 #[inline]
 pub fn unpack_sequence_and_type(packed: u64) -> (SequenceNumber, ValueType) {
     let seq = packed >> 8;
-    let vt = ValueType::from_u8((packed & 0xFF) as u8).unwrap_or(ValueType::Value);
+    // Safety: unknown type bytes default to Deletion (invisible) rather than
+    // Value (phantom data).  CRC-protected storage makes this path unreachable
+    // in practice; it guards against memory corruption or future format drift.
+    let vt = ValueType::from_u8((packed & 0xFF) as u8).unwrap_or(ValueType::Deletion);
     (seq, vt)
 }
 
@@ -104,7 +107,7 @@ impl InternalKey {
     #[inline]
     pub fn value_type(&self) -> ValueType {
         let trailer = self.trailer();
-        ValueType::from_u8((trailer & 0xFF) as u8).unwrap_or(ValueType::Value)
+        ValueType::from_u8((trailer & 0xFF) as u8).unwrap_or(ValueType::Deletion)
     }
 
     #[inline]
@@ -151,7 +154,7 @@ impl<'a> InternalKeyRef<'a> {
     #[inline]
     pub fn value_type(&self) -> ValueType {
         let trailer = self.trailer();
-        ValueType::from_u8((trailer & 0xFF) as u8).unwrap_or(ValueType::Value)
+        ValueType::from_u8((trailer & 0xFF) as u8).unwrap_or(ValueType::Deletion)
     }
 
     #[inline]
@@ -275,10 +278,12 @@ impl Default for WriteBatch {
 /// Allows iterating over batch contents merged with a DB snapshot.
 pub struct WriteBatchWithIndex {
     batch: WriteBatch,
-    /// Maps user_key -> index of the latest entry in batch.entries for that key.
-    index: std::collections::BTreeMap<Vec<u8>, usize>,
-    /// Range tombstones: (begin, end) pairs from delete_range calls.
-    range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Maps user_key -> (index of the latest entry in batch.entries, write position).
+    index: std::collections::BTreeMap<Vec<u8>, (usize, u64)>,
+    /// Range tombstones: (begin, end, write_position) from delete_range calls.
+    range_del_entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
+    /// Monotonic counter: each put/delete/delete_range increments this.
+    next_pos: u64,
 }
 
 impl WriteBatchWithIndex {
@@ -287,24 +292,32 @@ impl WriteBatchWithIndex {
             batch: WriteBatch::new(),
             index: std::collections::BTreeMap::new(),
             range_del_entries: Vec::new(),
+            next_pos: 0,
         }
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
         let idx = self.batch.entries.len();
+        let pos = self.next_pos;
+        self.next_pos += 1;
         self.batch.put(key, value);
-        self.index.insert(key.to_vec(), idx);
+        self.index.insert(key.to_vec(), (idx, pos));
     }
 
     pub fn delete(&mut self, key: &[u8]) {
         let idx = self.batch.entries.len();
+        let pos = self.next_pos;
+        self.next_pos += 1;
         self.batch.delete(key);
-        self.index.insert(key.to_vec(), idx);
+        self.index.insert(key.to_vec(), (idx, pos));
     }
 
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
+        let pos = self.next_pos;
+        self.next_pos += 1;
         self.batch.delete_range(begin, end);
-        self.range_del_entries.push((begin.to_vec(), end.to_vec()));
+        self.range_del_entries
+            .push((begin.to_vec(), end.to_vec(), pos));
     }
 
     pub fn len(&self) -> usize {
@@ -319,22 +332,27 @@ impl WriteBatchWithIndex {
         self.batch
     }
 
-    /// Return the range tombstones recorded by `delete_range` calls.
-    pub fn range_tombstones(&self) -> &[(Vec<u8>, Vec<u8>)] {
+    /// Total number of operations (point + range-del).
+    /// Used for sequence number range allocation.
+    pub fn operation_count(&self) -> u64 {
+        self.next_pos
+    }
+
+    /// Return the range tombstones with their write positions.
+    pub fn range_tombstones(&self) -> &[(Vec<u8>, Vec<u8>, u64)] {
         &self.range_del_entries
     }
 
-    /// Iterate the BTreeMap in order, producing (InternalKey, value) pairs
-    /// with incrementing sequence numbers starting at `base_seq`.
+    /// Iterate the BTreeMap in order, producing (InternalKey, value) pairs.
+    /// Sequence numbers are assigned as `base_seq + write_position`,
+    /// preserving temporal ordering regardless of key sort order.
     pub(crate) fn sorted_entries(&self, base_seq: SequenceNumber) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut result = Vec::with_capacity(self.index.len());
-        let mut seq = base_seq;
-        for (user_key, &entry_idx) in &self.index {
+        for (user_key, &(entry_idx, pos)) in &self.index {
             let entry = &self.batch.entries[entry_idx];
-            let ikey = InternalKey::new(user_key, seq, entry.value_type);
+            let ikey = InternalKey::new(user_key, base_seq + pos, entry.value_type);
             let value = entry.value.clone().unwrap_or_default();
             result.push((ikey.into_bytes(), value));
-            seq += 1;
         }
         result
     }

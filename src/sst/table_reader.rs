@@ -130,29 +130,34 @@ impl TableReader {
     /// Get cached index entries (shared across all TableIterators for this file).
     /// Populated once on first access, then reused via Arc.
     /// Parses extended index values (BlockHandle + optional first_key).
-    pub fn cached_index_entries(&self) -> IndexEntries {
-        self.index_entry_cache
-            .get_or_init(|| {
-                Arc::new(
-                    self.index_block
-                        .iter()
-                        .map(|(k, v)| {
-                            let d = decode_index_value_with_props(&v);
-                            IndexEntry {
-                                separator_key: k,
-                                handle: d.handle,
-                                first_key: d.first_key.map(|fk| fk.to_vec()),
-                                properties: d
-                                    .properties
-                                    .into_iter()
-                                    .map(|(n, p)| (n.to_vec(), p.to_vec()))
-                                    .collect(),
-                            }
-                        })
+    pub fn cached_index_entries(&self) -> Result<IndexEntries> {
+        if let Some(cached) = self.index_entry_cache.get() {
+            return Ok(cached.clone());
+        }
+        let entries = Arc::new(Self::parse_index_entries(&self.index_block)?);
+        // Benign race: worst case we parse twice.
+        let _ = self.index_entry_cache.set(entries.clone());
+        Ok(entries)
+    }
+
+    /// Parse index entries from the index block, propagating decode errors.
+    fn parse_index_entries(index_block: &Block) -> Result<Vec<IndexEntry>> {
+        index_block
+            .iter()
+            .map(|(k, v)| {
+                let d = decode_index_value_with_props(&v).c(d!())?;
+                Ok(IndexEntry {
+                    separator_key: k,
+                    handle: d.handle,
+                    first_key: d.first_key.map(|fk| fk.to_vec()),
+                    properties: d
+                        .properties
+                        .into_iter()
+                        .map(|(n, p)| (n.to_vec(), p.to_vec()))
                         .collect(),
-                )
+                })
             })
-            .clone()
+            .collect()
     }
 
     /// Look up a key in the SST (exact byte match). Returns the value if found.
@@ -517,7 +522,10 @@ impl TableReader {
     /// so that init_heap's first peek() always hits cache.
     pub fn pin_metadata_in_cache(&self) {
         // Populate the OnceLock index entry cache eagerly
-        let entries = self.cached_index_entries();
+        let entries = match self.cached_index_entries() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
         // Pin first data block in cache (non-evictable)
         if let Some(entry) = entries.first()
             && let Some(ref cache) = self.block_cache
@@ -660,7 +668,14 @@ impl TableIterator {
     /// Ensure index entries are loaded. Returns a reference to them.
     fn ensure_index(&mut self) -> &IndexEntries {
         if self.index_entries.is_none() {
-            self.index_entries = Some(self.reader.cached_index_entries());
+            match self.reader.cached_index_entries() {
+                Ok(entries) => self.index_entries = Some(entries),
+                Err(e) => {
+                    self.err = Some(format!("index decode error: {}", e));
+                    // Store an empty sentinel so we don't retry.
+                    self.index_entries = Some(Arc::new(Vec::new()));
+                }
+            }
         }
         self.index_entries.as_ref().unwrap()
     }

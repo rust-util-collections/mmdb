@@ -63,6 +63,8 @@ pub struct DbOptions {
     pub max_background_compactions: usize,
     /// Maximum sub-compactions per compaction job. Default: 1 (no sub-compaction).
     /// RocksDB equivalent: `max_subcompactions`.
+    /// **Not yet implemented** — accepted for API compatibility. Only single-threaded
+    /// compaction is used regardless of this value.
     pub max_subcompactions: usize,
 
     // ---- Cache behavior ----
@@ -71,22 +73,32 @@ pub struct DbOptions {
     pub pin_l0_filter_and_index_blocks_in_cache: bool,
     /// Cache index and filter blocks in block cache. Default: true.
     /// RocksDB equivalent: `cache_index_and_filter_blocks`.
+    /// **Not yet implemented** — index and filter blocks are always cached when
+    /// a block cache is configured. Accepted for API compatibility.
     pub cache_index_and_filter_blocks: bool,
 
     // ---- Write buffer ----
     /// Maximum total number of write buffers (active + immutable). Default: 6.
     /// RocksDB equivalent: `max_write_buffer_number`.
+    /// **Not yet implemented** — the actual limit is controlled by
+    /// `max_immutable_memtables`. Accepted for API compatibility.
     pub max_write_buffer_number: usize,
 
     // ---- Advanced tuning (reserved, documented) ----
     /// Use dynamic level sizes for compaction. Default: false.
     /// RocksDB equivalent: `level_compaction_dynamic_level_bytes`.
+    /// **Not yet implemented** — fixed level-size multiplier is always used.
+    /// Accepted for API compatibility.
     pub level_compaction_dynamic_level_bytes: bool,
     /// Allow concurrent memtable writes from multiple threads. Default: false.
     /// RocksDB equivalent: `allow_concurrent_memtable_write`.
+    /// **Not yet implemented** — writes are serialized via group commit.
+    /// Accepted for API compatibility.
     pub allow_concurrent_memtable_write: bool,
     /// Memtable prefix bloom ratio (fraction of memtable for bloom). Default: 0.0 (disabled).
     /// RocksDB equivalent: `memtable_prefix_bloom_ratio`.
+    /// **Not yet implemented** — memtable prefix bloom is not supported.
+    /// Accepted for API compatibility.
     pub memtable_prefix_bloom_ratio: f64,
     /// Factories for block property collectors. Each factory is called once per SST
     /// file build to produce a fresh collector instance.
@@ -238,17 +250,27 @@ pub struct ReadOptions {
     /// If set, reads will use this snapshot sequence number.
     pub snapshot: Option<u64>,
     /// Whether to fill the block cache for this read. Default: true.
+    /// **Not yet implemented** — reads always populate the cache when present.
+    /// Accepted for API compatibility.
     pub fill_cache: bool,
     /// Whether to verify checksums on reads. Default: false.
+    /// **Not yet implemented** — block checksums are always verified on read.
+    /// Accepted for API compatibility.
     pub verify_checksums: bool,
     /// Readahead size hint in bytes for sequential iteration. 0 = auto. Default: 0.
     /// RocksDB equivalent: `readahead_size`.
+    /// **Not yet implemented** — OS readahead is used.
+    /// Accepted for API compatibility.
     pub readahead_size: usize,
     /// If true, ignore prefix bloom filters and do a total order seek. Default: false.
     /// RocksDB equivalent: `total_order_seek`.
+    /// **Not yet implemented** — iterators always use the total-order path unless
+    /// created via `iter_with_prefix()`. Accepted for API compatibility.
     pub total_order_seek: bool,
     /// If true, pin data blocks in memory during iteration. Default: false.
     /// RocksDB equivalent: `pin_data`.
+    /// **Not yet implemented** — data blocks are managed by the block cache.
+    /// Accepted for API compatibility.
     pub pin_data: bool,
     /// Optional callback checked during iteration. If it returns `true` for a
     /// user key, that key is skipped without being yielded.
@@ -309,6 +331,8 @@ pub struct WriteOptions {
     /// If true, return an error instead of sleeping when writes are throttled.
     pub no_slowdown: bool,
     /// If true, gives this write lower priority during contention.
+    /// **Not yet implemented** — all writes use the same priority.
+    /// Accepted for API compatibility.
     pub low_pri: bool,
 }
 

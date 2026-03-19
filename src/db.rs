@@ -273,7 +273,8 @@ impl DB {
                 for record in reader.iter() {
                     match record {
                         Ok(data) => {
-                            Self::replay_wal_record(&data, &active_memtable, &mut max_sequence);
+                            Self::replay_wal_record(&data, &active_memtable, &mut max_sequence)
+                                .c(d!())?;
                         }
                         Err(e) => {
                             tracing::warn!("WAL {} recovery error: {}", wal_num, e);
@@ -336,7 +337,9 @@ impl DB {
         // Safe to clean up old WAL files now — data is in SST
         for wal_num in &wal_numbers {
             let old_wal = path.join(format!("{:06}.wal", wal_num));
-            let _ = std::fs::remove_file(old_wal);
+            if let Err(e) = std::fs::remove_file(&old_wal) {
+                tracing::warn!("failed to remove old WAL {}: {}", old_wal.display(), e);
+            }
         }
 
         // Record the new log number in MANIFEST
@@ -537,7 +540,7 @@ impl DB {
                         }
                     }
                 })
-                .expect("failed to spawn compaction thread");
+                .map_err(|e| eg!("failed to spawn compaction thread: {}", e))?;
             compaction_handles.push(handle);
         }
 
@@ -924,9 +927,8 @@ impl DB {
             }
             // L0 files are also at level 0.
             for tf in version.level_files(0) {
-                if tf.meta.has_range_deletions
-                    && let Ok(ts) = tf.reader.get_range_tombstones()
-                {
+                if tf.meta.has_range_deletions {
+                    let ts = tf.reader.get_range_tombstones().c(d!())?;
                     for (b, e, s) in ts {
                         all_tombstones.push((b, e, s, 0));
                     }
@@ -934,9 +936,8 @@ impl DB {
             }
             for level in 1..version.num_levels {
                 for tf in version.level_files(level) {
-                    if tf.meta.has_range_deletions
-                        && let Ok(ts) = tf.reader.get_range_tombstones()
-                    {
+                    if tf.meta.has_range_deletions {
+                        let ts = tf.reader.get_range_tombstones().c(d!())?;
                         for (b, e, s) in ts {
                             all_tombstones.push((b, e, s, level));
                         }
@@ -1085,9 +1086,8 @@ impl DB {
                 }
             }
             for tf in version.level_files(0) {
-                if tf.meta.has_range_deletions
-                    && let Ok(ts) = tf.reader.get_range_tombstones()
-                {
+                if tf.meta.has_range_deletions {
+                    let ts = tf.reader.get_range_tombstones().c(d!())?;
                     for (b, e, s) in ts {
                         all_tombstones.push((b, e, s, 0));
                     }
@@ -1095,9 +1095,8 @@ impl DB {
             }
             for level in 1..version.num_levels {
                 for tf in version.level_files(level) {
-                    if tf.meta.has_range_deletions
-                        && let Ok(ts) = tf.reader.get_range_tombstones()
-                    {
+                    if tf.meta.has_range_deletions {
+                        let ts = tf.reader.get_range_tombstones().c(d!())?;
                         for (b, e, s) in ts {
                             all_tombstones.push((b, e, s, level));
                         }
@@ -1138,7 +1137,7 @@ impl DB {
 
         let seq = self.current_sequence();
         let batch_entries = batch.sorted_entries(seq + 1);
-        let batch_len = batch_entries.len() as u64;
+        let batch_count = batch.operation_count();
 
         // Lock-free read via SuperVersion.
         let sv = self.get_super_version();
@@ -1177,13 +1176,13 @@ impl DB {
             sources.push(IterSource::from_level_iter(level_iter));
         }
 
-        let mut db_iter = DBIterator::from_sources(sources, seq + batch_len);
+        let mut db_iter = DBIterator::from_sources(sources, seq + batch_count);
 
         // Collect range tombstones (same as iter_with_range).
         let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
-        // Batch range tombstones get the highest sequence number (above batch point entries).
-        for (b, e) in batch.range_tombstones() {
-            all_tombstones.push((b.clone(), e.clone(), seq + batch_len + 1, 0));
+        // Batch range tombstones use position-based sequences (preserving write order).
+        for &(ref b, ref e, pos) in batch.range_tombstones() {
+            all_tombstones.push((b.clone(), e.clone(), seq + 1 + pos, 0));
         }
         if active_mem.has_range_deletions() {
             for (b, e, s) in active_mem.get_range_tombstones() {
@@ -1198,9 +1197,8 @@ impl DB {
             }
         }
         for tf in version.level_files(0) {
-            if tf.meta.has_range_deletions
-                && let Ok(ts) = tf.reader.get_range_tombstones()
-            {
+            if tf.meta.has_range_deletions {
+                let ts = tf.reader.get_range_tombstones().c(d!())?;
                 for (b, e, s) in ts {
                     all_tombstones.push((b, e, s, 0));
                 }
@@ -1208,9 +1206,8 @@ impl DB {
         }
         for level in 1..version.num_levels {
             for tf in version.level_files(level) {
-                if tf.meta.has_range_deletions
-                    && let Ok(ts) = tf.reader.get_range_tombstones()
-                {
+                if tf.meta.has_range_deletions {
+                    let ts = tf.reader.get_range_tombstones().c(d!())?;
                     for (b, e, s) in ts {
                         all_tombstones.push((b, e, s, level));
                     }
@@ -1834,7 +1831,9 @@ impl DB {
 
         // Clean up old WAL
         let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
-        let _ = std::fs::remove_file(old_wal_path);
+        if let Err(e) = std::fs::remove_file(&old_wal_path) {
+            tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
+        }
 
         Ok(())
     }
@@ -1934,9 +1933,9 @@ impl DB {
         buf
     }
 
-    fn replay_wal_record(data: &[u8], mem: &MemTable, max_sequence: &mut u64) {
+    fn replay_wal_record(data: &[u8], mem: &MemTable, max_sequence: &mut u64) -> Result<()> {
         if data.len() < 12 {
-            return;
+            return Err(eg!("WAL record too short: {} bytes", data.len()));
         }
         let seq = u64::from_le_bytes(data[0..8].try_into().unwrap());
         let count = u32::from_le_bytes(data[8..12].try_into().unwrap());
@@ -1944,7 +1943,7 @@ impl DB {
 
         for i in 0..count {
             if offset >= data.len() {
-                break;
+                return Err(eg!("WAL record truncated at entry {}/{}", i, count));
             }
             let entry_seq = seq + i as u64;
             *max_sequence = (*max_sequence).max(entry_seq);
@@ -1952,12 +1951,15 @@ impl DB {
             let vt = data[offset];
             offset += 1;
             if offset + 4 > data.len() {
-                break;
+                return Err(eg!(
+                    "WAL record truncated reading key length at entry {}",
+                    i
+                ));
             }
             let key_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             if offset + key_len > data.len() {
-                break;
+                return Err(eg!("WAL record truncated reading key at entry {}", i));
             }
             let key = &data[offset..offset + key_len];
             offset += key_len;
@@ -1965,13 +1967,16 @@ impl DB {
             match ValueType::from_u8(vt) {
                 Some(ValueType::Value) => {
                     if offset + 4 > data.len() {
-                        break;
+                        return Err(eg!(
+                            "WAL record truncated reading value length at entry {}",
+                            i
+                        ));
                     }
                     let val_len =
                         u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     if offset + val_len > data.len() {
-                        break;
+                        return Err(eg!("WAL record truncated reading value at entry {}", i));
                     }
                     let value = &data[offset..offset + val_len];
                     offset += val_len;
@@ -1983,21 +1988,34 @@ impl DB {
                 Some(ValueType::RangeDeletion) => {
                     // RangeDeletion: value is the end key
                     if offset + 4 > data.len() {
-                        break;
+                        return Err(eg!(
+                            "WAL record truncated reading range-del end key length at entry {}",
+                            i
+                        ));
                     }
                     let val_len =
                         u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     if offset + val_len > data.len() {
-                        break;
+                        return Err(eg!(
+                            "WAL record truncated reading range-del end key at entry {}",
+                            i
+                        ));
                     }
                     let value = &data[offset..offset + val_len];
                     offset += val_len;
                     mem.put(key, value, entry_seq, ValueType::RangeDeletion);
                 }
-                None => {}
+                None => {
+                    return Err(eg!(
+                        "WAL record contains unknown value type {} at entry {}",
+                        vt,
+                        i
+                    ));
+                }
             }
         }
+        Ok(())
     }
 
     fn write_memtable_to_sst(

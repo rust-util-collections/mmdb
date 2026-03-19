@@ -61,9 +61,10 @@ pub fn encode_header(
 
 /// Decode a record header from a 7-byte buffer.
 /// Returns (checksum, length, record_type).
-pub fn decode_header(buf: &[u8; HEADER_SIZE]) -> (u32, u16, RecordType) {
+/// `record_type` is `None` when the type byte is unknown (corruption).
+pub fn decode_header(buf: &[u8; HEADER_SIZE]) -> (u32, u16, Option<RecordType>) {
     let checksum = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let length = u16::from_le_bytes([buf[4], buf[5]]);
-    let record_type = RecordType::from_u8(buf[6]).unwrap_or(RecordType::Zero);
+    let record_type = RecordType::from_u8(buf[6]);
     (checksum, length, record_type)
 }

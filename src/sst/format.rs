@@ -114,15 +114,15 @@ pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> crate::error::Result<(BlockHan
 /// Decode an extended index value: BlockHandle + optional first_key.
 /// Old SST files store only 16-byte BlockHandle. New SSTs append first_key.
 /// Format: `[BlockHandle(16 bytes)][first_key_len(4 bytes LE)][first_key_bytes]`
-pub fn decode_index_value(data: &[u8]) -> (BlockHandle, Option<&[u8]>) {
-    let handle = BlockHandle::decode(data).unwrap_or(BlockHandle::new(0, 0));
+pub fn decode_index_value(data: &[u8]) -> crate::error::Result<(BlockHandle, Option<&[u8]>)> {
+    let handle = BlockHandle::decode(data).c(d!())?;
     if data.len() > 20 {
         let fk_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         if fk_len > 0 && data.len() >= 20 + fk_len {
-            return (handle, Some(&data[20..20 + fk_len]));
+            return Ok((handle, Some(&data[20..20 + fk_len])));
         }
     }
-    (handle, None)
+    Ok((handle, None))
 }
 
 /// Encode an extended index value: BlockHandle + first_key.
@@ -164,17 +164,17 @@ pub struct DecodedIndexValue<'a> {
 
 /// Decode an extended index value that may contain block properties.
 /// Compatible with old format (no properties appended).
-pub fn decode_index_value_with_props(data: &[u8]) -> DecodedIndexValue<'_> {
-    let handle = BlockHandle::decode(data).unwrap_or(BlockHandle::new(0, 0));
+pub fn decode_index_value_with_props(data: &[u8]) -> crate::error::Result<DecodedIndexValue<'_>> {
+    let handle = BlockHandle::decode(data).c(d!())?;
     let mut first_key: Option<&[u8]> = None;
     let mut props = Vec::new();
 
     if data.len() <= 16 {
-        return DecodedIndexValue {
+        return Ok(DecodedIndexValue {
             handle,
             first_key: None,
             properties: props,
-        };
+        });
     }
 
     // Parse first_key
@@ -219,11 +219,11 @@ pub fn decode_index_value_with_props(data: &[u8]) -> DecodedIndexValue<'_> {
         }
     }
 
-    DecodedIndexValue {
+    Ok(DecodedIndexValue {
         handle,
         first_key,
         properties: props,
-    }
+    })
 }
 
 #[cfg(test)]
