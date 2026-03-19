@@ -117,7 +117,17 @@ impl VersionSet {
             HashMap::new();
 
         for record in reader.iter() {
-            let data = record.c(d!())?;
+            let data = match record {
+                Ok(d) => d,
+                Err(e) => {
+                    // Tolerate a truncated tail record: this is expected when the
+                    // previous process exited without syncing the MANIFEST writer
+                    // (e.g. Box::leak singleton pattern, kill -9, power loss).
+                    // Matches the WAL recovery strategy in db.rs.
+                    tracing::warn!("MANIFEST: skipping truncated tail record: {}", e);
+                    break;
+                }
+            };
             let edit = VersionEdit::decode(&data).c(d!())?;
 
             if let Some(n) = edit.next_file_number {
