@@ -20,7 +20,6 @@ use crate::sst::format::*;
 use ruc::*;
 
 /// Options for building an SST table.
-#[derive(Clone)]
 pub struct TableBuildOptions {
     pub block_size: usize,
     pub block_restart_interval: usize,
@@ -31,6 +30,23 @@ pub struct TableBuildOptions {
     pub compression: CompressionType,
     /// Fixed prefix length for prefix bloom filter. 0 = disabled.
     pub prefix_len: usize,
+    /// Block property collectors to attach per-block metadata to the index.
+    pub block_property_collectors: Vec<Box<dyn crate::options::BlockPropertyCollector>>,
+}
+
+impl Clone for TableBuildOptions {
+    fn clone(&self) -> Self {
+        Self {
+            block_size: self.block_size,
+            block_restart_interval: self.block_restart_interval,
+            bloom_bits_per_key: self.bloom_bits_per_key,
+            internal_keys: self.internal_keys,
+            compression: self.compression,
+            prefix_len: self.prefix_len,
+            // Collectors are per-build; a clone starts with empty collectors
+            block_property_collectors: Vec::new(),
+        }
+    }
 }
 
 impl Default for TableBuildOptions {
@@ -42,6 +58,7 @@ impl Default for TableBuildOptions {
             internal_keys: false,
             compression: CompressionType::None,
             prefix_len: 0,
+            block_property_collectors: Vec::new(),
         }
     }
 }
@@ -53,8 +70,8 @@ pub struct TableBuilder {
 
     // Current data block being built
     data_block: BlockBuilder,
-    // Index entries: (last_key, handle, first_key_of_block)
-    index_entries: Vec<(Vec<u8>, BlockHandle, Vec<u8>)>,
+    // Index entries: (last_key, handle, first_key_of_block, block_properties)
+    index_entries: Vec<(Vec<u8>, BlockHandle, Vec<u8>, Vec<(String, Vec<u8>)>)>,
     // First key of the current (not-yet-flushed) data block
     pending_first_key: Option<Vec<u8>>,
     // Keys for bloom filter
@@ -80,13 +97,17 @@ pub struct TableBuilder {
     /// Buffered range deletion entries (key, value) to write as a separate block.
     range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
 
+    /// Block property collectors for per-block metadata.
+    block_property_collectors: Vec<Box<dyn crate::options::BlockPropertyCollector>>,
+
     finished: bool,
 }
 
 impl TableBuilder {
     /// Create a new table builder writing to the given path.
-    pub fn new(path: &Path, options: TableBuildOptions) -> Result<Self> {
+    pub fn new(path: &Path, mut options: TableBuildOptions) -> Result<Self> {
         let file = File::create(path).c(d!())?;
+        let collectors = std::mem::take(&mut options.block_property_collectors);
         Ok(Self {
             writer: BufWriter::new(file),
             data_block: BlockBuilder::new(options.block_restart_interval),
@@ -102,6 +123,7 @@ impl TableBuilder {
             prefix_set: HashSet::new(),
             has_range_deletions: false,
             range_del_entries: Vec::new(),
+            block_property_collectors: collectors,
             finished: false,
         })
     }
@@ -170,6 +192,10 @@ impl TableBuilder {
         self.last_key = key.to_vec();
         self.num_entries += 1;
 
+        for collector in &mut self.block_property_collectors {
+            collector.add(key, value);
+        }
+
         Ok(())
     }
 
@@ -226,8 +252,15 @@ impl TableBuilder {
         );
         let block_data = builder.finish();
 
+        // Collect block properties from all collectors, then reset for next block
+        let props: Vec<(String, Vec<u8>)> = self
+            .block_property_collectors
+            .iter_mut()
+            .map(|c| (c.name().to_string(), c.finish_block()))
+            .collect();
+
         let handle = self.write_raw_block(&block_data).c(d!())?;
-        self.index_entries.push((last_key, handle, first_key));
+        self.index_entries.push((last_key, handle, first_key, props));
 
         Ok(())
     }
@@ -345,8 +378,16 @@ impl TableBuilder {
     fn write_index_block(&mut self) -> Result<BlockHandle> {
         let mut builder = BlockBuilder::new(1);
 
-        for (last_key, handle, first_key) in &self.index_entries {
-            let value = encode_index_value(handle, first_key);
+        for (last_key, handle, first_key, props) in &self.index_entries {
+            let value = if props.is_empty() {
+                encode_index_value(handle, first_key)
+            } else {
+                let prop_refs: Vec<(&str, &[u8])> = props
+                    .iter()
+                    .map(|(n, d)| (n.as_str(), d.as_slice()))
+                    .collect();
+                crate::sst::format::encode_index_value_with_props(handle, first_key, &prop_refs)
+            };
             builder.add(last_key, &value);
         }
 

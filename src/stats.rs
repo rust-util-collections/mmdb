@@ -18,6 +18,10 @@ pub struct DbStats {
     pub block_cache_hits: AtomicU64,
     /// Number of block cache misses.
     pub block_cache_misses: AtomicU64,
+    /// Per-level read sample counters (levels 0..6).
+    pub read_level_samples: [AtomicU64; 7],
+    /// Counter for sampling reads (only sample every Nth read).
+    pub read_sample_counter: AtomicU64,
 }
 
 impl DbStats {
@@ -30,6 +34,16 @@ impl DbStats {
             flushes_completed: AtomicU64::new(0),
             block_cache_hits: AtomicU64::new(0),
             block_cache_misses: AtomicU64::new(0),
+            read_level_samples: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+            read_sample_counter: AtomicU64::new(0),
         }
     }
 
@@ -60,6 +74,27 @@ impl DbStats {
 
     pub fn record_cache_miss(&self) {
         self.block_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sample a read at the given level. Only records every 16th read to
+    /// reduce contention on the atomic counters.
+    pub fn maybe_sample_read_level(&self, level: usize) {
+        let count = self.read_sample_counter.fetch_add(1, Ordering::Relaxed);
+        // Sample every 16 reads to reduce atomic contention.
+        if count % 16 == 0 {
+            if level < self.read_level_samples.len() {
+                self.read_level_samples[level].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Atomically take (read and reset) the per-level read samples.
+    pub fn take_read_level_samples(&self) -> [u64; 7] {
+        let mut result = [0u64; 7];
+        for i in 0..7 {
+            result[i] = self.read_level_samples[i].swap(0, Ordering::Relaxed);
+        }
+        result
     }
 }
 

@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::sst::format::CompressionType;
 
 /// Database-level options.
-#[derive(Debug)]
 pub struct DbOptions {
     /// Create the database directory if it does not exist.
     pub create_if_missing: bool,
@@ -86,6 +85,9 @@ pub struct DbOptions {
     /// Memtable prefix bloom ratio (fraction of memtable for bloom). Default: 0.0 (disabled).
     /// RocksDB equivalent: `memtable_prefix_bloom_ratio`.
     pub memtable_prefix_bloom_ratio: f64,
+    /// Factories for block property collectors. Each factory is called once per SST
+    /// file build to produce a fresh collector instance.
+    pub block_property_collectors: Vec<Arc<dyn Fn() -> Box<dyn BlockPropertyCollector> + Send + Sync>>,
 }
 
 impl Default for DbOptions {
@@ -120,6 +122,7 @@ impl Default for DbOptions {
             level_compaction_dynamic_level_bytes: false,
             allow_concurrent_memtable_write: false,
             memtable_prefix_bloom_ratio: 0.0,
+            block_property_collectors: Vec::new(),
         }
     }
 }
@@ -156,7 +159,32 @@ impl Clone for DbOptions {
             level_compaction_dynamic_level_bytes: self.level_compaction_dynamic_level_bytes,
             allow_concurrent_memtable_write: self.allow_concurrent_memtable_write,
             memtable_prefix_bloom_ratio: self.memtable_prefix_bloom_ratio,
+            block_property_collectors: self.block_property_collectors.clone(),
         }
+    }
+}
+
+impl std::fmt::Debug for DbOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbOptions")
+            .field("create_if_missing", &self.create_if_missing)
+            .field("error_if_exists", &self.error_if_exists)
+            .field("write_buffer_size", &self.write_buffer_size)
+            .field("max_immutable_memtables", &self.max_immutable_memtables)
+            .field("l0_compaction_trigger", &self.l0_compaction_trigger)
+            .field("target_file_size_base", &self.target_file_size_base)
+            .field("max_bytes_for_level_base", &self.max_bytes_for_level_base)
+            .field("max_bytes_for_level_multiplier", &self.max_bytes_for_level_multiplier)
+            .field("num_levels", &self.num_levels)
+            .field("block_size", &self.block_size)
+            .field("block_restart_interval", &self.block_restart_interval)
+            .field("bloom_bits_per_key", &self.bloom_bits_per_key)
+            .field("compression", &self.compression)
+            .field("block_cache_capacity", &self.block_cache_capacity)
+            .field("max_open_files", &self.max_open_files)
+            .field("prefix_len", &self.prefix_len)
+            .field("block_property_collectors", &self.block_property_collectors.len())
+            .finish()
     }
 }
 
@@ -215,6 +243,8 @@ pub struct ReadOptions {
     /// Optional callback checked during iteration. If it returns `true` for a
     /// user key, that key is skipped without being yielded.
     pub skip_point: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    /// Block property filters to skip entire data blocks during iteration.
+    pub block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
 }
 
 impl std::fmt::Debug for ReadOptions {
@@ -227,6 +257,7 @@ impl std::fmt::Debug for ReadOptions {
             .field("total_order_seek", &self.total_order_seek)
             .field("pin_data", &self.pin_data)
             .field("skip_point", &self.skip_point.as_ref().map(|_| ".."))
+            .field("block_property_filters", &self.block_property_filters.len())
             .finish()
     }
 }
@@ -241,6 +272,7 @@ impl Default for ReadOptions {
             total_order_seek: false,
             pin_data: false,
             skip_point: None,
+            block_property_filters: Vec::new(),
         }
     }
 }
@@ -280,4 +312,24 @@ impl std::fmt::Debug for dyn CompactionFilter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "CompactionFilter")
     }
+}
+
+/// Collects properties from key-value pairs during SST building.
+/// One instance per property type per SST file build.
+pub trait BlockPropertyCollector: Send + Sync {
+    /// Called for each key-value pair added to the current data block.
+    fn add(&mut self, key: &[u8], value: &[u8]);
+    /// Called when a data block is flushed. Returns serialized properties
+    /// for this block. The collector is then reset for the next block.
+    fn finish_block(&mut self) -> Vec<u8>;
+    /// Unique name identifying this collector type.
+    fn name(&self) -> &str;
+}
+
+/// Filters data blocks based on collected properties during iteration.
+pub trait BlockPropertyFilter: Send + Sync {
+    /// Return true if this block should be SKIPPED (does not match the query).
+    fn should_skip(&self, properties: &[u8]) -> bool;
+    /// Name must match the corresponding BlockPropertyCollector's name.
+    fn name(&self) -> &str;
 }

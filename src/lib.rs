@@ -26,4 +26,4 @@ pub use options::{
     CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
 };
 pub use sst::format::CompressionType;
-pub use types::{SequenceNumber, WriteBatch};
+pub use types::{SequenceNumber, WriteBatch, WriteBatchWithIndex};

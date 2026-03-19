@@ -21,7 +21,19 @@ use crate::manifest::version_set::VersionSet;
 use crate::options::DbOptions;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
-use crate::types::{InternalKey, InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
+use crate::types::{
+    InternalKey, InternalKeyRef, LazyValue, SequenceNumber, ValueType, compare_internal_key,
+};
+
+/// A hint from the read path that a specific level may benefit from compaction.
+/// Accumulated by the DB and drained by the compaction worker.
+#[derive(Debug, Clone)]
+pub struct CompactionHint {
+    /// The level that was read-hot.
+    pub level: usize,
+    /// Number of sampled reads at this level.
+    pub read_count: u64,
+}
 
 /// Description of a compaction to perform.
 pub struct CompactionTask {
@@ -285,6 +297,11 @@ impl LeveledCompaction {
             internal_keys: true,
             compression: target_compression,
             prefix_len: options.prefix_len,
+            block_property_collectors: options
+                .block_property_collectors
+                .iter()
+                .map(|f| f())
+                .collect(),
         };
 
         let mut edit = VersionEdit::new();
@@ -304,7 +321,7 @@ impl LeveledCompaction {
 
             // Collect range tombstones for filtering
             if ikr.value_type() == ValueType::RangeDeletion {
-                range_tombstones.add(user_key.to_vec(), value.clone(), ikr.sequence());
+                range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
                 range_tombstones.reset();
                 // Skip older versions of the begin key
                 if let Some(ref last) = last_user_key
@@ -347,11 +364,11 @@ impl LeveledCompaction {
                 && ikr.value_type() == ValueType::Value
             {
                 use crate::options::CompactionFilterDecision;
-                match filter.filter(target_level, user_key, &final_value) {
+                match filter.filter(target_level, user_key, final_value.as_slice()) {
                     CompactionFilterDecision::Keep => {}
                     CompactionFilterDecision::Remove => continue,
                     CompactionFilterDecision::ChangeValue(new_val) => {
-                        final_value = new_val;
+                        final_value = LazyValue::Inline(new_val);
                     }
                 }
             }
@@ -389,7 +406,7 @@ impl LeveledCompaction {
             builder
                 .as_mut()
                 .unwrap()
-                .add(ikey_ref, &final_value)
+                .add(ikey_ref, final_value.as_slice())
                 .c(d!())?;
             current_size += entry_bytes;
 
@@ -519,6 +536,11 @@ impl LeveledCompaction {
             internal_keys: true,
             compression,
             prefix_len: options.prefix_len,
+            block_property_collectors: options
+                .block_property_collectors
+                .iter()
+                .map(|f| f())
+                .collect(),
         };
 
         let mut edit = VersionEdit::new();
@@ -536,7 +558,7 @@ impl LeveledCompaction {
             let user_key = ikr.user_key();
 
             if ikr.value_type() == ValueType::RangeDeletion {
-                range_tombstones.add(user_key.to_vec(), value.clone(), ikr.sequence());
+                range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
                 range_tombstones.reset();
                 if let Some(ref last) = last_user_key
                     && last.as_slice() == user_key
@@ -575,7 +597,7 @@ impl LeveledCompaction {
                 current_size = 0;
             }
 
-            builder.as_mut().unwrap().add(&ikey, &value).c(d!())?;
+            builder.as_mut().unwrap().add(&ikey, value.as_slice()).c(d!())?;
             current_size += ikey.len() + value.len();
 
             // Rate-limit compaction writes
@@ -642,6 +664,25 @@ impl LeveledCompaction {
         }
 
         Ok(())
+    }
+
+    /// Pick a compaction based on a read-triggered hint. If the hinted level
+    /// has more than one file, pick the largest file for compaction into the
+    /// next level.
+    pub fn pick_compaction_for_hint(
+        version: &Version,
+        hint: &CompactionHint,
+    ) -> Option<CompactionTask> {
+        let level = hint.level;
+        if level == 0 || level >= version.num_levels.saturating_sub(1) {
+            return None;
+        }
+        let files = version.level_files(level);
+        if files.len() <= 1 {
+            return None;
+        }
+        // Pick the largest file at the hinted level.
+        Self::pick_level_compaction(version, level)
     }
 
     /// Maximum bytes for a given level.

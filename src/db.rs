@@ -13,6 +13,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
+use crate::compaction::leveled::CompactionHint;
 use crate::compaction::LeveledCompaction;
 use crate::error::{Error, Result};
 use crate::iterator::db_iter::DBIterator;
@@ -27,7 +28,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
-use crate::types::{self, SequenceNumber, ValueType, WriteBatch};
+use crate::types::{self, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex};
 use crate::wal::{WalReader, WalWriter};
 use ruc::*;
 
@@ -78,6 +79,10 @@ pub struct DB {
     /// Readers take a read lock (uncontended, ~10ns). Writers update after
     /// memtable/version changes. Models RocksDB's SuperVersion mechanism.
     super_version: Arc<RwLock<Arc<SuperVersion>>>,
+    /// Read-triggered compaction hints accumulated from the get path.
+    read_compaction_hints: Arc<Mutex<Vec<CompactionHint>>>,
+    /// Counter for periodic read-compaction checks.
+    read_counter: AtomicU64,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -192,6 +197,11 @@ impl DB {
                 internal_keys: true,
                 compression: options.compression,
                 prefix_len: options.prefix_len,
+                block_property_collectors: options
+                    .block_property_collectors
+                    .iter()
+                    .map(|f| f())
+                    .collect(),
             };
             let mut builder = TableBuilder::new(&sst_path, build_opts).c(d!())?;
             for (key, value) in active_memtable.iter() {
@@ -264,6 +274,7 @@ impl DB {
         let num_compaction_threads = options.max_background_compactions.max(1);
         let mut compaction_handles = Vec::with_capacity(num_compaction_threads);
 
+        let read_compaction_hints = Arc::new(Mutex::new(Vec::<CompactionHint>::new()));
         for i in 0..num_compaction_threads {
             let bg_inner = Arc::clone(&inner);
             let bg_path = path.clone();
@@ -276,6 +287,7 @@ impl DB {
             let bg_sv = super_version.clone();
             let shutdown = compaction_shutdown.clone();
             let notify = compaction_notify.clone();
+            let bg_hints = read_compaction_hints.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -292,6 +304,40 @@ impl DB {
                         }
                         if shutdown.load(Ordering::Acquire) {
                             break;
+                        }
+                        // Drain read-compaction hints before picking compactions.
+                        {
+                            let hints: Vec<CompactionHint> =
+                                std::mem::take(&mut *bg_hints.lock());
+                            if !hints.is_empty() {
+                                let mut inner = bg_inner.lock();
+                                for hint in &hints {
+                                    let version = inner.versions.current();
+                                    if let Some(task) =
+                                        LeveledCompaction::pick_compaction_for_hint(&version, hint)
+                                    {
+                                        let _ = LeveledCompaction::execute_compaction_with_cache(
+                                            &task,
+                                            &mut inner.versions,
+                                            &bg_path,
+                                            &bg_options,
+                                            Some(&bg_table_cache),
+                                            Some(&bg_rate_limiter),
+                                            Some(&bg_stats),
+                                            &[],
+                                        );
+                                    }
+                                }
+                                bg_l0_count.store(
+                                    inner.versions.current().l0_file_count(),
+                                    Ordering::Relaxed,
+                                );
+                                *bg_sv.write() = Arc::new(SuperVersion {
+                                    active_memtable: inner.active_memtable.clone(),
+                                    immutable_memtables: inner.immutable_memtables.clone(),
+                                    version: inner.versions.current(),
+                                });
+                            }
                         }
                         // Run pending compactions
                         loop {
@@ -363,6 +409,8 @@ impl DB {
             compaction_handles: Mutex::new(compaction_handles),
             l0_file_count,
             super_version,
+            read_compaction_hints,
+            read_counter: AtomicU64::new(0),
         };
 
         Ok(db)
@@ -520,6 +568,11 @@ impl DB {
                 if max_tomb_seq > entry_seq {
                     return Ok(None);
                 }
+                // Sample reads at level >= 2 for read-triggered compaction.
+                if level >= 2 {
+                    self.stats.maybe_sample_read_level(level);
+                    self.maybe_check_read_compaction();
+                }
                 return Ok(result);
             }
         }
@@ -605,7 +658,12 @@ impl DB {
             if tf.meta.has_range_deletions {
                 any_range_deletions = true;
             }
-            let iter = TableIterator::new(tf.reader.clone());
+            let iter = if options.block_property_filters.is_empty() {
+                TableIterator::new(tf.reader.clone())
+            } else {
+                TableIterator::new(tf.reader.clone())
+                    .with_block_filters(options.block_property_filters.clone())
+            };
             sources.push(IterSource::from_seekable(Box::new(iter)));
         }
         for level in 1..version.num_levels {
@@ -621,8 +679,11 @@ impl DB {
                     }
                 }
             }
-            let level_iter = LevelIterator::new(files.to_vec())
+            let mut level_iter = LevelIterator::new(files.to_vec())
                 .with_range_hints(start_hint.map(|s| s.to_vec()), end_hint.map(|e| e.to_vec()));
+            if !options.block_property_filters.is_empty() {
+                level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
+            }
             sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
@@ -839,6 +900,55 @@ impl DB {
     pub fn iter_bidi(&self) -> Result<BidiIterator> {
         let db_iter = self.iter().c(d!())?;
         Ok(BidiIterator::lazy(db_iter))
+    }
+
+    /// Create a forward iterator that merges uncommitted batch writes with the
+    /// current DB state. Batch entries appear with sequence numbers above the
+    /// current snapshot so they take precedence over existing data.
+    pub fn iter_with_batch(&self, batch: &WriteBatchWithIndex) -> Result<DBIterator> {
+        self.check_usable().c(d!())?;
+
+        let seq = self.current_sequence();
+        let batch_entries = batch.sorted_entries(seq + 1);
+        let batch_len = batch.len() as u64;
+
+        // Lock-free read via SuperVersion.
+        let sv = self.get_super_version();
+        let (active_mem, imm_mems, version) =
+            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
+
+        let mut sources: Vec<IterSource> = Vec::new();
+
+        // Batch source first (highest priority due to higher sequence numbers).
+        sources.push(IterSource::new(batch_entries));
+
+        // Active memtable.
+        {
+            let cursor = MemTableCursorIter::new(active_mem.clone());
+            sources.push(IterSource::from_seekable(Box::new(cursor)));
+        }
+
+        // Immutable memtables.
+        for imm in imm_mems.iter() {
+            let cursor = MemTableCursorIter::new(Arc::clone(imm));
+            sources.push(IterSource::from_seekable(Box::new(cursor)));
+        }
+
+        // SST files: L0 individually, L1+ via LevelIterator.
+        for tf in version.level_files(0) {
+            let iter = TableIterator::new(tf.reader.clone());
+            sources.push(IterSource::from_seekable(Box::new(iter)));
+        }
+        for level in 1..version.num_levels {
+            let files = version.level_files(level);
+            if files.is_empty() {
+                continue;
+            }
+            let level_iter = LevelIterator::new(files.to_vec());
+            sources.push(IterSource::from_seekable(Box::new(level_iter)));
+        }
+
+        Ok(DBIterator::from_sources(sources, seq + batch_len))
     }
 
     /// Create a prefix iterator with lazy streaming.
@@ -1133,6 +1243,33 @@ impl DB {
             version: inner.versions.current(),
         });
         *self.super_version.write() = sv;
+    }
+
+    /// Periodically check read-level samples and generate compaction hints.
+    /// Called every 1024 reads from get_with_options.
+    fn maybe_check_read_compaction(&self) {
+        let count = self.read_counter.fetch_add(1, Ordering::Relaxed);
+        if count % 1024 != 0 {
+            return;
+        }
+        self.check_read_compaction();
+    }
+
+    /// Take read-level samples and convert them into compaction hints.
+    fn check_read_compaction(&self) {
+        let samples = self.stats.take_read_level_samples();
+        let mut hints = self.read_compaction_hints.lock();
+        for (level, &count) in samples.iter().enumerate() {
+            if count > 0 && level >= 2 {
+                hints.push(CompactionHint {
+                    level,
+                    read_count: count,
+                });
+            }
+        }
+        if !hints.is_empty() {
+            self.signal_compaction();
+        }
     }
 
     fn check_usable(&self) -> Result<()> {
@@ -1577,6 +1714,12 @@ impl DB {
             internal_keys: true,
             compression,
             prefix_len: self.options.prefix_len,
+            block_property_collectors: self
+                .options
+                .block_property_collectors
+                .iter()
+                .map(|f| f())
+                .collect(),
         };
 
         let mut builder = TableBuilder::new(path, opts).c(d!())?;

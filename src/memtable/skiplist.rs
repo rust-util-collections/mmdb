@@ -190,12 +190,12 @@ impl SeekableIterator for MemTableCursorIter {
         self.seek_internal(target);
     }
 
-    fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         if self.cursor.is_null() {
             return None;
         }
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
-        Some((k.as_bytes().to_vec(), v.clone()))
+        Some((k.as_bytes().to_vec(), crate::types::LazyValue::Inline(v.clone())))
     }
 
     /// Copy directly into caller buffers, reusing their capacity.
@@ -213,7 +213,7 @@ impl SeekableIterator for MemTableCursorIter {
         true
     }
 
-    fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         if self.cursor.is_null() {
             // Exhausted forward — seek to last for backward iteration.
             // O(1) via cached tail pointer.
@@ -222,7 +222,7 @@ impl SeekableIterator for MemTableCursorIter {
                 return None;
             }
             let (k, v) = unsafe { self.sl().node_kv(ptr) };
-            let result = (k.as_bytes().to_vec(), v.clone());
+            let result = (k.as_bytes().to_vec(), crate::types::LazyValue::Inline(v.clone()));
             // Follow prev0 for the next prev() call — O(1).
             self.cursor = unsafe { self.sl().node_prev0(ptr) };
             return Some(result);
@@ -235,7 +235,7 @@ impl SeekableIterator for MemTableCursorIter {
             return None;
         }
         let (pk, pv) = unsafe { self.sl().node_kv(prev_ptr) };
-        let result = (pk.as_bytes().to_vec(), pv.clone());
+        let result = (pk.as_bytes().to_vec(), crate::types::LazyValue::Inline(pv.clone()));
         self.cursor = prev_ptr;
         Some(result)
     }

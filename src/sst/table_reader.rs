@@ -11,13 +11,13 @@ use crate::sst::block::Block;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, RANGE_DEL_BLOCK_NAME,
-    decode_footer, decode_index_value,
+    decode_footer, decode_index_value_with_props,
 };
 use crate::stats::DbStats;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType};
 use ruc::*;
 
-/// Parsed index entry: separator key + block handle + optional first key.
+/// Parsed index entry: separator key + block handle + optional first key + block properties.
 pub struct IndexEntry {
     /// Separator key (last key of the data block).
     pub separator_key: Vec<u8>,
@@ -25,6 +25,8 @@ pub struct IndexEntry {
     pub handle: BlockHandle,
     /// First key of the data block (for deferred block reads). None for old SST format.
     pub first_key: Option<Vec<u8>>,
+    /// Block properties collected during SST build. Empty for old SST format.
+    pub properties: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Shared index entries parsed from the SST index block.
@@ -135,11 +137,15 @@ impl TableReader {
                     self.index_block
                         .iter()
                         .map(|(k, v)| {
-                            let (handle, first_key) = decode_index_value(&v);
+                            let (handle, first_key, props) = decode_index_value_with_props(&v);
                             IndexEntry {
                                 separator_key: k,
                                 handle,
                                 first_key: first_key.map(|fk| fk.to_vec()),
+                                properties: props
+                                    .into_iter()
+                                    .map(|(n, d)| (n.to_vec(), d.to_vec()))
+                                    .collect(),
                             }
                         })
                         .collect(),
@@ -609,6 +615,10 @@ pub struct TableIterator {
     /// Exclusive upper bound on user keys. When set, entries with
     /// user_key >= upper_bound are skipped to avoid unnecessary I/O.
     upper_bound: Option<Vec<u8>>,
+
+    // --- Block property filters ---
+    /// Filters that can skip entire data blocks based on collected properties.
+    block_property_filters: Vec<Arc<dyn crate::options::BlockPropertyFilter>>,
 }
 
 impl TableIterator {
@@ -632,7 +642,15 @@ impl TableIterator {
             backward_block_index: usize::MAX,
             err: None,
             upper_bound: None,
+            block_property_filters: Vec::new(),
         }
+    }
+
+    /// Attach block property filters to this iterator.
+    /// Blocks whose properties match a filter's skip criteria will be skipped entirely.
+    pub fn with_block_filters(mut self, filters: Vec<Arc<dyn crate::options::BlockPropertyFilter>>) -> Self {
+        self.block_property_filters = filters;
+        self
     }
 
     /// Ensure index entries are loaded. Returns a reference to them.
@@ -677,9 +695,9 @@ impl TableIterator {
     }
 
     /// Decode the next entry from the current block using the cursor.
-    /// Returns (key_clone, value_clone) — key is cloned from the reusable buffer,
-    /// value is copied from the block data slice.
-    fn cursor_next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    /// Decode the next entry from the current block, returning a lazy value
+    /// reference into the block's Arc data (zero-copy for the value).
+    fn cursor_next_lazy(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         let block = self.current_block.as_ref()?;
         if self.block_cursor_offset >= self.block_data_end {
             return None;
@@ -697,10 +715,18 @@ impl TableIterator {
             }
         }
         self.block_cursor_offset = next_offset;
-        Some((
-            self.block_cursor_key.clone(),
-            data[value_start..value_start + value_len].to_vec(),
-        ))
+        let lazy_val = crate::types::LazyValue::BlockRef {
+            data: block.data_arc().clone(),
+            offset: value_start as u32,
+            len: value_len as u32,
+        };
+        Some((self.block_cursor_key.clone(), lazy_val))
+    }
+
+    /// Convenience wrapper that materializes the lazy value for backward compat.
+    fn cursor_next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let (k, lv) = self.cursor_next_lazy()?;
+        Some((k, lv.into_vec()))
     }
 
     /// Seek to the first entry >= target using the index block for O(log N) lookup.
@@ -1034,6 +1060,25 @@ impl TableIterator {
                 }
             }
 
+            // Skip blocks based on block property filters
+            if !self.block_property_filters.is_empty() {
+                let props = &index_entries[block_idx].properties;
+                let mut skip = false;
+                'filter_check: for filter in &self.block_property_filters {
+                    let filter_name = filter.name().as_bytes();
+                    for (name, data) in props {
+                        if name.as_slice() == filter_name && filter.should_skip(data) {
+                            skip = true;
+                            break 'filter_check;
+                        }
+                    }
+                }
+                if skip {
+                    self.index_pos += 1;
+                    continue;
+                }
+            }
+
             let handle = index_entries[self.index_pos].handle;
             self.index_pos += 1;
 
@@ -1127,12 +1172,14 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.seek(target);
     }
 
-    fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         TableIterator::current(self)
+            .map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
     }
 
-    fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         TableIterator::prev(self)
+            .map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
@@ -1246,6 +1293,57 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
 
     fn iter_error(&self) -> Option<String> {
         self.err.clone()
+    }
+
+    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<crate::types::LazyValue> {
+        // Forward cursor path (hot path)
+        if self.current_block.is_some() {
+            let block = self.current_block.as_ref().unwrap();
+            if self.block_cursor_offset < self.block_data_end {
+                let data = block.data();
+                let result = crate::sst::block::decode_entry_reuse(
+                    data,
+                    self.block_cursor_offset,
+                    &mut self.block_cursor_key,
+                );
+                if let Some((value_start, value_len, next_offset)) = result {
+                    // Check upper bound
+                    if let Some(ref ub) = self.upper_bound {
+                        if crate::types::user_key(&self.block_cursor_key) >= ub.as_slice() {
+                            return None;
+                        }
+                    }
+                    self.block_cursor_offset = next_offset;
+                    key_buf.clear();
+                    key_buf.extend_from_slice(&self.block_cursor_key);
+                    return Some(crate::types::LazyValue::BlockRef {
+                        data: block.data_arc().clone(),
+                        offset: value_start as u32,
+                        len: value_len as u32,
+                    });
+                }
+            }
+        }
+        // Materialized entries path (backward iteration)
+        if self.block_pos < self.current_block_entries.len() {
+            let (ref k, ref v) = self.current_block_entries[self.block_pos];
+            if let Some(ref ub) = self.upper_bound {
+                if crate::types::user_key(k) >= ub.as_slice() {
+                    return None;
+                }
+            }
+            key_buf.clear();
+            key_buf.extend_from_slice(k);
+            let lv = crate::types::LazyValue::Inline(v.clone());
+            self.block_pos += 1;
+            return Some(lv);
+        }
+        // Try loading next block
+        if !self.load_next_block() {
+            return None;
+        }
+        // Recurse once after loading a new block
+        self.next_lazy(key_buf)
     }
 }
 

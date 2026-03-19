@@ -334,6 +334,12 @@ impl Block {
         &self.data
     }
 
+    /// Return a reference to the Arc wrapping the raw block data.
+    /// Used by LazyValue to keep the block alive without copying values.
+    pub fn data_arc(&self) -> &Arc<Vec<u8>> {
+        &self.data
+    }
+
     /// Binary search for a key using restart points, then linear scan.
     /// Returns Some((key, value)) for exact user key match at the latest sequence,
     /// or None if not found.

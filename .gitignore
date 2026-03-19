@@ -4,3 +4,8 @@
 **/*.proptest-regressions
 
 Cargo.lock
+
+.claude
+.copilot
+.aider
+.gemini

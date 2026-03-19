@@ -23,7 +23,7 @@ pub struct DBIterator {
     /// Whether last_user_key has been set at least once.
     has_last_key: bool,
     /// Buffered current entry for valid()/key()/value() API.
-    current: Option<(Vec<u8>, Vec<u8>)>,
+    current: Option<(Vec<u8>, crate::types::LazyValue)>,
     /// Whether we've already consumed current via advance().
     needs_advance: bool,
     /// Pre-fragmented, immutable range tombstone index for O(log T) coverage
@@ -38,7 +38,7 @@ pub struct DBIterator {
     /// Overshoot buffer for backward iteration: when collecting entries for one
     /// user key, we may read the first entry of the *previous* user key. This
     /// field saves that entry so the next backward walk consumes it first.
-    prev_overshoot: Option<(Vec<u8>, Vec<u8>)>,
+    prev_overshoot: Option<(Vec<u8>, crate::types::LazyValue)>,
     /// True when the last operation was a backward resolution (prev/seek_to_last).
     /// On the next forward iteration (next_visible), the merger must be re-seeked
     /// past the current user key to resume forward scanning correctly.
@@ -276,7 +276,7 @@ impl DBIterator {
     ///
     /// Uses peek_entry/advance_entry/take_entry to avoid heap allocations for
     /// skipped entries. Only the one returned entry pays the allocation cost.
-    fn next_visible(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn next_visible(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         // After a backward operation (prev/seek_to_last), the merger is in backward mode.
         // Re-seek forward past the last user key so forward iteration resumes correctly.
         if self.backward_positioned {
@@ -406,11 +406,11 @@ impl DBIterator {
 
     pub fn value(&mut self) -> &[u8] {
         self.ensure_current();
-        &self
-            .current
+        self.current
             .as_ref()
             .expect("called value() on invalid iterator")
             .1
+            .as_slice()
     }
 
     pub fn advance(&mut self) {
@@ -500,7 +500,7 @@ impl DBIterator {
             // we first see the lowest-seq entries, then higher-seq ones for the same user_key.
             let mut candidate_uk: Option<Vec<u8>> = None;
             // Best visible entry: (user_key, value) with highest seq <= snapshot
-            let mut best_entry: Option<(Vec<u8>, Vec<u8>)> = None;
+            let mut best_entry: Option<(Vec<u8>, crate::types::LazyValue)> = None;
             let mut best_seq: SequenceNumber = 0;
             // Track if best visible version is a deletion
             let mut best_is_deletion = false;
@@ -735,9 +735,9 @@ impl Iterator for DBIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.ensure_current() {
-            let entry = self.current.take();
+            let (k, lv) = self.current.take().unwrap();
             self.needs_advance = true;
-            entry
+            Some((k, lv.into_vec()))
         } else {
             None
         }

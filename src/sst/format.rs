@@ -131,6 +131,82 @@ pub fn encode_index_value(handle: &BlockHandle, first_key: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Encode an extended index value with block properties:
+/// `[BlockHandle(16)][first_key_len(4 LE)][first_key][num_props(2 LE)]`
+/// followed by for each property:
+/// `[name_len(2 LE)][name bytes][data_len(2 LE)][data bytes]`
+pub fn encode_index_value_with_props(
+    handle: &BlockHandle,
+    first_key: &[u8],
+    properties: &[(&str, &[u8])],
+) -> Vec<u8> {
+    let mut buf = encode_index_value(handle, first_key);
+    let num_props = properties.len() as u16;
+    buf.extend_from_slice(&num_props.to_le_bytes());
+    for (name, data) in properties {
+        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        buf.extend_from_slice(data);
+    }
+    buf
+}
+
+/// Decode an extended index value that may contain block properties.
+/// Returns (BlockHandle, optional first_key, properties).
+/// Compatible with old format (no properties appended).
+pub fn decode_index_value_with_props(data: &[u8]) -> (BlockHandle, Option<&[u8]>, Vec<(&[u8], &[u8])>) {
+    let handle = BlockHandle::decode(data);
+    let mut first_key: Option<&[u8]> = None;
+    let mut props = Vec::new();
+
+    if data.len() <= 16 {
+        return (handle, None, props);
+    }
+
+    // Parse first_key
+    let mut offset = 16;
+    if data.len() >= offset + 4 {
+        let fk_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if fk_len > 0 && data.len() >= offset + fk_len {
+            first_key = Some(&data[offset..offset + fk_len]);
+            offset += fk_len;
+        }
+    }
+
+    // Parse properties (if present)
+    if data.len() >= offset + 2 {
+        let num_props = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        for _ in 0..num_props {
+            if data.len() < offset + 2 {
+                break;
+            }
+            let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            if data.len() < offset + name_len {
+                break;
+            }
+            let name = &data[offset..offset + name_len];
+            offset += name_len;
+            if data.len() < offset + 2 {
+                break;
+            }
+            let data_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            if data.len() < offset + data_len {
+                break;
+            }
+            let prop_data = &data[offset..offset + data_len];
+            offset += data_len;
+            props.push((name, prop_data));
+        }
+    }
+
+    (handle, first_key, props)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

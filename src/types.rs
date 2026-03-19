@@ -5,6 +5,7 @@
 //!   Sort order: user_key ASC, sequence DESC, value_type DESC
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 /// Global monotonically increasing sequence number.
 pub type SequenceNumber = u64;
@@ -260,6 +261,153 @@ impl WriteBatch {
 impl Default for WriteBatch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WriteBatchWithIndex — indexed batch for iteration over uncommitted writes
+// ---------------------------------------------------------------------------
+
+/// A WriteBatch with a secondary sorted index for efficient iteration.
+/// Allows iterating over batch contents merged with a DB snapshot.
+pub struct WriteBatchWithIndex {
+    batch: WriteBatch,
+    /// Maps user_key -> index of the latest entry in batch.entries for that key.
+    index: std::collections::BTreeMap<Vec<u8>, usize>,
+}
+
+impl WriteBatchWithIndex {
+    pub fn new() -> Self {
+        Self {
+            batch: WriteBatch::new(),
+            index: std::collections::BTreeMap::new(),
+        }
+    }
+
+    pub fn put(&mut self, key: &[u8], value: &[u8]) {
+        let idx = self.batch.entries.len();
+        self.batch.put(key, value);
+        self.index.insert(key.to_vec(), idx);
+    }
+
+    pub fn delete(&mut self, key: &[u8]) {
+        let idx = self.batch.entries.len();
+        self.batch.delete(key);
+        self.index.insert(key.to_vec(), idx);
+    }
+
+    pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
+        let idx = self.batch.entries.len();
+        self.batch.delete_range(begin, end);
+        self.index.insert(begin.to_vec(), idx);
+    }
+
+    pub fn len(&self) -> usize {
+        self.batch.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.batch.is_empty()
+    }
+
+    pub fn into_batch(self) -> WriteBatch {
+        self.batch
+    }
+
+    /// Iterate the BTreeMap in order, producing (InternalKey, value) pairs
+    /// with incrementing sequence numbers starting at `base_seq`.
+    pub(crate) fn sorted_entries(&self, base_seq: SequenceNumber) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut result = Vec::with_capacity(self.index.len());
+        let mut seq = base_seq;
+        for (user_key, &entry_idx) in &self.index {
+            let entry = &self.batch.entries[entry_idx];
+            let ikey = InternalKey::new(user_key, seq, entry.value_type);
+            let value = entry.value.clone().unwrap_or_default();
+            result.push((ikey.into_bytes(), value));
+            seq += 1;
+        }
+        result
+    }
+}
+
+impl Default for WriteBatchWithIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LazyValue — deferred value materialization
+// ---------------------------------------------------------------------------
+
+/// A value that may be either owned or a zero-copy reference into block data.
+///
+/// Used internally to defer value copying until the caller actually needs
+/// ownership.  Skip-heavy paths (dedup, tombstone checks) call `as_slice()`
+/// without ever allocating, while the final `Iterator::next()` boundary
+/// calls `into_vec()` to produce the owned bytes the public API promises.
+#[derive(Clone)]
+pub enum LazyValue {
+    /// Owned bytes (from memtable sources or materialized backward iteration).
+    Inline(Vec<u8>),
+    /// Zero-copy slice into a cached/pinned SST block.
+    /// The `Arc` keeps the underlying block data alive.
+    BlockRef {
+        data: Arc<Vec<u8>>,
+        offset: u32,
+        len: u32,
+    },
+}
+
+impl LazyValue {
+    /// View the value bytes without copying.
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            LazyValue::Inline(v) => v,
+            LazyValue::BlockRef { data, offset, len } => {
+                &data[*offset as usize..(*offset + *len) as usize]
+            }
+        }
+    }
+
+    /// Consume self and produce owned bytes.
+    #[inline]
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            LazyValue::Inline(v) => v,
+            LazyValue::BlockRef { data, offset, len } => {
+                data[offset as usize..(offset + len) as usize].to_vec()
+            }
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            LazyValue::Inline(v) => v.len(),
+            LazyValue::BlockRef { len, .. } => *len as usize,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Create an empty inline value.
+    #[inline]
+    pub fn empty() -> Self {
+        LazyValue::Inline(Vec::new())
+    }
+}
+
+impl std::fmt::Debug for LazyValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LazyValue::Inline(v) => write!(f, "Inline({}B)", v.len()),
+            LazyValue::BlockRef { len, .. } => write!(f, "BlockRef({}B)", len),
+        }
     }
 }
 

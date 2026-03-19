@@ -4,8 +4,11 @@
 //! and opens one file's TableIterator at a time. This reduces MergingIterator heap size
 //! from O(total_files) to O(L0_count + num_levels).
 
+use std::sync::Arc;
+
 use crate::iterator::merge::SeekableIterator;
 use crate::manifest::version::TableFile;
+use crate::options::BlockPropertyFilter;
 use crate::sst::table_reader::TableIterator;
 use crate::types::compare_internal_key;
 
@@ -30,6 +33,8 @@ pub struct LevelIterator {
     end_hint: Option<Vec<u8>>,
     /// Upper bound for iteration (set via set_bounds).
     upper_bound: Option<Vec<u8>>,
+    /// Block property filters to pass to each TableIterator.
+    block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
 }
 
 impl LevelIterator {
@@ -43,6 +48,7 @@ impl LevelIterator {
             start_hint: None,
             end_hint: None,
             upper_bound: None,
+            block_property_filters: Vec::new(),
         }
     }
 
@@ -56,6 +62,12 @@ impl LevelIterator {
     pub fn with_range_hints(mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) -> Self {
         self.start_hint = start;
         self.end_hint = end;
+        self
+    }
+
+    /// Attach block property filters that will be passed to each TableIterator.
+    pub fn with_block_filters(mut self, filters: Vec<Arc<dyn BlockPropertyFilter>>) -> Self {
+        self.block_property_filters = filters;
         self
     }
 
@@ -114,6 +126,9 @@ impl LevelIterator {
                 }
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if !self.block_property_filters.is_empty() {
+                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
+            }
             if let Some(ref ub) = self.upper_bound {
                 table_iter.set_bounds(None, Some(ub));
             }
@@ -157,16 +172,17 @@ impl super::merge::SeekableIterator for LevelIterator {
         self.seek_impl(target);
     }
 
-    fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         self.current_iter.as_ref().and_then(|iter| iter.current())
+            .map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
     }
 
-    fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         // Try prev within current table iterator
         if let Some(ref mut iter) = self.current_iter
             && let Some(entry) = iter.prev()
         {
-            return Some(entry);
+            return Some((entry.0, crate::types::LazyValue::Inline(entry.1)));
         }
         // Current table exhausted backward — move to previous file
         loop {
@@ -180,6 +196,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 continue;
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if !self.block_property_filters.is_empty() {
+                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
+            }
             if let Some(ref ub) = self.upper_bound {
                 table_iter.set_bounds(None, Some(ub));
             }
@@ -188,7 +207,7 @@ impl super::merge::SeekableIterator for LevelIterator {
             // subsequent prev() calls work correctly.
             if let Some(entry) = table_iter.current() {
                 self.current_iter = Some(table_iter);
-                return Some(entry);
+                return Some((entry.0, crate::types::LazyValue::Inline(entry.1)));
             }
         }
     }
@@ -215,6 +234,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 continue;
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if !self.block_property_filters.is_empty() {
+                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
+            }
             if let Some(ref ub) = self.upper_bound {
                 table_iter.set_bounds(None, Some(ub));
             }
@@ -244,6 +266,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 continue;
             }
             let mut table_iter = TableIterator::new(tf.reader.clone());
+            if !self.block_property_filters.is_empty() {
+                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
+            }
             if let Some(ref ub) = self.upper_bound {
                 table_iter.set_bounds(None, Some(ub));
             }
