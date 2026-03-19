@@ -748,17 +748,36 @@ impl DBIterator {
     }
 }
 
+impl DBIterator {
+    /// Advance to the next visible entry, returning LazyValue without
+    /// materializing it. Avoids the into_vec() copy that Iterator::next()
+    /// must perform.
+    #[inline(always)]
+    pub fn next_lazy(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+        if self.ensure_current() {
+            let entry = self.current.take().unwrap();
+            self.needs_advance = true;
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    /// Take ownership of the current buffered entry without advancing.
+    /// After this call, valid() returns false until the next seek/advance.
+    #[inline(always)]
+    pub fn take_current(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+        let entry = self.current.take();
+        self.needs_advance = false;
+        entry
+    }
+}
+
 impl Iterator for DBIterator {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.ensure_current() {
-            let (k, lv) = self.current.take().unwrap();
-            self.needs_advance = true;
-            Some((k, lv.into_vec()))
-        } else {
-            None
-        }
+        self.next_lazy().map(|(k, lv)| (k, lv.into_vec()))
     }
 }
 
