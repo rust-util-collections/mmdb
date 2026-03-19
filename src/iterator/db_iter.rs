@@ -199,6 +199,7 @@ impl DBIterator {
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
     pub fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
         self.merger.set_bounds(lower.as_deref(), upper.as_deref());
+        self.iterate_lower_bound = lower;
         self.iterate_upper_bound = upper;
         self.current = None;
         self.needs_advance = true;

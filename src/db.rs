@@ -479,10 +479,19 @@ impl DB {
 
     /// Delete all keys in the range [begin, end).
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()> {
+        self.delete_range_with_options(&WriteOptions::default(), begin, end)
+    }
+
+    pub fn delete_range_with_options(
+        &self,
+        write_options: &WriteOptions,
+        begin: &[u8],
+        end: &[u8],
+    ) -> Result<()> {
         self.check_usable().c(d!())?;
         let mut batch = WriteBatch::new();
         batch.delete_range(begin, end);
-        self.write_batch_inner(batch, &WriteOptions::default())
+        self.write_batch_inner(batch, write_options)
     }
 
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
@@ -1909,9 +1918,16 @@ pub struct Snapshot<'a> {
 
 impl Snapshot<'_> {
     /// The sequence number for this snapshot.
-    /// Pass to `ReadOptions { snapshot: Some(seq), .. }` for consistent reads.
     pub fn sequence(&self) -> SequenceNumber {
         self.seq
+    }
+
+    /// Return `ReadOptions` pre-configured to read at this snapshot.
+    pub fn read_options(&self) -> ReadOptions {
+        ReadOptions {
+            snapshot: Some(self.seq),
+            ..ReadOptions::default()
+        }
     }
 }
 

@@ -217,8 +217,8 @@ impl DoubleEndedIterator for BidiIterator {
                 if !db_iter.valid() {
                     return None;
                 }
-                let k = db_iter.key().unwrap().to_vec();
-                let v = db_iter.value().unwrap().to_vec();
+                let k = db_iter.key()?.to_vec();
+                let v = db_iter.value()?.to_vec();
                 self.inner = BidiInner::LazyBackStarted {
                     db_iter,
                     last_fwd_key,
@@ -257,8 +257,8 @@ impl DoubleEndedIterator for BidiIterator {
                 // O(1) memory — no materialization needed.
                 db_iter.prev();
                 if db_iter.valid() {
-                    let k = db_iter.key().unwrap().to_vec();
-                    let v = db_iter.value().unwrap().to_vec();
+                    let k = db_iter.key()?.to_vec();
+                    let v = db_iter.value()?.to_vec();
                     // Stop if backward cursor has crossed the forward frontier.
                     // Keep last_back_key unchanged — it's the correct upper bound
                     // for a subsequent next() materialization.
