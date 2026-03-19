@@ -524,7 +524,10 @@ impl TableReader {
         // Populate the OnceLock index entry cache eagerly
         let entries = match self.cached_index_entries() {
             Ok(e) => e,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("pin_metadata_in_cache: index decode error: {}", e);
+                return;
+            }
         };
         // Pin first data block in cache (non-evictable)
         if let Some(entry) = entries.first()
