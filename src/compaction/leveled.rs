@@ -762,15 +762,24 @@ impl LeveledCompaction {
     }
 
     /// Find files in a level that overlap with the given key range.
-    /// Uses `compare_internal_key` for correct variable-length user key ordering.
+    /// Uses **user key** comparison to detect overlap correctly.
+    ///
+    /// Internal key comparison is wrong here: two files sharing the same user
+    /// key at different sequence numbers can appear non-overlapping in internal
+    /// key order (higher seq sorts first). For example, an L0 tombstone at
+    /// (key, seq=100) sorts *before* an L1 value at (key, seq=0), making the
+    /// internal-key ranges disjoint even though both files contain the same
+    /// user key.
     fn overlapping_files(files: &[TableFile], smallest: &[u8], largest: &[u8]) -> Vec<TableFile> {
+        let smallest_uk = crate::types::user_key(smallest);
+        let largest_uk = crate::types::user_key(largest);
         files
             .iter()
             .filter(|f| {
-                // File overlaps if: file.largest >= smallest AND file.smallest <= largest
-                compare_internal_key(&f.meta.largest_key, smallest) != std::cmp::Ordering::Less
-                    && compare_internal_key(&f.meta.smallest_key, largest)
-                        != std::cmp::Ordering::Greater
+                let file_largest_uk = crate::types::user_key(&f.meta.largest_key);
+                let file_smallest_uk = crate::types::user_key(&f.meta.smallest_key);
+                // File overlaps if: file.largest_uk >= smallest_uk AND file.smallest_uk <= largest_uk
+                file_largest_uk >= smallest_uk && file_smallest_uk <= largest_uk
             })
             .cloned()
             .collect()
