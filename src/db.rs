@@ -9,8 +9,8 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use parking_lot::{Condvar, Mutex};
 use arc_swap::ArcSwap;
+use parking_lot::{Condvar, Mutex};
 
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
@@ -75,6 +75,17 @@ struct WriteRequest {
 struct WriteQueueState {
     queue: VecDeque<*mut WriteRequest>,
     leader_active: bool,
+}
+
+/// Atomically install a fresh SuperVersion into the given `ArcSwap`.
+/// Shared between `DB::install_super_version` and compaction threads
+/// (which only hold an `Arc<ArcSwap<…>>`, not `&DB`).
+fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
+    target.store(Arc::new(SuperVersion {
+        active_memtable: inner.active_memtable.clone(),
+        immutable_memtables: inner.immutable_memtables.clone(),
+        version: inner.versions.current(),
+    }));
 }
 
 /// The core database handle.
@@ -367,11 +378,7 @@ impl DB {
                                     inner.versions.current().l0_file_count(),
                                     Ordering::Relaxed,
                                 );
-                                bg_sv.store(Arc::new(SuperVersion {
-                                    active_memtable: inner.active_memtable.clone(),
-                                    immutable_memtables: inner.immutable_memtables.clone(),
-                                    version: inner.versions.current(),
-                                }));
+                                refresh_super_version(&bg_sv, &inner);
                             }
                         }
                         // Run pending compactions
@@ -409,11 +416,7 @@ impl DB {
                                         inner.versions.current().l0_file_count(),
                                         Ordering::Relaxed,
                                     );
-                                    bg_sv.store(Arc::new(SuperVersion {
-                                        active_memtable: inner.active_memtable.clone(),
-                                        immutable_memtables: inner.immutable_memtables.clone(),
-                                        version: inner.versions.current(),
-                                    }));
+                                    refresh_super_version(&bg_sv, &inner);
                                 }
                                 None => break,
                             }
@@ -933,10 +936,7 @@ impl DB {
             }
             let level_iter = LevelIterator::new(files.to_vec())
                 .with_prefix(prefix_owned.to_vec())
-                .with_range_hints(
-                    Some(prefix_owned.to_vec()),
-                    prefix_upper.clone(),
-                );
+                .with_range_hints(Some(prefix_owned.to_vec()), prefix_upper.clone());
             sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
@@ -1376,12 +1376,14 @@ impl DB {
     /// Refresh the SuperVersion from current inner state.
     /// Called after memtable freeze, flush, or compaction.
     fn install_super_version(&self, inner: &DBInner) {
-        let sv = Arc::new(SuperVersion {
-            active_memtable: inner.active_memtable.clone(),
-            immutable_memtables: inner.immutable_memtables.clone(),
-            version: inner.versions.current(),
-        });
-        self.super_version.store(sv);
+        refresh_super_version(&self.super_version, inner);
+    }
+
+    /// Record a background error, setting the fast-path flag and the detailed message.
+    /// All subsequent `check_usable()` calls will return this error.
+    fn set_bg_error(&self, msg: String) {
+        self.has_bg_error.store(true, Ordering::Release);
+        *self.bg_error.lock() = Some(msg);
     }
 
     /// Periodically check read-level samples and generate compaction hints.
@@ -1602,8 +1604,7 @@ impl DB {
             None
         };
         if let Some(e) = wal_sync_err {
-            self.has_bg_error.store(true, Ordering::Release);
-            *self.bg_error.lock() = Some(format!("WAL sync failed: {}", e));
+            self.set_bg_error(format!("WAL sync failed: {}", e));
             for &rp in batch_group {
                 let rr = unsafe { &mut *rp };
                 rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
