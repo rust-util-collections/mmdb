@@ -301,8 +301,7 @@ impl WriteBatchWithIndex {
 
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
         self.batch.delete_range(begin, end);
-        self.range_del_entries
-            .push((begin.to_vec(), end.to_vec()));
+        self.range_del_entries.push((begin.to_vec(), end.to_vec()));
     }
 
     pub fn len(&self) -> usize {

@@ -352,15 +352,12 @@ impl LeveledCompaction {
                 {
                     // Same key as previous — check if a snapshot needs this version.
                     // Skip snapshots already satisfied by last_written_seq.
-                    while snapshot_idx > 0
-                        && active_snapshots[snapshot_idx - 1] >= last_written_seq
+                    while snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= last_written_seq
                     {
                         snapshot_idx -= 1;
                     }
                     // Keep if a snapshot falls in [entry_seq, last_written_seq)
-                    if snapshot_idx > 0
-                        && active_snapshots[snapshot_idx - 1] >= ikr.sequence()
-                    {
+                    if snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
                         last_written_seq = ikr.sequence();
                         // Snapshot-pinned version: write as-is, skip filters below
                     } else {
@@ -608,14 +605,10 @@ impl LeveledCompaction {
                 && last.as_slice() == user_key
             {
                 // Same key — check if a snapshot needs this version.
-                while snapshot_idx > 0
-                    && active_snapshots[snapshot_idx - 1] >= last_written_seq
-                {
+                while snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= last_written_seq {
                     snapshot_idx -= 1;
                 }
-                if snapshot_idx > 0
-                    && active_snapshots[snapshot_idx - 1] >= ikr.sequence()
-                {
+                if snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
                     last_written_seq = ikr.sequence();
                 } else {
                     continue;
