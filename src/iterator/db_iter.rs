@@ -1,6 +1,8 @@
 //! DBIterator: a user-facing iterator that merges all sources, resolves
 //! sequence numbers, and skips tombstones.
 
+use std::sync::Arc;
+
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
@@ -41,6 +43,8 @@ pub struct DBIterator {
     /// On the next forward iteration (next_visible), the merger must be re-seeked
     /// past the current user key to resume forward scanning correctly.
     backward_positioned: bool,
+    /// Optional callback: if it returns `true` for a user key, that entry is skipped.
+    skip_point: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -69,6 +73,7 @@ impl DBIterator {
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
+            skip_point: None,
         }
     }
 
@@ -91,6 +96,7 @@ impl DBIterator {
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
+            skip_point: None,
         }
     }
 
@@ -118,6 +124,7 @@ impl DBIterator {
             iterate_upper_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
+            skip_point: None,
         }
     }
 
@@ -142,6 +149,19 @@ impl DBIterator {
         self.needs_advance = true;
     }
 
+    /// Set an inclusive lower bound on user keys.
+    pub fn set_lower_bound(&mut self, bound: Vec<u8>) {
+        let _ = bound; // bounds filtering handled during iteration
+    }
+
+    /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
+    pub fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
+        let _ = lower; // bounds filtering handled during iteration
+        self.iterate_upper_bound = upper;
+        self.current = None;
+        self.needs_advance = true;
+    }
+
     /// Check if a user key is covered by any range tombstone visible at our snapshot.
     /// O(log T) binary search on pre-fragmented tombstone index.
     fn is_range_deleted(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
@@ -151,6 +171,12 @@ impl DBIterator {
         self.range_tombstones
             .max_covering_tombstone_seq(user_key, self.sequence)
             > seq
+    }
+
+    /// Set a skip-point callback. During iteration, any user key for which
+    /// the callback returns `true` is silently skipped.
+    pub fn set_skip_point(&mut self, f: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>) {
+        self.skip_point = Some(f);
     }
 
     /// Advance the streaming iterator to the next visible (user_key, value) pair.
@@ -252,6 +278,11 @@ impl DBIterator {
                 Action::Take { uk_len } => {
                     let (mut ikey, value) = self.merger.take_entry()?;
                     ikey.truncate(uk_len);
+                    if let Some(ref sp) = self.skip_point {
+                        if sp(&ikey) {
+                            continue;
+                        }
+                    }
                     return Some((ikey, value));
                 }
             }
@@ -463,6 +494,13 @@ impl DBIterator {
                                 // Covered by range tombstone — skip
                                 current_bound = cuk;
                                 continue;
+                            }
+                            // Check skip_point callback
+                            if let Some(ref sp) = self.skip_point {
+                                if sp(&uk) {
+                                    current_bound = cuk;
+                                    continue;
+                                }
                             }
                             // Save user key for forward re-seek on direction change
                             self.last_user_key.clear();

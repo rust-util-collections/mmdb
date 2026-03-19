@@ -1143,10 +1143,6 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         TableIterator::seek_for_prev(self, target);
     }
 
-    fn iter_error(&self) -> Option<String> {
-        self.err.clone()
-    }
-
     fn seek_to_first(&mut self) {
         // Reset to the beginning of the table
         self.ensure_index();

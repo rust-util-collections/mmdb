@@ -195,7 +195,7 @@ impl DbOptions {
 }
 
 /// Options for read operations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReadOptions {
     /// If set, reads will use this snapshot sequence number.
     pub snapshot: Option<u64>,
@@ -212,6 +212,23 @@ pub struct ReadOptions {
     /// If true, pin data blocks in memory during iteration. Default: false.
     /// RocksDB equivalent: `pin_data`.
     pub pin_data: bool,
+    /// Optional callback checked during iteration. If it returns `true` for a
+    /// user key, that key is skipped without being yielded.
+    pub skip_point: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ReadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadOptions")
+            .field("snapshot", &self.snapshot)
+            .field("fill_cache", &self.fill_cache)
+            .field("verify_checksums", &self.verify_checksums)
+            .field("readahead_size", &self.readahead_size)
+            .field("total_order_seek", &self.total_order_seek)
+            .field("pin_data", &self.pin_data)
+            .field("skip_point", &self.skip_point.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 impl Default for ReadOptions {
@@ -223,6 +240,7 @@ impl Default for ReadOptions {
             readahead_size: 0,
             total_order_seek: false,
             pin_data: false,
+            skip_point: None,
         }
     }
 }

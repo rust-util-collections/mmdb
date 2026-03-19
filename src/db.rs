@@ -663,6 +663,9 @@ impl DB {
                 db_iter.set_range_tombstones(all_tombstones);
             }
         }
+        if let Some(ref sp) = options.skip_point {
+            db_iter.set_skip_point(Arc::clone(sp));
+        }
         Ok(db_iter)
     }
 

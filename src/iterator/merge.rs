@@ -83,6 +83,15 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
 
     /// Seek to the last entry.
     fn seek_to_last(&mut self);
+
+    /// Return the last error encountered during iteration, if any.
+    /// This distinguishes normal exhaustion (None) from I/O failures.
+    fn iter_error(&self) -> Option<String> {
+        None
+    }
+
+    /// Set lower/upper bounds for iteration. Default: no-op.
+    fn set_bounds(&mut self, _lower: Option<&[u8]>, _upper: Option<&[u8]>) {}
 }
 
 impl IterSource {
@@ -203,6 +212,13 @@ impl IterSource {
 
     pub fn is_exhausted(&mut self) -> bool {
         self.peek().is_none()
+    }
+
+    /// Propagate iteration bounds to the underlying seekable iterator (if any).
+    pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
+        if let IterSourceInner::SeekableBoxed { ref mut iter } = self.inner {
+            iter.set_bounds(lower, upper);
+        }
     }
 
     /// Issue a prefetch hint for the first data block (if backed by a seekable iterator).
@@ -407,6 +423,10 @@ pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
     /// Fast path: bypass heap when exactly one source exists.
     /// Models RocksDB's MergeIteratorBuilder single-source optimization.
     single_source: bool,
+    /// Inclusive lower bound on user keys (for bounds propagation).
+    lower_bound: Option<Vec<u8>>,
+    /// Exclusive upper bound on user keys (for bounds propagation).
+    upper_bound: Option<Vec<u8>>,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
@@ -422,6 +442,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             direction: Direction::Forward,
             single_source: single,
             current_key: Vec::new(),
+            lower_bound: None,
+            upper_bound: None,
         }
     }
 
@@ -803,6 +825,16 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.current_key.clear();
         self.initialized = false;
         self.init_heap();
+    }
+
+    /// Set iteration bounds and propagate them to all sub-iterators.
+    /// `lower` is inclusive, `upper` is exclusive (user keys).
+    pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
+        self.lower_bound = lower.map(|b| b.to_vec());
+        self.upper_bound = upper.map(|b| b.to_vec());
+        for source in self.sources.iter_mut() {
+            source.set_bounds(lower, upper);
+        }
     }
 }
 

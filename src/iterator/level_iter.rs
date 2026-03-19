@@ -27,6 +27,8 @@ pub struct LevelIterator {
     start_hint: Option<Vec<u8>>,
     /// Range pruning: user key upper bound (exclusive).
     end_hint: Option<Vec<u8>>,
+    /// Upper bound for iteration (set via set_bounds).
+    upper_bound: Option<Vec<u8>>,
 }
 
 impl LevelIterator {
@@ -39,6 +41,7 @@ impl LevelIterator {
             prefix_filter: None,
             start_hint: None,
             end_hint: None,
+            upper_bound: None,
         }
     }
 
@@ -246,6 +249,7 @@ impl super::merge::SeekableIterator for LevelIterator {
             }
         }
     }
+
 }
 
 #[cfg(test)]
