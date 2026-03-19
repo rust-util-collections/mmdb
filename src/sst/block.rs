@@ -117,6 +117,9 @@ impl Block {
         target: &[u8],
         compare: F,
     ) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.restart_offset == 0 {
+            return None;
+        }
         // Binary search on restart points
         let mut left = 0u32;
         let mut right = self.num_restarts;
@@ -172,6 +175,9 @@ impl Block {
         target: &[u8],
         compare: F,
     ) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.restart_offset == 0 {
+            return None;
+        }
         // Binary search on restart points to find the last restart point whose
         // key is <= target.
         let mut left = 0u32;
@@ -332,6 +338,9 @@ impl Block {
     /// Returns Some((key, value)) for exact user key match at the latest sequence,
     /// or None if not found.
     pub fn seek(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.restart_offset == 0 {
+            return None;
+        }
         // Binary search on restart points to find the right region
         let mut left = 0u32;
         let mut right = self.num_restarts;

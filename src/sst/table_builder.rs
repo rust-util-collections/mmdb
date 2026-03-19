@@ -77,6 +77,9 @@ pub struct TableBuilder {
     // Whether any RangeDeletion entry was added
     has_range_deletions: bool,
 
+    /// Buffered range deletion entries (key, value) to write as a separate block.
+    range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
+
     finished: bool,
 }
 
@@ -98,6 +101,7 @@ impl TableBuilder {
             largest_key: None,
             prefix_set: HashSet::new(),
             has_range_deletions: false,
+            range_del_entries: Vec::new(),
             finished: false,
         })
     }
@@ -124,11 +128,15 @@ impl TableBuilder {
         }
         self.largest_key = Some(key.to_vec());
 
-        // Track range deletions
+        // Buffer range deletions into a separate block
         if self.options.internal_keys && key.len() >= 8 {
             let ikr = crate::types::InternalKeyRef::new(key);
             if ikr.value_type() == crate::types::ValueType::RangeDeletion {
                 self.has_range_deletions = true;
+                self.range_del_entries.push((key.to_vec(), value.to_vec()));
+                self.last_key = key.to_vec();
+                self.num_entries += 1;
+                return Ok(());
             }
         }
 
@@ -178,9 +186,12 @@ impl TableBuilder {
         // Write prefix filter block
         let prefix_filter_handle = self.write_prefix_filter_block().c(d!())?;
 
+        // Write range-del block if any
+        let range_del_handle = self.write_range_del_block().c(d!())?;
+
         // Write meta index block
         let metaindex_handle = self
-            .write_metaindex_block(&filter_handle, &prefix_filter_handle)
+            .write_metaindex_block(&filter_handle, &prefix_filter_handle, &range_del_handle)
             .c(d!())?;
 
         // Write index block
@@ -291,10 +302,24 @@ impl TableBuilder {
         self.write_raw_block(&filter_data).c(d!())
     }
 
+    fn write_range_del_block(&mut self) -> Result<BlockHandle> {
+        if self.range_del_entries.is_empty() {
+            return Ok(BlockHandle::default());
+        }
+
+        let mut builder = BlockBuilder::new(self.options.block_restart_interval);
+        for (key, value) in &self.range_del_entries {
+            builder.add(key, value);
+        }
+        let data = builder.finish();
+        self.write_raw_block(&data).c(d!())
+    }
+
     fn write_metaindex_block(
         &mut self,
         filter_handle: &BlockHandle,
         prefix_filter_handle: &BlockHandle,
+        range_del_handle: &BlockHandle,
     ) -> Result<BlockHandle> {
         let mut builder = BlockBuilder::new(1);
 
@@ -306,6 +331,11 @@ impl TableBuilder {
         if prefix_filter_handle.size > 0 {
             let handle_bytes = prefix_filter_handle.encode();
             builder.add(b"filter.prefix", &handle_bytes);
+        }
+
+        if range_del_handle.size > 0 {
+            let handle_bytes = range_del_handle.encode();
+            builder.add(RANGE_DEL_BLOCK_NAME.as_bytes(), &handle_bytes);
         }
 
         let data = builder.finish();
@@ -472,5 +502,85 @@ mod tests {
             )
         );
         assert_eq!(reader.get(b"nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_range_del_block_separate_storage() {
+        use crate::sst::table_reader::TableReader;
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("range_del.sst");
+
+        let opts = TableBuildOptions {
+            internal_keys: true,
+            ..Default::default()
+        };
+        let mut builder = TableBuilder::new(&path, opts).unwrap();
+
+        // Add a mix of point entries and range deletions in sorted order.
+        // Internal key ordering: user_key ASC, sequence DESC.
+        builder
+            .add(
+                InternalKey::new(b"aaa", 10, ValueType::Value).as_bytes(),
+                b"val_a",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"bbb", 9, ValueType::RangeDeletion).as_bytes(),
+                b"ddd",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"ccc", 8, ValueType::Value).as_bytes(),
+                b"val_c",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"eee", 7, ValueType::RangeDeletion).as_bytes(),
+                b"ggg",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"fff", 6, ValueType::Value).as_bytes(),
+                b"val_f",
+            )
+            .unwrap();
+
+        let result = builder.finish().unwrap();
+        assert_eq!(result.num_entries, 5);
+        assert!(result.has_range_deletions);
+
+        // Read back and verify
+        let reader = TableReader::open(&path).unwrap();
+
+        // Data block iterator should NOT return range deletion entries
+        let entries = reader.iter().unwrap();
+        let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
+        for k in &keys {
+            if k.len() >= 8 {
+                let ikr = crate::types::InternalKeyRef::new(k);
+                assert_ne!(
+                    ikr.value_type(),
+                    ValueType::RangeDeletion,
+                    "data blocks should not contain range deletions"
+                );
+            }
+        }
+        assert_eq!(entries.len(), 3, "only point entries in data blocks");
+
+        // get_range_tombstones() should return the correct tombstones
+        let tombstones = reader.get_range_tombstones().unwrap();
+        assert_eq!(tombstones.len(), 2);
+        assert_eq!(tombstones[0].0, b"bbb");
+        assert_eq!(tombstones[0].1, b"ddd");
+        assert_eq!(tombstones[0].2, 9);
+        assert_eq!(tombstones[1].0, b"eee");
+        assert_eq!(tombstones[1].1, b"ggg");
+        assert_eq!(tombstones[1].2, 7);
     }
 }

@@ -21,7 +21,9 @@ use crate::manifest::version_set::VersionSet;
 use crate::options::DbOptions;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
-use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
+use crate::types::{
+    InternalKey, InternalKeyRef, SequenceNumber, ValueType, compare_internal_key,
+};
 
 /// Description of a compaction to perform.
 pub struct CompactionTask {
@@ -34,6 +36,26 @@ pub struct CompactionTask {
 }
 
 pub struct LeveledCompaction;
+
+/// Collect range tombstones from input files and return them as sorted
+/// internal-key entries suitable for injection into the merge iterator.
+/// This ensures tombstones from new-format SSTs (which store range
+/// deletions in a separate block) participate in the merge.
+fn collect_range_del_entries(files: &[TableFile]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut entries = Vec::new();
+    for tf in files {
+        if tf.meta.has_range_deletions {
+            if let Ok(tombstones) = tf.reader.get_range_tombstones() {
+                for (begin, end, seq) in tombstones {
+                    let ikey = InternalKey::new(&begin, seq, ValueType::RangeDeletion);
+                    entries.push((ikey.as_bytes().to_vec(), end));
+                }
+            }
+        }
+    }
+    entries.sort_by(|a, b| compare_internal_key(&a.0, &b.0));
+    entries
+}
 
 impl LeveledCompaction {
     /// Check if compaction is needed and return a task if so.
@@ -219,6 +241,19 @@ impl LeveledCompaction {
         for tf in &task.input_files_next {
             let iter = TableIterator::new(tf.reader.clone());
             sources.push(IterSource::from_boxed(Box::new(iter)));
+        }
+
+        // Inject range tombstones from new-format SSTs into the merge stream
+        let range_del_entries = collect_range_del_entries(
+            &task
+                .input_files_level
+                .iter()
+                .chain(task.input_files_next.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        if !range_del_entries.is_empty() {
+            sources.push(IterSource::new(range_del_entries));
         }
 
         // Streaming merge in internal key order (lex = logical order)
@@ -424,6 +459,12 @@ impl LeveledCompaction {
         for tf in files {
             let iter = TableIterator::new(tf.reader.clone());
             sources.push(IterSource::from_boxed(Box::new(iter)));
+        }
+
+        // Inject range tombstones from new-format SSTs into the merge stream
+        let range_del_entries = collect_range_del_entries(files);
+        if !range_del_entries.is_empty() {
+            sources.push(IterSource::new(range_del_entries));
         }
 
         let mut merger = MergingIterator::new(sources, compare_internal_key);

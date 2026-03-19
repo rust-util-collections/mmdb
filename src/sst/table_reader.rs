@@ -10,8 +10,8 @@ use crate::error::{Error, Result};
 use crate::sst::block::Block;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::{
-    BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, decode_footer,
-    decode_index_value,
+    BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, RANGE_DEL_BLOCK_NAME,
+    decode_footer, decode_index_value,
 };
 use crate::stats::DbStats;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType};
@@ -30,10 +30,11 @@ pub struct IndexEntry {
 /// Shared index entries parsed from the SST index block.
 type IndexEntries = Arc<Vec<IndexEntry>>;
 
-/// Bloom filter data read from SST metaindex.
-struct FilterData {
+/// Bloom filter data and range-del handle read from SST metaindex.
+struct MetaIndexData {
     bloom: Option<Vec<u8>>,
     prefix: Option<Vec<u8>>,
+    range_del_handle: Option<BlockHandle>,
 }
 
 /// Reader for an SST file.
@@ -54,6 +55,8 @@ pub struct TableReader {
     /// max_covering_tombstone_seq call, then reused. Avoids re-reading all
     /// data blocks on every get() call.
     range_tombstone_cache: OnceLock<Arc<Vec<CachedRangeTombstone>>>,
+    /// Handle to the range-deletion block (if present in metaindex).
+    range_del_handle: Option<BlockHandle>,
 }
 
 /// A cached range tombstone entry extracted from an SST file.
@@ -110,21 +113,22 @@ impl TableReader {
         let index_data = Self::read_block_data(&mut file, &index_handle).c(d!())?;
         let index_block = Block::from_vec(index_data).c(d!())?;
 
-        // Read filters from metaindex
-        let filters = Self::read_filters(&mut file, &metaindex_handle).c(d!())?;
+        // Read filters and range-del handle from metaindex
+        let meta = Self::read_metaindex(&mut file, &metaindex_handle).c(d!())?;
 
         Ok(Self {
             path: path.to_path_buf(),
             file_size,
             file_number,
             index_block,
-            filter_data: filters.bloom,
-            prefix_filter_data: filters.prefix,
+            filter_data: meta.bloom,
+            prefix_filter_data: meta.prefix,
             file: Mutex::new(file),
             block_cache,
             stats,
             index_entry_cache: OnceLock::new(),
             range_tombstone_cache: OnceLock::new(),
+            range_del_handle: meta.range_del_handle,
         })
     }
 
@@ -327,24 +331,45 @@ impl TableReader {
         }
 
         let mut tombstones = Vec::new();
-        for (_, handle_bytes) in self.index_block.iter() {
-            let handle = BlockHandle::decode(&handle_bytes);
-            let block_data = self.read_block_cached(&handle).c(d!())?;
-            let block = Block::new(block_data).c(d!())?;
 
+        if let Some(ref handle) = self.range_del_handle {
+            // New path: read from dedicated range-del block
+            let block_data = self.read_block_cached(handle).c(d!())?;
+            let block = Block::new(block_data).c(d!())?;
             for (k, v) in block.iter() {
                 if k.len() < 8 {
                     continue;
                 }
                 let ikr = InternalKeyRef::new(&k);
-                if ikr.value_type() != ValueType::RangeDeletion {
-                    continue;
+                if ikr.value_type() == ValueType::RangeDeletion {
+                    tombstones.push(CachedRangeTombstone {
+                        begin: ikr.user_key().to_vec(),
+                        end: v,
+                        seq: ikr.sequence(),
+                    });
                 }
-                tombstones.push(CachedRangeTombstone {
-                    begin: ikr.user_key().to_vec(),
-                    end: v,
-                    seq: ikr.sequence(),
-                });
+            }
+        } else {
+            // Backward compatibility: old SST format without range-del block
+            for (_, handle_bytes) in self.index_block.iter() {
+                let handle = BlockHandle::decode(&handle_bytes);
+                let block_data = self.read_block_cached(&handle).c(d!())?;
+                let block = Block::new(block_data).c(d!())?;
+
+                for (k, v) in block.iter() {
+                    if k.len() < 8 {
+                        continue;
+                    }
+                    let ikr = InternalKeyRef::new(&k);
+                    if ikr.value_type() != ValueType::RangeDeletion {
+                        continue;
+                    }
+                    tombstones.push(CachedRangeTombstone {
+                        begin: ikr.user_key().to_vec(),
+                        end: v,
+                        seq: ikr.sequence(),
+                    });
+                }
             }
         }
 
@@ -421,11 +446,12 @@ impl TableReader {
         Ok(data)
     }
 
-    fn read_filters(file: &mut File, metaindex_handle: &BlockHandle) -> Result<FilterData> {
+    fn read_metaindex(file: &mut File, metaindex_handle: &BlockHandle) -> Result<MetaIndexData> {
         if metaindex_handle.size == 0 {
-            return Ok(FilterData {
+            return Ok(MetaIndexData {
                 bloom: None,
                 prefix: None,
+                range_del_handle: None,
             });
         }
 
@@ -434,6 +460,7 @@ impl TableReader {
 
         let mut bloom = None;
         let mut prefix = None;
+        let mut range_del_handle = None;
 
         for (key, value) in metaindex.iter() {
             if key == b"filter.bloom" {
@@ -442,10 +469,16 @@ impl TableReader {
             } else if key == b"filter.prefix" {
                 let handle = BlockHandle::decode(&value);
                 prefix = Some(Self::read_block_data(file, &handle).c(d!())?);
+            } else if key == RANGE_DEL_BLOCK_NAME.as_bytes() {
+                range_del_handle = Some(BlockHandle::decode(&value));
             }
         }
 
-        Ok(FilterData { bloom, prefix })
+        Ok(MetaIndexData {
+            bloom,
+            prefix,
+            range_del_handle,
+        })
     }
 
     /// Check if a prefix may exist in this SST file using the prefix bloom filter.
@@ -592,6 +625,10 @@ pub struct TableIterator {
     backward_block: Option<Block>,
     /// Index of the block used for backward iteration.
     backward_block_index: usize,
+
+    // --- Error state ---
+    /// Last I/O or corruption error encountered during iteration.
+    err: Option<String>,
 }
 
 impl TableIterator {
@@ -613,6 +650,7 @@ impl TableIterator {
             current_restart_index: 0,
             backward_block: None,
             backward_block_index: usize::MAX,
+            err: None,
         }
     }
 
@@ -637,13 +675,23 @@ impl TableIterator {
 
     /// Materialize the deferred block: load the data block for deferred_index_pos.
     fn materialize_deferred_block(&mut self) {
-        if let Some(ref index_entries) = self.index_entries
-            && let Ok(data) = self
+        if let Some(ref index_entries) = self.index_entries {
+            match self
                 .reader
                 .read_block_cached(&index_entries[self.deferred_index_pos].handle)
-            && let Ok(block) = Block::new(data)
-        {
-            self.set_block_for_cursor(block);
+            {
+                Ok(data) => match Block::new(data) {
+                    Ok(block) => {
+                        self.set_block_for_cursor(block);
+                    }
+                    Err(e) => {
+                        self.err = Some(format!("block decode error: {e}"));
+                    }
+                },
+                Err(e) => {
+                    self.err = Some(format!("block read error: {e}"));
+                }
+            }
         }
     }
 
@@ -1010,9 +1058,17 @@ impl TableIterator {
                             return true;
                         }
                     }
-                    Err(_) => continue,
+                    Err(e) => {
+                        self.err =
+                            Some(format!("block decode error at index {block_idx}: {e}"));
+                        return false;
+                    }
                 },
-                Err(_) => continue,
+                Err(e) => {
+                    self.err =
+                        Some(format!("block read error at index {block_idx}: {e}"));
+                    return false;
+                }
             }
         }
         false
@@ -1085,6 +1141,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
 
     fn seek_for_prev(&mut self, target: &[u8]) {
         TableIterator::seek_for_prev(self, target);
+    }
+
+    fn iter_error(&self) -> Option<String> {
+        self.err.clone()
     }
 
     fn seek_to_first(&mut self) {

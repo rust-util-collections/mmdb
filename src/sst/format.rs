@@ -18,6 +18,9 @@ pub const TABLE_MAGIC: u64 = 0x4D4D_4442_5353_5400; // "MMDBSST\0"
 /// Fixed footer size.
 pub const FOOTER_SIZE: usize = 48;
 
+/// Metaindex key for the range-deletion block.
+pub const RANGE_DEL_BLOCK_NAME: &str = "rangedelblock";
+
 /// A handle pointing to a block within an SST file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BlockHandle {
