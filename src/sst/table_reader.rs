@@ -212,7 +212,7 @@ impl TableReader {
             .index_block
             .seek_by(seek_key.as_bytes(), compare_internal_key)
         {
-            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes),
+            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).c(d!())?,
             None => return Ok(None),
         };
 
@@ -260,7 +260,7 @@ impl TableReader {
             .index_block
             .seek_by(seek_key.as_bytes(), compare_internal_key)
         {
-            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes),
+            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).c(d!())?,
             None => return Ok(None),
         };
 
@@ -337,7 +337,7 @@ impl TableReader {
         } else {
             // Backward compatibility: old SST format without range-del block
             for (_, handle_bytes) in self.index_block.iter() {
-                let handle = BlockHandle::decode(&handle_bytes);
+                let handle = BlockHandle::decode(&handle_bytes).c(d!())?;
                 let block_data = self.read_block_cached(&handle).c(d!())?;
                 let block = Block::new(block_data).c(d!())?;
 
@@ -366,7 +366,7 @@ impl TableReader {
         let mut result = Vec::new();
 
         for (_, handle_bytes) in self.index_block.iter() {
-            let handle = BlockHandle::decode(&handle_bytes);
+            let handle = BlockHandle::decode(&handle_bytes).c(d!())?;
             let block_data = self.read_block_cached(&handle).c(d!())?;
             let block = Block::new(block_data).c(d!())?;
             for entry in block.iter() {
@@ -381,7 +381,7 @@ impl TableReader {
     fn find_data_block(&self, key: &[u8]) -> Result<Option<BlockHandle>> {
         match self.index_block.seek(key) {
             Some((_idx_key, handle_bytes)) => {
-                let handle = BlockHandle::decode(&handle_bytes);
+                let handle = BlockHandle::decode(&handle_bytes).c(d!())?;
                 Ok(Some(handle))
             }
             None => Ok(None),
@@ -446,13 +446,13 @@ impl TableReader {
 
         for (key, value) in metaindex.iter() {
             if key == b"filter.bloom" {
-                let handle = BlockHandle::decode(&value);
+                let handle = BlockHandle::decode(&value).c(d!())?;
                 bloom = Some(Self::read_block_data(file, &handle).c(d!())?);
             } else if key == b"filter.prefix" {
-                let handle = BlockHandle::decode(&value);
+                let handle = BlockHandle::decode(&value).c(d!())?;
                 prefix = Some(Self::read_block_data(file, &handle).c(d!())?);
             } else if key == RANGE_DEL_BLOCK_NAME.as_bytes() {
-                range_del_handle = Some(BlockHandle::decode(&value));
+                range_del_handle = Some(BlockHandle::decode(&value).c(d!())?);
             }
         }
 
@@ -1029,21 +1029,28 @@ impl TableIterator {
         self.ensure_index();
         let handle = self.index_entries.as_ref().unwrap()[prev_block_index].handle;
 
-        if let Ok(data) = self.reader.read_block_cached(&handle)
-            && let Ok(block) = Block::new(data)
-        {
-            // Load only the last restart segment of the previous block
-            let last_restart = block.num_restarts().saturating_sub(1);
-            self.current_block_entries = block.iter_restart_segment(last_restart);
-            if self.current_block_entries.is_empty() {
-                return None;
+        match self.reader.read_block_cached(&handle) {
+            Ok(data) => match Block::new(data) {
+                Ok(block) => {
+                    let last_restart = block.num_restarts().saturating_sub(1);
+                    self.current_block_entries = block.iter_restart_segment(last_restart);
+                    if self.current_block_entries.is_empty() {
+                        return None;
+                    }
+                    self.block_pos = self.current_block_entries.len() - 1;
+                    self.index_pos = prev_block_index + 1;
+                    self.current_restart_index = last_restart;
+                    self.backward_block = Some(block);
+                    self.backward_block_index = prev_block_index;
+                    return Some(self.current_block_entries[self.block_pos].clone());
+                }
+                Err(e) => {
+                    self.err = Some(format!("block decode error in prev: {e}"));
+                }
+            },
+            Err(e) => {
+                self.err = Some(format!("block read error in prev: {e}"));
             }
-            self.block_pos = self.current_block_entries.len() - 1;
-            self.index_pos = prev_block_index + 1;
-            self.current_restart_index = last_restart;
-            self.backward_block = Some(block);
-            self.backward_block_index = prev_block_index;
-            return Some(self.current_block_entries[self.block_pos].clone());
         }
 
         None
@@ -1220,17 +1227,25 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         // Load only the last restart segment of the last block
         let last_idx = index_entries.len() - 1;
         let handle = index_entries[last_idx].handle;
-        if let Ok(data) = self.reader.read_block_cached(&handle)
-            && let Ok(block) = Block::new(data)
-        {
-            let last_restart = block.num_restarts().saturating_sub(1);
-            self.current_block_entries = block.iter_restart_segment(last_restart);
-            if !self.current_block_entries.is_empty() {
-                self.block_pos = self.current_block_entries.len() - 1;
-                self.index_pos = last_idx + 1;
-                self.current_restart_index = last_restart;
-                self.backward_block = Some(block);
-                self.backward_block_index = last_idx;
+        match self.reader.read_block_cached(&handle) {
+            Ok(data) => match Block::new(data) {
+                Ok(block) => {
+                    let last_restart = block.num_restarts().saturating_sub(1);
+                    self.current_block_entries = block.iter_restart_segment(last_restart);
+                    if !self.current_block_entries.is_empty() {
+                        self.block_pos = self.current_block_entries.len() - 1;
+                        self.index_pos = last_idx + 1;
+                        self.current_restart_index = last_restart;
+                        self.backward_block = Some(block);
+                        self.backward_block_index = last_idx;
+                    }
+                }
+                Err(e) => {
+                    self.err = Some(format!("block decode error in seek_to_last: {e}"));
+                }
+            },
+            Err(e) => {
+                self.err = Some(format!("block read error in seek_to_last: {e}"));
             }
         }
         self.current_block = None;
@@ -1238,6 +1253,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     }
 
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
+        // Bail immediately if a prior I/O error was recorded
+        if self.err.is_some() {
+            return false;
+        }
         // Handle deferred block read
         if self.at_first_key_from_index {
             self.at_first_key_from_index = false;

@@ -274,6 +274,8 @@ pub struct WriteBatchWithIndex {
     batch: WriteBatch,
     /// Maps user_key -> index of the latest entry in batch.entries for that key.
     index: std::collections::BTreeMap<Vec<u8>, usize>,
+    /// Range tombstones: (begin, end) pairs from delete_range calls.
+    range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl WriteBatchWithIndex {
@@ -281,6 +283,7 @@ impl WriteBatchWithIndex {
         Self {
             batch: WriteBatch::new(),
             index: std::collections::BTreeMap::new(),
+            range_del_entries: Vec::new(),
         }
     }
 
@@ -298,9 +301,8 @@ impl WriteBatchWithIndex {
 
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
         self.batch.delete_range(begin, end);
-        // Range deletions are NOT point operations — they should not be in the
-        // point key index. They flow through the batch's internal entry list and
-        // are handled by the range tombstone system.
+        self.range_del_entries
+            .push((begin.to_vec(), end.to_vec()));
     }
 
     pub fn len(&self) -> usize {
@@ -313,6 +315,11 @@ impl WriteBatchWithIndex {
 
     pub fn into_batch(self) -> WriteBatch {
         self.batch
+    }
+
+    /// Return the range tombstones recorded by `delete_range` calls.
+    pub fn range_tombstones(&self) -> &[(Vec<u8>, Vec<u8>)] {
+        &self.range_del_entries
     }
 
     /// Iterate the BTreeMap in order, producing (InternalKey, value) pairs

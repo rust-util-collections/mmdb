@@ -43,14 +43,14 @@ impl BlockHandle {
         buf
     }
 
-    /// Decode from bytes. Returns zero handle if input is too short.
-    pub fn decode(buf: &[u8]) -> Self {
+    /// Decode from bytes. Returns an error if `buf` is shorter than 16 bytes.
+    pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < 16 {
-            return Self { offset: 0, size: 0 };
+            return Err(eg!("BlockHandle::decode: need 16 bytes, got {}", buf.len()));
         }
         let offset = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let size = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        Self { offset, size }
+        Ok(Self { offset, size })
     }
 }
 
@@ -106,8 +106,8 @@ pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> crate::error::Result<(BlockHan
             magic
         ))));
     }
-    let metaindex_handle = BlockHandle::decode(&data[0..16]);
-    let index_handle = BlockHandle::decode(&data[16..32]);
+    let metaindex_handle = BlockHandle::decode(&data[0..16]).c(d!())?;
+    let index_handle = BlockHandle::decode(&data[16..32]).c(d!())?;
     Ok((metaindex_handle, index_handle))
 }
 
@@ -115,7 +115,7 @@ pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> crate::error::Result<(BlockHan
 /// Old SST files store only 16-byte BlockHandle. New SSTs append first_key.
 /// Format: `[BlockHandle(16 bytes)][first_key_len(4 bytes LE)][first_key_bytes]`
 pub fn decode_index_value(data: &[u8]) -> (BlockHandle, Option<&[u8]>) {
-    let handle = BlockHandle::decode(data);
+    let handle = BlockHandle::decode(data).unwrap_or(BlockHandle::new(0, 0));
     if data.len() > 20 {
         let fk_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
         if fk_len > 0 && data.len() >= 20 + fk_len {
@@ -165,7 +165,7 @@ pub struct DecodedIndexValue<'a> {
 /// Decode an extended index value that may contain block properties.
 /// Compatible with old format (no properties appended).
 pub fn decode_index_value_with_props(data: &[u8]) -> DecodedIndexValue<'_> {
-    let handle = BlockHandle::decode(data);
+    let handle = BlockHandle::decode(data).unwrap_or(BlockHandle::new(0, 0));
     let mut first_key: Option<&[u8]> = None;
     let mut props = Vec::new();
 
@@ -234,7 +234,7 @@ mod tests {
     fn test_block_handle_encode_decode() {
         let bh = BlockHandle::new(12345, 6789);
         let encoded = bh.encode();
-        let decoded = BlockHandle::decode(&encoded);
+        let decoded = BlockHandle::decode(&encoded).unwrap();
         assert_eq!(bh, decoded);
     }
 

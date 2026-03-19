@@ -311,6 +311,10 @@ impl LeveledCompaction {
         let mut current_size = 0usize;
         let mut last_point_key: Option<Vec<u8>> = None;
         let mut last_range_del_key: Option<Vec<u8>> = None;
+        // Snapshot-aware dedup: track which snapshot boundaries still need
+        // an older version of the current key to be preserved.
+        let mut last_written_seq: SequenceNumber = 0;
+        let mut snapshot_idx: usize = active_snapshots.len();
         // Sweep-line range tombstone tracker for O(1) amortized coverage checks.
         let mut range_tombstones = RangeTombstoneTracker::new();
 
@@ -341,24 +345,45 @@ impl LeveledCompaction {
                 }
                 // Keep range tombstone in non-bottommost levels — fall through to write it
             } else {
-                // Deduplicate point keys: skip older versions of same user key
+                // Deduplicate point keys (snapshot-aware): keep the newest
+                // version, plus one version per active snapshot boundary.
                 if let Some(ref last) = last_point_key
                     && last.as_slice() == user_key
                 {
-                    continue;
-                }
-                last_point_key = Some(user_key.to_vec());
+                    // Same key as previous — check if a snapshot needs this version.
+                    // Skip snapshots already satisfied by last_written_seq.
+                    while snapshot_idx > 0
+                        && active_snapshots[snapshot_idx - 1] >= last_written_seq
+                    {
+                        snapshot_idx -= 1;
+                    }
+                    // Keep if a snapshot falls in [entry_seq, last_written_seq)
+                    if snapshot_idx > 0
+                        && active_snapshots[snapshot_idx - 1] >= ikr.sequence()
+                    {
+                        last_written_seq = ikr.sequence();
+                        // Snapshot-pinned version: write as-is, skip filters below
+                    } else {
+                        continue; // No snapshot needs this older version
+                    }
+                } else {
+                    // New user key — reset snapshot tracking
+                    last_point_key = Some(user_key.to_vec());
+                    last_written_seq = ikr.sequence();
+                    snapshot_idx = active_snapshots.len();
 
-                // Drop point tombstones at the bottommost level
-                if ikr.value_type() == ValueType::Deletion && is_bottommost {
-                    continue;
-                }
-
-                // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
-                if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
-                    let entry_seq = ikr.sequence();
-                    if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
+                    // Drop point tombstones at the bottommost level
+                    // (only the newest version — snapshot-pinned are handled above)
+                    if ikr.value_type() == ValueType::Deletion && is_bottommost {
                         continue;
+                    }
+
+                    // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
+                    if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
+                        let entry_seq = ikr.sequence();
+                        if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
+                            continue;
+                        }
                     }
                 }
             }
@@ -497,6 +522,7 @@ impl LeveledCompaction {
 
     /// Force-merge all files at a given level into one output at the same level.
     /// Drops tombstones if this is the bottommost level.
+    #[allow(clippy::too_many_arguments)]
     pub fn force_merge_level(
         level: usize,
         versions: &mut VersionSet,
@@ -505,6 +531,7 @@ impl LeveledCompaction {
         table_cache: Option<&Arc<TableCache>>,
         rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
         stats: Option<&Arc<crate::stats::DbStats>>,
+        active_snapshots: &[SequenceNumber],
     ) -> Result<()> {
         let is_bottommost = level >= options.num_levels - 1;
         let version = versions.current();
@@ -554,6 +581,8 @@ impl LeveledCompaction {
         let mut current_size = 0usize;
         let mut last_point_key: Option<Vec<u8>> = None;
         let mut last_range_del_key: Option<Vec<u8>> = None;
+        let mut last_written_seq: SequenceNumber = 0;
+        let mut snapshot_idx: usize = active_snapshots.len();
         let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
@@ -575,19 +604,31 @@ impl LeveledCompaction {
                 if is_bottommost {
                     continue;
                 }
-            } else {
-                if let Some(ref last) = last_point_key
-                    && last.as_slice() == user_key
+            } else if let Some(ref last) = last_point_key
+                && last.as_slice() == user_key
+            {
+                // Same key — check if a snapshot needs this version.
+                while snapshot_idx > 0
+                    && active_snapshots[snapshot_idx - 1] >= last_written_seq
                 {
+                    snapshot_idx -= 1;
+                }
+                if snapshot_idx > 0
+                    && active_snapshots[snapshot_idx - 1] >= ikr.sequence()
+                {
+                    last_written_seq = ikr.sequence();
+                } else {
                     continue;
                 }
+            } else {
                 last_point_key = Some(user_key.to_vec());
+                last_written_seq = ikr.sequence();
+                snapshot_idx = active_snapshots.len();
 
                 if ikr.value_type() == ValueType::Deletion && is_bottommost {
                     continue;
                 }
 
-                // Skip keys covered by range tombstones (O(1) amortized via sweep-line)
                 if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
                     let entry_seq = ikr.sequence();
                     if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {

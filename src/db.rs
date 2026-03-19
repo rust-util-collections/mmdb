@@ -944,7 +944,7 @@ impl DB {
 
         let seq = self.current_sequence();
         let batch_entries = batch.sorted_entries(seq + 1);
-        let batch_len = batch.len() as u64;
+        let batch_len = batch_entries.len() as u64;
 
         // Lock-free read via SuperVersion.
         let sv = self.get_super_version();
@@ -986,6 +986,10 @@ impl DB {
 
         // Collect range tombstones (same as iter_with_range).
         let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
+        // Batch range tombstones get the highest sequence number (above batch point entries).
+        for (b, e) in batch.range_tombstones() {
+            all_tombstones.push((b.clone(), e.clone(), seq + batch_len + 1, 0));
+        }
         if active_mem.has_range_deletions() {
             for (b, e, s) in active_mem.get_range_tombstones() {
                 all_tombstones.push((b, e, s, 0));
@@ -1685,6 +1689,7 @@ impl DB {
                 Some(&self.table_cache),
                 Some(&self.rate_limiter),
                 Some(&self.stats),
+                &active_snaps,
             )
             .c(d!())?;
         }
