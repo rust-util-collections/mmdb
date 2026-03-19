@@ -330,13 +330,13 @@ impl IterSource {
     pub fn seek_for_prev_to<F: Fn(&[u8], &[u8]) -> Ordering>(
         &mut self,
         target: &[u8],
-        _compare: &F,
+        compare: &F,
     ) {
         self.has_peeked = false;
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 // partition_point returns first idx where key > target
-                let idx = entries.partition_point(|(k, _)| k.as_slice() <= target);
+                let idx = entries.partition_point(|(k, _)| compare(k, target) != Ordering::Greater);
                 if idx > 0 {
                     *pos = idx - 1;
                     let (ref k, ref v) = entries[*pos];
@@ -528,32 +528,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         for source in self.sources.iter_mut() {
             source.prefetch_hint();
         }
-        // Phase 2: peek all sources (I/O should hit page cache / block cache).
-        // When there are many sources, use parallel threads to overlap I/O.
-        const PARALLEL_PEEK_THRESHOLD: usize = 4;
-        if self.sources.len() > PARALLEL_PEEK_THRESHOLD {
-            let base = self.sources.as_mut_ptr();
-            let len = self.sources.len();
-            // Convert pointers to usize to satisfy Send bounds. The scoped
-            // threads join before this function returns, so the mutable
-            // references remain valid for the duration.
-            let addrs: Vec<usize> =
-                (0..len).map(|i| unsafe { base.add(i) } as usize).collect();
-            std::thread::scope(|s| {
-                for addr in addrs {
-                    s.spawn(move || {
-                        // SAFETY: each thread accesses a distinct source element.
-                        // The thread::scope guarantees all threads complete before
-                        // the borrow of self.sources ends.
-                        let source = unsafe { &mut *(addr as *mut IterSource) };
-                        let _ = source.peek();
-                    });
-                }
-            });
-        } else {
-            for source in self.sources.iter_mut() {
-                let _ = source.peek();
-            }
+        // Phase 2: peek all sources (I/O should hit page cache / block cache
+        // thanks to the prefetch hints issued above).
+        for source in self.sources.iter_mut() {
+            let _ = source.peek();
         }
 
         // Collect non-exhausted source indices
@@ -745,19 +723,15 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     fn switch_to_forward(&mut self) {
         self.direction = Direction::Forward;
         if self.current_key.is_empty() {
-            // No current position — just seek to first
             for source in self.sources.iter_mut() {
                 source.seek_to_first_impl();
             }
-        } else if self.single_source {
-            // Single-source fast path bypasses the heap, so in_heap
-            // tracking is not maintained — always re-seek.
-            self.sources[0].seek_to(&self.current_key, &self.compare);
         } else {
-            for i in 0..self.sources.len() {
-                if !self.in_heap[i] {
-                    self.sources[i].seek_to(&self.current_key, &self.compare);
-                }
+            // Re-seek ALL sources: in-heap sources hold peeked entries
+            // from the backward (max-heap) direction and are not valid
+            // for a forward (min-heap) without re-positioning.
+            for source in self.sources.iter_mut() {
+                source.seek_to(&self.current_key, &self.compare);
             }
         }
         self.initialized = false;
@@ -765,23 +739,18 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     }
 
     /// Switch from forward to backward direction.
-    /// Only re-seeks sources not currently in the heap; sources still in
-    /// the heap already hold valid peeked entries and just need the heap
-    /// rebuilt for backward (max-heap) ordering.
     fn switch_to_backward(&mut self) {
         self.direction = Direction::Backward;
         if self.current_key.is_empty() {
-            // No current position — seek to last
             for source in self.sources.iter_mut() {
                 source.seek_to_last_impl();
             }
-        } else if self.single_source {
-            self.sources[0].seek_for_prev_to(&self.current_key, &self.compare);
         } else {
-            for i in 0..self.sources.len() {
-                if !self.in_heap[i] {
-                    self.sources[i].seek_for_prev_to(&self.current_key, &self.compare);
-                }
+            // Re-seek ALL sources: in-heap sources hold peeked entries
+            // from the forward (min-heap) direction and are not valid
+            // for a backward (max-heap) without re-positioning.
+            for source in self.sources.iter_mut() {
+                source.seek_for_prev_to(&self.current_key, &self.compare);
             }
         }
         self.initialized = false;
@@ -833,13 +802,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 // Single-source: just advance until >= target or fallback
                 let src = &mut self.sources[0];
                 let mut stepped = 0;
-                loop {
-                    if let Some((k, _)) = src.peek() {
-                        if (self.compare)(k, target) != Ordering::Less {
-                            break; // already >= target
-                        }
-                    } else {
-                        break; // exhausted
+                while let Some((k, _)) = src.peek() {
+                    if (self.compare)(k, target) != Ordering::Less {
+                        break; // already >= target
                     }
                     src.has_peeked = false;
                     stepped += 1;
@@ -949,6 +914,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     #[inline]
     pub fn advance_entry(&mut self) {
         if self.single_source {
+            self.last_source_level = self.sources[0].level;
             self.sources[0].skip_peeked();
             let _ = self.sources[0].peek();
             return;
@@ -959,6 +925,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
 
         let min_idx = self.heap[0];
+        self.last_source_level = self.sources[min_idx].level;
         self.sources[min_idx].skip_peeked();
         let _ = self.sources[min_idx].peek();
 
@@ -979,6 +946,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Only call this for entries that will actually be returned to the caller.
     pub fn take_entry(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
         if self.single_source {
+            self.last_source_level = self.sources[0].level;
             let entry = self.sources[0].take_peeked()?;
             self.current_key.clear();
             self.current_key.extend_from_slice(&entry.0);
@@ -991,6 +959,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
 
         let min_idx = self.heap[0];
+        self.last_source_level = self.sources[min_idx].level;
         let entry = self.sources[min_idx].take_peeked()?;
 
         self.current_key.clear();
@@ -1052,6 +1021,19 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Returns `usize::MAX` if no entry has been emitted yet.
     pub fn last_source_level(&self) -> usize {
         self.last_source_level
+    }
+
+    /// Return the LSM level of the source currently at the top of the heap
+    /// (i.e., the source whose entry would be returned by peek_entry).
+    /// Returns `usize::MAX` if no entry is available.
+    pub fn peek_source_level(&self) -> usize {
+        if self.single_source {
+            return self.sources[0].level;
+        }
+        if self.heap_size == 0 {
+            return usize::MAX;
+        }
+        self.sources[self.heap[0]].level
     }
 
     /// Return the first error from any source iterator.

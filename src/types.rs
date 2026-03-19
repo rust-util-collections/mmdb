@@ -297,9 +297,10 @@ impl WriteBatchWithIndex {
     }
 
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
-        let idx = self.batch.entries.len();
         self.batch.delete_range(begin, end);
-        self.index.insert(begin.to_vec(), idx);
+        // Range deletions are NOT point operations — they should not be in the
+        // point key index. They flow through the batch's internal entry list and
+        // are handled by the range tombstone system.
     }
 
     pub fn len(&self) -> usize {

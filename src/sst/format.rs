@@ -43,8 +43,11 @@ impl BlockHandle {
         buf
     }
 
-    /// Decode from bytes.
+    /// Decode from bytes. Returns zero handle if input is too short.
     pub fn decode(buf: &[u8]) -> Self {
+        if buf.len() < 16 {
+            return Self { offset: 0, size: 0 };
+        }
         let offset = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let size = u64::from_le_bytes(buf[8..16].try_into().unwrap());
         Self { offset, size }

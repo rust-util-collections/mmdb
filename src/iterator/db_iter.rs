@@ -35,6 +35,8 @@ pub struct DBIterator {
     /// If set, iteration stops when user key >= this bound (exclusive upper bound).
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
     iterate_upper_bound: Option<Vec<u8>>,
+    /// If set, inclusive lower bound on user keys.
+    iterate_lower_bound: Option<Vec<u8>>,
     /// Overshoot buffer for backward iteration: when collecting entries for one
     /// user key, we may read the first entry of the *previous* user key. This
     /// field saves that entry so the next backward walk consumes it first.
@@ -75,6 +77,7 @@ impl DBIterator {
             range_tombstones: FragmentedRangeTombstoneList::empty(),
             prefix: None,
             iterate_upper_bound: None,
+            iterate_lower_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
             skip_point: None,
@@ -99,6 +102,7 @@ impl DBIterator {
             range_tombstones: FragmentedRangeTombstoneList::empty(),
             prefix: None,
             iterate_upper_bound: None,
+            iterate_lower_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
             skip_point: None,
@@ -128,6 +132,7 @@ impl DBIterator {
             range_tombstones: FragmentedRangeTombstoneList::empty(),
             prefix: Some(prefix),
             iterate_upper_bound: None,
+            iterate_lower_bound: None,
             prev_overshoot: None,
             backward_positioned: false,
             skip_point: None,
@@ -147,6 +152,7 @@ impl DBIterator {
         self.range_tombstones = FragmentedRangeTombstoneList::empty();
         self.prefix = None;
         self.iterate_upper_bound = None;
+        self.iterate_lower_bound = None;
         self.prev_overshoot = None;
         self.backward_positioned = false;
         self.skip_point = None;
@@ -177,7 +183,8 @@ impl DBIterator {
     /// Iteration stops when user key >= this bound.
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
     pub fn set_upper_bound(&mut self, bound: Vec<u8>) {
-        self.merger.set_bounds(None, Some(&bound));
+        self.merger
+            .set_bounds(self.iterate_lower_bound.as_deref(), Some(&bound));
         self.iterate_upper_bound = Some(bound);
         // Invalidate any buffered entry — it may now be beyond the new bound.
         self.current = None;
@@ -186,7 +193,9 @@ impl DBIterator {
 
     /// Set an inclusive lower bound on user keys.
     pub fn set_lower_bound(&mut self, bound: Vec<u8>) {
-        self.merger.set_bounds(Some(&bound), None);
+        self.merger
+            .set_bounds(Some(&bound), self.iterate_upper_bound.as_deref());
+        self.iterate_lower_bound = Some(bound);
     }
 
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
@@ -204,24 +213,18 @@ impl DBIterator {
         self.merger.error()
     }
 
-    /// Check if a user key is covered by any range tombstone visible at our snapshot.
-    /// O(log T) binary search on pre-fragmented tombstone index.
-    /// Uses cross-level pruning: only tombstones from shallower levels can
-    /// delete a key from source_level.
-    fn is_range_deleted(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
+    /// Check if a user key is covered by any range tombstone visible at our snapshot,
+    /// without cross-level pruning. Used for backward iteration where the source level
+    /// of the best entry may not match `last_source_level` (backward collection
+    /// aggregates entries from multiple sources).
+    fn is_range_deleted_no_level_filter(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
         if self.range_tombstones.is_empty() {
             return false;
         }
-        let source_level = self.merger.last_source_level();
-        let level_filter = if source_level != usize::MAX {
-            Some(source_level)
-        } else {
-            None
-        };
         self.range_tombstones.max_covering_tombstone_seq_for_level(
             user_key,
             self.sequence,
-            level_filter,
+            None,
         ) > seq
     }
 
@@ -237,7 +240,9 @@ impl DBIterator {
     pub fn next_prefix(&mut self, prefix_len: usize) {
         // Compute the successor prefix: increment the first `prefix_len` bytes.
         if let Some((ref key, _)) = self.current {
-            let user_key = crate::types::user_key(key);
+            // `current` already holds a user key (internal key was truncated
+            // in next_visible), so do NOT call user_key() again.
+            let user_key = key.as_slice();
             if user_key.len() >= prefix_len {
                 let mut succ = user_key[..prefix_len].to_vec();
                 // Increment: find rightmost byte < 0xFF and increment it
@@ -295,6 +300,8 @@ impl DBIterator {
             Take { uk_len: usize },
         }
         loop {
+            // Get the source level before borrowing the merger for peek_entry.
+            let source_level = self.merger.peek_source_level();
             let action = {
                 let (ikey_ref, _value_ref) = self.merger.peek_entry()?;
                 if ikey_ref.len() < 8 {
@@ -346,12 +353,21 @@ impl DBIterator {
                             } else if self.range_tombstones.is_empty() {
                                 Action::Take { uk_len }
                             } else {
-                                // Must check range tombstones — inline the check
-                                // since is_range_deleted needs &self but merger is borrowed.
+                                // Check range tombstones with cross-level pruning:
+                                // only tombstones from shallower levels can delete
+                                // a key from source_level.
+                                let level_filter = if source_level != usize::MAX {
+                                    Some(source_level)
+                                } else {
+                                    None
+                                };
                                 let covered = self
                                     .range_tombstones
-                                    .max_covering_tombstone_seq(&ikey_ref[..uk_len], self.sequence)
-                                    > seq;
+                                    .max_covering_tombstone_seq_for_level(
+                                        &ikey_ref[..uk_len],
+                                        self.sequence,
+                                        level_filter,
+                                    ) > seq;
                                 if covered {
                                     Action::Skip
                                 } else {
@@ -371,10 +387,10 @@ impl DBIterator {
                 Action::Take { uk_len } => {
                     let (mut ikey, value) = self.merger.take_entry()?;
                     ikey.truncate(uk_len);
-                    if let Some(ref sp) = self.skip_point {
-                        if sp(&ikey) {
-                            continue;
-                        }
+                    if let Some(ref sp) = self.skip_point
+                        && sp(&ikey)
+                    {
+                        continue;
                     }
                     return Some((ikey, value));
                 }
@@ -587,18 +603,21 @@ impl DBIterator {
                     }
                     match best_entry {
                         Some((uk, val)) => {
-                            // Check range tombstone coverage (O(log T) binary search)
-                            if self.is_range_deleted(&uk, best_seq) {
+                            // Check range tombstone coverage (O(log T) binary search).
+                            // Use no-level-filter variant: backward collection aggregates
+                            // entries from multiple sources, so last_source_level may not
+                            // correspond to the winning entry's source.
+                            if self.is_range_deleted_no_level_filter(&uk, best_seq) {
                                 // Covered by range tombstone — skip
                                 current_bound = cuk;
                                 continue;
                             }
                             // Check skip_point callback
-                            if let Some(ref sp) = self.skip_point {
-                                if sp(&uk) {
-                                    current_bound = cuk;
-                                    continue;
-                                }
+                            if let Some(ref sp) = self.skip_point
+                                && sp(&uk)
+                            {
+                                current_bound = cuk;
+                                continue;
                             }
                             // Save user key for forward re-seek on direction change
                             self.last_user_key.clear();

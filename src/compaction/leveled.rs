@@ -54,12 +54,12 @@ pub struct LeveledCompaction;
 fn collect_range_del_entries(files: &[TableFile]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut entries = Vec::new();
     for tf in files {
-        if tf.meta.has_range_deletions {
-            if let Ok(tombstones) = tf.reader.get_range_tombstones() {
-                for (begin, end, seq) in tombstones {
-                    let ikey = InternalKey::new(&begin, seq, ValueType::RangeDeletion);
-                    entries.push((ikey.as_bytes().to_vec(), end));
-                }
+        if tf.meta.has_range_deletions
+            && let Ok(tombstones) = tf.reader.get_range_tombstones()
+        {
+            for (begin, end, seq) in tombstones {
+                let ikey = InternalKey::new(&begin, seq, ValueType::RangeDeletion);
+                entries.push((ikey.as_bytes().to_vec(), end));
             }
         }
     }
@@ -220,6 +220,7 @@ impl LeveledCompaction {
     /// Keys with sequence numbers below the smallest active snapshot get
     /// their sequence zeroed (P5.1). At the bottommost level, tombstones
     /// are dropped (P5.2).
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_compaction_with_cache(
         task: &CompactionTask,
         versions: &mut VersionSet,
@@ -308,7 +309,8 @@ impl LeveledCompaction {
         let mut builder: Option<TableBuilder> = None;
         let mut current_file_number = 0u64;
         let mut current_size = 0usize;
-        let mut last_user_key: Option<Vec<u8>> = None;
+        let mut last_point_key: Option<Vec<u8>> = None;
+        let mut last_range_del_key: Option<Vec<u8>> = None;
         // Sweep-line range tombstone tracker for O(1) amortized coverage checks.
         let mut range_tombstones = RangeTombstoneTracker::new();
 
@@ -319,30 +321,33 @@ impl LeveledCompaction {
             let ikr = InternalKeyRef::new(&ikey);
             let user_key = ikr.user_key();
 
-            // Collect range tombstones for filtering
+            // Collect range tombstones for filtering.
+            // Range-del entries use separate dedup tracking from point keys:
+            // a range-del and a point key can share the same user_key and
+            // both must be preserved.
             if ikr.value_type() == ValueType::RangeDeletion {
                 range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
                 range_tombstones.reset();
-                // Skip older versions of the begin key
-                if let Some(ref last) = last_user_key
+                // Skip older range-del versions of the same begin key
+                if let Some(ref last) = last_range_del_key
                     && last.as_slice() == user_key
                 {
                     continue;
                 }
-                last_user_key = Some(user_key.to_vec());
+                last_range_del_key = Some(user_key.to_vec());
                 // Drop range tombstones at the bottommost level
                 if is_bottommost {
                     continue;
                 }
                 // Keep range tombstone in non-bottommost levels — fall through to write it
             } else {
-                // Deduplicate: skip older versions of same user key
-                if let Some(ref last) = last_user_key
+                // Deduplicate point keys: skip older versions of same user key
+                if let Some(ref last) = last_point_key
                     && last.as_slice() == user_key
                 {
                     continue;
                 }
-                last_user_key = Some(user_key.to_vec());
+                last_point_key = Some(user_key.to_vec());
 
                 // Drop point tombstones at the bottommost level
                 if ikr.value_type() == ValueType::Deletion && is_bottommost {
@@ -547,7 +552,8 @@ impl LeveledCompaction {
         let mut builder: Option<TableBuilder> = None;
         let mut current_file_number = 0u64;
         let mut current_size = 0usize;
-        let mut last_user_key: Option<Vec<u8>> = None;
+        let mut last_point_key: Option<Vec<u8>> = None;
+        let mut last_range_del_key: Option<Vec<u8>> = None;
         let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
@@ -560,22 +566,22 @@ impl LeveledCompaction {
             if ikr.value_type() == ValueType::RangeDeletion {
                 range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
                 range_tombstones.reset();
-                if let Some(ref last) = last_user_key
+                if let Some(ref last) = last_range_del_key
                     && last.as_slice() == user_key
                 {
                     continue;
                 }
-                last_user_key = Some(user_key.to_vec());
+                last_range_del_key = Some(user_key.to_vec());
                 if is_bottommost {
                     continue;
                 }
             } else {
-                if let Some(ref last) = last_user_key
+                if let Some(ref last) = last_point_key
                     && last.as_slice() == user_key
                 {
                     continue;
                 }
-                last_user_key = Some(user_key.to_vec());
+                last_point_key = Some(user_key.to_vec());
 
                 if ikr.value_type() == ValueType::Deletion && is_bottommost {
                     continue;

@@ -81,18 +81,16 @@ impl DbStats {
     pub fn maybe_sample_read_level(&self, level: usize) {
         let count = self.read_sample_counter.fetch_add(1, Ordering::Relaxed);
         // Sample every 16 reads to reduce atomic contention.
-        if count % 16 == 0 {
-            if level < self.read_level_samples.len() {
-                self.read_level_samples[level].fetch_add(1, Ordering::Relaxed);
-            }
+        if count.is_multiple_of(16) && level < self.read_level_samples.len() {
+            self.read_level_samples[level].fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Atomically take (read and reset) the per-level read samples.
     pub fn take_read_level_samples(&self) -> [u64; 7] {
         let mut result = [0u64; 7];
-        for i in 0..7 {
-            result[i] = self.read_level_samples[i].swap(0, Ordering::Relaxed);
+        for (i, slot) in result.iter_mut().enumerate() {
+            *slot = self.read_level_samples[i].swap(0, Ordering::Relaxed);
         }
         result
     }

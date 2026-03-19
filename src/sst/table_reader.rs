@@ -709,10 +709,10 @@ impl TableIterator {
             &mut self.block_cursor_key,
         )?;
         // Check upper bound before returning entry
-        if let Some(ref ub) = self.upper_bound {
-            if crate::types::user_key(&self.block_cursor_key) >= ub.as_slice() {
-                return None;
-            }
+        if let Some(ref ub) = self.upper_bound
+            && crate::types::user_key(&self.block_cursor_key) >= ub.as_slice()
+        {
+            return None;
         }
         self.block_cursor_offset = next_offset;
         let lazy_val = crate::types::LazyValue::BlockRef {
@@ -773,10 +773,18 @@ impl TableIterator {
                 return;
             }
 
-            if let Ok(data) = self.reader.read_block_cached(&entry.handle)
-                && let Ok(block) = Block::new(data)
-            {
-                self.seek_within_block(block, target, compare_internal_key);
+            match self.reader.read_block_cached(&entry.handle) {
+                Ok(data) => match Block::new(data) {
+                    Ok(block) => {
+                        self.seek_within_block(block, target, compare_internal_key);
+                    }
+                    Err(e) => {
+                        self.err = Some(format!("block decode error in seek: {e}"));
+                    }
+                },
+                Err(e) => {
+                    self.err = Some(format!("block read error in seek: {e}"));
+                }
             }
         }
     }
@@ -893,11 +901,14 @@ impl TableIterator {
 
             let handle = index_entries[try_idx].handle;
 
-            if let Ok(data) = self.reader.read_block_cached(&handle)
-                && let Ok(block) = Block::new(data)
-            {
-                // Use seek_for_prev_by to find the target entry efficiently
-                match block.seek_for_prev_by(target, compare_internal_key) {
+            let block_result = self.reader.read_block_cached(&handle)
+                .and_then(Block::new);
+            match block_result {
+                Err(e) => {
+                    self.err = Some(format!("block read error in seek_for_prev: {e}"));
+                    break;
+                }
+                Ok(block) => match block.seek_for_prev_by(target, compare_internal_key) {
                     Some((found_key, _found_val)) => {
                         // Determine which restart segment this entry belongs to
                         // and decode all entries from that segment to end of block.
@@ -927,8 +938,8 @@ impl TableIterator {
                     None => {
                         // No entry <= target in this block; try previous
                     }
-                }
-            }
+                },  // Ok(block) => match seek_for_prev_by
+            }  // match block_result
 
             if try_idx == 0 {
                 break;
@@ -1051,13 +1062,12 @@ impl TableIterator {
             let block_idx = self.index_pos;
 
             // Skip blocks whose first_key user key >= upper_bound
-            if let Some(ref ub) = self.upper_bound {
-                if let Some(ref fk) = index_entries[block_idx].first_key {
-                    if crate::types::user_key(fk) >= ub.as_slice() {
-                        self.index_pos = index_entries.len();
-                        return false;
-                    }
-                }
+            if let Some(ref ub) = self.upper_bound
+                && let Some(ref fk) = index_entries[block_idx].first_key
+                && crate::types::user_key(fk) >= ub.as_slice()
+            {
+                self.index_pos = index_entries.len();
+                return false;
             }
 
             // Skip blocks based on block property filters
@@ -1139,6 +1149,10 @@ impl Iterator for TableIterator {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // F7: bail immediately if a prior I/O error was recorded
+        if self.err.is_some() {
+            return None;
+        }
         loop {
             // Handle deferred block read: materialize now that we need the value
             if self.at_first_key_from_index {
@@ -1240,10 +1254,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                     &mut self.block_cursor_key,
                 ) {
                     // Check upper bound before returning entry
-                    if let Some(ref ub) = self.upper_bound {
-                        if crate::types::user_key(&self.block_cursor_key) >= ub.as_slice() {
-                            return false;
-                        }
+                    if let Some(ref ub) = self.upper_bound
+                        && crate::types::user_key(&self.block_cursor_key) >= ub.as_slice()
+                    {
+                        return false;
                     }
                     self.block_cursor_offset = next;
                     key_buf.clear();
@@ -1257,10 +1271,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             if self.block_pos < self.current_block_entries.len() {
                 let (ref k, ref v) = self.current_block_entries[self.block_pos];
                 // Check upper bound before returning entry
-                if let Some(ref ub) = self.upper_bound {
-                    if crate::types::user_key(k) >= ub.as_slice() {
-                        return false;
-                    }
+                if let Some(ref ub) = self.upper_bound
+                    && crate::types::user_key(k) >= ub.as_slice()
+                {
+                    return false;
                 }
                 key_buf.clear();
                 key_buf.extend_from_slice(k);
@@ -1296,41 +1310,51 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     }
 
     fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<crate::types::LazyValue> {
+        // F7: bail immediately if a prior I/O error was recorded
+        if self.err.is_some() {
+            return None;
+        }
+        // F6: materialize deferred block if positioned at first_key from index
+        if self.at_first_key_from_index {
+            self.materialize_deferred_block();
+            if self.err.is_some() {
+                return None;
+            }
+        }
         // Forward cursor path (hot path)
-        if self.current_block.is_some() {
-            let block = self.current_block.as_ref().unwrap();
-            if self.block_cursor_offset < self.block_data_end {
-                let data = block.data();
-                let result = crate::sst::block::decode_entry_reuse(
-                    data,
-                    self.block_cursor_offset,
-                    &mut self.block_cursor_key,
-                );
-                if let Some((value_start, value_len, next_offset)) = result {
-                    // Check upper bound
-                    if let Some(ref ub) = self.upper_bound {
-                        if crate::types::user_key(&self.block_cursor_key) >= ub.as_slice() {
-                            return None;
-                        }
-                    }
-                    self.block_cursor_offset = next_offset;
-                    key_buf.clear();
-                    key_buf.extend_from_slice(&self.block_cursor_key);
-                    return Some(crate::types::LazyValue::BlockRef {
-                        data: block.data_arc().clone(),
-                        offset: value_start as u32,
-                        len: value_len as u32,
-                    });
+        if let Some(ref block) = self.current_block
+            && self.block_cursor_offset < self.block_data_end
+        {
+            let data = block.data();
+            let result = crate::sst::block::decode_entry_reuse(
+                data,
+                self.block_cursor_offset,
+                &mut self.block_cursor_key,
+            );
+            if let Some((value_start, value_len, next_offset)) = result {
+                // Check upper bound
+                if let Some(ref ub) = self.upper_bound
+                    && crate::types::user_key(&self.block_cursor_key) >= ub.as_slice()
+                {
+                    return None;
                 }
+                self.block_cursor_offset = next_offset;
+                key_buf.clear();
+                key_buf.extend_from_slice(&self.block_cursor_key);
+                return Some(crate::types::LazyValue::BlockRef {
+                    data: block.data_arc().clone(),
+                    offset: value_start as u32,
+                    len: value_len as u32,
+                });
             }
         }
         // Materialized entries path (backward iteration)
         if self.block_pos < self.current_block_entries.len() {
             let (ref k, ref v) = self.current_block_entries[self.block_pos];
-            if let Some(ref ub) = self.upper_bound {
-                if crate::types::user_key(k) >= ub.as_slice() {
-                    return None;
-                }
+            if let Some(ref ub) = self.upper_bound
+                && crate::types::user_key(k) >= ub.as_slice()
+            {
+                return None;
             }
             key_buf.clear();
             key_buf.extend_from_slice(k);

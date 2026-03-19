@@ -32,6 +32,34 @@ use crate::types::{self, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIn
 use crate::wal::{WalReader, WalWriter};
 use ruc::*;
 
+/// Tracks active snapshots so compaction doesn't delete data still needed by readers.
+struct SnapshotList {
+    snapshots: parking_lot::Mutex<Vec<SequenceNumber>>,
+}
+
+impl SnapshotList {
+    fn new() -> Self {
+        Self {
+            snapshots: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn acquire(&self, seq: SequenceNumber) -> SequenceNumber {
+        self.snapshots.lock().push(seq);
+        seq
+    }
+
+    fn release(&self, seq: SequenceNumber) {
+        self.snapshots.lock().retain(|&s| s != seq);
+    }
+
+    fn as_sorted_vec(&self) -> Vec<SequenceNumber> {
+        let mut v = self.snapshots.lock().clone();
+        v.sort_unstable();
+        v
+    }
+}
+
 /// A pending write request for group commit.
 struct WriteRequest {
     batch: WriteBatch,
@@ -83,6 +111,8 @@ pub struct DB {
     read_compaction_hints: Arc<Mutex<Vec<CompactionHint>>>,
     /// Counter for periodic read-compaction checks.
     read_counter: AtomicU64,
+    /// Tracks active snapshots for compaction safety.
+    snapshot_list: Arc<SnapshotList>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -275,6 +305,7 @@ impl DB {
         let mut compaction_handles = Vec::with_capacity(num_compaction_threads);
 
         let read_compaction_hints = Arc::new(Mutex::new(Vec::<CompactionHint>::new()));
+        let snapshot_list = Arc::new(SnapshotList::new());
         for i in 0..num_compaction_threads {
             let bg_inner = Arc::clone(&inner);
             let bg_path = path.clone();
@@ -288,6 +319,7 @@ impl DB {
             let shutdown = compaction_shutdown.clone();
             let notify = compaction_notify.clone();
             let bg_hints = read_compaction_hints.clone();
+            let bg_snapshot_list = snapshot_list.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -310,6 +342,7 @@ impl DB {
                             let hints: Vec<CompactionHint> =
                                 std::mem::take(&mut *bg_hints.lock());
                             if !hints.is_empty() {
+                                let active_snaps = bg_snapshot_list.as_sorted_vec();
                                 let mut inner = bg_inner.lock();
                                 for hint in &hints {
                                     let version = inner.versions.current();
@@ -324,7 +357,7 @@ impl DB {
                                             Some(&bg_table_cache),
                                             Some(&bg_rate_limiter),
                                             Some(&bg_stats),
-                                            &[],
+                                            &active_snaps,
                                         );
                                     }
                                 }
@@ -341,6 +374,7 @@ impl DB {
                         }
                         // Run pending compactions
                         loop {
+                            let active_snaps = bg_snapshot_list.as_sorted_vec();
                             let mut inner = bg_inner.lock();
                             let version = inner.versions.current();
                             match LeveledCompaction::pick_compaction(&version, &bg_options) {
@@ -362,7 +396,7 @@ impl DB {
                                         Some(&bg_table_cache),
                                         Some(&bg_rate_limiter),
                                         Some(&bg_stats),
-                                        &[],
+                                        &active_snaps,
                                     );
                                     // Unpin L0 files from block cache after compaction
                                     for num in &l0_inputs {
@@ -411,6 +445,7 @@ impl DB {
             super_version,
             read_compaction_hints,
             read_counter: AtomicU64::new(0),
+            snapshot_list,
         };
 
         Ok(db)
@@ -948,7 +983,47 @@ impl DB {
             sources.push(IterSource::from_seekable(Box::new(level_iter)));
         }
 
-        Ok(DBIterator::from_sources(sources, seq + batch_len))
+        let mut db_iter = DBIterator::from_sources(sources, seq + batch_len);
+
+        // Collect range tombstones (same as iter_with_range).
+        let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
+        if active_mem.has_range_deletions() {
+            for (b, e, s) in active_mem.get_range_tombstones() {
+                all_tombstones.push((b, e, s, 0));
+            }
+        }
+        for imm in imm_mems.iter() {
+            if imm.has_range_deletions() {
+                for (b, e, s) in imm.get_range_tombstones() {
+                    all_tombstones.push((b, e, s, 0));
+                }
+            }
+        }
+        for tf in version.level_files(0) {
+            if tf.meta.has_range_deletions
+                && let Ok(ts) = tf.reader.get_range_tombstones()
+            {
+                for (b, e, s) in ts {
+                    all_tombstones.push((b, e, s, 0));
+                }
+            }
+        }
+        for level in 1..version.num_levels {
+            for tf in version.level_files(level) {
+                if tf.meta.has_range_deletions
+                    && let Ok(ts) = tf.reader.get_range_tombstones()
+                {
+                    for (b, e, s) in ts {
+                        all_tombstones.push((b, e, s, level));
+                    }
+                }
+            }
+        }
+        if !all_tombstones.is_empty() {
+            db_iter.set_range_tombstones_with_levels(all_tombstones);
+        }
+
+        Ok(db_iter)
     }
 
     /// Create a prefix iterator with lazy streaming.
@@ -971,7 +1046,13 @@ impl DB {
     }
 
     pub fn snapshot_seq(&self) -> SequenceNumber {
-        self.current_sequence()
+        let seq = self.current_sequence();
+        self.snapshot_list.acquire(seq)
+    }
+
+    /// Release a previously acquired snapshot so compaction can reclaim its data.
+    pub fn release_snapshot(&self, seq: SequenceNumber) {
+        self.snapshot_list.release(seq);
     }
 
     pub fn path(&self) -> &Path {
@@ -1117,6 +1198,7 @@ impl DB {
         }
 
         // Range-filtered compaction: compact files overlapping [begin, end)
+        let active_snaps = self.snapshot_list.as_sorted_vec();
         loop {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
@@ -1137,7 +1219,7 @@ impl DB {
                         Some(&self.table_cache),
                         Some(&self.rate_limiter),
                         Some(&self.stats),
-                        &[],
+                        &active_snaps,
                     )
                     .c(d!())?;
                     for num in &l0_inputs {
@@ -1249,7 +1331,7 @@ impl DB {
     /// Called every 1024 reads from get_with_options.
     fn maybe_check_read_compaction(&self) {
         let count = self.read_counter.fetch_add(1, Ordering::Relaxed);
-        if count % 1024 != 0 {
+        if !count.is_multiple_of(1024) {
             return;
         }
         self.check_read_compaction();
@@ -1427,6 +1509,13 @@ impl DB {
         }
 
         if let Some((e, fail_idx)) = wal_add_error {
+            // Flush already-buffered WAL records for succeeded batches so
+            // their data is durable even though later batches failed.
+            if fail_idx > 0
+                && let Some(ref mut wal) = inner.wal_writer
+            {
+                let _ = wal.flush();
+            }
             // Mark succeeded batches as Ok, failed as Err
             for &rp in &batch_group[..fail_idx] {
                 let rr = unsafe { &mut *rp };
@@ -1552,6 +1641,7 @@ impl DB {
             l0_compaction_trigger: 1,
             ..self.options.clone()
         };
+        let active_snaps = self.snapshot_list.as_sorted_vec();
         loop {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction(&version, &force_opts) {
@@ -1573,7 +1663,7 @@ impl DB {
                         Some(&self.table_cache),
                         Some(&self.rate_limiter),
                         Some(&self.stats),
-                        &[],
+                        &active_snaps,
                     )
                     .c(d!())?;
                     // Unpin L0 files from block cache after compaction

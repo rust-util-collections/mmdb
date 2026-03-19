@@ -271,10 +271,10 @@ impl FragmentedRangeTombstoneList {
                 continue;
             }
             // Only tombstones from shallower levels can delete this key.
-            if let Some(src_lvl) = source_level {
-                if level >= src_lvl {
-                    continue;
-                }
+            if let Some(src_lvl) = source_level
+                && level >= src_lvl
+            {
+                continue;
             }
             return seq;
         }
