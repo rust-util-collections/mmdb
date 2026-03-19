@@ -1,6 +1,6 @@
 [package]
 name = "mmdb"
-version = "2.1.2"
+version = "2.2.0"
 edition = "2024"
 description = "A modern LSM-Tree storage engine in pure Rust"
 license = "MIT"
