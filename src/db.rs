@@ -13,8 +13,8 @@ use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
-use crate::compaction::leveled::CompactionHint;
 use crate::compaction::LeveledCompaction;
+use crate::compaction::leveled::CompactionHint;
 use crate::error::{Error, Result};
 use crate::iterator::db_iter::DBIterator;
 use crate::iterator::merge::IterSource;
@@ -339,8 +339,7 @@ impl DB {
                         }
                         // Drain read-compaction hints before picking compactions.
                         {
-                            let hints: Vec<CompactionHint> =
-                                std::mem::take(&mut *bg_hints.lock());
+                            let hints: Vec<CompactionHint> = std::mem::take(&mut *bg_hints.lock());
                             if !hints.is_empty() {
                                 let active_snaps = bg_snapshot_list.as_sorted_vec();
                                 let mut inner = bg_inner.lock();

@@ -1,8 +1,6 @@
 //! DBIterator: a user-facing iterator that merges all sources, resolves
 //! sequence numbers, and skips tombstones.
 
-use std::sync::Arc;
-
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
@@ -46,7 +44,7 @@ pub struct DBIterator {
     /// past the current user key to resume forward scanning correctly.
     backward_positioned: bool,
     /// Optional callback: if it returns `true` for a user key, that entry is skipped.
-    skip_point: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    skip_point: Option<crate::options::SkipPointFn>,
     /// Last seek target for TrySeekUsingNext optimization. When the next
     /// seek target >= this, the merger can try stepping forward instead of
     /// full re-seeking all sources.
@@ -221,16 +219,14 @@ impl DBIterator {
         if self.range_tombstones.is_empty() {
             return false;
         }
-        self.range_tombstones.max_covering_tombstone_seq_for_level(
-            user_key,
-            self.sequence,
-            None,
-        ) > seq
+        self.range_tombstones
+            .max_covering_tombstone_seq_for_level(user_key, self.sequence, None)
+            > seq
     }
 
     /// Set a skip-point callback. During iteration, any user key for which
     /// the callback returns `true` is silently skipped.
-    pub fn set_skip_point(&mut self, f: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>) {
+    pub fn set_skip_point(&mut self, f: crate::options::SkipPointFn) {
         self.skip_point = Some(f);
     }
 
@@ -361,9 +357,8 @@ impl DBIterator {
                                 } else {
                                     None
                                 };
-                                let covered = self
-                                    .range_tombstones
-                                    .max_covering_tombstone_seq_for_level(
+                                let covered =
+                                    self.range_tombstones.max_covering_tombstone_seq_for_level(
                                         &ikey_ref[..uk_len],
                                         self.sequence,
                                         level_filter,

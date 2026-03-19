@@ -137,14 +137,15 @@ impl TableReader {
                     self.index_block
                         .iter()
                         .map(|(k, v)| {
-                            let (handle, first_key, props) = decode_index_value_with_props(&v);
+                            let d = decode_index_value_with_props(&v);
                             IndexEntry {
                                 separator_key: k,
-                                handle,
-                                first_key: first_key.map(|fk| fk.to_vec()),
-                                properties: props
+                                handle: d.handle,
+                                first_key: d.first_key.map(|fk| fk.to_vec()),
+                                properties: d
+                                    .properties
                                     .into_iter()
-                                    .map(|(n, d)| (n.to_vec(), d.to_vec()))
+                                    .map(|(n, p)| (n.to_vec(), p.to_vec()))
                                     .collect(),
                             }
                         })
@@ -648,7 +649,10 @@ impl TableIterator {
 
     /// Attach block property filters to this iterator.
     /// Blocks whose properties match a filter's skip criteria will be skipped entirely.
-    pub fn with_block_filters(mut self, filters: Vec<Arc<dyn crate::options::BlockPropertyFilter>>) -> Self {
+    pub fn with_block_filters(
+        mut self,
+        filters: Vec<Arc<dyn crate::options::BlockPropertyFilter>>,
+    ) -> Self {
         self.block_property_filters = filters;
         self
     }
@@ -901,8 +905,7 @@ impl TableIterator {
 
             let handle = index_entries[try_idx].handle;
 
-            let block_result = self.reader.read_block_cached(&handle)
-                .and_then(Block::new);
+            let block_result = self.reader.read_block_cached(&handle).and_then(Block::new);
             match block_result {
                 Err(e) => {
                     self.err = Some(format!("block read error in seek_for_prev: {e}"));
@@ -938,8 +941,8 @@ impl TableIterator {
                     None => {
                         // No entry <= target in this block; try previous
                     }
-                },  // Ok(block) => match seek_for_prev_by
-            }  // match block_result
+                }, // Ok(block) => match seek_for_prev_by
+            } // match block_result
 
             if try_idx == 0 {
                 break;
@@ -1187,13 +1190,11 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     }
 
     fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
-        TableIterator::current(self)
-            .map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
+        TableIterator::current(self).map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
     }
 
     fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
-        TableIterator::prev(self)
-            .map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
+        TableIterator::prev(self).map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {

@@ -203,15 +203,13 @@ impl IterSource {
                 }
                 None => false,
             },
-            IterSourceInner::SeekableBoxed { iter } => {
-                match iter.next_lazy(&mut self.peeked_key) {
-                    Some(lv) => {
-                        self.peeked_value = lv;
-                        true
-                    }
-                    None => false,
+            IterSourceInner::SeekableBoxed { iter } => match iter.next_lazy(&mut self.peeked_key) {
+                Some(lv) => {
+                    self.peeked_value = lv;
+                    true
                 }
-            }
+                None => false,
+            },
         }
     }
 

@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use crate::sst::format::CompressionType;
 
+/// Callback that returns `true` for user keys that should be skipped during iteration.
+pub type SkipPointFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 /// Database-level options.
 pub struct DbOptions {
     /// Create the database directory if it does not exist.
@@ -87,7 +90,8 @@ pub struct DbOptions {
     pub memtable_prefix_bloom_ratio: f64,
     /// Factories for block property collectors. Each factory is called once per SST
     /// file build to produce a fresh collector instance.
-    pub block_property_collectors: Vec<Arc<dyn Fn() -> Box<dyn BlockPropertyCollector> + Send + Sync>>,
+    pub block_property_collectors:
+        Vec<Arc<dyn Fn() -> Box<dyn BlockPropertyCollector> + Send + Sync>>,
 }
 
 impl Default for DbOptions {
@@ -174,7 +178,10 @@ impl std::fmt::Debug for DbOptions {
             .field("l0_compaction_trigger", &self.l0_compaction_trigger)
             .field("target_file_size_base", &self.target_file_size_base)
             .field("max_bytes_for_level_base", &self.max_bytes_for_level_base)
-            .field("max_bytes_for_level_multiplier", &self.max_bytes_for_level_multiplier)
+            .field(
+                "max_bytes_for_level_multiplier",
+                &self.max_bytes_for_level_multiplier,
+            )
             .field("num_levels", &self.num_levels)
             .field("block_size", &self.block_size)
             .field("block_restart_interval", &self.block_restart_interval)
@@ -183,7 +190,10 @@ impl std::fmt::Debug for DbOptions {
             .field("block_cache_capacity", &self.block_cache_capacity)
             .field("max_open_files", &self.max_open_files)
             .field("prefix_len", &self.prefix_len)
-            .field("block_property_collectors", &self.block_property_collectors.len())
+            .field(
+                "block_property_collectors",
+                &self.block_property_collectors.len(),
+            )
             .finish()
     }
 }
@@ -242,7 +252,7 @@ pub struct ReadOptions {
     pub pin_data: bool,
     /// Optional callback checked during iteration. If it returns `true` for a
     /// user key, that key is skipped without being yielded.
-    pub skip_point: Option<Arc<dyn Fn(&[u8]) -> bool + Send + Sync>>,
+    pub skip_point: Option<SkipPointFn>,
     /// Block property filters to skip entire data blocks during iteration.
     pub block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
 }

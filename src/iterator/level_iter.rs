@@ -173,7 +173,9 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
-        self.current_iter.as_ref().and_then(|iter| iter.current())
+        self.current_iter
+            .as_ref()
+            .and_then(|iter| iter.current())
             .map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
     }
 

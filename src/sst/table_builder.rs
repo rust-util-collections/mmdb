@@ -63,6 +63,14 @@ impl Default for TableBuildOptions {
     }
 }
 
+/// A pending index entry produced when a data block is flushed.
+struct PendingIndexEntry {
+    last_key: Vec<u8>,
+    handle: BlockHandle,
+    first_key: Vec<u8>,
+    properties: Vec<(String, Vec<u8>)>,
+}
+
 /// Builds an SST file.
 pub struct TableBuilder {
     writer: BufWriter<File>,
@@ -70,8 +78,8 @@ pub struct TableBuilder {
 
     // Current data block being built
     data_block: BlockBuilder,
-    // Index entries: (last_key, handle, first_key_of_block, block_properties)
-    index_entries: Vec<(Vec<u8>, BlockHandle, Vec<u8>, Vec<(String, Vec<u8>)>)>,
+    // Index entries produced by flushed data blocks
+    index_entries: Vec<PendingIndexEntry>,
     // First key of the current (not-yet-flushed) data block
     pending_first_key: Option<Vec<u8>>,
     // Keys for bloom filter
@@ -260,7 +268,12 @@ impl TableBuilder {
             .collect();
 
         let handle = self.write_raw_block(&block_data).c(d!())?;
-        self.index_entries.push((last_key, handle, first_key, props));
+        self.index_entries.push(PendingIndexEntry {
+            last_key,
+            handle,
+            first_key,
+            properties: props,
+        });
 
         Ok(())
     }
@@ -378,17 +391,22 @@ impl TableBuilder {
     fn write_index_block(&mut self) -> Result<BlockHandle> {
         let mut builder = BlockBuilder::new(1);
 
-        for (last_key, handle, first_key, props) in &self.index_entries {
-            let value = if props.is_empty() {
-                encode_index_value(handle, first_key)
+        for entry in &self.index_entries {
+            let value = if entry.properties.is_empty() {
+                encode_index_value(&entry.handle, &entry.first_key)
             } else {
-                let prop_refs: Vec<(&str, &[u8])> = props
+                let prop_refs: Vec<(&str, &[u8])> = entry
+                    .properties
                     .iter()
                     .map(|(n, d)| (n.as_str(), d.as_slice()))
                     .collect();
-                crate::sst::format::encode_index_value_with_props(handle, first_key, &prop_refs)
+                crate::sst::format::encode_index_value_with_props(
+                    &entry.handle,
+                    &entry.first_key,
+                    &prop_refs,
+                )
             };
-            builder.add(last_key, &value);
+            builder.add(&entry.last_key, &value);
         }
 
         let data = builder.finish();

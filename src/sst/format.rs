@@ -155,16 +155,26 @@ pub fn encode_index_value_with_props(
     buf
 }
 
+/// Decoded extended index value with optional block properties.
+pub struct DecodedIndexValue<'a> {
+    pub handle: BlockHandle,
+    pub first_key: Option<&'a [u8]>,
+    pub properties: Vec<(&'a [u8], &'a [u8])>,
+}
+
 /// Decode an extended index value that may contain block properties.
-/// Returns (BlockHandle, optional first_key, properties).
 /// Compatible with old format (no properties appended).
-pub fn decode_index_value_with_props(data: &[u8]) -> (BlockHandle, Option<&[u8]>, Vec<(&[u8], &[u8])>) {
+pub fn decode_index_value_with_props(data: &[u8]) -> DecodedIndexValue<'_> {
     let handle = BlockHandle::decode(data);
     let mut first_key: Option<&[u8]> = None;
     let mut props = Vec::new();
 
     if data.len() <= 16 {
-        return (handle, None, props);
+        return DecodedIndexValue {
+            handle,
+            first_key: None,
+            properties: props,
+        };
     }
 
     // Parse first_key
@@ -186,7 +196,8 @@ pub fn decode_index_value_with_props(data: &[u8]) -> (BlockHandle, Option<&[u8]>
             if data.len() < offset + 2 {
                 break;
             }
-            let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            let name_len =
+                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
             if data.len() < offset + name_len {
                 break;
@@ -196,7 +207,8 @@ pub fn decode_index_value_with_props(data: &[u8]) -> (BlockHandle, Option<&[u8]>
             if data.len() < offset + 2 {
                 break;
             }
-            let data_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            let data_len =
+                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
             if data.len() < offset + data_len {
                 break;
@@ -207,7 +219,11 @@ pub fn decode_index_value_with_props(data: &[u8]) -> (BlockHandle, Option<&[u8]>
         }
     }
 
-    (handle, first_key, props)
+    DecodedIndexValue {
+        handle,
+        first_key,
+        properties: props,
+    }
 }
 
 #[cfg(test)]

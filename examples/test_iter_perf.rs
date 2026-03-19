@@ -3,8 +3,10 @@ use std::time::Instant;
 
 fn main() {
     let dir = tempfile::tempdir().unwrap();
-    let mut opts = DbOptions::default();
-    opts.write_buffer_size = 1024 * 1024 * 1024;
+    let opts = DbOptions {
+        write_buffer_size: 1024 * 1024 * 1024,
+        ..Default::default()
+    };
     let db = DB::open(opts, dir.path()).unwrap();
 
     let wo = WriteOptions::default();

@@ -603,7 +603,11 @@ impl LeveledCompaction {
                 current_size = 0;
             }
 
-            builder.as_mut().unwrap().add(&ikey, value.as_slice()).c(d!())?;
+            builder
+                .as_mut()
+                .unwrap()
+                .add(&ikey, value.as_slice())
+                .c(d!())?;
             current_size += ikey.len() + value.len();
 
             // Rate-limit compaction writes
