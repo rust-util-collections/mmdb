@@ -49,6 +49,9 @@ pub struct DBIterator {
     /// seek target >= this, the merger can try stepping forward instead of
     /// full re-seeking all sources.
     last_seek_key: Option<Vec<u8>>,
+    /// Fast path: true when no range tombstones and no skip_point callback.
+    /// Enables next_visible_clean() which skips tombstone checks.
+    clean_read: bool,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
@@ -80,6 +83,7 @@ impl DBIterator {
             backward_positioned: false,
             skip_point: None,
             last_seek_key: None,
+            clean_read: true,
         }
     }
 
@@ -105,6 +109,7 @@ impl DBIterator {
             backward_positioned: false,
             skip_point: None,
             last_seek_key: None,
+            clean_read: true,
         }
     }
 
@@ -135,6 +140,7 @@ impl DBIterator {
             backward_positioned: false,
             skip_point: None,
             last_seek_key: None,
+            clean_read: true,
         }
     }
 
@@ -172,6 +178,7 @@ impl DBIterator {
     /// collecting tombstones from all memtables and SST files.
     pub fn set_range_tombstones(&mut self, tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) {
         self.range_tombstones = FragmentedRangeTombstoneList::new(tombstones);
+        self.clean_read = false;
     }
 
     /// Set range tombstones with level info for cross-level pruning.
@@ -181,6 +188,7 @@ impl DBIterator {
         tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
     ) {
         self.range_tombstones = FragmentedRangeTombstoneList::new_with_levels(tombstones);
+        self.clean_read = false;
     }
 
     /// No-op: tombstones are loaded upfront; emptiness is checked via is_empty().
@@ -240,6 +248,7 @@ impl DBIterator {
     /// the callback returns `true` is silently skipped.
     pub fn set_skip_point(&mut self, f: crate::options::SkipPointFn) {
         self.skip_point = Some(f);
+        self.clean_read = false;
     }
 
     /// Jump to the first key of the next prefix, skipping all remaining keys
@@ -405,10 +414,82 @@ impl DBIterator {
         }
     }
 
+    /// Streamlined next_visible for the common case: no range tombstones,
+    /// no skip_point callback. Removes per-entry source_level tracking,
+    /// tombstone checks, and skip_point callback dispatch.
+    #[inline(always)]
+    fn next_visible_clean(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+        if self.backward_positioned {
+            self.backward_positioned = false;
+            self.prev_overshoot = None;
+            if self.has_last_key {
+                use crate::types::InternalKey;
+                let seek_key = InternalKey::new(&self.last_user_key, 0, ValueType::Deletion);
+                self.merger.seek(seek_key.as_bytes());
+            }
+        }
+        loop {
+            let (ikey_ref, _) = self.merger.peek_entry()?;
+            if ikey_ref.len() < 8 {
+                self.merger.advance_entry();
+                continue;
+            }
+            let uk_len = ikey_ref.len() - 8;
+            let ikr = InternalKeyRef::new(ikey_ref);
+            let seq = ikr.sequence();
+            let vt = ikr.value_type();
+
+            if seq > self.sequence {
+                self.merger.advance_entry();
+                continue;
+            }
+
+            // Prefix boundary
+            if let Some(ref pfx) = self.prefix
+                && !ikey_ref[..uk_len].starts_with(pfx)
+            {
+                return None;
+            }
+
+            // Upper bound
+            if let Some(ref ub) = self.iterate_upper_bound
+                && ikey_ref[..uk_len] >= **ub
+            {
+                return None;
+            }
+
+            // Dedup + deletion check
+            if vt == ValueType::RangeDeletion
+                || (self.has_last_key && self.last_user_key.as_slice() == &ikey_ref[..uk_len])
+            {
+                self.merger.advance_entry();
+                continue;
+            }
+
+            // New user key
+            self.last_user_key.clear();
+            self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
+            self.has_last_key = true;
+
+            if vt == ValueType::Deletion {
+                self.merger.advance_entry();
+                continue;
+            }
+
+            let (mut ikey, value) = self.merger.take_entry()?;
+            ikey.truncate(uk_len);
+            return Some((ikey, value));
+        }
+    }
+
     /// Ensure current is populated. Returns whether there's a valid entry.
     fn ensure_current(&mut self) -> bool {
         if self.needs_advance {
-            self.current = self.next_visible();
+            self.current = if self.clean_read {
+                self.next_visible_clean()
+            } else {
+                self.next_visible()
+            };
             self.needs_advance = false;
         }
         self.current.is_some()
