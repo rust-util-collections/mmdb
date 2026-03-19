@@ -721,7 +721,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_seekable(Box::new(cursor)));
+            sources.push(IterSource::from_memtable(cursor));
         }
 
         // Immutable memtables
@@ -730,7 +730,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_seekable(Box::new(cursor)));
+            sources.push(IterSource::from_memtable(cursor));
         }
 
         // SST files — only include files whose key range overlaps [lower_bound, upper_bound].
@@ -757,7 +757,7 @@ impl DB {
                 TableIterator::new(tf.reader.clone())
                     .with_block_filters(options.block_property_filters.clone())
             };
-            sources.push(IterSource::from_seekable(Box::new(iter)));
+            sources.push(IterSource::from_table_iter(iter));
         }
         for level in 1..version.num_levels {
             let files = version.level_files(level);
@@ -779,7 +779,7 @@ impl DB {
             if !options.block_property_filters.is_empty() {
                 level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
             }
-            sources.push(IterSource::from_seekable(Box::new(level_iter)));
+            sources.push(IterSource::from_level_iter(level_iter));
         }
 
         let mut db_iter = match pool_take() {
@@ -900,7 +900,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_seekable(Box::new(cursor)));
+            sources.push(IterSource::from_memtable(cursor));
         }
 
         // Immutable memtables
@@ -909,7 +909,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_seekable(Box::new(cursor)));
+            sources.push(IterSource::from_memtable(cursor));
         }
 
         // Compute prefix upper bound once, share across all uses.
@@ -948,7 +948,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let iter = TableIterator::new(tf.reader.clone());
-            sources.push(IterSource::from_seekable(Box::new(iter)));
+            sources.push(IterSource::from_table_iter(iter));
         }
         // L1+: one LevelIterator per level with lazy file opening.
         for level in 1..version.num_levels {
@@ -967,7 +967,7 @@ impl DB {
             let level_iter = LevelIterator::new(files.to_vec())
                 .with_prefix(prefix_owned.to_vec())
                 .with_range_hints(Some(prefix_owned.to_vec()), prefix_upper.clone());
-            sources.push(IterSource::from_seekable(Box::new(level_iter)));
+            sources.push(IterSource::from_level_iter(level_iter));
         }
 
         let mut iter = match pool_take() {
@@ -1063,19 +1063,19 @@ impl DB {
         // Active memtable.
         {
             let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_seekable(Box::new(cursor)));
+            sources.push(IterSource::from_memtable(cursor));
         }
 
         // Immutable memtables.
         for imm in imm_mems.iter() {
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_seekable(Box::new(cursor)));
+            sources.push(IterSource::from_memtable(cursor));
         }
 
         // SST files: L0 individually, L1+ via LevelIterator.
         for tf in version.level_files(0) {
             let iter = TableIterator::new(tf.reader.clone());
-            sources.push(IterSource::from_seekable(Box::new(iter)));
+            sources.push(IterSource::from_table_iter(iter));
         }
         for level in 1..version.num_levels {
             let files = version.level_files(level);
@@ -1083,7 +1083,7 @@ impl DB {
                 continue;
             }
             let level_iter = LevelIterator::new(files.to_vec());
-            sources.push(IterSource::from_seekable(Box::new(level_iter)));
+            sources.push(IterSource::from_level_iter(level_iter));
         }
 
         let mut db_iter = DBIterator::from_sources(sources, seq + batch_len);

@@ -28,6 +28,18 @@ enum IterSourceInner {
     SeekableBoxed {
         iter: Box<dyn SeekableIterator>,
     },
+    /// Direct (non-boxed) memtable cursor — zero vtable dispatch.
+    Memtable {
+        iter: crate::memtable::skiplist::MemTableCursorIter,
+    },
+    /// Direct (non-boxed) SST table iterator — zero vtable dispatch.
+    Sst {
+        iter: crate::sst::table_reader::TableIterator,
+    },
+    /// Direct (non-boxed) level iterator — zero vtable dispatch.
+    Level {
+        iter: crate::iterator::LevelIterator,
+    },
 }
 
 /// Trait for iterators that support seeking and bidirectional traversal.
@@ -141,6 +153,36 @@ impl IterSource {
         }
     }
 
+    pub fn from_memtable(iter: crate::memtable::skiplist::MemTableCursorIter) -> Self {
+        Self {
+            inner: IterSourceInner::Memtable { iter },
+            peeked_key: Vec::new(),
+            peeked_value: crate::types::LazyValue::empty(),
+            has_peeked: false,
+            level: usize::MAX,
+        }
+    }
+
+    pub fn from_table_iter(iter: crate::sst::table_reader::TableIterator) -> Self {
+        Self {
+            inner: IterSourceInner::Sst { iter },
+            peeked_key: Vec::new(),
+            peeked_value: crate::types::LazyValue::empty(),
+            has_peeked: false,
+            level: usize::MAX,
+        }
+    }
+
+    pub fn from_level_iter(iter: crate::iterator::LevelIterator) -> Self {
+        Self {
+            inner: IterSourceInner::Level { iter },
+            peeked_key: Vec::new(),
+            peeked_value: crate::types::LazyValue::empty(),
+            has_peeked: false,
+            level: usize::MAX,
+        }
+    }
+
     /// Tag this source with its LSM level.
     pub fn with_level(mut self, level: usize) -> Self {
         self.level = level;
@@ -204,10 +246,19 @@ impl IterSource {
                 None => false,
             },
             IterSourceInner::SeekableBoxed { iter } => match iter.next_lazy(&mut self.peeked_key) {
-                Some(lv) => {
-                    self.peeked_value = lv;
-                    true
-                }
+                Some(lv) => { self.peeked_value = lv; true }
+                None => false,
+            },
+            IterSourceInner::Memtable { iter } => match iter.next_lazy(&mut self.peeked_key) {
+                Some(lv) => { self.peeked_value = lv; true }
+                None => false,
+            },
+            IterSourceInner::Sst { iter } => match iter.next_lazy(&mut self.peeked_key) {
+                Some(lv) => { self.peeked_value = lv; true }
+                None => false,
+            },
+            IterSourceInner::Level { iter } => match iter.next_lazy(&mut self.peeked_key) {
+                Some(lv) => { self.peeked_value = lv; true }
                 None => false,
             },
         }
@@ -218,10 +269,6 @@ impl IterSource {
     fn reverse_advance_into_buffers(&mut self) -> bool {
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
-                // pos points to the entry AFTER the last consumed one.
-                // The current entry is at pos - 1. The previous entry is at pos - 2.
-                // But in peek mode, the peeked entry is entries[pos-1].
-                // For prev, we want the entry before the peeked one.
                 if *pos >= 2 {
                     *pos -= 2;
                     let (ref k, ref v) = entries[*pos];
@@ -234,15 +281,34 @@ impl IterSource {
                     false
                 }
             }
-            IterSourceInner::Boxed(_) => false, // Plain iterators cannot go backward
+            IterSourceInner::Boxed(_) => false,
             IterSourceInner::SeekableBoxed { iter } => {
                 let mut tmp_val = Vec::new();
                 if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
                     self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
                     true
-                } else {
-                    false
-                }
+                } else { false }
+            }
+            IterSourceInner::Memtable { iter } => {
+                let mut tmp_val = Vec::new();
+                if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
+                    self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
+                    true
+                } else { false }
+            }
+            IterSourceInner::Sst { iter } => {
+                let mut tmp_val = Vec::new();
+                if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
+                    self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
+                    true
+                } else { false }
+            }
+            IterSourceInner::Level { iter } => {
+                let mut tmp_val = Vec::new();
+                if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
+                    self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
+                    true
+                } else { false }
             }
         }
     }
@@ -253,24 +319,32 @@ impl IterSource {
 
     /// Propagate iteration bounds to the underlying seekable iterator (if any).
     pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
-        if let IterSourceInner::SeekableBoxed { ref mut iter } = self.inner {
-            iter.set_bounds(lower, upper);
+        match &mut self.inner {
+            IterSourceInner::SeekableBoxed { iter } => iter.set_bounds(lower, upper),
+            IterSourceInner::Memtable { iter } => iter.set_bounds(lower, upper),
+            IterSourceInner::Sst { iter } => iter.set_bounds(lower, upper),
+            IterSourceInner::Level { iter } => iter.set_bounds(lower, upper),
+            _ => {}
         }
     }
 
     /// Return the first error from the underlying iterator, if any.
     pub fn iter_error(&self) -> Option<String> {
-        if let IterSourceInner::SeekableBoxed { ref iter } = self.inner {
-            iter.iter_error()
-        } else {
-            None
+        match &self.inner {
+            IterSourceInner::SeekableBoxed { iter } => iter.iter_error(),
+            IterSourceInner::Sst { iter } => iter.iter_error(),
+            IterSourceInner::Level { iter } => iter.iter_error(),
+            _ => None,
         }
     }
 
     /// Issue a prefetch hint for the first data block (if backed by a seekable iterator).
     pub fn prefetch_hint(&mut self) {
-        if let IterSourceInner::SeekableBoxed { ref mut iter } = self.inner {
-            iter.prefetch_first_block();
+        match &mut self.inner {
+            IterSourceInner::SeekableBoxed { iter } => iter.prefetch_first_block(),
+            IterSourceInner::Sst { iter } => iter.prefetch_first_block(),
+            IterSourceInner::Level { iter } => iter.prefetch_first_block(),
+            _ => {}
         }
     }
 
@@ -293,6 +367,10 @@ impl IterSource {
                     *pos += 1;
                 }
             }
+            IterSourceInner::Boxed(_) => {
+                self.seek(target, compare);
+            }
+            // Seekable variants: seek + peek next entry
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_to(target);
                 if let Some((k, v)) = iter.next() {
@@ -301,8 +379,29 @@ impl IterSource {
                     self.has_peeked = true;
                 }
             }
-            IterSourceInner::Boxed(_) => {
-                self.seek(target, compare);
+            IterSourceInner::Memtable { iter } => {
+                iter.seek_to(target);
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k;
+                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Sst { iter } => {
+                iter.seek_to(target);
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k;
+                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Level { iter } => {
+                iter.seek_to(target);
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k;
+                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.has_peeked = true;
+                }
             }
         }
     }
@@ -347,18 +446,29 @@ impl IterSource {
             }
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_for_prev(target);
-                // Use current() to peek without advancing the cursor.
-                // next() would advance past the entry, causing prev() to
-                // return the same entry again (duplicate).
                 if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
-                    self.has_peeked = true;
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
                 }
             }
-            IterSourceInner::Boxed(_) => {
-                // Cannot seek backward on plain iterator
+            IterSourceInner::Memtable { iter } => {
+                iter.seek_for_prev(target);
+                if let Some((k, v)) = iter.current() {
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
+                }
             }
+            IterSourceInner::Sst { iter } => {
+                SeekableIterator::seek_for_prev(iter, target);
+                if let Some((k, v)) = SeekableIterator::current(iter) {
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Level { iter } => {
+                iter.seek_for_prev(target);
+                if let Some((k, v)) = iter.current() {
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Boxed(_) => {}
         }
     }
 
@@ -380,14 +490,28 @@ impl IterSource {
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_to_first();
                 if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
-                    self.has_peeked = true;
+                    self.peeked_key = k; self.peeked_value = crate::types::LazyValue::Inline(v); self.has_peeked = true;
                 }
             }
-            IterSourceInner::Boxed(_) => {
-                // Cannot reset a plain iterator
+            IterSourceInner::Memtable { iter } => {
+                iter.seek_to_first();
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k; self.peeked_value = crate::types::LazyValue::Inline(v); self.has_peeked = true;
+                }
             }
+            IterSourceInner::Sst { iter } => {
+                iter.seek_to_first();
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k; self.peeked_value = crate::types::LazyValue::Inline(v); self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Level { iter } => {
+                iter.seek_to_first();
+                if let Some((k, v)) = iter.next() {
+                    self.peeked_key = k; self.peeked_value = crate::types::LazyValue::Inline(v); self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Boxed(_) => {}
         }
     }
 
@@ -408,13 +532,26 @@ impl IterSource {
             }
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_to_last();
-                // Use current() to peek without advancing the cursor.
-                // next() would advance past the last entry to null, causing
-                // prev() to return the same last entry again (duplicate).
                 if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
-                    self.has_peeked = true;
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Memtable { iter } => {
+                iter.seek_to_last();
+                if let Some((k, v)) = iter.current() {
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Sst { iter } => {
+                SeekableIterator::seek_to_last(iter);
+                if let Some((k, v)) = SeekableIterator::current(iter) {
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
+                }
+            }
+            IterSourceInner::Level { iter } => {
+                iter.seek_to_last();
+                if let Some((k, v)) = iter.current() {
+                    self.peeked_key = k; self.peeked_value = v; self.has_peeked = true;
                 }
             }
             IterSourceInner::Boxed(_) => {
