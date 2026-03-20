@@ -258,6 +258,12 @@ let opts = DbOptions::read_heavy();   // large cache, 14 bits/key bloom
 
 ---
 
+## Feature Comparison
+
+See [COMPARISON.md](COMPARISON.md) for a detailed feature-by-feature comparison with RocksDB and Pebble, including gap analysis and recommendations.
+
+---
+
 ## Build & Test
 
 ```bash

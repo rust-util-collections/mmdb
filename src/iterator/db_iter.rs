@@ -1234,3 +1234,45 @@ mod tests {
         assert!(!iter.valid());
     }
 }
+
+/// A pooled iterator that automatically returns to the global pool on drop.
+///
+/// Wraps a [`DBIterator`] and implements `Deref`/`DerefMut` so it can be used
+/// identically. When dropped, the iterator is reset (releasing `Arc<TableReader>`
+/// references) and returned to the global pool for reuse by any thread.
+pub struct PooledIterator {
+    inner: Option<DBIterator>,
+}
+
+impl PooledIterator {
+    /// Wrap a `DBIterator` for automatic pool return on drop.
+    pub fn new(iter: DBIterator) -> Self {
+        Self { inner: Some(iter) }
+    }
+
+    /// Take ownership of the inner iterator, disabling automatic pool return.
+    pub fn into_inner(mut self) -> DBIterator {
+        self.inner.take().unwrap()
+    }
+}
+
+impl Drop for PooledIterator {
+    fn drop(&mut self) {
+        if let Some(iter) = self.inner.take() {
+            crate::db::pool_return(iter);
+        }
+    }
+}
+
+impl std::ops::Deref for PooledIterator {
+    type Target = DBIterator;
+    fn deref(&self) -> &DBIterator {
+        self.inner.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for PooledIterator {
+    fn deref_mut(&mut self) -> &mut DBIterator {
+        self.inner.as_mut().unwrap()
+    }
+}

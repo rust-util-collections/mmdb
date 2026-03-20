@@ -1,10 +1,9 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, LazyLock,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -34,27 +33,35 @@ use crate::types::{self, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIn
 use crate::wal::{WalReader, WalWriter};
 use ruc::*;
 
-/// Thread-local pool of reusable DBIterator objects.
+/// Global pool of reusable DBIterator objects.
 /// Avoids heap allocation overhead when creating iterators in tight loops.
-const ITER_POOL_CAP: usize = 8;
+/// Uses a lock-free-contention global pool instead of thread-local storage
+/// so that iterators can be recycled across threads (e.g., thread-per-request
+/// servers, tokio spawn_blocking).
+static POOL_CAPACITY: LazyLock<usize> = LazyLock::new(|| {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    (cpus * 4).max(32).min(512)
+});
 
-thread_local! {
-    static ITER_POOL: RefCell<Vec<DBIterator>> = const { RefCell::new(Vec::new()) };
-}
+static GLOBAL_ITER_POOL: LazyLock<Mutex<Vec<DBIterator>>> =
+    LazyLock::new(|| Mutex::new(Vec::with_capacity(*POOL_CAPACITY)));
 
-/// Take a DBIterator from the thread-local pool, or return None.
+/// Take a DBIterator from the global pool, or return None.
 fn pool_take() -> Option<DBIterator> {
-    ITER_POOL.with(|pool| pool.borrow_mut().pop())
+    GLOBAL_ITER_POOL.lock().pop()
 }
 
-/// Return a DBIterator to the thread-local pool for reuse.
-pub fn pool_return(iter: DBIterator) {
-    ITER_POOL.with(|pool| {
-        let mut p = pool.borrow_mut();
-        if p.len() < ITER_POOL_CAP {
-            p.push(iter);
-        }
-    });
+/// Return a DBIterator to the global pool for reuse.
+/// The iterator's sources are cleared to release Arc<TableReader> references,
+/// preventing stale SST files from being kept alive by pooled iterators.
+pub fn pool_return(mut iter: DBIterator) {
+    iter.reset(Vec::new(), 0);
+    let mut pool = GLOBAL_ITER_POOL.lock();
+    if pool.len() < *POOL_CAPACITY {
+        pool.push(iter);
+    }
 }
 
 /// Tracks active snapshots so compaction doesn't delete data still needed by readers.
@@ -454,7 +461,8 @@ impl DB {
                                                 .map(|task| {
                                                     let max_out = task.total_input_size()
                                                         / bg_options.target_file_size_base
-                                                        + 1;
+                                                        + bg_options.max_subcompactions.max(1)
+                                                            as u64;
                                                     let file_start = inner
                                                         .versions
                                                         .reserve_file_numbers(max_out);
@@ -523,7 +531,7 @@ impl DB {
                                                 };
                                                 let max_out = task.total_input_size()
                                                     / bg_options.target_file_size_base
-                                                    + 1;
+                                                    + bg_options.max_subcompactions.max(1) as u64;
                                                 let file_start =
                                                     inner.versions.reserve_file_numbers(max_out);
                                                 Some((task, file_start, l0_inputs))

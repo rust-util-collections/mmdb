@@ -23,10 +23,10 @@ enum IterSourceInner {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         pos: usize,
     },
-    Boxed(Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>>),
+    Boxed(Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>),
     /// A seekable boxed source (e.g., backed by a TableIterator that supports seek).
     SeekableBoxed {
-        iter: Box<dyn SeekableIterator>,
+        iter: Box<dyn SeekableIterator + Send>,
     },
     /// Direct (non-boxed) memtable cursor — zero vtable dispatch.
     Memtable {
@@ -133,7 +133,7 @@ impl IterSource {
         }
     }
 
-    pub fn from_boxed(iter: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)>>) -> Self {
+    pub fn from_boxed(iter: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>) -> Self {
         Self {
             inner: IterSourceInner::Boxed(iter),
             peeked_key: Vec::new(),
@@ -143,7 +143,7 @@ impl IterSource {
         }
     }
 
-    pub fn from_seekable(iter: Box<dyn SeekableIterator>) -> Self {
+    pub fn from_seekable(iter: Box<dyn SeekableIterator + Send>) -> Self {
         Self {
             inner: IterSourceInner::SeekableBoxed { iter },
             peeked_key: Vec::new(),

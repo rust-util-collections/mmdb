@@ -24,6 +24,7 @@ pub use db::pool_return;
 pub use error::{Error, Result};
 pub use iterator::BidiIterator;
 pub use iterator::DBIterator;
+pub use iterator::PooledIterator;
 pub use options::{
     CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
 };

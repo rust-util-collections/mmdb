@@ -327,6 +327,15 @@ impl VersionSet {
         self.next_file_number
     }
 
+    /// Ensure `next_file_number` is at least `min_next`.
+    /// Used after sub-compaction to guarantee no collision with numbers
+    /// consumed by the atomic counter during parallel I/O.
+    pub fn ensure_file_number_at_least(&mut self, min_next: u64) {
+        if min_next > self.next_file_number {
+            self.next_file_number = min_next;
+        }
+    }
+
     pub fn log_number(&self) -> u64 {
         self.log_number
     }
