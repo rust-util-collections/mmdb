@@ -220,7 +220,9 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
 }
 
 /// Collect raw tombstone triples from input files.
-fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>> {
+type RawTombstone = (Vec<u8>, Vec<u8>, SequenceNumber);
+
+fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<RawTombstone>> {
     let mut tombstones = Vec::new();
     for tf in files {
         if tf.meta.has_range_deletions {
@@ -304,10 +306,10 @@ fn execute_sub_compaction_io(
         let user_key = ikr.user_key();
 
         // Check upper bound: stop if user_key >= upper_bound
-        if let Some(ref hi) = sub.upper_bound {
-            if user_key >= hi.as_slice() {
-                break;
-            }
+        if let Some(ref hi) = sub.upper_bound
+            && user_key >= hi.as_slice()
+        {
+            break;
         }
 
         if ikr.value_type() == ValueType::RangeDeletion {
