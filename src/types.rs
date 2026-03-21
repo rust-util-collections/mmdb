@@ -1,7 +1,7 @@
 //! Core data types: InternalKey, ValueType, SequenceNumber.
 //!
 //! Encoding follows RocksDB convention:
-//!   InternalKey = [user_key bytes][packed: seq << 8 | type]  (last 8 bytes)
+//!   InternalKey = \[user_key bytes\]\[packed: seq << 8 | type\]  (last 8 bytes)
 //!   Sort order: user_key ASC, sequence DESC, value_type DESC
 
 use std::cmp::Ordering;

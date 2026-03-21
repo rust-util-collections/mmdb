@@ -54,7 +54,7 @@ fn pool_take() -> Option<DBIterator> {
 }
 
 /// Return a DBIterator to the global pool for reuse.
-/// The iterator's sources are cleared to release Arc<TableReader> references,
+/// The iterator's sources are cleared to release `Arc<TableReader>` references,
 /// preventing stale SST files from being kept alive by pooled iterators.
 pub fn pool_return(mut iter: DBIterator) {
     iter.reset(Vec::new(), 0);
@@ -826,28 +826,59 @@ impl DB {
         Ok(None)
     }
 
-    /// Create a forward iterator over the database.
+    /// Create a forward iterator over the entire database.
+    ///
+    /// Scans all keys in order. No SST pruning is applied.
+    /// Equivalent to `iter_with_options(&ReadOptions::default())`.
+    ///
+    /// Prefer `iter_with_prefix()` or `iter_with_range()` when only a subset of
+    /// keys is needed — both can skip irrelevant SST files.
     pub fn iter(&self) -> Result<DBIterator> {
         self.iter_with_options(&ReadOptions::default())
     }
 
-    /// Create a forward iterator with options.
+    /// Create a forward iterator over the entire database with options.
     ///
-    /// Uses streaming TableIterators for SST files (O(1 block) memory per SST)
-    /// instead of loading entire tables into memory.
+    /// Uses streaming `TableIterator`s for SST files (O(1 block) memory per SST).
+    /// No SST pruning is applied; all files are visited.
+    ///
+    /// Use `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to restrict
+    /// the key range returned, but note that SST files are still opened for the
+    /// full scan. For query-time SST pruning use `iter_with_range()` or
+    /// `iter_with_prefix()`.
     pub fn iter_with_options(&self, options: &ReadOptions) -> Result<DBIterator> {
         self.iter_with_range(options, None, None)
     }
 
-    /// Create a forward iterator that only includes sources overlapping [lower_bound, upper_bound].
-    /// SST files outside this range are skipped entirely, avoiding costly block reads.
-    /// `None` bounds mean unbounded in that direction.
+    /// Create a forward iterator for an arbitrary key range `[lower_bound, upper_bound)`.
     ///
-    /// **WARNING**: Does NOT use prefix bloom filters. For prefix-scoped queries,
-    /// prefer `iter_with_prefix()` which is significantly faster.
+    /// SST files whose key range does not overlap `[lower_bound, upper_bound)` are
+    /// skipped entirely at construction time, avoiding unnecessary block reads.
+    /// `None` means unbounded in that direction.
     ///
-    /// Bounds from `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` are
-    /// also applied if set, using the tighter of the two.
+    /// # When to use
+    ///
+    /// Use this when the scan range **does not align to a single key prefix** —
+    /// for example `[b"m", b"z")` spans many prefixes and cannot be expressed as
+    /// a single `iter_with_prefix()` call.
+    ///
+    /// If your range *does* align to a prefix (e.g. all keys starting with
+    /// `b"user:"`), prefer `iter_with_prefix()`: it additionally uses bloom
+    /// filters to skip SST files that don't contain the prefix, which is more
+    /// precise than range-metadata pruning alone.
+    ///
+    /// # Pruning comparison
+    ///
+    /// | Method              | SST range pruning | Bloom filter pruning |
+    /// |---------------------|:-----------------:|:--------------------:|
+    /// | `iter()`            | ✗                 | ✗                    |
+    /// | `iter_with_range()` | ✓                 | ✗                    |
+    /// | `iter_with_prefix()`| ✓                 | ✓                    |
+    ///
+    /// # Bound merging
+    ///
+    /// Explicit `lower_bound`/`upper_bound` parameters are merged with any bounds
+    /// already set in `ReadOptions`, using the tighter of the two.
     pub fn iter_with_range(
         &self,
         options: &ReadOptions,
@@ -1017,12 +1048,27 @@ impl DB {
 
     /// Create a prefix-bounded iterator with full options support.
     ///
-    /// Uses prefix bloom filters to skip SST files that don't contain the prefix,
-    /// and stops iteration as soon as the prefix boundary is crossed.
-    /// Significantly faster than `iter_with_range()` for prefix-scoped queries.
+    /// Iterates over all keys that start with `prefix` in order.
     ///
-    /// Supports `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` for
-    /// sub-range queries within a prefix, and `snapshot` for historical reads.
+    /// # When to use
+    ///
+    /// Use this whenever your query is naturally prefix-scoped — for example,
+    /// all keys under a tenant (`b"tenant_42:"`), a table (`b"orders:"`), etc.
+    /// It is the fastest iterator variant because it applies **two levels of
+    /// SST pruning**:
+    ///
+    /// 1. **Range pruning** — skips SST files whose `[smallest, largest]` key
+    ///    range does not overlap the prefix.
+    /// 2. **Bloom filter pruning** — among the remaining files, skips those
+    ///    whose per-block bloom filters report that `prefix` is absent.
+    ///
+    /// For cross-prefix ranges (e.g. `[b"m", b"z")`) use `iter_with_range()`
+    /// instead, as there is no single prefix that covers the query.
+    ///
+    /// # Sub-range within a prefix
+    ///
+    /// Set `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to further
+    /// restrict iteration to a sub-range inside the prefix.
     pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator> {
         let seq = options.snapshot.unwrap_or_else(|| self.current_sequence());
         self.iter_with_prefix_inner(prefix, seq, options)

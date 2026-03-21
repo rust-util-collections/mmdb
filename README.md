@@ -190,13 +190,34 @@ impl DB {
     pub fn write_with_options(&self, batch: WriteBatch, options: &WriteOptions) -> Result<()>;
     pub fn iter(&self) -> Result<DBIterator>;
 
-    /// Prefix-optimized iteration. Uses prefix bloom filters to skip entire SST
-    /// files that don't contain `prefix`. Supports bounds via ReadOptions.
+    /// Prefix-bounded iteration — the fastest option for prefix-scoped queries.
+    ///
+    /// Applies two levels of SST pruning:
+    ///   1. Range pruning  — skips files whose key range doesn't overlap the prefix.
+    ///   2. Bloom filter   — skips files that don't contain the prefix (finer-grained).
+    ///
+    /// Use this when all target keys share a common prefix (e.g. `b"orders:"`).
+    /// For a sub-range within the prefix, set ReadOptions bounds.
     pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator>;
 
-    /// Full-scan iteration with optional key-range bounds.
-    /// WARNING: Does NOT use prefix bloom filters. For prefix-scoped queries,
-    /// prefer `iter_with_prefix()` which is significantly faster.
+    /// Arbitrary key-range iteration with SST range pruning.
+    ///
+    /// Skips SST files whose `[smallest, largest]` key range does not overlap
+    /// `[lower, upper)` — but does NOT use bloom filters.
+    ///
+    /// Use this when the scan range spans multiple prefixes and cannot be
+    /// expressed as a single `iter_with_prefix()` call (e.g. `[b"m", b"z")`).
+    /// For full-database scans, prefer `iter()` / `iter_with_options()`.
+    ///
+    /// Explicit bounds are merged with any bounds in ReadOptions (tighter wins).
+    ///
+    /// ## Pruning comparison
+    ///
+    /// | Method               | SST range pruning | Bloom filter pruning |
+    /// |----------------------|:-----------------:|:--------------------:|
+    /// | `iter()`             | ✗                 | ✗                    |
+    /// | `iter_with_range()`  | ✓                 | ✗                    |
+    /// | `iter_with_prefix()` | ✓                 | ✓                    |
     pub fn iter_with_range(&self, options: &ReadOptions, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<DBIterator>;
 
     /// RAII snapshot — automatically released on drop.
