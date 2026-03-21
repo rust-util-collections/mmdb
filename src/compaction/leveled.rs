@@ -626,7 +626,12 @@ impl LeveledCompaction {
 
         // Trivial move optimization: if there's exactly one input file and no
         // overlap with the next level, just move the metadata without rewriting.
-        if task.input_files_level.len() == 1 && task.input_files_next.is_empty() {
+        // Skip the optimisation when a compaction filter is installed, because
+        // the filter needs to see every key-value pair to decide on removals.
+        if task.input_files_level.len() == 1
+            && task.input_files_next.is_empty()
+            && options.compaction_filter.is_none()
+        {
             let tf = &task.input_files_level[0];
             let mut edit = VersionEdit::new();
             edit.delete_file(task.level as u32, tf.meta.number);
@@ -1005,6 +1010,28 @@ impl LeveledCompaction {
                     let entry_seq = ikr.sequence();
                     if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
                         continue;
+                    }
+                }
+            }
+
+            // Apply compaction filter
+            if let Some(ref filter) = options.compaction_filter
+                && ikr.value_type() == ValueType::Value
+            {
+                use crate::options::CompactionFilterDecision;
+                match filter.filter(level, user_key, value.as_slice()) {
+                    CompactionFilterDecision::Keep => {}
+                    CompactionFilterDecision::Remove => continue,
+                    CompactionFilterDecision::ChangeValue(_) => {
+                        // force_merge_level doesn't rewrite values — the output
+                        // SST reuses the existing encoded block. Silently treat
+                        // as Keep. Regular level-to-level compaction handles
+                        // ChangeValue correctly.
+                        debug_assert!(
+                            false,
+                            "CompactionFilter returned ChangeValue in force_merge_level, \
+                             which cannot rewrite values — treating as Keep"
+                        );
                     }
                 }
             }

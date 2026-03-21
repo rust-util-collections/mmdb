@@ -1,6 +1,6 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, LazyLock,
@@ -24,7 +24,9 @@ use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
 use crate::memtable::MemTable;
 use crate::memtable::skiplist::MemTableCursorIter;
-use crate::options::{DbOptions, ReadOptions, WriteOptions};
+use crate::options::{
+    CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
+};
 use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
@@ -175,6 +177,9 @@ pub struct DB {
     /// The field is "read" via Drop (releases flock) — not dead code.
     #[allow(dead_code)]
     lock_file: Option<std::fs::File>,
+    /// Keys registered for lazy deletion. Checked during compaction
+    /// and dropped without writing tombstones.
+    dead_keys: Arc<std::sync::RwLock<HashSet<Vec<u8>>>>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -200,9 +205,32 @@ struct SuperVersion {
     version: Arc<crate::manifest::version::Version>,
 }
 
+/// Internal compaction filter that checks the dead-keys set before
+/// delegating to an optional user-provided filter.
+struct LazyDeleteFilter {
+    dead_keys: Arc<std::sync::RwLock<HashSet<Vec<u8>>>>,
+    user_filter: Option<Arc<dyn CompactionFilter>>,
+}
+
+impl CompactionFilter for LazyDeleteFilter {
+    fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionFilterDecision {
+        {
+            let set = self.dead_keys.read().unwrap();
+            if set.contains(key) {
+                return CompactionFilterDecision::Remove;
+            }
+        }
+        if let Some(ref f) = self.user_filter {
+            return f.filter(level, key, value);
+        }
+        CompactionFilterDecision::Keep
+    }
+}
+
 impl DB {
     /// Open or create a database.
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
+        let mut options = options;
         let path = path.as_ref().to_path_buf();
 
         if options.create_if_missing {
@@ -384,6 +412,17 @@ impl DB {
         let compaction_notify = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let has_bg_error = Arc::new(AtomicBool::new(false));
         let bg_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        // Wrap the user's compaction filter with lazy-delete support.
+        let dead_keys = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        {
+            let lazy_filter = LazyDeleteFilter {
+                dead_keys: dead_keys.clone(),
+                user_filter: options.compaction_filter.take(),
+            };
+            options.compaction_filter = Some(Arc::new(lazy_filter));
+        }
+
         let (l0_file_count, super_version) = {
             let g = inner.lock();
             let l0 = Arc::new(AtomicUsize::new(g.versions.current().l0_file_count()));
@@ -631,6 +670,7 @@ impl DB {
             read_counter: AtomicU64::new(0),
             snapshot_list,
             lock_file,
+            dead_keys,
         };
 
         Ok(db)
@@ -1535,6 +1575,62 @@ impl DB {
             .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
         self.install_super_version(&inner);
         Ok(())
+    }
+
+    /// Register a key for lazy deletion. The key will be silently dropped
+    /// during the next compaction that encounters it, without writing a
+    /// tombstone. This avoids write amplification for bulk cleanup.
+    ///
+    /// **Note:** The key remains readable via `get()` until compaction
+    /// physically removes it. Use regular `delete()` if immediate
+    /// invisibility is required.
+    ///
+    /// **Warning:** Dead keys are held in memory only and are **not**
+    /// persisted to WAL or SST. If the process crashes or restarts
+    /// before compaction removes them, the registrations are lost and
+    /// the keys will remain in the database permanently unless
+    /// re-registered.
+    pub fn lazy_delete(&self, key: &[u8]) {
+        let mut set = self.dead_keys.write().unwrap();
+        set.insert(key.to_vec());
+    }
+
+    /// Batch version of [`lazy_delete`](Self::lazy_delete).
+    ///
+    /// Dead keys are **not** persisted — see [`lazy_delete`](Self::lazy_delete)
+    /// for durability caveats.
+    ///
+    /// If the number of accumulated dead keys newly crosses
+    /// `lazy_delete_compaction_threshold`, a background compaction is
+    /// automatically signalled.
+    pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
+        let threshold = self.options.lazy_delete_compaction_threshold;
+        let mut set = self.dead_keys.write().unwrap();
+        let prev_len = set.len();
+        for k in keys {
+            set.insert(k.as_ref().to_vec());
+        }
+        let len = set.len();
+        drop(set);
+        if threshold > 0 && len >= threshold && prev_len < threshold {
+            self.signal_compaction();
+        }
+    }
+
+    /// Returns the current number of keys registered for lazy deletion.
+    pub fn dead_key_count(&self) -> usize {
+        self.dead_keys.read().unwrap().len()
+    }
+
+    /// Clear all dead keys to reclaim memory used by the dead-keys set.
+    ///
+    /// **Caution:** Only call this after a full compaction
+    /// ([`compact_range(None, None)`](Self::compact_range)) has
+    /// finished. Any dead keys that have not yet been visited by
+    /// compaction will be silently abandoned — those keys will remain
+    /// in the database and will not be removed unless re-registered.
+    pub fn clear_dead_keys(&self) {
+        self.dead_keys.write().unwrap().clear();
     }
 
     /// Close the database.

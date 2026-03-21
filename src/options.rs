@@ -105,6 +105,10 @@ pub struct DbOptions {
     /// file build to produce a fresh collector instance.
     pub block_property_collectors:
         Vec<Arc<dyn Fn() -> Box<dyn BlockPropertyCollector> + Send + Sync>>,
+    /// When the number of keys registered via [`DB::lazy_delete_batch`]
+    /// reaches this threshold, a background compaction is automatically
+    /// signalled. Set to 0 to disable auto-triggering.
+    pub lazy_delete_compaction_threshold: usize,
 }
 
 impl Default for DbOptions {
@@ -140,6 +144,7 @@ impl Default for DbOptions {
             allow_concurrent_memtable_write: false,
             memtable_prefix_bloom_ratio: 0.0,
             block_property_collectors: Vec::new(),
+            lazy_delete_compaction_threshold: 10_000,
         }
     }
 }
@@ -177,6 +182,7 @@ impl Clone for DbOptions {
             allow_concurrent_memtable_write: self.allow_concurrent_memtable_write,
             memtable_prefix_bloom_ratio: self.memtable_prefix_bloom_ratio,
             block_property_collectors: self.block_property_collectors.clone(),
+            lazy_delete_compaction_threshold: self.lazy_delete_compaction_threshold,
         }
     }
 }
