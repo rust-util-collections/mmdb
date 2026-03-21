@@ -1,13 +1,21 @@
 # MMDB
 
-**A Modern LSM-Tree Storage Engine!**
+**The Storage Engine Behind [vsdb](https://github.com/rust-util-collections/vsdb).**
 
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 [![Tests](https://img.shields.io/badge/tests-250_passing-brightgreen.svg)]()
 
-A pure-Rust, synchronous LSM-Tree key-value storage engine with competitive scan and point-read performance.
+A pure-Rust LSM-Tree key-value storage engine, purpose-built for
+[vsdb](https://github.com/rust-util-collections/vsdb).
+
+> **Scope** — MMDB is designed and optimised exclusively for vsdb's
+> workload: prefix-partitioned keys, bulk COW mutations, and
+> compaction-driven garbage collection. While the API is generic enough
+> for other key-value use cases, **optimisation efforts focus solely on
+> the vsdb scenario**. If you need a general-purpose embedded KV store,
+> consider RocksDB, sled, or redb.
 
 ---
 
