@@ -37,9 +37,9 @@ MSRV: Rust 1.89 (edition 2024)
 
 Custom slash commands for AI-assisted code review:
 
-- `/review` — deep regression analysis of recent changes
-- `/debug` — crash/corruption root cause investigation
-- `/verify` — validate whether a reported finding is a true bug or false positive
+- `/mm-review` — deep regression analysis of recent changes
+- `/mm-debug` — crash/corruption root cause investigation
+- `/mm-verify` — validate whether a reported finding is a true bug or false positive
 
 Supporting documentation in `.claude/docs/`:
 - `technical-patterns.md` — cataloged bug patterns for LSM-Tree/Rust
