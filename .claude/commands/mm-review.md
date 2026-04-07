@@ -64,7 +64,16 @@ Check every change for:
 2. **Performance** — does this add latency to hot paths?
 3. **API compatibility** — does this change observable behavior?
 
-### Task 4: Unsafe Code Audit
+### Task 4: Code Style Enforcement
+
+Check changed files against project style rules:
+
+1. **No lint suppression** — `#[allow(clippy::...)]`, `#[allow(unused_...)]`, `#[allow(dead_code)]` etc. are forbidden. All warnings must be fixed at the source, not silenced. Report every `allow(...)` attribute in changed code as a finding.
+2. **No inline paths** — Types must be imported via `use` at the top of the file, not referenced inline as `std::collections::HashMap::new()`. The only exception is disambiguation in a single call site where two types share a name.
+3. **Import grouping** — Imports with a common prefix must be merged using nested braces: `use std::sync::{Arc, Mutex};` not separate `use std::sync::Arc; use std::sync::Mutex;`.
+4. **Doc-code alignment** — If the change modifies a public function signature, struct field, or module-level behavior, verify that the corresponding doc comments, README, and CLAUDE.md still accurately describe the current behavior. Report any stale documentation as a finding.
+
+### Task 5: Unsafe Code Audit
 
 If ANY `unsafe` block is added or modified:
 1. Read `.claude/docs/patterns/unsafe-audit.md`

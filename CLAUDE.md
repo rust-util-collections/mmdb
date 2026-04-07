@@ -50,6 +50,10 @@ Supporting documentation in `.claude/docs/`:
 ## Conventions
 
 - All clippy warnings are errors (CI enforced)
+- **No `#[allow(...)]`** — fix warnings at the source, never suppress them
+- **No inline paths** — use `use` imports at file top; no `std::foo::Bar::new()` in function bodies
+- **Grouped imports** — merge common prefixes: `use std::sync::{Arc, Mutex};`
+- **Doc-code alignment** — public API changes must update corresponding docs
 - `parking_lot` for Mutex/RwLock (non-reentrant, no poisoning)
 - `thiserror` for error types
 - `tracing` for logging
