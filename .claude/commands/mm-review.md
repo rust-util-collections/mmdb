@@ -10,11 +10,20 @@ You are performing a deep code review of changes to MMDB, a Rust LSM-Tree storag
 
 ## Input
 
-Analyze the changes specified by the user. If no specific input is given:
-- Run `git diff HEAD~1` to get the latest commit diff
-- Run `git log -1 --format="%H %s"` to understand the commit intent
+Arguments: `$ARGUMENTS`
 
-If the user provides a commit hash, PR number, or file list, analyze those instead.
+Parse the arguments to determine review scope:
+
+| Input | Scope | How |
+|-------|-------|-----|
+| *(empty)* | Latest commit | `git diff HEAD~1`, `git log -1` |
+| `N` (integer) | Last N commits | `git diff HEAD~N`, `git log -N --oneline` |
+| `all` | Full codebase audit | Read all `src/` files by subsystem (see Full Audit Protocol below) |
+| `<commit hash>` | Specific commit | `git diff <hash>~1 <hash>` |
+| `<hash1>..<hash2>` | Commit range | `git diff <hash1> <hash2>` |
+
+For diff-based reviews (everything except `all`), proceed to the Execution Protocol below.
+For `all`, skip to the **Full Audit Protocol** section at the end of this document.
 
 ## Execution Protocol
 
@@ -115,4 +124,65 @@ If zero findings after full analysis, report:
 ## Review Summary
 **Result**: LGTM — no regressions found
 **Coverage**: <list of subsystems and invariants checked>
+```
+
+---
+
+## Full Audit Protocol (for `all` mode)
+
+When `$ARGUMENTS` is `all`, perform a full codebase audit instead of a diff-based review.
+
+### Strategy: Parallel Subsystem Audit
+
+Launch **one Agent per subsystem** in parallel. Each agent receives:
+1. The subsystem file list to read
+2. The corresponding pattern file from `.claude/docs/patterns/`
+3. `technical-patterns.md` and `false-positive-guide.md`
+4. The code style rules from Task 4
+
+### Subsystem Partitioning
+
+| Subsystem | Files | Pattern Guide |
+|-----------|-------|---------------|
+| write-path & read-path | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `concurrency.md` |
+| memtable | `src/memtable/mod.rs`, `src/memtable/skiplist.rs`, `src/memtable/skiplist_impl.rs` | `memtable.md`, `unsafe-audit.md` |
+| WAL | `src/wal/writer.rs`, `src/wal/reader.rs`, `src/wal/record.rs` | `wal.md` |
+| SST | `src/sst/table_builder.rs`, `src/sst/table_reader.rs`, `src/sst/block.rs`, `src/sst/block_builder.rs`, `src/sst/filter.rs`, `src/sst/format.rs` | `sst.md`, `unsafe-audit.md` |
+| iterator | `src/iterator/db_iter.rs`, `src/iterator/merge.rs`, `src/iterator/level_iter.rs`, `src/iterator/bidi_iter.rs`, `src/iterator/range_del.rs` | `iterator.md` |
+| compaction | `src/compaction/leveled.rs` | `compaction.md` |
+| manifest & cache | `src/manifest/version_set.rs`, `src/manifest/version_edit.rs`, `src/manifest/version.rs`, `src/cache/block_cache.rs`, `src/cache/table_cache.rs` | `concurrency.md` |
+| types & encoding | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | (cross-cutting) |
+
+### Per-Subsystem Agent Instructions
+
+Each agent must:
+1. Read ALL files in its subsystem
+2. Read `technical-patterns.md` and the assigned pattern guide(s)
+3. Read `false-positive-guide.md`
+4. Perform the **full review-core methodology** (invariants, boundary conditions, failure paths, concurrency)
+5. Apply **code style rules** (no `#[allow(...)]`, no inline paths, grouped imports, doc-code alignment)
+6. Report findings in the standard format, prefixed with subsystem name
+
+### Aggregation
+
+After all agents complete:
+1. Collect all findings
+2. Deduplicate cross-subsystem findings (e.g., a concurrency issue reported by both write-path and compaction agents)
+3. Sort by severity: CRITICAL → HIGH → MEDIUM → LOW
+4. Output a unified audit report:
+
+```
+## Full Audit Report
+
+**Scope**: All src/ files (~17K LOC)
+**Subsystems Audited**: <list>
+**Total Findings**: N (X critical, Y high, Z medium, W low)
+
+## Findings
+
+(sorted by severity, grouped by subsystem)
+
+## Clean Areas
+
+(subsystems with no findings — list what was checked)
 ```
