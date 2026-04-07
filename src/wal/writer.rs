@@ -1,7 +1,7 @@
 //! WAL writer: appends records to a WAL file with block-based fragmentation.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use ruc::*;
@@ -40,6 +40,22 @@ impl WalWriter {
             .c(d!())?;
         let len = file.metadata().c(d!())?.len() as usize;
         let block_offset = len % BLOCK_SIZE;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            block_offset,
+        })
+    }
+
+    /// Reopen a WAL file for appending, truncating it to `valid_len` first.
+    ///
+    /// After a crash, the file may contain a corrupt partial record at the tail.
+    /// Use `WalReader::last_valid_offset()` to determine the safe truncation
+    /// point, then call this to discard the corrupt tail before appending.
+    pub fn open_append_truncated(path: &Path, valid_len: u64) -> Result<Self> {
+        let mut file = OpenOptions::new().write(true).open(path).c(d!())?;
+        file.set_len(valid_len).c(d!())?;
+        file.seek(SeekFrom::End(0)).c(d!())?;
+        let block_offset = valid_len as usize % BLOCK_SIZE;
         Ok(Self {
             writer: BufWriter::new(file),
             block_offset,

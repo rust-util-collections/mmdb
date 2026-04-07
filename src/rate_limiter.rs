@@ -1,6 +1,6 @@
 //! Token-bucket rate limiter for controlling compaction write throughput.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 /// A token-bucket rate limiter.
@@ -36,7 +36,7 @@ impl RateLimiter {
     /// Request `bytes` tokens. Blocks until enough tokens are available.
     /// Returns immediately if the rate limiter is disabled (rate = 0).
     pub fn request(&self, bytes: usize) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         if inner.rate_bytes_per_sec == 0 {
             return;
         }
@@ -54,10 +54,10 @@ impl RateLimiter {
             return;
         }
 
-        // Not enough tokens — calculate wait time
-        let deficit = needed - inner.available;
-        let wait_secs = deficit / inner.rate_bytes_per_sec as f64;
-        inner.available = 0.0;
+        // Not enough tokens — deduct full amount (goes negative as debt)
+        // so concurrent callers also wait for their share of the refill.
+        inner.available -= needed;
+        let wait_secs = (-inner.available) / inner.rate_bytes_per_sec as f64;
         drop(inner);
 
         std::thread::sleep(Duration::from_secs_f64(wait_secs));
@@ -65,7 +65,7 @@ impl RateLimiter {
 
     /// Check if the rate limiter is enabled.
     pub fn is_enabled(&self) -> bool {
-        self.inner.lock().unwrap().rate_bytes_per_sec > 0
+        self.inner.lock().rate_bytes_per_sec > 0
     }
 }
 

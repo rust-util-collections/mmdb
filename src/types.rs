@@ -5,6 +5,8 @@
 //!   Sort order: user_key ASC, sequence DESC, value_type DESC
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 /// Global monotonically increasing sequence number.
@@ -279,7 +281,7 @@ impl Default for WriteBatch {
 pub struct WriteBatchWithIndex {
     batch: WriteBatch,
     /// Maps user_key -> (index of the latest entry in batch.entries, write position).
-    index: std::collections::BTreeMap<Vec<u8>, (usize, u64)>,
+    index: BTreeMap<Vec<u8>, (usize, u64)>,
     /// Range tombstones: (begin, end, write_position) from delete_range calls.
     range_del_entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
     /// Monotonic counter: each put/delete/delete_range increments this.
@@ -290,7 +292,7 @@ impl WriteBatchWithIndex {
     pub fn new() -> Self {
         Self {
             batch: WriteBatch::new(),
-            index: std::collections::BTreeMap::new(),
+            index: BTreeMap::new(),
             range_del_entries: Vec::new(),
             next_pos: 0,
         }
@@ -343,7 +345,11 @@ impl WriteBatchWithIndex {
         &self.range_del_entries
     }
 
-    /// Iterate the BTreeMap in order, producing (InternalKey, value) pairs.
+    /// Iterate the BTreeMap in order, producing (InternalKey, value) pairs
+    /// for point operations only. Range tombstones are handled separately
+    /// by `range_tombstones()` and injected into `DBIterator` via
+    /// `set_range_tombstones_with_levels()`.
+    ///
     /// Sequence numbers are assigned as `base_seq + write_position`,
     /// preserving temporal ordering regardless of key sort order.
     pub(crate) fn sorted_entries(&self, base_seq: SequenceNumber) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -394,7 +400,7 @@ impl LazyValue {
         match self {
             LazyValue::Inline(v) => v,
             LazyValue::BlockRef { data, offset, len } => {
-                &data[*offset as usize..(*offset + *len) as usize]
+                &data[*offset as usize..(*offset as usize) + (*len as usize)]
             }
         }
     }
@@ -405,7 +411,7 @@ impl LazyValue {
         match self {
             LazyValue::Inline(v) => v,
             LazyValue::BlockRef { data, offset, len } => {
-                data[offset as usize..(offset + len) as usize].to_vec()
+                data[offset as usize..(offset as usize) + (len as usize)].to_vec()
             }
         }
     }
@@ -430,8 +436,8 @@ impl LazyValue {
     }
 }
 
-impl std::fmt::Debug for LazyValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for LazyValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LazyValue::Inline(v) => write!(f, "Inline({}B)", v.len()),
             LazyValue::BlockRef { len, .. } => write!(f, "BlockRef({}B)", len),

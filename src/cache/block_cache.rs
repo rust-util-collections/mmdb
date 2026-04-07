@@ -1,6 +1,9 @@
 //! LRU block cache for SST data blocks, backed by moka.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 /// Cache key: (sst_file_number, block_offset).
 type CacheKey = (u64, u64);
@@ -13,7 +16,9 @@ type CacheValue = Arc<Vec<u8>>;
 pub struct BlockCache {
     inner: moka::sync::Cache<CacheKey, CacheValue>,
     /// Pinned entries — never evicted by LRU. Protected by mutex.
-    pinned: std::sync::Mutex<std::collections::HashMap<CacheKey, CacheValue>>,
+    pinned: Mutex<HashMap<CacheKey, CacheValue>>,
+    /// Track which offsets belong to each file for bulk invalidation.
+    file_offsets: Mutex<HashMap<u64, HashSet<u64>>>,
 }
 
 impl BlockCache {
@@ -26,14 +31,15 @@ impl BlockCache {
                     value.len().min(u32::MAX as usize) as u32
                 })
                 .build(),
-            pinned: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pinned: Mutex::new(HashMap::new()),
+            file_offsets: Mutex::new(HashMap::new()),
         }
     }
 
     /// Look up a cached block. Pinned entries are checked first.
     pub fn get(&self, file_number: u64, block_offset: u64) -> Option<Arc<Vec<u8>>> {
         let key = (file_number, block_offset);
-        if let Some(v) = self.pinned.lock().unwrap().get(&key) {
+        if let Some(v) = self.pinned.lock().get(&key) {
             return Some(v.clone());
         }
         self.inner.get(&key)
@@ -43,6 +49,11 @@ impl BlockCache {
     pub fn insert(&self, file_number: u64, block_offset: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let arc = Arc::new(data);
         self.inner.insert((file_number, block_offset), arc.clone());
+        self.file_offsets
+            .lock()
+            .entry(file_number)
+            .or_default()
+            .insert(block_offset);
         arc
     }
 
@@ -56,16 +67,26 @@ impl BlockCache {
     ) -> Arc<Vec<u8>> {
         let key = (file_number, block_offset);
         let arc = Arc::new(data);
-        self.pinned.lock().unwrap().insert(key, arc.clone());
+        self.pinned.lock().insert(key, arc.clone());
         arc
     }
 
     /// Unpin all entries for a specific file (e.g., when L0 file is compacted away).
     pub fn unpin_file(&self, file_number: u64) {
-        self.pinned
-            .lock()
-            .unwrap()
-            .retain(|&(f, _), _| f != file_number);
+        self.pinned.lock().retain(|&(f, _), _| f != file_number);
+    }
+
+    /// Invalidate all cached blocks for a specific file.
+    /// Called after compaction removes an SST file.
+    pub fn invalidate_file(&self, file_number: u64) {
+        self.unpin_file(file_number);
+        let offsets = self.file_offsets.lock().remove(&file_number);
+        if let Some(offsets) = offsets {
+            for offset in offsets {
+                self.inner.invalidate(&(file_number, offset));
+            }
+            self.inner.run_pending_tasks();
+        }
     }
 
     /// Invalidate a specific cached block.

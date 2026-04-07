@@ -1,7 +1,7 @@
 //! WAL reader: reads and reassembles records from a WAL file.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use ruc::*;
@@ -16,6 +16,10 @@ pub struct WalReader {
     block_offset: usize,
     /// Whether we've reached EOF.
     eof: bool,
+    /// Byte position of the end of the last successfully read complete record.
+    /// After iterating all records, this is the safe truncation point for
+    /// append-after-crash (any bytes beyond this are corrupt/partial).
+    last_valid_offset: u64,
 }
 
 impl WalReader {
@@ -26,6 +30,7 @@ impl WalReader {
             reader: BufReader::new(file),
             block_offset: 0,
             eof: false,
+            last_valid_offset: 0,
         })
     }
 
@@ -34,7 +39,14 @@ impl WalReader {
         self.reader.seek(SeekFrom::Start(0)).c(d!())?;
         self.block_offset = 0;
         self.eof = false;
+        self.last_valid_offset = 0;
         Ok(())
+    }
+
+    /// Byte position of the end of the last successfully read complete record.
+    /// Use this as the truncation point when reopening for append after a crash.
+    pub fn last_valid_offset(&self) -> u64 {
+        self.last_valid_offset
     }
 
     /// Return an iterator over all records in the WAL.
@@ -71,6 +83,7 @@ impl WalReader {
                                 "full record inside fragment".to_string(),
                             )));
                         }
+                        self.last_valid_offset = self.reader.stream_position().unwrap_or(0);
                         return Ok(Some(data));
                     }
                     RecordType::First => {
@@ -97,6 +110,7 @@ impl WalReader {
                             )));
                         }
                         result.extend_from_slice(&data);
+                        self.last_valid_offset = self.reader.stream_position().unwrap_or(0);
                         return Ok(Some(result));
                     }
                     RecordType::Zero => {
@@ -119,7 +133,7 @@ impl WalReader {
                     let mut skip = vec![0u8; leftover];
                     match self.reader.read_exact(&mut skip) {
                         Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
                         Err(e) => return Err(eg!(e)),
                     }
                 }
@@ -131,7 +145,7 @@ impl WalReader {
             let mut header_buf = [0u8; HEADER_SIZE];
             match self.reader.read_exact(&mut header_buf) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
                 Err(e) => return Err(eg!(e)),
             }
 
@@ -151,13 +165,21 @@ impl WalReader {
             let mut data = vec![0u8; length];
             match self.reader.read_exact(&mut data) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    return Err(eg!(Error::Corruption("truncated record data".to_string())));
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    // Crash-truncated tail record: treat as clean end-of-data
+                    return Ok(None);
                 }
                 Err(e) => return Err(eg!(e)),
             }
 
             self.block_offset += HEADER_SIZE + length;
+
+            // Skip zero-padding (pre-allocated regions or crash-zeroed blocks)
+            // before CRC verification — all-zero headers have CRC=0 which won't
+            // match the computed CRC, so this must be checked first.
+            if header_buf == [0u8; HEADER_SIZE] {
+                continue;
+            }
 
             // Verify checksum
             let mut hasher = crc32fast::Hasher::new();
@@ -170,10 +192,6 @@ impl WalReader {
                     "WAL checksum mismatch: expected {:#x}, got {:#x}",
                     expected_checksum, checksum
                 ))));
-            }
-
-            if record_type == RecordType::Zero && length == 0 {
-                continue; // skip padding
             }
 
             return Ok(Some((record_type, data)));

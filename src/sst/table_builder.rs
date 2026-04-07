@@ -8,6 +8,7 @@
 //! builder.finish()?;
 //! ```
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -17,6 +18,7 @@ use crate::error::Result;
 use crate::sst::block_builder::BlockBuilder;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::*;
+use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
 use ruc::*;
 
 /// Options for building an SST table.
@@ -142,8 +144,7 @@ impl TableBuilder {
         if self.options.internal_keys {
             assert!(
                 self.last_key.is_empty()
-                    || crate::types::compare_internal_key(key, &self.last_key)
-                        == std::cmp::Ordering::Greater,
+                    || compare_internal_key(key, &self.last_key) == Ordering::Greater,
                 "keys must be added in order"
             );
         } else {
@@ -160,8 +161,8 @@ impl TableBuilder {
 
         // Buffer range deletions into a separate block
         if self.options.internal_keys && key.len() >= 8 {
-            let ikr = crate::types::InternalKeyRef::new(key);
-            if ikr.value_type() == crate::types::ValueType::RangeDeletion {
+            let ikr = InternalKeyRef::new(key);
+            if ikr.value_type() == ValueType::RangeDeletion {
                 self.has_range_deletions = true;
                 self.range_del_entries.push((key.to_vec(), value.to_vec()));
                 self.last_key = key.to_vec();
@@ -400,11 +401,7 @@ impl TableBuilder {
                     .iter()
                     .map(|(n, d)| (n.as_str(), d.as_slice()))
                     .collect();
-                crate::sst::format::encode_index_value_with_props(
-                    &entry.handle,
-                    &entry.first_key,
-                    &prop_refs,
-                )
+                encode_index_value_with_props(&entry.handle, &entry.first_key, &prop_refs)
             };
             builder.add(&entry.last_key, &value);
         }
@@ -622,7 +619,7 @@ mod tests {
         let keys: Vec<&[u8]> = entries.iter().map(|(k, _)| k.as_slice()).collect();
         for k in &keys {
             if k.len() >= 8 {
-                let ikr = crate::types::InternalKeyRef::new(k);
+                let ikr = InternalKeyRef::new(k);
                 assert_ne!(
                     ikr.value_type(),
                     ValueType::RangeDeletion,

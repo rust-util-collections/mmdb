@@ -161,6 +161,7 @@ impl DBIterator {
         self.backward_positioned = false;
         self.skip_point = None;
         self.last_seek_key = None;
+        self.clean_read = true;
     }
 
     /// Reset with prefix-bounded iteration, reusing allocated memory.

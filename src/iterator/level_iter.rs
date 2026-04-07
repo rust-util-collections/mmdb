@@ -4,6 +4,7 @@
 //! and opens one file's TableIterator at a time. This reduces MergingIterator heap size
 //! from O(total_files) to O(L0_count + num_levels).
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::iterator::merge::SeekableIterator;
@@ -101,7 +102,7 @@ impl LevelIterator {
         // Binary search: find first file whose largest_key >= target.
         // partition_point returns first index where predicate is false.
         let idx = self.files.partition_point(|tf| {
-            compare_internal_key(&tf.meta.largest_key, target) == std::cmp::Ordering::Less
+            compare_internal_key(&tf.meta.largest_key, target) == Ordering::Less
         });
         self.file_index = idx;
         self.current_iter = None;
@@ -217,7 +218,7 @@ impl super::merge::SeekableIterator for LevelIterator {
     fn seek_for_prev(&mut self, target: &[u8]) {
         // Binary search: find last file whose smallest_key <= target.
         let idx = self.files.partition_point(|tf| {
-            compare_internal_key(&tf.meta.smallest_key, target) != std::cmp::Ordering::Greater
+            compare_internal_key(&tf.meta.smallest_key, target) != Ordering::Greater
         });
         if idx == 0 {
             self.file_index = 0;

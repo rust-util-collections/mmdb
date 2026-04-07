@@ -1,21 +1,29 @@
 //! SST table reader: reads key-value pairs from an SST file.
 
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::cache::block_cache::BlockCache;
 use crate::error::{Error, Result};
-use crate::sst::block::Block;
+use crate::sst::block::{Block, decode_entry_reuse};
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, RANGE_DEL_BLOCK_NAME,
     decode_footer, decode_index_value_with_props,
 };
 use crate::stats::DbStats;
-use crate::types::{InternalKeyRef, SequenceNumber, ValueType};
+use crate::types::{
+    InternalKeyRef, LazyValue, SequenceNumber, ValueType, compare_internal_key, user_key,
+};
 use ruc::*;
+
+/// A range tombstone: (begin_key, end_key, sequence_number).
+type RangeTombstoneEntry = (Vec<u8>, Vec<u8>, SequenceNumber);
 
 /// Parsed index entry: separator key + block handle + optional first key + block properties.
 pub struct IndexEntry {
@@ -210,8 +218,6 @@ impl TableReader {
         // key in the index block finds the right data block via binary search.
         let seek_key = InternalKey::new(user_key, sequence, ValueType::Value);
 
-        use crate::types::compare_internal_key;
-
         // Use index block seek to find the data block that may contain our key.
         let handle = match self
             .index_block
@@ -259,8 +265,6 @@ impl TableReader {
 
         let seek_key = InternalKey::new(user_key, sequence, ValueType::Value);
 
-        use crate::types::compare_internal_key;
-
         let handle = match self
             .index_block
             .seek_by(seek_key.as_bytes(), compare_internal_key)
@@ -307,10 +311,7 @@ impl TableReader {
 
     /// Return all range tombstones as (begin, end, seq) triples.
     /// Delegates to `cached_range_tombstones()` — no extra I/O after first call.
-    #[allow(clippy::type_complexity)]
-    pub fn get_range_tombstones(
-        &self,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, crate::types::SequenceNumber)>> {
+    pub fn get_range_tombstones(&self) -> Result<Vec<RangeTombstoneEntry>> {
         let cached = self.cached_range_tombstones().c(d!())?;
         Ok(cached.tombstones())
     }
@@ -419,11 +420,27 @@ impl TableReader {
             ))));
         }
 
-        // Decompress if needed
+        // Decompress if needed (with size bound to prevent allocation bombs)
+        const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
         let data = match compression_type {
-            CompressionType::Lz4 => lz4_flex::decompress_size_prepended(&data)
-                .map_err(|e| Error::Corruption(format!("LZ4 decompression error: {}", e)))
-                .c(d!())?,
+            CompressionType::Lz4 => {
+                if data.len() < 4 {
+                    return Err(eg!(Error::Corruption(
+                        "LZ4 block too small for size header".to_string()
+                    )));
+                }
+                let uncompressed_size =
+                    u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+                if uncompressed_size > MAX_DECOMPRESSED_BLOCK_SIZE {
+                    return Err(eg!(Error::Corruption(format!(
+                        "LZ4 decompressed size {} exceeds limit {}",
+                        uncompressed_size, MAX_DECOMPRESSED_BLOCK_SIZE
+                    ))));
+                }
+                lz4_flex::decompress_size_prepended(&data)
+                    .map_err(|e| Error::Corruption(format!("LZ4 decompression error: {}", e)))
+                    .c(d!())?
+            }
             CompressionType::Zstd => zstd::stream::decode_all(data.as_slice())
                 .map_err(|e| Error::Corruption(format!("Zstd decompression error: {}", e)))
                 .c(d!())?,
@@ -547,6 +564,11 @@ impl TableReader {
         {
             use std::os::unix::io::AsRawFd;
             if let Ok(file) = self.open_file() {
+                // SAFETY: `posix_fadvise` is an advisory hint with no safety
+                // invariants beyond a valid fd. The fd is obtained from a live
+                // `File` via `AsRawFd` and remains valid for the `MutexGuard`
+                // lifetime. The offset and length are derived from SST block
+                // handles and cannot be negative.
                 unsafe {
                     libc::posix_fadvise(
                         file.as_raw_fd(),
@@ -565,9 +587,7 @@ impl TableReader {
 
     /// Get a file handle for reading. Uses the held file via mutex.
     fn open_file(&self) -> Result<MutexGuard<'_, File>> {
-        self.file
-            .lock()
-            .map_err(|_| eg!(Error::Corruption("file mutex poisoned".to_string())))
+        Ok(self.file.lock())
     }
 }
 
@@ -719,25 +739,22 @@ impl TableIterator {
     /// Decode the next entry from the current block using the cursor.
     /// Decode the next entry from the current block, returning a lazy value
     /// reference into the block's Arc data (zero-copy for the value).
-    fn cursor_next_lazy(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn cursor_next_lazy(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         let block = self.current_block.as_ref()?;
         if self.block_cursor_offset >= self.block_data_end {
             return None;
         }
         let data = block.data();
-        let (value_start, value_len, next_offset) = crate::sst::block::decode_entry_reuse(
-            data,
-            self.block_cursor_offset,
-            &mut self.block_cursor_key,
-        )?;
+        let (value_start, value_len, next_offset) =
+            decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key)?;
         // Check upper bound before returning entry
         if let Some(ref ub) = self.upper_bound
-            && crate::types::user_key(&self.block_cursor_key) >= ub.as_slice()
+            && user_key(&self.block_cursor_key) >= ub.as_slice()
         {
             return None;
         }
         self.block_cursor_offset = next_offset;
-        let lazy_val = crate::types::LazyValue::BlockRef {
+        let lazy_val = LazyValue::BlockRef {
             data: block.data_arc().clone(),
             offset: value_start as u32,
             len: value_len as u32,
@@ -753,14 +770,12 @@ impl TableIterator {
 
     /// Seek to the first entry >= target using the index block for O(log N) lookup.
     pub fn seek(&mut self, target: &[u8]) {
-        use crate::types::compare_internal_key;
-
         self.ensure_index();
         let index_entries = self.index_entries.as_ref().unwrap();
 
         // Quick check: if target > file's largest key, mark exhausted.
         if let Some(last) = index_entries.last()
-            && compare_internal_key(target, &last.separator_key) == std::cmp::Ordering::Greater
+            && compare_internal_key(target, &last.separator_key) == Ordering::Greater
         {
             self.index_pos = index_entries.len();
             self.current_block_entries.clear();
@@ -770,7 +785,7 @@ impl TableIterator {
 
         // Binary search index entries to find the first block that may contain target
         let idx = index_entries.partition_point(|entry| {
-            compare_internal_key(&entry.separator_key, target) == std::cmp::Ordering::Less
+            compare_internal_key(&entry.separator_key, target) == Ordering::Less
         });
 
         self.index_pos = idx;
@@ -785,7 +800,7 @@ impl TableIterator {
 
             // Deferred block read: if target <= first_key, position without I/O
             if let Some(ref first_key) = entry.first_key
-                && compare_internal_key(target, first_key) != std::cmp::Ordering::Greater
+                && compare_internal_key(target, first_key) != Ordering::Greater
             {
                 self.at_first_key_from_index = true;
                 self.deferred_index_pos = self.index_pos - 1;
@@ -812,7 +827,7 @@ impl TableIterator {
     }
 
     /// Position the cursor at the first entry >= `target` within `block`.
-    fn seek_within_block<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+    fn seek_within_block<F: Fn(&[u8], &[u8]) -> Ordering>(
         &mut self,
         block: Block,
         target: &[u8],
@@ -832,9 +847,9 @@ impl TableIterator {
             let rp = u32::from_le_bytes(block_data[rp_offset..rp_offset + 4].try_into().unwrap())
                 as usize;
             tmp_key.clear();
-            match crate::sst::block::decode_entry_reuse(block_data, rp, &mut tmp_key) {
+            match decode_entry_reuse(block_data, rp, &mut tmp_key) {
                 Some(_) => {
-                    if compare(&tmp_key, target) == std::cmp::Ordering::Less {
+                    if compare(&tmp_key, target) == Ordering::Less {
                         left = mid + 1;
                     } else {
                         right = mid;
@@ -863,13 +878,9 @@ impl TableIterator {
             prev_key_snapshot.clear();
             prev_key_snapshot.extend_from_slice(&self.block_cursor_key);
 
-            match crate::sst::block::decode_entry_reuse(
-                block_data,
-                offset,
-                &mut self.block_cursor_key,
-            ) {
+            match decode_entry_reuse(block_data, offset, &mut self.block_cursor_key) {
                 Some((_, _, next_off)) => {
-                    if compare(&self.block_cursor_key, target) != std::cmp::Ordering::Less {
+                    if compare(&self.block_cursor_key, target) != Ordering::Less {
                         // Found first entry >= target.
                         // Restore key buffer to pre-decode state so cursor_next()
                         // will re-decode this entry correctly.
@@ -899,13 +910,11 @@ impl TableIterator {
     /// Uses windowed segment decoding: only decodes the restart segment containing
     /// the target entry, not the entire block.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
-        use crate::types::compare_internal_key;
-
         self.ensure_index();
         let index_entries = self.index_entries.as_ref().unwrap();
 
         let idx = index_entries.partition_point(|entry| {
-            compare_internal_key(&entry.separator_key, target) == std::cmp::Ordering::Less
+            compare_internal_key(&entry.separator_key, target) == Ordering::Less
         });
 
         // Try the block at `idx` first, then fall back to previous blocks.
@@ -943,7 +952,7 @@ impl TableIterator {
                         let pos_in_entries = entries_from_restart
                             .iter()
                             .rposition(|(k, _)| {
-                                compare_internal_key(k, target) != std::cmp::Ordering::Greater
+                                compare_internal_key(k, target) != Ordering::Greater
                             })
                             .unwrap_or(0);
 
@@ -978,7 +987,7 @@ impl TableIterator {
 
     /// Find the restart index that contains a given key.
     /// Uses O(log R) binary search with O(1) per probe (single entry decode).
-    fn find_restart_for_key<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+    fn find_restart_for_key<F: Fn(&[u8], &[u8]) -> Ordering>(
         &self,
         block: &Block,
         key: &[u8],
@@ -994,7 +1003,7 @@ impl TableIterator {
         while left < right {
             let mid = left + (right - left) / 2;
             if let Some(first_key) = block.first_key_at_restart(mid) {
-                if compare(&first_key, key) != std::cmp::Ordering::Greater {
+                if compare(&first_key, key) != Ordering::Greater {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -1092,7 +1101,7 @@ impl TableIterator {
             // Skip blocks whose first_key user key >= upper_bound
             if let Some(ref ub) = self.upper_bound
                 && let Some(ref fk) = index_entries[block_idx].first_key
-                && crate::types::user_key(fk) >= ub.as_slice()
+                && user_key(fk) >= ub.as_slice()
             {
                 self.index_pos = index_entries.len();
                 return false;
@@ -1214,12 +1223,12 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.seek(target);
     }
 
-    fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
-        TableIterator::current(self).map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
+    fn current(&self) -> Option<(Vec<u8>, LazyValue)> {
+        TableIterator::current(self).map(|(k, v)| (k, LazyValue::Inline(v)))
     }
 
-    fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
-        TableIterator::prev(self).map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
+    fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        TableIterator::prev(self).map(|(k, v)| (k, LazyValue::Inline(v)))
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
@@ -1286,14 +1295,12 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 && self.block_cursor_offset < self.block_data_end
             {
                 let data = block.data();
-                if let Some((vs, vl, next)) = crate::sst::block::decode_entry_reuse(
-                    data,
-                    self.block_cursor_offset,
-                    &mut self.block_cursor_key,
-                ) {
+                if let Some((vs, vl, next)) =
+                    decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key)
+                {
                     // Check upper bound before returning entry
                     if let Some(ref ub) = self.upper_bound
-                        && crate::types::user_key(&self.block_cursor_key) >= ub.as_slice()
+                        && user_key(&self.block_cursor_key) >= ub.as_slice()
                     {
                         return false;
                     }
@@ -1310,7 +1317,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 let (ref k, ref v) = self.current_block_entries[self.block_pos];
                 // Check upper bound before returning entry
                 if let Some(ref ub) = self.upper_bound
-                    && crate::types::user_key(k) >= ub.as_slice()
+                    && user_key(k) >= ub.as_slice()
                 {
                     return false;
                 }
@@ -1347,13 +1354,14 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.err.clone()
     }
 
-    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<crate::types::LazyValue> {
+    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
         // F7: bail immediately if a prior I/O error was recorded
         if self.err.is_some() {
             return None;
         }
         // F6: materialize deferred block if positioned at first_key from index
         if self.at_first_key_from_index {
+            self.at_first_key_from_index = false;
             self.materialize_deferred_block();
             if self.err.is_some() {
                 return None;
@@ -1364,22 +1372,19 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             && self.block_cursor_offset < self.block_data_end
         {
             let data = block.data();
-            let result = crate::sst::block::decode_entry_reuse(
-                data,
-                self.block_cursor_offset,
-                &mut self.block_cursor_key,
-            );
+            let result =
+                decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key);
             if let Some((value_start, value_len, next_offset)) = result {
                 // Check upper bound
                 if let Some(ref ub) = self.upper_bound
-                    && crate::types::user_key(&self.block_cursor_key) >= ub.as_slice()
+                    && user_key(&self.block_cursor_key) >= ub.as_slice()
                 {
                     return None;
                 }
                 self.block_cursor_offset = next_offset;
                 key_buf.clear();
                 key_buf.extend_from_slice(&self.block_cursor_key);
-                return Some(crate::types::LazyValue::BlockRef {
+                return Some(LazyValue::BlockRef {
                     data: block.data_arc().clone(),
                     offset: value_start as u32,
                     len: value_len as u32,
@@ -1390,13 +1395,13 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         if self.block_pos < self.current_block_entries.len() {
             let (ref k, ref v) = self.current_block_entries[self.block_pos];
             if let Some(ref ub) = self.upper_bound
-                && crate::types::user_key(k) >= ub.as_slice()
+                && user_key(k) >= ub.as_slice()
             {
                 return None;
             }
             key_buf.clear();
             key_buf.extend_from_slice(k);
-            let lv = crate::types::LazyValue::Inline(v.clone());
+            let lv = LazyValue::Inline(v.clone());
             self.block_pos += 1;
             return Some(lv);
         }
@@ -1615,7 +1620,7 @@ mod tests {
             .collect();
         // Internal keys with distinct user_keys are already in correct order since
         // user_key ASC is the primary sort. But let's sort to be safe.
-        entries.sort_by(|(a, _), (b, _)| crate::types::compare_internal_key(a, b));
+        entries.sort_by(|(a, _), (b, _)| compare_internal_key(a, b));
 
         for (k, v) in &entries {
             builder.add(k, v).unwrap();

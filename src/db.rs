@@ -1,9 +1,13 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
 use std::collections::{HashSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io;
+use std::mem;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, LazyLock,
+    Arc, Condvar as StdCondvar, LazyLock, Mutex as StdMutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -15,7 +19,7 @@ use parking_lot::{Condvar, Mutex};
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
 use crate::compaction::LeveledCompaction;
-use crate::compaction::leveled::CompactionHint;
+use crate::compaction::leveled::{CompactionContext, CompactionHint};
 use crate::error::{Error, Result};
 use crate::iterator::LevelIterator;
 use crate::iterator::db_iter::DBIterator;
@@ -116,7 +120,7 @@ struct WriteQueueState {
 struct FrozenMemtable {
     old_mem: Arc<MemTable>,
     sst_number: u64,
-    sst_path: std::path::PathBuf,
+    sst_path: PathBuf,
     old_wal_number: u64,
     new_wal_number: u64,
 }
@@ -155,7 +159,7 @@ pub struct DB {
     /// Shutdown flag for compaction threads.
     compaction_shutdown: Arc<AtomicBool>,
     /// Notification condvar for compaction threads: (has_work, condvar).
-    compaction_notify: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    compaction_notify: Arc<(StdMutex<bool>, StdCondvar)>,
     /// Background compaction thread handles.
     compaction_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Cached L0 file count for fast write-throttle checks.
@@ -175,11 +179,10 @@ pub struct DB {
     /// The File handle holds the flock; released automatically when dropped.
     /// Explicitly taken in `simulate_crash()` to allow re-open in tests.
     /// The field is "read" via Drop (releases flock) — not dead code.
-    #[allow(dead_code)]
-    lock_file: Option<std::fs::File>,
+    _lock_file: Option<std::fs::File>,
     /// Keys registered for lazy deletion. Checked during compaction
     /// and dropped without writing tombstones.
-    dead_keys: Arc<std::sync::RwLock<HashSet<Vec<u8>>>>,
+    dead_keys: Arc<parking_lot::RwLock<HashSet<Vec<u8>>>>,
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
@@ -208,14 +211,14 @@ struct SuperVersion {
 /// Internal compaction filter that checks the dead-keys set before
 /// delegating to an optional user-provided filter.
 struct LazyDeleteFilter {
-    dead_keys: Arc<std::sync::RwLock<HashSet<Vec<u8>>>>,
+    dead_keys: Arc<parking_lot::RwLock<HashSet<Vec<u8>>>>,
     user_filter: Option<Arc<dyn CompactionFilter>>,
 }
 
 impl CompactionFilter for LazyDeleteFilter {
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionFilterDecision {
         {
-            let set = self.dead_keys.read().unwrap();
+            let set = self.dead_keys.read();
             if set.contains(key) {
                 return CompactionFilterDecision::Remove;
             }
@@ -253,9 +256,9 @@ impl DB {
         }
 
         // Acquire exclusive directory lock to prevent concurrent DB access
-        let lock_file = {
+        let _lock_file = {
             let lock_path = path.join("LOCK");
-            let file = std::fs::OpenOptions::new()
+            let file = OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
@@ -267,7 +270,7 @@ impl DB {
                 use std::os::fd::AsRawFd;
                 let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if ret != 0 {
-                    let err = std::io::Error::last_os_error();
+                    let err = io::Error::last_os_error();
                     return Err(eg!(Error::InvalidArgument(format!(
                         "failed to lock DB directory {}: {} (is another process using it?)",
                         path.display(),
@@ -409,12 +412,12 @@ impl DB {
 
         // Spawn background compaction threads
         let compaction_shutdown = Arc::new(AtomicBool::new(false));
-        let compaction_notify = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let compaction_notify = Arc::new((StdMutex::new(false), StdCondvar::new()));
         let has_bg_error = Arc::new(AtomicBool::new(false));
         let bg_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         // Wrap the user's compaction filter with lazy-delete support.
-        let dead_keys = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let dead_keys = Arc::new(parking_lot::RwLock::new(HashSet::new()));
         {
             let lazy_filter = LazyDeleteFilter {
                 dead_keys: dead_keys.clone(),
@@ -481,12 +484,12 @@ impl DB {
 
                         // Wrap compaction work in catch_unwind to prevent
                         // thread death from panics in corrupt data paths.
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        let result = catch_unwind(AssertUnwindSafe(
                             || -> std::result::Result<(), String> {
                                 // Drain read-compaction hints (lock released during I/O)
                                 {
                                     let hints: Vec<CompactionHint> =
-                                        std::mem::take(&mut *bg_hints.lock());
+                                        mem::take(&mut *bg_hints.lock());
                                     if !hints.is_empty() {
                                         let active_snaps = bg_snapshot_list.as_sorted_vec();
                                         for hint in &hints {
@@ -511,15 +514,16 @@ impl DB {
 
                                             if let Some((task, file_start)) = pick {
                                                 // Phase 2: I/O (no lock)
+                                                let ctx = CompactionContext {
+                                                    db_path: &bg_path,
+                                                    options: &bg_options,
+                                                    rate_limiter: Some(&bg_rate_limiter),
+                                                    stats: Some(&bg_stats),
+                                                    active_snapshots: &active_snaps,
+                                                };
                                                 let output =
                                                     LeveledCompaction::execute_compaction_io(
-                                                        &task,
-                                                        file_start,
-                                                        &bg_path,
-                                                        &bg_options,
-                                                        Some(&bg_rate_limiter),
-                                                        Some(&bg_stats),
-                                                        &active_snaps,
+                                                        &ctx, &task, file_start,
                                                     )
                                                     .map_err(|e| {
                                                         format!("hint compaction error: {}", e)
@@ -531,6 +535,7 @@ impl DB {
                                                     output,
                                                     &mut inner.versions,
                                                     Some(&bg_table_cache),
+                                                    Some(&bg_block_cache),
                                                     &bg_path,
                                                     Some(&bg_stats),
                                                 )
@@ -584,14 +589,15 @@ impl DB {
                                     };
 
                                     // Phase 2: I/O (no lock held)
+                                    let ctx = CompactionContext {
+                                        db_path: &bg_path,
+                                        options: &bg_options,
+                                        rate_limiter: Some(&bg_rate_limiter),
+                                        stats: Some(&bg_stats),
+                                        active_snapshots: &active_snaps,
+                                    };
                                     let output = LeveledCompaction::execute_compaction_io(
-                                        &task,
-                                        file_start,
-                                        &bg_path,
-                                        &bg_options,
-                                        Some(&bg_rate_limiter),
-                                        Some(&bg_stats),
-                                        &active_snaps,
+                                        &ctx, &task, file_start,
                                     )
                                     .map_err(|e| format!("compaction error: {}", e))?;
 
@@ -602,6 +608,7 @@ impl DB {
                                             output,
                                             &mut inner.versions,
                                             Some(&bg_table_cache),
+                                            Some(&bg_block_cache),
                                             &bg_path,
                                             Some(&bg_stats),
                                         )
@@ -669,7 +676,7 @@ impl DB {
             read_compaction_hints,
             read_counter: AtomicU64::new(0),
             snapshot_list,
-            lock_file,
+            _lock_file,
             dead_keys,
         };
 
@@ -1539,6 +1546,13 @@ impl DB {
 
         // Range-filtered compaction: compact files overlapping [begin, end)
         let active_snaps = self.snapshot_list.as_sorted_vec();
+        let ctx = CompactionContext {
+            db_path: &self.path,
+            options: &self.options,
+            rate_limiter: Some(&self.rate_limiter),
+            stats: Some(&self.stats),
+            active_snapshots: &active_snaps,
+        };
         loop {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
@@ -1552,14 +1566,10 @@ impl DB {
                         Vec::new()
                     };
                     LeveledCompaction::execute_compaction_with_cache(
+                        &ctx,
                         &task,
                         &mut inner.versions,
-                        &self.path,
-                        &self.options,
                         Some(&self.table_cache),
-                        Some(&self.rate_limiter),
-                        Some(&self.stats),
-                        &active_snaps,
                     )
                     .c(d!())?;
                     for num in &l0_inputs {
@@ -1591,7 +1601,7 @@ impl DB {
     /// the keys will remain in the database permanently unless
     /// re-registered.
     pub fn lazy_delete(&self, key: &[u8]) {
-        let mut set = self.dead_keys.write().unwrap();
+        let mut set = self.dead_keys.write();
         set.insert(key.to_vec());
     }
 
@@ -1605,7 +1615,7 @@ impl DB {
     /// automatically signalled.
     pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
         let threshold = self.options.lazy_delete_compaction_threshold;
-        let mut set = self.dead_keys.write().unwrap();
+        let mut set = self.dead_keys.write();
         let prev_len = set.len();
         for k in keys {
             set.insert(k.as_ref().to_vec());
@@ -1619,7 +1629,7 @@ impl DB {
 
     /// Returns the current number of keys registered for lazy deletion.
     pub fn dead_key_count(&self) -> usize {
-        self.dead_keys.read().unwrap().len()
+        self.dead_keys.read().len()
     }
 
     /// Clear all dead keys to reclaim memory used by the dead-keys set.
@@ -1630,7 +1640,7 @@ impl DB {
     /// compaction will be silently abandoned — those keys will remain
     /// in the database and will not be removed unless re-registered.
     pub fn clear_dead_keys(&self) {
-        self.dead_keys.write().unwrap().clear();
+        self.dead_keys.write().clear();
     }
 
     /// Close the database.
@@ -1844,9 +1854,7 @@ impl DB {
                 if r.result.is_none() {
                     r.result = match &result {
                         Ok(()) => Some(Ok(())),
-                        Err(e) => {
-                            Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))))
-                        }
+                        Err(e) => Some(Err(eg!(Error::Io(io::Error::other(format!("{}", e)))))),
                     };
                 }
                 r.done = true;
@@ -1930,16 +1938,16 @@ impl DB {
                 // Flush failed: earlier batches are NOT durable either
                 for &rp in &batch_group[..fail_idx] {
                     let rr = unsafe { &mut *rp };
-                    rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(
+                    rr.result = Some(Err(eg!(Error::Io(io::Error::other(
                         "WAL flush failed after partial batch group write"
                     )))));
                 }
             }
             for &rp in &batch_group[fail_idx..] {
                 let rr = unsafe { &mut *rp };
-                rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
+                rr.result = Some(Err(eg!(Error::Io(io::Error::other(format!("{}", e))))));
             }
-            return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
+            return Err(eg!(Error::Io(io::Error::other(format!("{}", e)))));
         }
 
         // Single fsync for all batches
@@ -1959,9 +1967,9 @@ impl DB {
             self.set_bg_error(format!("WAL sync failed: {}", e));
             for &rp in batch_group {
                 let rr = unsafe { &mut *rp };
-                rr.result = Some(Err(eg!(Error::Io(std::io::Error::other(format!("{}", e))))));
+                rr.result = Some(Err(eg!(Error::Io(io::Error::other(format!("{}", e))))));
             }
-            return Err(eg!(Error::Io(std::io::Error::other(format!("{}", e)))));
+            return Err(eg!(Error::Io(io::Error::other(format!("{}", e)))));
         }
 
         // Check memtable size threshold — release lock during SST I/O
@@ -2012,7 +2020,7 @@ impl DB {
 
     /// Phase 1 (under lock, fast): swap memtable, create WAL, allocate SST number.
     fn freeze_memtable(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
-        let old_mem = std::mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
+        let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
 
         let new_wal_number = inner.versions.new_file_number();
         let new_wal_path = self.path.join(format!("{:06}.wal", new_wal_number));
@@ -2102,6 +2110,13 @@ impl DB {
             ..self.options.clone()
         };
         let active_snaps = self.snapshot_list.as_sorted_vec();
+        let ctx = CompactionContext {
+            db_path: &self.path,
+            options: &self.options,
+            rate_limiter: Some(&self.rate_limiter),
+            stats: Some(&self.stats),
+            active_snapshots: &active_snaps,
+        };
         loop {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction(&version, &force_opts) {
@@ -2116,14 +2131,10 @@ impl DB {
                         Vec::new()
                     };
                     LeveledCompaction::execute_compaction_with_cache(
+                        &ctx,
                         &task,
                         &mut inner.versions,
-                        &self.path,
-                        &self.options,
                         Some(&self.table_cache),
-                        Some(&self.rate_limiter),
-                        Some(&self.stats),
-                        &active_snaps,
                     )
                     .c(d!())?;
                     // Unpin L0 files from block cache after compaction
@@ -2139,14 +2150,10 @@ impl DB {
         // from the data they cover. Merging fixes this.
         for level in 1..self.options.num_levels {
             LeveledCompaction::force_merge_level(
+                &ctx,
                 level,
                 &mut inner.versions,
-                &self.path,
-                &self.options,
                 Some(&self.table_cache),
-                Some(&self.rate_limiter),
-                Some(&self.stats),
-                &active_snaps,
             )
             .c(d!())?;
         }
@@ -2314,8 +2321,8 @@ impl DB {
         }
         // Release directory lock before forgetting self, so subsequent
         // DB::open on the same directory will succeed (e.g., in tests).
-        self.lock_file.take();
-        std::mem::forget(self);
+        self._lock_file.take();
+        mem::forget(self);
     }
 }
 

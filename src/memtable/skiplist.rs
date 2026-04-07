@@ -1,9 +1,11 @@
 //! SkipList-based MemTable implementation using a custom concurrent skiplist.
 
+use std::cmp::Ordering;
+use std::sync::Arc;
+
 use super::skiplist_impl::ConcurrentSkipList;
 use crate::iterator::merge::SeekableIterator;
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
-use std::sync::Arc;
 
 /// Newtype wrapper for internal keys that implements `Ord` using `compare_internal_key`.
 /// This ensures the skip list maintains logical internal key order directly,
@@ -19,20 +21,20 @@ impl OrdInternalKey {
 
 impl PartialEq for OrdInternalKey {
     fn eq(&self, other: &Self) -> bool {
-        compare_internal_key(&self.0, &other.0) == std::cmp::Ordering::Equal
+        compare_internal_key(&self.0, &other.0) == Ordering::Equal
     }
 }
 
 impl Eq for OrdInternalKey {}
 
 impl PartialOrd for OrdInternalKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for OrdInternalKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         compare_internal_key(&self.0, &other.0)
     }
 }

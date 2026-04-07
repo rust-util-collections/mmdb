@@ -5,13 +5,17 @@
 //!
 //! After compaction, the old files are deleted and new files are installed.
 
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
+use std::fs::remove_file;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::scope;
 
 use ruc::*;
 
+use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
 use crate::error::Result;
 use crate::iterator::merge::{IterSource, MergingIterator};
@@ -19,11 +23,14 @@ use crate::iterator::range_del::RangeTombstoneTracker;
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
-use crate::options::DbOptions;
+use crate::options::{CompactionFilterDecision, DbOptions};
+use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
+use crate::stats::DbStats;
 use crate::types::{
-    InternalKey, InternalKeyRef, LazyValue, SequenceNumber, ValueType, compare_internal_key,
+    InternalKey, InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType,
+    compare_internal_key, user_key,
 };
 
 /// A hint from the read path that a specific level may benefit from compaction.
@@ -34,6 +41,15 @@ pub struct CompactionHint {
     pub level: usize,
     /// Number of sampled reads at this level.
     pub read_count: u64,
+}
+
+/// Shared context for compaction operations, reducing argument count.
+pub(crate) struct CompactionContext<'a> {
+    pub db_path: &'a Path,
+    pub options: &'a DbOptions,
+    pub rate_limiter: Option<&'a Arc<RateLimiter>>,
+    pub stats: Option<&'a Arc<DbStats>>,
+    pub active_snapshots: &'a [SequenceNumber],
 }
 
 /// Description of a compaction to perform.
@@ -104,6 +120,17 @@ struct SubCompactionTask {
     input_files_next: Vec<TableFile>,
 }
 
+/// Parameters shared across all sub-compactions within a single compaction I/O.
+struct SubCompactionParams<'a> {
+    target_level: usize,
+    is_bottommost: bool,
+    build_opts: &'a TableBuildOptions,
+    min_unflushed_seq: SequenceNumber,
+    file_number_counter: &'a AtomicU64,
+    all_range_del_entries: &'a [(Vec<u8>, Vec<u8>)],
+    all_raw_tombstones: &'a [(Vec<u8>, Vec<u8>, SequenceNumber)],
+}
+
 /// Output of a single sub-compaction (new files only; deletions handled by orchestrator).
 struct SubCompactionOutput {
     new_files: Vec<(u32, FileMetaData)>,
@@ -125,7 +152,7 @@ fn compute_split_points(task: &CompactionTask, max_subs: usize) -> Vec<Vec<u8>> 
     // since the last file's largest_key doesn't split anything).
     let boundaries: Vec<Vec<u8>> = next_files[..next_files.len() - 1]
         .iter()
-        .map(|tf| crate::types::user_key(&tf.meta.largest_key).to_vec())
+        .map(|tf| user_key(&tf.meta.largest_key).to_vec())
         .collect();
 
     if boundaries.is_empty() {
@@ -169,8 +196,8 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
         let sub_next: Vec<TableFile> = next_files
             .iter()
             .filter(|tf| {
-                let file_smallest = crate::types::user_key(&tf.meta.smallest_key);
-                let file_largest = crate::types::user_key(&tf.meta.largest_key);
+                let file_smallest = user_key(&tf.meta.smallest_key);
+                let file_largest = user_key(&tf.meta.largest_key);
                 let above_lower = match &lower {
                     Some(lo) => file_largest >= lo.as_slice(),
                     None => true,
@@ -192,8 +219,8 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
             task.input_files_level
                 .iter()
                 .filter(|tf| {
-                    let file_smallest = crate::types::user_key(&tf.meta.smallest_key);
-                    let file_largest = crate::types::user_key(&tf.meta.largest_key);
+                    let file_smallest = user_key(&tf.meta.smallest_key);
+                    let file_largest = user_key(&tf.meta.largest_key);
                     let above_lower = match &lower {
                         Some(lo) => file_largest >= lo.as_slice(),
                         None => true,
@@ -239,21 +266,10 @@ fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<RawTombstone>> {
 /// `all_raw_tombstones` contains raw (begin, end, seq) triples to pre-populate
 /// the RangeTombstoneTracker, ensuring tombstones whose start key is before
 /// this sub-task's lower_bound are still applied.
-#[allow(clippy::too_many_arguments)]
 fn execute_sub_compaction_io(
+    ctx: &CompactionContext<'_>,
     sub: &SubCompactionTask,
-    target_level: usize,
-    is_bottommost: bool,
-    db_path: &Path,
-    build_opts: &TableBuildOptions,
-    options: &DbOptions,
-    rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
-    stats: Option<&Arc<crate::stats::DbStats>>,
-    active_snapshots: &[SequenceNumber],
-    min_unflushed_seq: SequenceNumber,
-    file_number_counter: &AtomicU64,
-    all_range_del_entries: &[(Vec<u8>, Vec<u8>)],
-    all_raw_tombstones: &[(Vec<u8>, Vec<u8>, SequenceNumber)],
+    params: &SubCompactionParams<'_>,
 ) -> Result<SubCompactionOutput> {
     // Build streaming merge sources
     let mut sources: Vec<IterSource> = Vec::new();
@@ -267,15 +283,15 @@ fn execute_sub_compaction_io(
     }
 
     // Inject ALL range tombstones into merge stream
-    if !all_range_del_entries.is_empty() {
-        sources.push(IterSource::new(all_range_del_entries.to_vec()));
+    if !params.all_range_del_entries.is_empty() {
+        sources.push(IterSource::new(params.all_range_del_entries.to_vec()));
     }
 
     let mut merger = MergingIterator::new(sources, compare_internal_key);
 
     // If lower_bound is set, seek past it
     if let Some(ref lo) = sub.lower_bound {
-        let seek_key = InternalKey::new(lo, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value)
+        let seek_key = InternalKey::new(lo, MAX_SEQUENCE_NUMBER, ValueType::Value)
             .as_bytes()
             .to_vec();
         merger.seek(&seek_key);
@@ -289,11 +305,11 @@ fn execute_sub_compaction_io(
     let mut last_point_key: Option<Vec<u8>> = None;
     let mut last_range_del_key: Option<Vec<u8>> = None;
     let mut last_written_seq: SequenceNumber = 0;
-    let mut snapshot_idx: usize = active_snapshots.len();
+    let mut snapshot_idx: usize = ctx.active_snapshots.len();
     let mut range_tombstones = RangeTombstoneTracker::new();
     // Pre-populate tracker with ALL tombstones so that tombstones whose
     // start key is before this sub-task's lower_bound still take effect.
-    for (begin, end, seq) in all_raw_tombstones {
+    for (begin, end, seq) in params.all_raw_tombstones {
         range_tombstones.add(begin.clone(), end.clone(), *seq);
     }
     range_tombstones.reset();
@@ -321,16 +337,21 @@ fn execute_sub_compaction_io(
                 continue;
             }
             last_range_del_key = Some(user_key.to_vec());
-            if is_bottommost {
+            if params.is_bottommost
+                && !ctx
+                    .active_snapshots
+                    .iter()
+                    .any(|&snap| snap >= ikr.sequence())
+            {
                 continue;
             }
         } else if let Some(ref last) = last_point_key
             && last.as_slice() == user_key
         {
-            while snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= last_written_seq {
+            while snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= last_written_seq {
                 snapshot_idx -= 1;
             }
-            if snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
+            if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
                 last_written_seq = ikr.sequence();
             } else {
                 continue;
@@ -338,15 +359,21 @@ fn execute_sub_compaction_io(
         } else {
             last_point_key = Some(user_key.to_vec());
             last_written_seq = ikr.sequence();
-            snapshot_idx = active_snapshots.len();
+            snapshot_idx = ctx.active_snapshots.len();
 
-            if ikr.value_type() == ValueType::Deletion && is_bottommost {
+            if ikr.value_type() == ValueType::Deletion
+                && params.is_bottommost
+                && !ctx
+                    .active_snapshots
+                    .iter()
+                    .any(|&snap| snap >= ikr.sequence())
+            {
                 continue;
             }
 
             if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
                 let entry_seq = ikr.sequence();
-                if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
+                if range_tombstones.is_deleted(user_key, entry_seq, params.min_unflushed_seq) {
                     continue;
                 }
             }
@@ -354,11 +381,10 @@ fn execute_sub_compaction_io(
 
         // Apply compaction filter
         let mut final_value = value;
-        if let Some(ref filter) = options.compaction_filter
+        if let Some(ref filter) = ctx.options.compaction_filter
             && ikr.value_type() == ValueType::Value
         {
-            use crate::options::CompactionFilterDecision;
-            match filter.filter(target_level, user_key, final_value.as_slice()) {
+            match filter.filter(params.target_level, user_key, final_value.as_slice()) {
                 CompactionFilterDecision::Keep => {}
                 CompactionFilterDecision::Remove => continue,
                 CompactionFilterDecision::ChangeValue(new_val) => {
@@ -369,11 +395,12 @@ fn execute_sub_compaction_io(
 
         // Create new output file if needed
         if builder.is_none() {
-            current_file_number = file_number_counter.fetch_add(1, Ordering::Relaxed);
+            current_file_number = params.file_number_counter.fetch_add(1, Ordering::Relaxed);
             next_file_idx += 1;
-            let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
-            let mut opts = build_opts.clone();
-            opts.block_property_collectors = options
+            let sst_path = ctx.db_path.join(format!("{:06}.sst", current_file_number));
+            let mut opts = params.build_opts.clone();
+            opts.block_property_collectors = ctx
+                .options
                 .block_property_collectors
                 .iter()
                 .map(|f| f())
@@ -383,9 +410,9 @@ fn execute_sub_compaction_io(
         }
 
         let final_ikey;
-        let ikey_ref = if is_bottommost
+        let ikey_ref = if params.is_bottommost
             && ikr.sequence() > 0
-            && ikr.sequence() < min_unflushed_seq
+            && ikr.sequence() < params.min_unflushed_seq
             && ikr.value_type() == ValueType::Value
         {
             final_ikey = InternalKey::new(user_key, 0, ikr.value_type())
@@ -404,17 +431,17 @@ fn execute_sub_compaction_io(
             .c(d!())?;
         current_size += entry_bytes;
 
-        if let Some(rl) = rate_limiter {
+        if let Some(rl) = ctx.rate_limiter {
             rl.request(entry_bytes);
         }
 
-        if current_size >= options.target_file_size_base as usize {
+        if current_size >= ctx.options.target_file_size_base as usize {
             let result = builder.take().unwrap().finish().c(d!())?;
-            if let Some(s) = stats {
+            if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
             }
             new_files.push((
-                target_level as u32,
+                params.target_level as u32,
                 FileMetaData {
                     number: current_file_number,
                     file_size: result.file_size,
@@ -429,11 +456,11 @@ fn execute_sub_compaction_io(
     // Flush remaining builder
     if let Some(b) = builder {
         let result = b.finish().c(d!())?;
-        if let Some(s) = stats {
+        if let Some(s) = ctx.stats {
             s.record_compaction_bytes(result.file_size);
         }
         new_files.push((
-            target_level as u32,
+            params.target_level as u32,
             FileMetaData {
                 number: current_file_number,
                 file_size: result.file_size,
@@ -538,8 +565,8 @@ impl LeveledCompaction {
         let l0_files = version.level_files(0);
         let mut input_l0: Vec<TableFile> = Vec::new();
         for tf in l0_files {
-            let file_smallest = crate::types::user_key(&tf.meta.smallest_key);
-            let file_largest = crate::types::user_key(&tf.meta.largest_key);
+            let file_smallest = user_key(&tf.meta.smallest_key);
+            let file_largest = user_key(&tf.meta.largest_key);
             let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
             let overlaps_end = end.is_none_or(|e| file_smallest < e);
             if overlaps_begin && overlaps_end {
@@ -562,8 +589,8 @@ impl LeveledCompaction {
             let files = version.level_files(level);
             let mut input_level: Vec<TableFile> = Vec::new();
             for tf in files {
-                let file_smallest = crate::types::user_key(&tf.meta.smallest_key);
-                let file_largest = crate::types::user_key(&tf.meta.largest_key);
+                let file_smallest = user_key(&tf.meta.smallest_key);
+                let file_largest = user_key(&tf.meta.largest_key);
                 let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
                 let overlaps_end = end.is_none_or(|e| file_smallest < e);
                 if overlaps_begin && overlaps_end {
@@ -598,7 +625,14 @@ impl LeveledCompaction {
         db_path: &Path,
         options: &DbOptions,
     ) -> Result<()> {
-        Self::execute_compaction_with_cache(task, versions, db_path, options, None, None, None, &[])
+        let ctx = CompactionContext {
+            db_path,
+            options,
+            rate_limiter: None,
+            stats: None,
+            active_snapshots: &[],
+        };
+        Self::execute_compaction_with_cache(&ctx, task, versions, None)
     }
 
     /// Execute compaction with optional table cache for eviction and rate limiter.
@@ -607,20 +641,15 @@ impl LeveledCompaction {
     /// Keys with sequence numbers below the smallest active snapshot get
     /// their sequence zeroed (P5.1). At the bottommost level, tombstones
     /// are dropped (P5.2).
-    #[allow(clippy::too_many_arguments)]
     /// Convenience wrapper: runs compaction I/O and installs the result.
     /// Requires `&mut VersionSet` for the entire duration — use
     /// `execute_compaction_io` + `install_compaction` separately when
     /// you want to release the lock during I/O.
-    pub fn execute_compaction_with_cache(
+    pub(crate) fn execute_compaction_with_cache(
+        ctx: &CompactionContext<'_>,
         task: &CompactionTask,
         versions: &mut VersionSet,
-        db_path: &Path,
-        options: &DbOptions,
         table_cache: Option<&Arc<TableCache>>,
-        rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
-        stats: Option<&Arc<crate::stats::DbStats>>,
-        active_snapshots: &[SequenceNumber],
     ) -> Result<()> {
         let target_level = task.level + 1;
 
@@ -630,7 +659,7 @@ impl LeveledCompaction {
         // the filter needs to see every key-value pair to decide on removals.
         if task.input_files_level.len() == 1
             && task.input_files_next.is_empty()
-            && options.compaction_filter.is_none()
+            && ctx.options.compaction_filter.is_none()
         {
             let tf = &task.input_files_level[0];
             let mut edit = VersionEdit::new();
@@ -638,28 +667,20 @@ impl LeveledCompaction {
             edit.add_file(target_level as u32, tf.meta.clone());
             edit.set_next_file_number(versions.next_file_number());
             versions.log_and_apply(edit).c(d!())?;
-            if let Some(s) = stats {
+            if let Some(s) = ctx.stats {
                 s.record_compaction_completed();
             }
             return Ok(());
         }
 
-        let max_outputs = task.total_input_size() / options.target_file_size_base
-            + options.max_subcompactions.max(1) as u64;
+        let max_outputs = task.total_input_size() / ctx.options.target_file_size_base
+            + ctx.options.max_subcompactions.max(1) as u64;
         let file_number_start = versions.reserve_file_numbers(max_outputs);
 
-        let output = Self::execute_compaction_io(
-            task,
-            file_number_start,
-            db_path,
-            options,
-            rate_limiter,
-            stats,
-            active_snapshots,
-        )
-        .c(d!())?;
+        let output = Self::execute_compaction_io(ctx, task, file_number_start).c(d!())?;
 
-        Self::install_compaction(output, versions, table_cache, db_path, stats).c(d!())
+        Self::install_compaction(output, versions, table_cache, None, ctx.db_path, ctx.stats)
+            .c(d!())
     }
 
     /// Pure I/O phase of compaction — does NOT require any lock.
@@ -670,38 +691,34 @@ impl LeveledCompaction {
     /// When `options.max_subcompactions > 1` and the target level has enough
     /// files to split on, the work is divided into parallel sub-compactions
     /// using `std::thread::scope`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_compaction_io(
+    pub(crate) fn execute_compaction_io(
+        ctx: &CompactionContext<'_>,
         task: &CompactionTask,
         file_number_start: u64,
-        db_path: &Path,
-        options: &DbOptions,
-        rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
-        stats: Option<&Arc<crate::stats::DbStats>>,
-        active_snapshots: &[SequenceNumber],
     ) -> Result<CompactionOutput> {
         let target_level = task.level + 1;
-        let is_bottommost = target_level >= options.num_levels - 1;
-        let min_unflushed_seq = active_snapshots
+        let is_bottommost = target_level >= ctx.options.num_levels - 1;
+        let min_unflushed_seq = ctx
+            .active_snapshots
             .iter()
             .min()
             .copied()
             .unwrap_or(SequenceNumber::MAX);
 
-        let target_compression = if !options.compression_per_level.is_empty()
-            && target_level < options.compression_per_level.len()
+        let target_compression = if !ctx.options.compression_per_level.is_empty()
+            && target_level < ctx.options.compression_per_level.len()
         {
-            options.compression_per_level[target_level]
+            ctx.options.compression_per_level[target_level]
         } else {
-            options.compression
+            ctx.options.compression
         };
         let build_opts = TableBuildOptions {
-            block_size: options.block_size,
-            block_restart_interval: options.block_restart_interval,
-            bloom_bits_per_key: options.bloom_bits_per_key,
+            block_size: ctx.options.block_size,
+            block_restart_interval: ctx.options.block_restart_interval,
+            bloom_bits_per_key: ctx.options.bloom_bits_per_key,
             internal_keys: true,
             compression: target_compression,
-            prefix_len: options.prefix_len,
+            prefix_len: ctx.options.prefix_len,
             block_property_collectors: Vec::new(),
         };
 
@@ -712,7 +729,7 @@ impl LeveledCompaction {
         let max_subs = if task.level == 0 {
             1
         } else {
-            options.max_subcompactions.max(1)
+            ctx.options.max_subcompactions.max(1)
         };
         let split_points = compute_split_points(task, max_subs);
         let actual_subs = split_points.len() + 1;
@@ -735,50 +752,25 @@ impl LeveledCompaction {
         // Shared atomic counter for thread-safe file number allocation
         let file_counter = AtomicU64::new(file_number_start);
 
+        let sub_params = SubCompactionParams {
+            target_level,
+            is_bottommost,
+            build_opts: &build_opts,
+            min_unflushed_seq,
+            file_number_counter: &file_counter,
+            all_range_del_entries: &all_range_del_entries,
+            all_raw_tombstones: &all_raw_tombstones,
+        };
+
         let sub_outputs = if actual_subs <= 1 {
             // Fast path: single sub-compaction (zero overhead)
-            vec![
-                execute_sub_compaction_io(
-                    &sub_tasks[0],
-                    target_level,
-                    is_bottommost,
-                    db_path,
-                    &build_opts,
-                    options,
-                    rate_limiter,
-                    stats,
-                    active_snapshots,
-                    min_unflushed_seq,
-                    &file_counter,
-                    &all_range_del_entries,
-                    &all_raw_tombstones,
-                )
-                .c(d!())?,
-            ]
+            vec![execute_sub_compaction_io(ctx, &sub_tasks[0], &sub_params).c(d!())?]
         } else {
             // Parallel sub-compactions
-            let thread_results: Vec<Result<SubCompactionOutput>> = std::thread::scope(|s| {
+            let thread_results: Vec<Result<SubCompactionOutput>> = scope(|s| {
                 let handles: Vec<_> = sub_tasks
                     .iter()
-                    .map(|sub| {
-                        s.spawn(|| {
-                            execute_sub_compaction_io(
-                                sub,
-                                target_level,
-                                is_bottommost,
-                                db_path,
-                                &build_opts,
-                                options,
-                                rate_limiter,
-                                stats,
-                                active_snapshots,
-                                min_unflushed_seq,
-                                &file_counter,
-                                &all_range_del_entries,
-                                &all_raw_tombstones,
-                            )
-                        })
-                    })
+                    .map(|sub| s.spawn(|| execute_sub_compaction_io(ctx, sub, &sub_params)))
                     .collect();
                 handles
                     .into_iter()
@@ -789,8 +781,26 @@ impl LeveledCompaction {
                     .collect()
             });
             let mut outputs = Vec::with_capacity(thread_results.len());
+            let mut first_err: Option<Box<dyn ruc::RucError>> = None;
             for r in thread_results {
-                outputs.push(r.c(d!())?);
+                match r {
+                    Ok(sub_out) => outputs.push(sub_out),
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                // Clean up SST files from successful sub-compactions
+                for sub_out in &outputs {
+                    for (_, meta) in &sub_out.new_files {
+                        let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
+                        let _ = remove_file(&orphan);
+                    }
+                }
+                return Err(e);
             }
             outputs
         };
@@ -835,8 +845,9 @@ impl LeveledCompaction {
         mut output: CompactionOutput,
         versions: &mut VersionSet,
         table_cache: Option<&Arc<TableCache>>,
+        block_cache: Option<&Arc<BlockCache>>,
         db_path: &Path,
-        stats: Option<&Arc<crate::stats::DbStats>>,
+        stats: Option<&Arc<DbStats>>,
     ) -> Result<()> {
         // Guard against stale compaction results: if any input file has already
         // been removed from the current version (e.g. by a concurrent inline
@@ -856,7 +867,7 @@ impl LeveledCompaction {
                 // (now-invalidated) I/O phase.
                 for (_, meta) in &output.edit.new_files {
                     let orphan = db_path.join(format!("{:06}.sst", meta.number));
-                    let _ = std::fs::remove_file(&orphan);
+                    let _ = remove_file(&orphan);
                 }
                 if let Some(cache) = table_cache {
                     for (_, meta) in &output.edit.new_files {
@@ -876,17 +887,20 @@ impl LeveledCompaction {
             .set_next_file_number(versions.next_file_number());
         versions.log_and_apply(output.edit).c(d!())?;
 
-        // Evict from table cache before deleting SST files
-        if let Some(cache) = table_cache {
-            for num in &output.input_file_numbers {
+        // Evict from caches before deleting SST files
+        for num in &output.input_file_numbers {
+            if let Some(cache) = table_cache {
                 cache.evict(*num);
+            }
+            if let Some(bc) = block_cache {
+                bc.invalidate_file(*num);
             }
         }
 
         // Delete old SST files
         for num in &output.input_file_numbers {
             let old_path = db_path.join(format!("{:06}.sst", num));
-            if let Err(e) = std::fs::remove_file(&old_path) {
+            if let Err(e) = remove_file(&old_path) {
                 tracing::warn!("failed to remove old SST {}: {}", old_path.display(), e);
             }
         }
@@ -900,19 +914,15 @@ impl LeveledCompaction {
 
     /// Force-merge all files at a given level into one output at the same level.
     /// Drops tombstones if this is the bottommost level.
-    #[allow(clippy::too_many_arguments)]
-    pub fn force_merge_level(
+    pub(crate) fn force_merge_level(
+        ctx: &CompactionContext<'_>,
         level: usize,
         versions: &mut VersionSet,
-        db_path: &Path,
-        options: &DbOptions,
         table_cache: Option<&Arc<TableCache>>,
-        rate_limiter: Option<&Arc<crate::rate_limiter::RateLimiter>>,
-        stats: Option<&Arc<crate::stats::DbStats>>,
-        active_snapshots: &[SequenceNumber],
     ) -> Result<()> {
-        let is_bottommost = level >= options.num_levels - 1;
-        let min_unflushed_seq = active_snapshots
+        let is_bottommost = level >= ctx.options.num_levels - 1;
+        let min_unflushed_seq = ctx
+            .active_snapshots
             .iter()
             .min()
             .copied()
@@ -937,22 +947,22 @@ impl LeveledCompaction {
 
         let mut merger = MergingIterator::new(sources, compare_internal_key);
 
-        let compression = if !options.compression_per_level.is_empty()
-            && level < options.compression_per_level.len()
+        let compression = if !ctx.options.compression_per_level.is_empty()
+            && level < ctx.options.compression_per_level.len()
         {
-            options.compression_per_level[level]
+            ctx.options.compression_per_level[level]
         } else {
-            options.compression
+            ctx.options.compression
         };
         // build_opts is a template; block_property_collectors are created fresh
         // per output file (via factory functions) to avoid sharing mutable state.
         let build_opts = TableBuildOptions {
-            block_size: options.block_size,
-            block_restart_interval: options.block_restart_interval,
-            bloom_bits_per_key: options.bloom_bits_per_key,
+            block_size: ctx.options.block_size,
+            block_restart_interval: ctx.options.block_restart_interval,
+            bloom_bits_per_key: ctx.options.bloom_bits_per_key,
             internal_keys: true,
             compression,
-            prefix_len: options.prefix_len,
+            prefix_len: ctx.options.prefix_len,
             block_property_collectors: Vec::new(),
         };
 
@@ -963,7 +973,7 @@ impl LeveledCompaction {
         let mut last_point_key: Option<Vec<u8>> = None;
         let mut last_range_del_key: Option<Vec<u8>> = None;
         let mut last_written_seq: SequenceNumber = 0;
-        let mut snapshot_idx: usize = active_snapshots.len();
+        let mut snapshot_idx: usize = ctx.active_snapshots.len();
         let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
@@ -982,17 +992,23 @@ impl LeveledCompaction {
                     continue;
                 }
                 last_range_del_key = Some(user_key.to_vec());
-                if is_bottommost {
+                if is_bottommost
+                    && !ctx
+                        .active_snapshots
+                        .iter()
+                        .any(|&snap| snap >= ikr.sequence())
+                {
                     continue;
                 }
             } else if let Some(ref last) = last_point_key
                 && last.as_slice() == user_key
             {
                 // Same key — check if a snapshot needs this version.
-                while snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= last_written_seq {
+                while snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= last_written_seq
+                {
                     snapshot_idx -= 1;
                 }
-                if snapshot_idx > 0 && active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
+                if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
                     last_written_seq = ikr.sequence();
                 } else {
                     continue;
@@ -1000,47 +1016,46 @@ impl LeveledCompaction {
             } else {
                 last_point_key = Some(user_key.to_vec());
                 last_written_seq = ikr.sequence();
-                snapshot_idx = active_snapshots.len();
+                snapshot_idx = ctx.active_snapshots.len();
 
-                if ikr.value_type() == ValueType::Deletion && is_bottommost {
+                if ikr.value_type() == ValueType::Deletion
+                    && is_bottommost
+                    && !ctx
+                        .active_snapshots
+                        .iter()
+                        .any(|&snap| snap >= ikr.sequence())
+                {
                     continue;
                 }
 
                 if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
                     let entry_seq = ikr.sequence();
-                    if range_tombstones.is_deleted(user_key, entry_seq, SequenceNumber::MAX) {
+                    if range_tombstones.is_deleted(user_key, entry_seq, min_unflushed_seq) {
                         continue;
                     }
                 }
             }
 
             // Apply compaction filter
-            if let Some(ref filter) = options.compaction_filter
+            let mut final_value = value;
+            if let Some(ref filter) = ctx.options.compaction_filter
                 && ikr.value_type() == ValueType::Value
             {
-                use crate::options::CompactionFilterDecision;
-                match filter.filter(level, user_key, value.as_slice()) {
+                match filter.filter(level, user_key, final_value.as_slice()) {
                     CompactionFilterDecision::Keep => {}
                     CompactionFilterDecision::Remove => continue,
-                    CompactionFilterDecision::ChangeValue(_) => {
-                        // force_merge_level doesn't rewrite values — the output
-                        // SST reuses the existing encoded block. Silently treat
-                        // as Keep. Regular level-to-level compaction handles
-                        // ChangeValue correctly.
-                        debug_assert!(
-                            false,
-                            "CompactionFilter returned ChangeValue in force_merge_level, \
-                             which cannot rewrite values — treating as Keep"
-                        );
+                    CompactionFilterDecision::ChangeValue(new_val) => {
+                        final_value = LazyValue::Inline(new_val);
                     }
                 }
             }
 
             if builder.is_none() {
                 current_file_number = versions.new_file_number();
-                let sst_path = db_path.join(format!("{:06}.sst", current_file_number));
+                let sst_path = ctx.db_path.join(format!("{:06}.sst", current_file_number));
                 let mut opts = build_opts.clone();
-                opts.block_property_collectors = options
+                opts.block_property_collectors = ctx
+                    .options
                     .block_property_collectors
                     .iter()
                     .map(|f| f())
@@ -1068,19 +1083,19 @@ impl LeveledCompaction {
             builder
                 .as_mut()
                 .unwrap()
-                .add(ikey_ref, value.as_slice())
+                .add(ikey_ref, final_value.as_slice())
                 .c(d!())?;
-            let entry_bytes = ikey_ref.len() + value.len();
+            let entry_bytes = ikey_ref.len() + final_value.len();
             current_size += entry_bytes;
 
             // Rate-limit compaction writes
-            if let Some(rl) = rate_limiter {
+            if let Some(rl) = ctx.rate_limiter {
                 rl.request(entry_bytes);
             }
 
-            if current_size >= options.target_file_size_base as usize {
+            if current_size >= ctx.options.target_file_size_base as usize {
                 let result = builder.take().unwrap().finish().c(d!())?;
-                if let Some(s) = stats {
+                if let Some(s) = ctx.stats {
                     s.record_compaction_bytes(result.file_size);
                 }
                 edit.add_file(
@@ -1098,7 +1113,7 @@ impl LeveledCompaction {
 
         if let Some(b) = builder {
             let result = b.finish().c(d!())?;
-            if let Some(s) = stats {
+            if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
             }
             edit.add_file(
@@ -1133,13 +1148,13 @@ impl LeveledCompaction {
         }
 
         for num in &input_file_numbers {
-            let old_path = db_path.join(format!("{:06}.sst", num));
-            if let Err(e) = std::fs::remove_file(&old_path) {
+            let old_path = ctx.db_path.join(format!("{:06}.sst", num));
+            if let Err(e) = remove_file(&old_path) {
                 tracing::warn!("failed to remove old SST {}: {}", old_path.display(), e);
             }
         }
 
-        if let Some(s) = stats {
+        if let Some(s) = ctx.stats {
             s.record_compaction_completed();
         }
 
@@ -1182,13 +1197,12 @@ impl LeveledCompaction {
 
         for f in files {
             if smallest.is_empty()
-                || compare_internal_key(&f.meta.smallest_key, &smallest) == std::cmp::Ordering::Less
+                || compare_internal_key(&f.meta.smallest_key, &smallest) == CmpOrdering::Less
             {
                 smallest = f.meta.smallest_key.clone();
             }
             if largest.is_empty()
-                || compare_internal_key(&f.meta.largest_key, &largest)
-                    == std::cmp::Ordering::Greater
+                || compare_internal_key(&f.meta.largest_key, &largest) == CmpOrdering::Greater
             {
                 largest = f.meta.largest_key.clone();
             }
@@ -1207,13 +1221,13 @@ impl LeveledCompaction {
     /// internal-key ranges disjoint even though both files contain the same
     /// user key.
     fn overlapping_files(files: &[TableFile], smallest: &[u8], largest: &[u8]) -> Vec<TableFile> {
-        let smallest_uk = crate::types::user_key(smallest);
-        let largest_uk = crate::types::user_key(largest);
+        let smallest_uk = user_key(smallest);
+        let largest_uk = user_key(largest);
         files
             .iter()
             .filter(|f| {
-                let file_largest_uk = crate::types::user_key(&f.meta.largest_key);
-                let file_smallest_uk = crate::types::user_key(&f.meta.smallest_key);
+                let file_largest_uk = user_key(&f.meta.largest_key);
+                let file_smallest_uk = user_key(&f.meta.smallest_key);
                 // File overlaps if: file.largest_uk >= smallest_uk AND file.smallest_uk <= largest_uk
                 file_largest_uk >= smallest_uk && file_smallest_uk <= largest_uk
             })

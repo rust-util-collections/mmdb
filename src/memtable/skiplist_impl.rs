@@ -13,6 +13,7 @@
 //! Max height 12, probability p = 0.25.
 
 use std::cell::UnsafeCell;
+use std::cmp::Ordering as CmpOrdering;
 use std::ops::RangeBounds;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -242,9 +243,8 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
 
         // Link the new node into each level (and maintain prev0 at level 0).
         let new_ref = unsafe { &*new_node };
-        #[allow(clippy::needless_range_loop)]
-        for level in 0..height {
-            if prev[level].is_null() {
+        for (level, &prev_node) in prev[..height].iter().enumerate() {
+            if prev_node.is_null() {
                 // New node becomes the first at this level.
                 let old_head = self.head[level].load(Ordering::Relaxed);
                 new_ref.next[level].store(old_head, Ordering::Relaxed);
@@ -259,13 +259,13 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 }
                 self.head[level].store(new_node, Ordering::Release);
             } else {
-                // SAFETY: prev[level] is a valid node.
-                let p = unsafe { &*prev[level] };
+                // SAFETY: prev_node is a valid node.
+                let p = unsafe { &*prev_node };
                 let old_next = p.next[level].load(Ordering::Relaxed);
                 new_ref.next[level].store(old_next, Ordering::Relaxed);
                 // Level-0 backward pointer maintenance
                 if level == 0 {
-                    new_ref.prev0.store(prev[level], Ordering::Relaxed);
+                    new_ref.prev0.store(prev_node, Ordering::Relaxed);
                     if !old_next.is_null() {
                         unsafe { &*old_next }
                             .prev0
@@ -305,12 +305,12 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             while !next.is_null() {
                 let n = unsafe { &*next };
                 match n.key.borrow().cmp(key) {
-                    std::cmp::Ordering::Less => {
+                    CmpOrdering::Less => {
                         current = next;
                         next = n.next[level].load(Ordering::Acquire);
                     }
-                    std::cmp::Ordering::Equal => return Some(n.value.clone()),
-                    std::cmp::Ordering::Greater => break,
+                    CmpOrdering::Equal => return Some(n.value.clone()),
+                    CmpOrdering::Greater => break,
                 }
             }
         }

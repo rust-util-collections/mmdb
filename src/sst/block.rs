@@ -18,6 +18,7 @@
 //! └──────────────────────────────────────────────────┘
 //! ```
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use ruc::*;
@@ -112,7 +113,7 @@ impl Block {
     /// Binary search for a key using a custom comparator, then linear scan.
     /// Returns Some((key, value)) for the first key where compare(key, target) >= Equal,
     /// or None if all keys are less than target.
-    pub fn seek_by<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+    pub fn seek_by<F: Fn(&[u8], &[u8]) -> Ordering>(
         &self,
         target: &[u8],
         compare: F,
@@ -130,7 +131,7 @@ impl Block {
 
             match decode_entry_at(&self.data, rp, &[]) {
                 Some((key, _, _)) => {
-                    if compare(&key, target) == std::cmp::Ordering::Less {
+                    if compare(&key, target) == Ordering::Less {
                         left = mid + 1;
                     } else {
                         right = mid;
@@ -155,7 +156,7 @@ impl Block {
         while offset < self.restart_offset {
             match decode_entry_at(&self.data, offset, &current_key) {
                 Some((key, value, next_off)) => {
-                    if compare(&key, target) != std::cmp::Ordering::Less {
+                    if compare(&key, target) != Ordering::Less {
                         return Some((key, value));
                     }
                     current_key = key;
@@ -170,7 +171,7 @@ impl Block {
 
     /// Seek to the last entry where compare(key, target) <= Equal.
     /// Uses binary search on restart points, then forward scan to find the last entry <= target.
-    pub fn seek_for_prev_by<F: Fn(&[u8], &[u8]) -> std::cmp::Ordering>(
+    pub fn seek_for_prev_by<F: Fn(&[u8], &[u8]) -> Ordering>(
         &self,
         target: &[u8],
         compare: F,
@@ -189,7 +190,7 @@ impl Block {
 
             match decode_entry_at(&self.data, rp, &[]) {
                 Some((key, _, _)) => {
-                    if compare(&key, target) != std::cmp::Ordering::Greater {
+                    if compare(&key, target) != Ordering::Greater {
                         left = mid + 1;
                     } else {
                         right = mid;
@@ -216,7 +217,7 @@ impl Block {
         while offset < self.restart_offset {
             match decode_entry_at(&self.data, offset, &current_key) {
                 Some((key, value, next_off)) => {
-                    if compare(&key, target) != std::cmp::Ordering::Greater {
+                    if compare(&key, target) != Ordering::Greater {
                         best = Some((key.clone(), value));
                     } else {
                         // All subsequent entries will be > target, we're done

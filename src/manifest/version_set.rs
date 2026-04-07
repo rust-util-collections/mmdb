@@ -1,12 +1,16 @@
 //! VersionSet: manages the MANIFEST file and the chain of Versions.
 
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::table_cache::TableCache;
 use crate::error::{Error, Result};
 use crate::manifest::version::{TableFile, Version};
-use crate::manifest::version_edit::VersionEdit;
+use crate::manifest::version_edit::{FileMetaData, VersionEdit};
+use crate::sst::table_reader::TableReader;
 use crate::types::{SequenceNumber, compare_internal_key};
 use crate::wal::{WalReader, WalWriter};
 use ruc::*;
@@ -112,9 +116,7 @@ impl VersionSet {
         let mut last_sequence = 0u64;
 
         // (level, meta) pairs for files that are still live after all edits.
-        use std::collections::HashMap;
-        let mut live_files: HashMap<u64, (usize, crate::manifest::version_edit::FileMetaData)> =
-            HashMap::new();
+        let mut live_files: HashMap<u64, (usize, FileMetaData)> = HashMap::new();
 
         for record in reader.iter() {
             let data = match record {
@@ -161,7 +163,7 @@ impl VersionSet {
                 tc.get_reader(meta.number)
             } else {
                 let sst_path = db_path.join(format!("{:06}.sst", meta.number));
-                crate::sst::table_reader::TableReader::open(&sst_path).map(Arc::new)
+                TableReader::open(&sst_path).map(Arc::new)
             };
             match reader_result {
                 Ok(reader) => {
@@ -187,8 +189,10 @@ impl VersionSet {
                 .sort_by(|a, b| compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key));
         }
 
-        // Reopen manifest for appending
-        let manifest_writer = WalWriter::open_append(&manifest_path).c(d!())?;
+        // Reopen manifest for appending, truncating any corrupt tail
+        let valid_offset = reader.last_valid_offset();
+        let manifest_writer =
+            WalWriter::open_append_truncated(&manifest_path, valid_offset).c(d!())?;
 
         Ok(Self {
             db_path: db_path.to_path_buf(),
@@ -225,25 +229,9 @@ impl VersionSet {
 
     /// Apply a VersionEdit: write to MANIFEST and install a new Version.
     pub fn log_and_apply(&mut self, edit: VersionEdit) -> Result<()> {
-        // Write edit to MANIFEST
-        let encoded = edit.encode();
-        if let Some(ref mut writer) = self.manifest_writer {
-            writer.add_record(&encoded).c(d!())?;
-            writer.sync().c(d!())?;
-        }
-
-        // Update bookkeeping
-        if let Some(n) = edit.next_file_number {
-            self.next_file_number = n;
-        }
-        if let Some(n) = edit.log_number {
-            self.log_number = n;
-        }
-        if let Some(s) = edit.last_sequence {
-            self.last_sequence = s;
-        }
-
-        // Build new version from current + edit
+        // Build new version from current + edit FIRST, before persisting.
+        // This ensures that if an SST fails to open, the MANIFEST is not
+        // polluted with an edit referencing a broken file.
         let mut new_version = (*self.current).clone();
 
         for (level, meta) in &edit.new_files {
@@ -253,7 +241,7 @@ impl VersionSet {
                     tc.get_reader(meta.number)
                 } else {
                     let sst_path = self.db_path.join(format!("{:06}.sst", meta.number));
-                    crate::sst::table_reader::TableReader::open(&sst_path).map(Arc::new)
+                    TableReader::open(&sst_path).map(Arc::new)
                 };
                 match reader {
                     Ok(reader) => {
@@ -292,6 +280,24 @@ impl VersionSet {
             if level < self.num_levels {
                 new_version.files[level].retain(|f| f.meta.number != *file_number);
             }
+        }
+
+        // Version built successfully — now persist to MANIFEST
+        let encoded = edit.encode();
+        if let Some(ref mut writer) = self.manifest_writer {
+            writer.add_record(&encoded).c(d!())?;
+            writer.sync().c(d!())?;
+        }
+
+        // Update bookkeeping
+        if let Some(n) = edit.next_file_number {
+            self.next_file_number = n;
+        }
+        if let Some(n) = edit.log_number {
+            self.log_number = n;
+        }
+        if let Some(s) = edit.last_sequence {
+            self.last_sequence = s;
         }
 
         self.current = Arc::new(new_version);
@@ -357,16 +363,17 @@ impl VersionSet {
             return Ok(());
         }
 
+        // Allocate new manifest number BEFORE taking the snapshot,
+        // so the snapshot's next_file_number accounts for the manifest file.
+        let new_manifest_number = self.next_file_number;
+        self.next_file_number += 1;
+
         let snapshot_edit = VersionEdit::from_version_snapshot(
             &self.current,
             self.log_number,
             self.next_file_number,
             self.last_sequence,
         );
-
-        // Allocate new manifest number
-        let new_manifest_number = self.next_file_number;
-        self.next_file_number += 1;
 
         let new_manifest_path = self
             .db_path
@@ -385,7 +392,7 @@ impl VersionSet {
         let old_manifest_path = self
             .db_path
             .join(format!("MANIFEST-{:06}", self.manifest_number));
-        if let Err(e) = std::fs::remove_file(&old_manifest_path) {
+        if let Err(e) = fs::remove_file(&old_manifest_path) {
             tracing::warn!(
                 "failed to remove old manifest {}: {}",
                 old_manifest_path.display(),
@@ -406,15 +413,15 @@ impl VersionSet {
 
         // Write and fsync the temp file before rename to ensure durability
         {
-            let file = std::fs::File::create(&tmp_path).c(d!())?;
-            let mut writer = std::io::BufWriter::new(file);
-            std::io::Write::write_all(&mut writer, contents.as_bytes()).c(d!())?;
-            std::io::Write::flush(&mut writer).c(d!())?;
+            let file = fs::File::create(&tmp_path).c(d!())?;
+            let mut writer = BufWriter::new(file);
+            writer.write_all(contents.as_bytes()).c(d!())?;
+            writer.flush().c(d!())?;
             writer.get_ref().sync_all().c(d!())?;
         }
 
         // Atomic rename
-        std::fs::rename(&tmp_path, db_path.join("CURRENT")).c(d!())?;
+        fs::rename(&tmp_path, db_path.join("CURRENT")).c(d!())?;
 
         // Fsync the directory to persist the rename metadata
         Self::fsync_directory(db_path).c(d!())?;
@@ -424,7 +431,7 @@ impl VersionSet {
 
     /// Fsync a directory to persist metadata changes (renames, creates).
     fn fsync_directory(dir: &Path) -> Result<()> {
-        let f = std::fs::File::open(dir).c(d!())?;
+        let f = fs::File::open(dir).c(d!())?;
         f.sync_all().c(d!())?;
         Ok(())
     }
@@ -467,7 +474,7 @@ mod tests {
             edit.set_last_sequence(100);
             edit.add_file(
                 0,
-                crate::manifest::version_edit::FileMetaData {
+                FileMetaData {
                     number: 10,
                     file_size: 4096,
                     smallest_key: b"aaa".to_vec(),
