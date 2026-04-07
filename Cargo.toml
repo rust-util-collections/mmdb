@@ -1,6 +1,6 @@
 [package]
 name = "mmdb"
-version = "3.0.0"
+version = "3.1.0"
 edition = "2024"
 description = "The storage engine behind vsdb — a pure-Rust LSM-Tree key-value store"
 license = "MIT"
