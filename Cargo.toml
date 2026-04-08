@@ -1,6 +1,6 @@
 [package]
 name = "mmdb"
-version = "3.1.0"
+version = "3.1.1"
 edition = "2024"
 description = "The storage engine behind vsdb — a pure-Rust LSM-Tree key-value store"
 license = "MIT"
@@ -20,7 +20,7 @@ lz4_flex = "0.13"
 zstd = "0.13"
 moka = { version = "0.12", features = ["sync"] }
 parking_lot = "0.12"
-ruc = "9.3.1"
+ruc = "10.0.0"
 thiserror = "2"
 tracing = "0.1"
 arc-swap = "1.8.2"
