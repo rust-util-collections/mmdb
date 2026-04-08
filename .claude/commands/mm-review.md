@@ -80,7 +80,12 @@ Check changed files against project style rules:
 1. **No lint suppression** — `#[allow(clippy::...)]`, `#[allow(unused_...)]`, `#[allow(dead_code)]` etc. are forbidden. All warnings must be fixed at the source, not silenced. Report every `allow(...)` attribute in changed code as a finding.
 2. **No inline paths** — Types must be imported via `use` at the top of the file, not referenced inline as `std::collections::HashMap::new()`. The only exception is disambiguation in a single call site where two types share a name.
 3. **Import grouping** — Imports with a common prefix must be merged using nested braces: `use std::sync::{Arc, Mutex};` not separate `use std::sync::Arc; use std::sync::Mutex;`.
-4. **Doc-code alignment** — If the change modifies a public function signature, struct field, or module-level behavior, verify that the corresponding doc comments, README, and CLAUDE.md still accurately describe the current behavior. Report any stale documentation as a finding.
+4. **Doc-code alignment** — If the change modifies a public function signature, struct field, module structure, or adds/removes/renames a public type or module, verify docs still match. Specifically check:
+   - `CLAUDE.md` architecture table (subsystem paths, type names, dependency info)
+   - `.claude/docs/review-core.md` subsystem path mappings
+   - `.claude/commands/mm-review.md` full-audit subsystem partitioning table
+   - `.claude/docs/patterns/` guides — referenced file lists and invariants
+   - Doc comments and README
 
 ### Task 5: Unsafe Code Audit
 

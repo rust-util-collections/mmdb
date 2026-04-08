@@ -93,7 +93,11 @@ These are enforced project conventions — violations are findings (severity LOW
 - **No lint suppression**: `#[allow(...)]` is forbidden. Warnings must be fixed, not silenced.
 - **No inline paths**: Use `use` imports at file top. No `std::foo::Bar::new()` in function bodies. **Exception**: a single-use reference in a file is allowed to stay inline. For multi-use, prefer `use std::mem;` + `mem::take(..)` style (import parent module, not leaf item).
 - **Grouped imports**: Common prefixes must be merged — `use std::sync::{Arc, Mutex};` not two separate `use` lines.
-- **Doc-code alignment**: Public API changes must have matching doc comment / README / CLAUDE.md updates. Stale docs are a finding.
+- **Doc-code alignment**: Public API changes must have matching doc comment / README / CLAUDE.md updates. Stale docs are a finding. When a change adds, removes, or renames a public type, module, or subsystem path, also verify:
+  - `CLAUDE.md` architecture table (paths, type names, dependency info)
+  - `.claude/docs/review-core.md` subsystem path mappings
+  - `.claude/commands/mm-review.md` full-audit subsystem partitioning table
+  - `.claude/docs/patterns/` guides — referenced file lists and invariants
 
 ## Phase 5: Reporting
 
