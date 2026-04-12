@@ -65,10 +65,8 @@ impl DBIterator {
     pub fn new(sources: Vec<Vec<(Vec<u8>, Vec<u8>)>>, sequence: SequenceNumber) -> Self {
         let iter_sources: Vec<IterSource> = sources.into_iter().map(IterSource::new).collect();
 
-        let merger = MergingIterator::new(
-            iter_sources,
-            ikey_compare as fn(&[u8], &[u8]) -> Ordering,
-        );
+        let merger =
+            MergingIterator::new(iter_sources, ikey_compare as fn(&[u8], &[u8]) -> Ordering);
 
         Self {
             merger,
@@ -91,10 +89,7 @@ impl DBIterator {
 
     /// Build a DB iterator from pre-built IterSource objects (supports streaming).
     pub fn from_sources(sources: Vec<IterSource>, sequence: SequenceNumber) -> Self {
-        let merger = MergingIterator::new(
-            sources,
-            ikey_compare as fn(&[u8], &[u8]) -> Ordering,
-        );
+        let merger = MergingIterator::new(sources, ikey_compare as fn(&[u8], &[u8]) -> Ordering);
 
         Self {
             merger,
@@ -122,10 +117,7 @@ impl DBIterator {
         sequence: SequenceNumber,
         prefix: Vec<u8>,
     ) -> Self {
-        let merger = MergingIterator::new(
-            sources,
-            ikey_compare as fn(&[u8], &[u8]) -> Ordering,
-        );
+        let merger = MergingIterator::new(sources, ikey_compare as fn(&[u8], &[u8]) -> Ordering);
 
         Self {
             merger,
