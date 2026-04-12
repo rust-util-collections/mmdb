@@ -1,7 +1,7 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
 use std::collections::{HashSet, VecDeque};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -179,7 +179,7 @@ pub struct DB {
     /// The File handle holds the flock; released automatically when dropped.
     /// Explicitly taken in `simulate_crash()` to allow re-open in tests.
     /// The field is "read" via Drop (releases flock) — not dead code.
-    _lock_file: Option<std::fs::File>,
+    _lock_file: Option<fs::File>,
     /// Keys registered for lazy deletion. Checked during compaction
     /// and dropped without writing tombstones.
     dead_keys: Arc<parking_lot::RwLock<HashSet<Vec<u8>>>>,
@@ -237,7 +237,7 @@ impl DB {
         let path = path.as_ref().to_path_buf();
 
         if options.create_if_missing {
-            std::fs::create_dir_all(&path).c(d!())?;
+            fs::create_dir_all(&path).c(d!())?;
         } else if !path.exists() {
             return Err(eg!(Error::InvalidArgument(format!(
                 "DB path does not exist: {}",
@@ -301,7 +301,7 @@ impl DB {
         // Recover from any WAL files not yet flushed
         let mut active_memtable = Arc::new(MemTable::new());
         let mut wal_numbers: Vec<u64> = Vec::new();
-        for entry in std::fs::read_dir(&path).c(d!())? {
+        for entry in fs::read_dir(&path).c(d!())? {
             let entry = entry.c(d!())?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -386,7 +386,7 @@ impl DB {
         // Safe to clean up old WAL files now — data is in SST
         for wal_num in &wal_numbers {
             let old_wal = path.join(format!("{:06}.wal", wal_num));
-            if let Err(e) = std::fs::remove_file(&old_wal) {
+            if let Err(e) = fs::remove_file(&old_wal) {
                 tracing::warn!("failed to remove old WAL {}: {}", old_wal.display(), e);
             }
         }
@@ -2094,7 +2094,7 @@ impl DB {
         self.install_super_version(inner);
 
         let old_wal_path = self.path.join(format!("{:06}.wal", frozen.old_wal_number));
-        if let Err(e) = std::fs::remove_file(&old_wal_path) {
+        if let Err(e) = fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
         }
 
@@ -2662,7 +2662,7 @@ mod tests {
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
         }
 
-        let sst_count = std::fs::read_dir(dir.path())
+        let sst_count = fs::read_dir(dir.path())
             .unwrap()
             .filter(|e| {
                 e.as_ref()

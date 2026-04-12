@@ -1,11 +1,13 @@
 //! DBIterator: a user-facing iterator that merges all sources, resolves
 //! sequence numbers, and skips tombstones.
 
+use std::cmp::Ordering;
+
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
 
-type IKeyCompareFn = fn(&[u8], &[u8]) -> std::cmp::Ordering;
+type IKeyCompareFn = fn(&[u8], &[u8]) -> Ordering;
 
 /// A database-level iterator that presents a clean view of key-value pairs.
 ///
@@ -54,7 +56,7 @@ pub struct DBIterator {
     clean_read: bool,
 }
 
-fn ikey_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+fn ikey_compare(a: &[u8], b: &[u8]) -> Ordering {
     compare_internal_key(a, b)
 }
 
@@ -65,7 +67,7 @@ impl DBIterator {
 
         let merger = MergingIterator::new(
             iter_sources,
-            ikey_compare as fn(&[u8], &[u8]) -> std::cmp::Ordering,
+            ikey_compare as fn(&[u8], &[u8]) -> Ordering,
         );
 
         Self {
@@ -91,7 +93,7 @@ impl DBIterator {
     pub fn from_sources(sources: Vec<IterSource>, sequence: SequenceNumber) -> Self {
         let merger = MergingIterator::new(
             sources,
-            ikey_compare as fn(&[u8], &[u8]) -> std::cmp::Ordering,
+            ikey_compare as fn(&[u8], &[u8]) -> Ordering,
         );
 
         Self {
@@ -122,7 +124,7 @@ impl DBIterator {
     ) -> Self {
         let merger = MergingIterator::new(
             sources,
-            ikey_compare as fn(&[u8], &[u8]) -> std::cmp::Ordering,
+            ikey_compare as fn(&[u8], &[u8]) -> Ordering,
         );
 
         Self {

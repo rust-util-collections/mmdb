@@ -6,6 +6,8 @@
 //!   First `next_back()` uses `seek_to_last()` (O(log N)).
 //!   Subsequent `next_back()` calls use `db_iter.prev()` for O(1) memory streaming.
 
+use std::mem;
+
 use crate::iterator::db_iter::DBIterator;
 
 /// A bidirectional iterator over (user_key, value) pairs.
@@ -131,7 +133,7 @@ impl Iterator for BidiIterator {
                     front: 0,
                     back: 0,
                 };
-                let old = std::mem::replace(&mut self.inner, placeholder);
+                let old = mem::replace(&mut self.inner, placeholder);
                 if let BidiInner::LazyBackStarted {
                     mut db_iter,
                     last_fwd_key,
@@ -205,7 +207,7 @@ impl DoubleEndedIterator for BidiIterator {
                     front: 0,
                     back: 0,
                 };
-                let old = std::mem::replace(&mut self.inner, placeholder);
+                let old = mem::replace(&mut self.inner, placeholder);
                 let BidiInner::Lazy { mut db_iter, .. } = old else {
                     unreachable!()
                 };
@@ -235,7 +237,7 @@ impl DoubleEndedIterator for BidiIterator {
                     front: 0,
                     back: 0,
                 };
-                let old = std::mem::replace(&mut self.inner, placeholder);
+                let old = mem::replace(&mut self.inner, placeholder);
                 let BidiInner::LazyFwdResumed { mut db_iter } = old else {
                     unreachable!()
                 };

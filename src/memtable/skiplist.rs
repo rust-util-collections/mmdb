@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::skiplist_impl::ConcurrentSkipList;
 use crate::iterator::merge::SeekableIterator;
-use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
+use crate::types::{InternalKeyRef, LazyValue, ValueType, compare_internal_key};
 
 /// Newtype wrapper for internal keys that implements `Ord` using `compare_internal_key`.
 /// This ensures the skip list maintains logical internal key order directly,
@@ -192,14 +192,14 @@ impl SeekableIterator for MemTableCursorIter {
         self.seek_internal(target);
     }
 
-    fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn current(&self) -> Option<(Vec<u8>, LazyValue)> {
         if self.cursor.is_null() {
             return None;
         }
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         Some((
             k.as_bytes().to_vec(),
-            crate::types::LazyValue::Inline(v.clone()),
+            LazyValue::Inline(v.clone()),
         ))
     }
 
@@ -220,19 +220,19 @@ impl SeekableIterator for MemTableCursorIter {
 
     /// Override default next_lazy to avoid temporary Vec::new() allocation.
     /// Writes key into caller buffer, returns value as LazyValue directly.
-    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<crate::types::LazyValue> {
+    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
         if self.cursor.is_null() {
             return None;
         }
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
         key_buf.extend_from_slice(k.as_bytes());
-        let lv = crate::types::LazyValue::Inline(v.clone());
+        let lv = LazyValue::Inline(v.clone());
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
         Some(lv)
     }
 
-    fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if self.cursor.is_null() {
             // Exhausted forward — seek to last for backward iteration.
             // O(1) via cached tail pointer.
@@ -243,7 +243,7 @@ impl SeekableIterator for MemTableCursorIter {
             let (k, v) = unsafe { self.sl().node_kv(ptr) };
             let result = (
                 k.as_bytes().to_vec(),
-                crate::types::LazyValue::Inline(v.clone()),
+                LazyValue::Inline(v.clone()),
             );
             // Follow prev0 for the next prev() call — O(1).
             self.cursor = unsafe { self.sl().node_prev0(ptr) };
@@ -259,7 +259,7 @@ impl SeekableIterator for MemTableCursorIter {
         let (pk, pv) = unsafe { self.sl().node_kv(prev_ptr) };
         let result = (
             pk.as_bytes().to_vec(),
-            crate::types::LazyValue::Inline(pv.clone()),
+            LazyValue::Inline(pv.clone()),
         );
         self.cursor = prev_ptr;
         Some(result)

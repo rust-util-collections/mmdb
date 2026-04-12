@@ -93,7 +93,7 @@ impl VersionSet {
     ) -> Result<Self> {
         // Read CURRENT to find manifest file
         let current_path = db_path.join("CURRENT");
-        let manifest_name = std::fs::read_to_string(&current_path)
+        let manifest_name = fs::read_to_string(&current_path)
             .map_err(|e| eg!(Error::Corruption(format!("cannot read CURRENT: {}", e))))
             .c(d!())?;
         let manifest_name = manifest_name.trim();
@@ -457,7 +457,7 @@ mod tests {
 
         // Verify CURRENT file exists
         assert!(path.join("CURRENT").exists());
-        let current_content = std::fs::read_to_string(path.join("CURRENT")).unwrap();
+        let current_content = fs::read_to_string(path.join("CURRENT")).unwrap();
         assert!(current_content.trim().starts_with("MANIFEST-"));
 
         // Recovery should succeed for a clean (empty) DB
