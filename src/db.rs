@@ -744,13 +744,7 @@ impl DB {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let result = self
-            .get_with_options(&ReadOptions::default(), key)
-            .c(d!())?;
-        if let Some(ref v) = result {
-            self.stats.record_read(key.len() as u64 + v.len() as u64);
-        }
-        Ok(result)
+        self.get_with_options(&ReadOptions::default(), key)
     }
 
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -776,6 +770,9 @@ impl DB {
             if max_tomb_seq > entry_seq {
                 return Ok(None);
             }
+            if let Some(ref v) = result {
+                self.stats.record_read(key.len() as u64 + v.len() as u64);
+            }
             return Ok(result);
         }
 
@@ -784,6 +781,9 @@ impl DB {
             if let Some((result, entry_seq)) = imm.get_with_seq(key, seq) {
                 if max_tomb_seq > entry_seq {
                     return Ok(None);
+                }
+                if let Some(ref v) = result {
+                    self.stats.record_read(key.len() as u64 + v.len() as u64);
                 }
                 return Ok(result);
             }
@@ -805,6 +805,9 @@ impl DB {
             if let Some((result, entry_seq)) = tf.reader.get_internal_with_seq(key, seq).c(d!())? {
                 if max_tomb_seq > entry_seq {
                     return Ok(None);
+                }
+                if let Some(ref v) = result {
+                    self.stats.record_read(key.len() as u64 + v.len() as u64);
                 }
                 return Ok(result);
             }
@@ -860,6 +863,9 @@ impl DB {
                 if level >= 2 {
                     self.stats.maybe_sample_read_level(level);
                     self.maybe_check_read_compaction();
+                }
+                if let Some(ref v) = result {
+                    self.stats.record_read(key.len() as u64 + v.len() as u64);
                 }
                 return Ok(result);
             }
@@ -2154,6 +2160,7 @@ impl DB {
                 level,
                 &mut inner.versions,
                 Some(&self.table_cache),
+                Some(&self.block_cache),
             )
             .c(d!())?;
         }

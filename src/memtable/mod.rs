@@ -62,7 +62,11 @@ impl MemTable {
                 value.to_vec()
             }
         };
-        let entry_size = ikey.encoded_len() + val.len() + 160; // Node struct overhead (inline [AtomicPtr; 12] + Vec headers)
+        let mut entry_size = ikey.encoded_len() + val.len() + 160; // Node struct overhead (inline [AtomicPtr; 12] + Vec headers)
+        if value_type == ValueType::RangeDeletion {
+            // Account for duplicated data in range_tombstones Vec
+            entry_size += key.len() + value.len() + std::mem::size_of::<MemRangeTombstone>();
+        }
         self.inner.insert(ikey.into_bytes(), val);
         self.approximate_size
             .fetch_add(entry_size, Ordering::Relaxed);

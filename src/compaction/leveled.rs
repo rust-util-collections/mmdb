@@ -472,6 +472,11 @@ fn execute_sub_compaction_io(
     }
 
     if let Some(e) = merger.error() {
+        // Clean up orphan SST files written during the failed merge
+        for (_, meta) in &new_files {
+            let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
+            let _ = remove_file(&orphan);
+        }
         return Err(eg!("sub-compaction merge error: {}", e));
     }
 
@@ -919,6 +924,7 @@ impl LeveledCompaction {
         level: usize,
         versions: &mut VersionSet,
         table_cache: Option<&Arc<TableCache>>,
+        block_cache: Option<&Arc<BlockCache>>,
     ) -> Result<()> {
         let is_bottommost = level >= ctx.options.num_levels - 1;
         let min_unflushed_seq = ctx
@@ -1130,6 +1136,11 @@ impl LeveledCompaction {
 
         // Abort if the merge iterator encountered an I/O or corruption error.
         if let Some(e) = merger.error() {
+            // Clean up orphan SST files written during the failed merge
+            for (_, meta) in &edit.new_files {
+                let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
+                let _ = remove_file(&orphan);
+            }
             return Err(eg!("force_merge iterator error: {}", e));
         }
 
@@ -1144,6 +1155,11 @@ impl LeveledCompaction {
         if let Some(cache) = table_cache {
             for num in &input_file_numbers {
                 cache.evict(*num);
+            }
+        }
+        if let Some(bc) = block_cache {
+            for num in &input_file_numbers {
+                bc.invalidate_file(*num);
             }
         }
 

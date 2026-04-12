@@ -52,7 +52,6 @@ pub struct DbOptions {
     /// Per-level compression types. If empty, uses `compression` for all levels.
     /// Index corresponds to level number (0 = L0, 1 = L1, etc.).
     pub compression_per_level: Vec<CompressionType>,
-    /// Optional compaction filter.
     /// Optional compaction filter. Wrapped in `Arc` so it survives Clone
     /// and is shared with background compaction threads.
     pub compaction_filter: Option<Arc<dyn CompactionFilter>>,

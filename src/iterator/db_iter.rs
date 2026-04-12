@@ -315,11 +315,17 @@ impl DBIterator {
         // peek_entry() borrows self.merger; we need self.is_range_deleted() etc.
         enum Action {
             Skip,
-            Take { uk_len: usize },
+            Take {
+                uk_len: usize,
+            },
+            /// Deferred tombstone check — need peek_source_level() after
+            /// the peek_entry() borrow ends so the heap is initialized.
+            TakeCheckTombstone {
+                uk_len: usize,
+                seq: SequenceNumber,
+            },
         }
         loop {
-            // Get the source level before borrowing the merger for peek_entry.
-            let source_level = self.merger.peek_source_level();
             let action = {
                 let (ikey_ref, _value_ref) = self.merger.peek_entry()?;
                 if ikey_ref.len() < 8 {
@@ -371,25 +377,9 @@ impl DBIterator {
                             } else if self.range_tombstones.is_empty() {
                                 Action::Take { uk_len }
                             } else {
-                                // Check range tombstones with cross-level pruning:
-                                // only tombstones from shallower levels can delete
-                                // a key from source_level.
-                                let level_filter = if source_level != usize::MAX {
-                                    Some(source_level)
-                                } else {
-                                    None
-                                };
-                                let covered =
-                                    self.range_tombstones.max_covering_tombstone_seq_for_level(
-                                        &ikey_ref[..uk_len],
-                                        self.sequence,
-                                        level_filter,
-                                    ) > seq;
-                                if covered {
-                                    Action::Skip
-                                } else {
-                                    Action::Take { uk_len }
-                                }
+                                // Defer tombstone check until after peek_entry
+                                // borrow ends so we can call peek_source_level().
+                                Action::TakeCheckTombstone { uk_len, seq }
                             }
                         }
                     }
@@ -400,6 +390,33 @@ impl DBIterator {
                 Action::Skip => {
                     self.merger.advance_entry();
                     continue;
+                }
+                Action::TakeCheckTombstone { uk_len, seq } => {
+                    // Now that peek_entry() borrow is released and the heap is
+                    // initialized, peek_source_level() returns the true level.
+                    let source_level = self.merger.peek_source_level();
+                    let level_filter = if source_level != usize::MAX {
+                        Some(source_level)
+                    } else {
+                        None
+                    };
+                    let covered = self.range_tombstones.max_covering_tombstone_seq_for_level(
+                        &self.last_user_key,
+                        self.sequence,
+                        level_filter,
+                    ) > seq;
+                    if covered {
+                        self.merger.advance_entry();
+                        continue;
+                    }
+                    let (mut ikey, value) = self.merger.take_entry()?;
+                    ikey.truncate(uk_len);
+                    if let Some(ref sp) = self.skip_point
+                        && sp(&ikey)
+                    {
+                        continue;
+                    }
+                    return Some((ikey, value));
                 }
                 Action::Take { uk_len } => {
                     let (mut ikey, value) = self.merger.take_entry()?;
@@ -622,6 +639,13 @@ impl DBIterator {
                 // Prefix guard
                 if let Some(ref pfx) = self.prefix
                     && !uk.starts_with(pfx)
+                {
+                    break;
+                }
+
+                // Lower bound guard
+                if let Some(ref lb) = self.iterate_lower_bound
+                    && uk < lb.as_slice()
                 {
                     break;
                 }

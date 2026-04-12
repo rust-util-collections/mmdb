@@ -142,17 +142,20 @@ impl VersionSet {
                 last_sequence = s;
             }
 
+            // Track deletions FIRST — a trivial-move edit deletes from the
+            // old level and adds to the new level with the same file number.
+            // Processing additions first would insert then immediately remove
+            // the file, losing it entirely.
+            for (_level, file_number) in &edit.deleted_files {
+                live_files.remove(file_number);
+            }
+
             // Track additions
             for (level, meta) in &edit.new_files {
                 let level = *level as usize;
                 if level < num_levels {
                     live_files.insert(meta.number, (level, meta.clone()));
                 }
-            }
-
-            // Track deletions
-            for (_level, file_number) in &edit.deleted_files {
-                live_files.remove(file_number);
             }
         }
 

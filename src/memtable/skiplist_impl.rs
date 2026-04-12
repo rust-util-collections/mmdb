@@ -65,8 +65,9 @@ impl Arena {
                 let aligned = (base + *offset + align - 1) & !(align - 1);
                 let new_offset = aligned - base + size;
                 if new_offset <= block.capacity() {
+                    let actual = new_offset - *offset; // includes alignment padding
                     *offset = new_offset;
-                    self.bytes_allocated.fetch_add(size, Ordering::Relaxed);
+                    self.bytes_allocated.fetch_add(actual, Ordering::Relaxed);
                     return aligned as *mut u8;
                 }
             }
@@ -83,8 +84,9 @@ impl Arena {
             let block = Vec::<u8>::with_capacity(block_size);
             let base = block.as_ptr() as usize;
             let aligned = (base + align - 1) & !(align - 1);
-            *offset = aligned - base + size;
-            self.bytes_allocated.fetch_add(size, Ordering::Relaxed);
+            let actual = aligned - base + size; // padding + size
+            *offset = actual;
+            self.bytes_allocated.fetch_add(actual, Ordering::Relaxed);
             blocks.push(block);
             aligned as *mut u8
         }

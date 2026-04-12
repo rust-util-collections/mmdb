@@ -441,9 +441,11 @@ impl TableReader {
                     .map_err(|e| Error::Corruption(format!("LZ4 decompression error: {}", e)))
                     .c(d!())?
             }
-            CompressionType::Zstd => zstd::stream::decode_all(data.as_slice())
-                .map_err(|e| Error::Corruption(format!("Zstd decompression error: {}", e)))
-                .c(d!())?,
+            CompressionType::Zstd => {
+                zstd::bulk::decompress(data.as_slice(), MAX_DECOMPRESSED_BLOCK_SIZE)
+                    .map_err(|e| Error::Corruption(format!("Zstd decompression error: {}", e)))
+                    .c(d!())?
+            }
             CompressionType::None => data,
         };
 

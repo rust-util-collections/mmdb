@@ -54,10 +54,11 @@ impl RateLimiter {
             return;
         }
 
-        // Not enough tokens — deduct full amount (goes negative as debt)
-        // so concurrent callers also wait for their share of the refill.
+        // Compute this caller's own deficit before deducting, so it
+        // only sleeps for its own share rather than the total accumulated debt.
+        let deficit = needed - inner.available.max(0.0);
         inner.available -= needed;
-        let wait_secs = (-inner.available) / inner.rate_bytes_per_sec as f64;
+        let wait_secs = deficit / inner.rate_bytes_per_sec as f64;
         drop(inner);
 
         std::thread::sleep(Duration::from_secs_f64(wait_secs));

@@ -70,9 +70,8 @@ impl WalReader {
                 None => {
                     self.eof = true;
                     if in_fragmented_record {
-                        return Err(eg!(Error::Corruption(
-                            "partial record without end".to_string()
-                        )));
+                        tracing::warn!("WAL: partial record without end (truncated)");
+                        return Ok(None);
                     }
                     return Ok(None);
                 }

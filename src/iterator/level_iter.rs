@@ -225,12 +225,12 @@ impl super::merge::SeekableIterator for LevelIterator {
             self.current_iter = None;
             return;
         }
-        // For non-overlapping files, at most 2 candidates need checking:
-        // the file at idx-1 (whose range spans the target), and possibly
-        // idx-2 (if target falls in a gap between files).  The previous
-        // unbounded backward scan was O(files) worst case.
+        // Scan backward through candidate files. For non-overlapping files
+        // only 1-2 tries are needed, but when prefix bloom filtering rejects
+        // candidates we must continue scanning to avoid missing entries.
+        // Early return on first match keeps this O(1) amortized.
         let start = idx - 1;
-        let min_try = start.saturating_sub(1);
+        let min_try = 0;
         for try_idx in (min_try..=start).rev() {
             let tf = &self.files[try_idx];
             if !self.file_passes_filters(tf) {
