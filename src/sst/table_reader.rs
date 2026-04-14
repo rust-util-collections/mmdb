@@ -913,6 +913,9 @@ impl TableIterator {
     /// the target entry, not the entire block.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.ensure_index();
+        // Clear forward-iteration cursor state so a subsequent next() doesn't
+        // yield stale entries from the previous forward block.
+        self.current_block = None;
         let index_entries = self.index_entries.as_ref().unwrap();
 
         let idx = index_entries.partition_point(|entry| {

@@ -68,6 +68,11 @@ impl BlockCache {
         let key = (file_number, block_offset);
         let arc = Arc::new(data);
         self.pinned.lock().insert(key, arc.clone());
+        self.file_offsets
+            .lock()
+            .entry(file_number)
+            .or_default()
+            .insert(block_offset);
         arc
     }
 

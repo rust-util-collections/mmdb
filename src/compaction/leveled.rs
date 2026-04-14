@@ -9,8 +9,10 @@ use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
 use std::fs::remove_file;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread::scope;
 
 use ruc::*;
@@ -339,17 +341,12 @@ fn execute_sub_compaction_io(
             range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
             range_tombstones.reset();
             if let Some(ref last) = last_range_del_key
-                && last.as_slice() == user_key
+                && last.as_slice() == ikey.as_slice()
             {
                 continue;
             }
-            last_range_del_key = Some(user_key.to_vec());
-            if params.is_bottommost
-                && !ctx
-                    .active_snapshots
-                    .iter()
-                    .any(|&snap| snap >= ikr.sequence())
-            {
+            last_range_del_key = Some(ikey.clone());
+            if params.is_bottommost && ikr.sequence() < params.min_unflushed_seq {
                 continue;
             }
         } else if let Some(ref last) = last_point_key
@@ -370,10 +367,7 @@ fn execute_sub_compaction_io(
 
             if ikr.value_type() == ValueType::Deletion
                 && params.is_bottommost
-                && !ctx
-                    .active_snapshots
-                    .iter()
-                    .any(|&snap| snap >= ikr.sequence())
+                && ikr.sequence() < params.min_unflushed_seq
             {
                 continue;
             }
@@ -1024,17 +1018,12 @@ impl LeveledCompaction {
                 range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
                 range_tombstones.reset();
                 if let Some(ref last) = last_range_del_key
-                    && last.as_slice() == user_key
+                    && last.as_slice() == ikey.as_slice()
                 {
                     continue;
                 }
-                last_range_del_key = Some(user_key.to_vec());
-                if is_bottommost
-                    && !ctx
-                        .active_snapshots
-                        .iter()
-                        .any(|&snap| snap >= ikr.sequence())
-                {
+                last_range_del_key = Some(ikey.clone());
+                if is_bottommost && ikr.sequence() < min_unflushed_seq {
                     continue;
                 }
             } else if let Some(ref last) = last_point_key
@@ -1057,10 +1046,7 @@ impl LeveledCompaction {
 
                 if ikr.value_type() == ValueType::Deletion
                     && is_bottommost
-                    && !ctx
-                        .active_snapshots
-                        .iter()
-                        .any(|&snap| snap >= ikr.sequence())
+                    && ikr.sequence() < min_unflushed_seq
                 {
                     continue;
                 }

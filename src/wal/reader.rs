@@ -82,7 +82,7 @@ impl WalReader {
                                 "full record inside fragment".to_string(),
                             )));
                         }
-                        self.last_valid_offset = self.reader.stream_position().unwrap_or(0);
+                        self.last_valid_offset = self.reader.stream_position().c(d!())?;
                         return Ok(Some(data));
                     }
                     RecordType::First => {
@@ -109,7 +109,7 @@ impl WalReader {
                             )));
                         }
                         result.extend_from_slice(&data);
-                        self.last_valid_offset = self.reader.stream_position().unwrap_or(0);
+                        self.last_valid_offset = self.reader.stream_position().c(d!())?;
                         return Ok(Some(result));
                     }
                     RecordType::Zero => {

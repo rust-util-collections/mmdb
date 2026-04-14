@@ -224,7 +224,7 @@ impl VersionEdit {
         version: &crate::manifest::version::Version,
         log_number: u64,
         next_file_number: u64,
-        last_sequence: crate::types::SequenceNumber,
+        last_sequence: SequenceNumber,
     ) -> Self {
         let mut edit = Self::new();
         edit.set_log_number(log_number);

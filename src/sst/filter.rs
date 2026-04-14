@@ -34,7 +34,7 @@ impl BloomFilter {
 
         for key in keys {
             let h = bloom_hash(key);
-            let delta = h.rotate_left(15); // rotate right 17
+            let delta = h.rotate_left(15); // rotate_left(15) == rotate_right(17)
             let mut h = h;
             for _ in 0..self.k {
                 let bit_pos = h % bits;

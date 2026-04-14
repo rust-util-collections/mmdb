@@ -112,19 +112,6 @@ pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> crate::error::Result<(BlockHan
 }
 
 /// Decode an extended index value: BlockHandle + optional first_key.
-/// Old SST files store only 16-byte BlockHandle. New SSTs append first_key.
-/// Format: `[BlockHandle(16 bytes)][first_key_len(4 bytes LE)][first_key_bytes]`
-pub fn decode_index_value(data: &[u8]) -> crate::error::Result<(BlockHandle, Option<&[u8]>)> {
-    let handle = BlockHandle::decode(data).c(d!())?;
-    if data.len() > 20 {
-        let fk_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-        if fk_len > 0 && data.len() >= 20 + fk_len {
-            return Ok((handle, Some(&data[20..20 + fk_len])));
-        }
-    }
-    Ok((handle, None))
-}
-
 /// Encode an extended index value: BlockHandle + first_key.
 pub fn encode_index_value(handle: &BlockHandle, first_key: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(20 + first_key.len());

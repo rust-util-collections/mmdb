@@ -88,7 +88,10 @@ impl SnapshotList {
     }
 
     fn release(&self, seq: SequenceNumber) {
-        self.snapshots.lock().retain(|&s| s != seq);
+        let mut v = self.snapshots.lock();
+        if let Some(pos) = v.iter().position(|&s| s == seq) {
+            v.swap_remove(pos);
+        }
     }
 
     fn as_sorted_vec(&self) -> Vec<SequenceNumber> {

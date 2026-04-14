@@ -4,13 +4,15 @@
 
 use std::cmp::Ordering;
 
+use crate::types::LazyValue;
+
 /// A source of sorted (key, value) pairs — can be backed by a Vec or a streaming iterator.
 pub struct IterSource {
     inner: IterSourceInner,
     /// Reusable key buffer for peeked entry.
     peeked_key: Vec<u8>,
     /// Lazy value buffer for peeked entry (zero-copy for SST sources).
-    peeked_value: crate::types::LazyValue,
+    peeked_value: LazyValue,
     /// Whether a peeked entry is available.
     pub(crate) has_peeked: bool,
     /// LSM level this source belongs to. Memtable/L0 = 0, L1 = 1, etc.
@@ -67,7 +69,7 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
 
     /// Move to the previous entry. Returns the entry at the new position,
     /// or None if we've moved before the first entry.
-    fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         None
     }
 
@@ -86,7 +88,7 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
     /// Return the entry at the current cursor position WITHOUT advancing.
     /// Used after seek_for_prev() / seek_to_last() to peek the current entry
     /// without moving the cursor forward — critical for correct backward iteration.
-    fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn current(&self) -> Option<(Vec<u8>, LazyValue)> {
         None
     }
 
@@ -111,11 +113,11 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
     /// Decode next entry with lazy value — key written into caller buffer,
     /// value returned as LazyValue (zero-copy for SST sources).
     /// Default impl delegates to next_into() and wraps as Inline.
-    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<crate::types::LazyValue> {
+    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
         // Default: allocate a temp value buffer and wrap as Inline.
         let mut val_buf = Vec::new();
         if self.next_into(key_buf, &mut val_buf) {
-            Some(crate::types::LazyValue::Inline(val_buf))
+            Some(LazyValue::Inline(val_buf))
         } else {
             None
         }
@@ -127,7 +129,7 @@ impl IterSource {
         Self {
             inner: IterSourceInner::Vec { entries, pos: 0 },
             peeked_key: Vec::new(),
-            peeked_value: crate::types::LazyValue::empty(),
+            peeked_value: LazyValue::empty(),
             has_peeked: false,
             level: usize::MAX,
         }
@@ -137,7 +139,7 @@ impl IterSource {
         Self {
             inner: IterSourceInner::Boxed(iter),
             peeked_key: Vec::new(),
-            peeked_value: crate::types::LazyValue::empty(),
+            peeked_value: LazyValue::empty(),
             has_peeked: false,
             level: usize::MAX,
         }
@@ -147,7 +149,7 @@ impl IterSource {
         Self {
             inner: IterSourceInner::SeekableBoxed { iter },
             peeked_key: Vec::new(),
-            peeked_value: crate::types::LazyValue::empty(),
+            peeked_value: LazyValue::empty(),
             has_peeked: false,
             level: usize::MAX,
         }
@@ -157,7 +159,7 @@ impl IterSource {
         Self {
             inner: IterSourceInner::Memtable { iter },
             peeked_key: Vec::new(),
-            peeked_value: crate::types::LazyValue::empty(),
+            peeked_value: LazyValue::empty(),
             has_peeked: false,
             level: usize::MAX,
         }
@@ -167,7 +169,7 @@ impl IterSource {
         Self {
             inner: IterSourceInner::Sst { iter },
             peeked_key: Vec::new(),
-            peeked_value: crate::types::LazyValue::empty(),
+            peeked_value: LazyValue::empty(),
             has_peeked: false,
             level: usize::MAX,
         }
@@ -177,7 +179,7 @@ impl IterSource {
         Self {
             inner: IterSourceInner::Level { iter },
             peeked_key: Vec::new(),
-            peeked_value: crate::types::LazyValue::empty(),
+            peeked_value: LazyValue::empty(),
             has_peeked: false,
             level: usize::MAX,
         }
@@ -206,7 +208,7 @@ impl IterSource {
     }
 
     /// Take the peeked key/lazy-value, transferring ownership.
-    pub fn take_peeked(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    pub fn take_peeked(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if !self.has_peeked {
             self.has_peeked = self.advance_into_buffers();
         }
@@ -214,7 +216,7 @@ impl IterSource {
             self.has_peeked = false;
             Some((
                 std::mem::take(&mut self.peeked_key),
-                std::mem::replace(&mut self.peeked_value, crate::types::LazyValue::empty()),
+                std::mem::replace(&mut self.peeked_value, LazyValue::empty()),
             ))
         } else {
             None
@@ -230,7 +232,7 @@ impl IterSource {
                     let (ref k, ref v) = entries[*pos];
                     self.peeked_key.clear();
                     self.peeked_key.extend_from_slice(k);
-                    self.peeked_value = crate::types::LazyValue::Inline(v.clone());
+                    self.peeked_value = LazyValue::Inline(v.clone());
                     *pos += 1;
                     true
                 } else {
@@ -240,7 +242,7 @@ impl IterSource {
             IterSourceInner::Boxed(iter) => match iter.next() {
                 Some((k, v)) => {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     true
                 }
                 None => false,
@@ -286,7 +288,7 @@ impl IterSource {
                     let (ref k, ref v) = entries[*pos];
                     self.peeked_key.clear();
                     self.peeked_key.extend_from_slice(k);
-                    self.peeked_value = crate::types::LazyValue::Inline(v.clone());
+                    self.peeked_value = LazyValue::Inline(v.clone());
                     *pos += 1;
                     true
                 } else {
@@ -297,7 +299,7 @@ impl IterSource {
             IterSourceInner::SeekableBoxed { iter } => {
                 let mut tmp_val = Vec::new();
                 if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
+                    self.peeked_value = LazyValue::Inline(tmp_val);
                     true
                 } else {
                     false
@@ -306,7 +308,7 @@ impl IterSource {
             IterSourceInner::Memtable { iter } => {
                 let mut tmp_val = Vec::new();
                 if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
+                    self.peeked_value = LazyValue::Inline(tmp_val);
                     true
                 } else {
                     false
@@ -315,7 +317,7 @@ impl IterSource {
             IterSourceInner::Sst { iter } => {
                 let mut tmp_val = Vec::new();
                 if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
+                    self.peeked_value = LazyValue::Inline(tmp_val);
                     true
                 } else {
                     false
@@ -324,7 +326,7 @@ impl IterSource {
             IterSourceInner::Level { iter } => {
                 let mut tmp_val = Vec::new();
                 if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = crate::types::LazyValue::Inline(tmp_val);
+                    self.peeked_value = LazyValue::Inline(tmp_val);
                     true
                 } else {
                     false
@@ -382,7 +384,7 @@ impl IterSource {
                     let (ref k, ref v) = entries[*pos];
                     self.peeked_key.clear();
                     self.peeked_key.extend_from_slice(k);
-                    self.peeked_value = crate::types::LazyValue::Inline(v.clone());
+                    self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
                     *pos += 1;
                 }
@@ -395,7 +397,7 @@ impl IterSource {
                 iter.seek_to(target);
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -403,7 +405,7 @@ impl IterSource {
                 iter.seek_to(target);
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -411,7 +413,7 @@ impl IterSource {
                 iter.seek_to(target);
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -419,7 +421,7 @@ impl IterSource {
                 iter.seek_to(target);
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -459,7 +461,7 @@ impl IterSource {
                     let (ref k, ref v) = entries[*pos];
                     self.peeked_key.clear();
                     self.peeked_key.extend_from_slice(k);
-                    self.peeked_value = crate::types::LazyValue::Inline(v.clone());
+                    self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
                     *pos += 1;
                 }
@@ -510,7 +512,7 @@ impl IterSource {
                     let (ref k, ref v) = entries[0];
                     self.peeked_key.clear();
                     self.peeked_key.extend_from_slice(k);
-                    self.peeked_value = crate::types::LazyValue::Inline(v.clone());
+                    self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
                     *pos = 1;
                 }
@@ -519,7 +521,7 @@ impl IterSource {
                 iter.seek_to_first();
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -527,7 +529,7 @@ impl IterSource {
                 iter.seek_to_first();
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -535,7 +537,7 @@ impl IterSource {
                 iter.seek_to_first();
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -543,7 +545,7 @@ impl IterSource {
                 iter.seek_to_first();
                 if let Some((k, v)) = iter.next() {
                     self.peeked_key = k;
-                    self.peeked_value = crate::types::LazyValue::Inline(v);
+                    self.peeked_value = LazyValue::Inline(v);
                     self.has_peeked = true;
                 }
             }
@@ -561,7 +563,7 @@ impl IterSource {
                     let (ref k, ref v) = entries[*pos];
                     self.peeked_key.clear();
                     self.peeked_key.extend_from_slice(k);
-                    self.peeked_value = crate::types::LazyValue::Inline(v.clone());
+                    self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
                     *pos += 1;
                 }
@@ -783,7 +785,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     }
 
     /// Get the next (key, value) pair from the merged stream (forward direction).
-    pub fn next_entry(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    pub fn next_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         // Direction check must come before single-source fast path:
         // after prev_entry() sets direction=Backward, the source is
         // backward-positioned and must be re-seeked forward.
@@ -840,7 +842,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     }
 
     /// Get the previous (key, value) pair from the merged stream (backward direction).
-    pub fn prev_entry(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    pub fn prev_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if self.direction != Direction::Backward {
             self.switch_to_backward();
         }
@@ -937,7 +939,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     }
 
     /// Collect all entries.
-    pub fn collect_all(&mut self) -> Vec<(Vec<u8>, crate::types::LazyValue)> {
+    pub fn collect_all(&mut self) -> Vec<(Vec<u8>, LazyValue)> {
         let mut result = Vec::new();
         while let Some(entry) = self.next_entry() {
             result.push(entry);
@@ -1123,7 +1125,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Take ownership of the current minimum entry.
     /// Uses take_peeked (which resets buffer capacity to 0 for the source).
     /// Only call this for entries that will actually be returned to the caller.
-    pub fn take_entry(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    pub fn take_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if self.single_source {
             self.last_source_level = self.sources[0].level;
             let entry = self.sources[0].take_peeked()?;

@@ -43,8 +43,10 @@ impl RangeTombstoneTracker {
 
     /// Reset the sweep state (e.g., after seek or after adding new tombstones).
     pub fn reset(&mut self) {
-        if !self.sorted && self.tombstones.len() > 1 {
-            self.tombstones.sort_by(|a, b| a.begin.cmp(&b.begin));
+        if !self.sorted {
+            if self.tombstones.len() > 1 {
+                self.tombstones.sort_by(|a, b| a.begin.cmp(&b.begin));
+            }
             self.sorted = true;
         }
         self.next_idx = 0;
