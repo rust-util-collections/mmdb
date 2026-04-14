@@ -134,7 +134,7 @@ struct SubCompactionParams<'a> {
     target_level: usize,
     is_bottommost: bool,
     build_opts: &'a TableBuildOptions,
-    min_unflushed_seq: SequenceNumber,
+    oldest_snapshot_seq: SequenceNumber,
     file_number_counter: &'a AtomicU64,
     all_range_del_entries: &'a [(Vec<u8>, Vec<u8>)],
     all_raw_tombstones: &'a [(Vec<u8>, Vec<u8>, SequenceNumber)],
@@ -346,7 +346,7 @@ fn execute_sub_compaction_io(
                 continue;
             }
             last_range_del_key = Some(ikey.clone());
-            if params.is_bottommost && ikr.sequence() < params.min_unflushed_seq {
+            if params.is_bottommost && ikr.sequence() < params.oldest_snapshot_seq {
                 continue;
             }
         } else if let Some(ref last) = last_point_key
@@ -367,14 +367,14 @@ fn execute_sub_compaction_io(
 
             if ikr.value_type() == ValueType::Deletion
                 && params.is_bottommost
-                && ikr.sequence() < params.min_unflushed_seq
+                && ikr.sequence() < params.oldest_snapshot_seq
             {
                 continue;
             }
 
             if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
                 let entry_seq = ikr.sequence();
-                if range_tombstones.is_deleted(user_key, entry_seq, params.min_unflushed_seq) {
+                if range_tombstones.is_deleted(user_key, entry_seq, params.oldest_snapshot_seq) {
                     continue;
                 }
             }
@@ -413,7 +413,7 @@ fn execute_sub_compaction_io(
         let final_ikey;
         let ikey_ref = if params.is_bottommost
             && ikr.sequence() > 0
-            && ikr.sequence() < params.min_unflushed_seq
+            && ikr.sequence() < params.oldest_snapshot_seq
             && ikr.value_type() == ValueType::Value
         {
             final_ikey = InternalKey::new(user_key, 0, ikr.value_type())
@@ -720,7 +720,7 @@ impl LeveledCompaction {
         is_bottommost: bool,
     ) -> Result<CompactionOutput> {
         let target_level = task.level + 1;
-        let min_unflushed_seq = ctx
+        let oldest_snapshot_seq = ctx
             .active_snapshots
             .iter()
             .min()
@@ -778,7 +778,7 @@ impl LeveledCompaction {
             target_level,
             is_bottommost,
             build_opts: &build_opts,
-            min_unflushed_seq,
+            oldest_snapshot_seq,
             file_number_counter: &file_counter,
             all_range_del_entries: &all_range_del_entries,
             all_raw_tombstones: &all_raw_tombstones,
@@ -950,7 +950,7 @@ impl LeveledCompaction {
         table_cache: Option<&Arc<TableCache>>,
         block_cache: Option<&Arc<BlockCache>>,
     ) -> Result<()> {
-        let min_unflushed_seq = ctx
+        let oldest_snapshot_seq = ctx
             .active_snapshots
             .iter()
             .min()
@@ -1023,7 +1023,7 @@ impl LeveledCompaction {
                     continue;
                 }
                 last_range_del_key = Some(ikey.clone());
-                if is_bottommost && ikr.sequence() < min_unflushed_seq {
+                if is_bottommost && ikr.sequence() < oldest_snapshot_seq {
                     continue;
                 }
             } else if let Some(ref last) = last_point_key
@@ -1046,14 +1046,14 @@ impl LeveledCompaction {
 
                 if ikr.value_type() == ValueType::Deletion
                     && is_bottommost
-                    && ikr.sequence() < min_unflushed_seq
+                    && ikr.sequence() < oldest_snapshot_seq
                 {
                     continue;
                 }
 
                 if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
                     let entry_seq = ikr.sequence();
-                    if range_tombstones.is_deleted(user_key, entry_seq, min_unflushed_seq) {
+                    if range_tombstones.is_deleted(user_key, entry_seq, oldest_snapshot_seq) {
                         continue;
                     }
                 }
@@ -1092,7 +1092,7 @@ impl LeveledCompaction {
             let final_ikey;
             let ikey_ref = if is_bottommost
                 && ikr.sequence() > 0
-                && ikr.sequence() < min_unflushed_seq
+                && ikr.sequence() < oldest_snapshot_seq
                 && ikr.value_type() == ValueType::Value
             {
                 final_ikey = InternalKey::new(user_key, 0, ikr.value_type())

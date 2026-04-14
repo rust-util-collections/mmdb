@@ -11,9 +11,7 @@ use crate::iterator::merge::SeekableIterator;
 use crate::manifest::version::TableFile;
 use crate::options::BlockPropertyFilter;
 use crate::sst::table_reader::TableIterator;
-use crate::types::compare_internal_key;
-
-use crate::types::user_key as user_key_from_internal;
+use crate::types::{LazyValue, compare_internal_key, user_key as user_key_from_internal};
 
 /// A lazy iterator over a sorted, non-overlapping set of SST files (L1+).
 ///
@@ -173,19 +171,19 @@ impl super::merge::SeekableIterator for LevelIterator {
         self.seek_impl(target);
     }
 
-    fn current(&self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn current(&self) -> Option<(Vec<u8>, LazyValue)> {
         self.current_iter
             .as_ref()
             .and_then(|iter| iter.current())
-            .map(|(k, v)| (k, crate::types::LazyValue::Inline(v)))
+            .map(|(k, v)| (k, LazyValue::Inline(v)))
     }
 
-    fn prev(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         // Try prev within current table iterator
         if let Some(ref mut iter) = self.current_iter
             && let Some(entry) = iter.prev()
         {
-            return Some((entry.0, crate::types::LazyValue::Inline(entry.1)));
+            return Some((entry.0, LazyValue::Inline(entry.1)));
         }
         // Current table exhausted backward — move to previous file
         loop {
@@ -210,7 +208,7 @@ impl super::merge::SeekableIterator for LevelIterator {
             // subsequent prev() calls work correctly.
             if let Some(entry) = table_iter.current() {
                 self.current_iter = Some(table_iter);
-                return Some((entry.0, crate::types::LazyValue::Inline(entry.1)));
+                return Some((entry.0, LazyValue::Inline(entry.1)));
             }
         }
     }

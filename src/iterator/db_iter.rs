@@ -5,7 +5,9 @@ use std::cmp::Ordering;
 
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
-use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
+use crate::types::{
+    InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
+};
 
 type IKeyCompareFn = fn(&[u8], &[u8]) -> Ordering;
 
@@ -23,7 +25,7 @@ pub struct DBIterator {
     /// Whether last_user_key has been set at least once.
     has_last_key: bool,
     /// Buffered current entry for valid()/key()/value() API.
-    current: Option<(Vec<u8>, crate::types::LazyValue)>,
+    current: Option<(Vec<u8>, LazyValue)>,
     /// Whether we've already consumed current via advance().
     needs_advance: bool,
     /// Pre-fragmented, immutable range tombstone index for O(log T) coverage
@@ -40,7 +42,7 @@ pub struct DBIterator {
     /// Overshoot buffer for backward iteration: when collecting entries for one
     /// user key, we may read the first entry of the *previous* user key. This
     /// field saves that entry so the next backward walk consumes it first.
-    prev_overshoot: Option<(Vec<u8>, crate::types::LazyValue)>,
+    prev_overshoot: Option<(Vec<u8>, LazyValue)>,
     /// True when the last operation was a backward resolution (prev/seek_to_last).
     /// On the next forward iteration (next_visible), the merger must be re-seeked
     /// past the current user key to resume forward scanning correctly.
@@ -265,11 +267,9 @@ impl DBIterator {
                         succ[i] += 1;
                         succ.truncate(i + 1);
                         // Use seek_opt with try_next=true since succ > current
-                        let seek_key = crate::types::InternalKey::new(
-                            &succ,
-                            crate::types::MAX_SEQUENCE_NUMBER,
-                            ValueType::Value,
-                        );
+                        use crate::types::InternalKey;
+                        let seek_key =
+                            InternalKey::new(&succ, MAX_SEQUENCE_NUMBER, ValueType::Value);
                         self.merger.seek_opt(seek_key.as_bytes(), true);
                         self.has_last_key = false;
                         self.needs_advance = true;
@@ -293,7 +293,7 @@ impl DBIterator {
     ///
     /// Uses peek_entry/advance_entry/take_entry to avoid heap allocations for
     /// skipped entries. Only the one returned entry pays the allocation cost.
-    fn next_visible(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn next_visible(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         // After a backward operation (prev/seek_to_last), the merger is in backward mode.
         // Re-seek forward past the last user key so forward iteration resumes correctly.
         if self.backward_positioned {
@@ -430,7 +430,7 @@ impl DBIterator {
     /// no skip_point callback. Removes per-entry source_level tracking,
     /// tombstone checks, and skip_point callback dispatch.
     #[inline(always)]
-    fn next_visible_clean(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    fn next_visible_clean(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if self.backward_positioned {
             self.backward_positioned = false;
             self.prev_overshoot = None;
@@ -530,8 +530,7 @@ impl DBIterator {
     pub fn seek(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
         // Seek the merger to a synthetic internal key with max sequence
-        let seek_key =
-            InternalKey::new(target, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+        let seek_key = InternalKey::new(target, MAX_SEQUENCE_NUMBER, ValueType::Value);
         // TrySeekUsingNext: if the new target >= the last seek target, use
         // incremental advancement instead of full re-seek.
         let try_next = self
@@ -608,7 +607,7 @@ impl DBIterator {
             // we first see the lowest-seq entries, then higher-seq ones for the same user_key.
             let mut candidate_uk: Option<Vec<u8>> = None;
             // Best visible entry: (user_key, value) with highest seq <= snapshot
-            let mut best_entry: Option<(Vec<u8>, crate::types::LazyValue)> = None;
+            let mut best_entry: Option<(Vec<u8>, LazyValue)> = None;
             let mut best_seq: SequenceNumber = 0;
             // Track if best visible version is a deletion
             let mut best_is_deletion = false;
@@ -792,16 +791,14 @@ impl DBIterator {
                 !carry
             };
             if has_upper {
-                let seek_key =
-                    InternalKey::new(&upper, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+                let seek_key = InternalKey::new(&upper, MAX_SEQUENCE_NUMBER, ValueType::Value);
                 self.merger.seek_for_prev(seek_key.as_bytes());
             } else {
                 self.merger.seek_to_last_merge();
             }
         } else if let Some(ref ub) = self.iterate_upper_bound {
             // Upper-bound constrained: seek backward from upper bound.
-            let seek_key =
-                InternalKey::new(ub, crate::types::MAX_SEQUENCE_NUMBER, ValueType::Value);
+            let seek_key = InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::Value);
             self.merger.seek_for_prev(seek_key.as_bytes());
         } else {
             self.merger.seek_to_last_merge();
@@ -855,7 +852,7 @@ impl DBIterator {
     /// materializing it. Avoids the into_vec() copy that Iterator::next()
     /// must perform.
     #[inline(always)]
-    pub fn next_lazy(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    pub fn next_lazy(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if self.ensure_current() {
             let entry = self.current.take().unwrap();
             self.needs_advance = true;
@@ -868,7 +865,7 @@ impl DBIterator {
     /// Take ownership of the current buffered entry without advancing.
     /// After this call, valid() returns false until the next seek/advance.
     #[inline(always)]
-    pub fn take_current(&mut self) -> Option<(Vec<u8>, crate::types::LazyValue)> {
+    pub fn take_current(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         let entry = self.current.take();
         self.needs_advance = false;
         entry

@@ -97,11 +97,14 @@ impl BlockCache {
     /// Invalidate a specific cached block.
     pub fn invalidate(&self, file_number: u64, block_offset: u64) {
         self.inner.invalidate(&(file_number, block_offset));
+        if let Some(offsets) = self.file_offsets.lock().get_mut(&file_number) {
+            offsets.remove(&block_offset);
+        }
     }
 
-    /// Current approximate entry count.
+    /// Current approximate entry count (includes pinned entries).
     pub fn entry_count(&self) -> u64 {
-        self.inner.entry_count()
+        self.inner.entry_count() + self.pinned.lock().len() as u64
     }
 }
 

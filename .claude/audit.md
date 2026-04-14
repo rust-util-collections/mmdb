@@ -4,13 +4,21 @@
 
 ## Open
 
-### [LOW] compaction: misleading variable name `min_unflushed_seq` for oldest snapshot
-- **Where**: src/compaction/leveled.rs:723, 953
-- **What**: The variable `min_unflushed_seq` is used to store the sequence number of the oldest active snapshot.
-- **Why**: In LSM-Tree terminology, `min_unflushed_seq` typically refers to the sequence of the oldest data in the memtable/WAL. Using it to mean "oldest snapshot" might confuse future maintainers.
-- **Suggested fix**: Rename to `oldest_snapshot_seq` or `min_active_snapshot_seq` in a future cleanup.
+(none)
+
+---
 
 ## Won't Fix
+
+### [MEDIUM] db: `do_compaction` holds db_mutex during blocking I/O
+- **Where**: src/db.rs:2405-2446
+- **What**: `do_compaction()` holds the inner mutex across `execute_compaction_with_cache` and `force_merge_level`, blocking all writers for the entire compaction duration.
+- **Reason**: Refactoring to a 3-phase pattern (lock → I/O → lock) requires `do_compaction` to not take `&self` with the lock, which is a deep architectural change. Only triggered by explicit `compact()`/`flush()` API calls, not the background compaction path.
+
+### [MEDIUM] db: `freeze_and_flush` holds db_mutex during SST write I/O
+- **Where**: src/db.rs:2288-2299
+- **What**: Writes an entire SST file while the caller holds the DB lock.
+- **Reason**: Only called from `close()` (shutdown path). Refactoring is disproportionate risk for a non-hot path. The background flush path correctly uses the 3-phase pattern.
 
 ### [MEDIUM] manifest: `log_and_apply` performs I/O via `maybe_compact_manifest` while caller holds DB mutex
 - **Where**: src/manifest/version_set.rs:316, 406-414

@@ -182,10 +182,11 @@ impl WalReader {
 
             self.block_offset += HEADER_SIZE + length;
 
-            // Skip zero-padding (pre-allocated regions or crash-zeroed blocks)
-            // before CRC verification — all-zero headers have CRC=0 which won't
-            // match the computed CRC, so this must be checked first.
-            if header_buf == [0u8; HEADER_SIZE] {
+            // Skip zero-padding and Zero-type records uniformly.
+            // All-zero headers come from pre-allocated or crash-zeroed regions;
+            // decoded Zero-type with non-zero fields comes from partial corruption.
+            // Both are treated as padding — no CRC check, no error.
+            if header_buf == [0u8; HEADER_SIZE] || matches!(record_type, RecordType::Zero) {
                 continue;
             }
 

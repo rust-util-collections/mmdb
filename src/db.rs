@@ -506,6 +506,7 @@ impl DB {
                                     let Some(frozen) = frozen else { break };
 
                                     // Slow I/O: write SST from frozen memtable
+                                    // Flush always targets L0, so index 0 is safe.
                                     let compression =
                                         if !bg_options.compression_per_level.is_empty() {
                                             bg_options.compression_per_level[0]
@@ -2396,7 +2397,7 @@ impl DB {
         let active_snaps = self.snapshot_list.as_sorted_vec();
         let ctx = CompactionContext {
             db_path: &self.path,
-            options: &self.options,
+            options: &force_opts,
             rate_limiter: Some(&self.rate_limiter),
             stats: Some(&self.stats),
             active_snapshots: &active_snaps,
@@ -2556,6 +2557,7 @@ impl DB {
     }
 
     fn write_memtable_to_sst(&self, mem: &MemTable, path: &Path) -> Result<TableBuildResult> {
+        // Flush always targets L0, so index 0 is safe.
         let compression = if !self.options.compression_per_level.is_empty() {
             self.options.compression_per_level[0]
         } else {

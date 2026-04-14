@@ -31,21 +31,6 @@ impl WalWriter {
         })
     }
 
-    /// Append an existing WAL file (for recovery writing).
-    pub fn open_append(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .c(d!())?;
-        let len = file.metadata().c(d!())?.len() as usize;
-        let block_offset = len % BLOCK_SIZE;
-        Ok(Self {
-            writer: BufWriter::new(file),
-            block_offset,
-        })
-    }
-
     /// Reopen a WAL file for appending, truncating it to `valid_len` first.
     ///
     /// After a crash, the file may contain a corrupt partial record at the tail.
