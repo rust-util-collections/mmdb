@@ -10,6 +10,7 @@ Cargo.lock
 !.claude/commands/
 !.claude/docs/
 !.claude/settings.json
+!.claude/audit.md
 .copilot
 .aider
 .gemini
