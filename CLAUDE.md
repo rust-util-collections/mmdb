@@ -38,7 +38,8 @@ MSRV: Rust 1.89 (edition 2024)
 - `/x-review` — deep regression analysis of recent changes
 - `/x-fix` — resolve all open findings in `.claude/audit.md`
 - `/x-commit` — self-reviewing commit (review, fix, format, commit)
-- `/x-auto` — full pipeline: review → fix → commit
+- `/x-auto` — full pipeline: review → fix → commit (incremental, uncommitted changes only)
+- `/x-overhaul` — full codebase overhaul: review all → fix → commit
 
 Supporting documentation in `.claude/docs/`:
 - `technical-patterns.md` — cataloged bug patterns for LSM-Tree/Rust
