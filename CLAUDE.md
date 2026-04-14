@@ -36,9 +36,8 @@ MSRV: Rust 1.89 (edition 2024)
 ## Commands
 
 - `/x-review` — deep regression analysis of recent changes
-- `/x-fix` — resolve all open findings in `.claude/audit.md`
-- `/x-commit` — self-reviewing commit (review, fix, format, commit)
-- `/x-auto` — full pipeline: review → fix → commit (incremental, uncommitted changes only)
+- `/x-fix` — fix audit backlog: resolve `.claude/audit.md` → self-review → commit
+- `/x-commit` — self-reviewing commit: review uncommitted changes → fix → commit
 - `/x-overhaul` — full codebase overhaul: review all → fix → commit
 
 Supporting documentation in `.claude/docs/`:
