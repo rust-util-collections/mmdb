@@ -83,7 +83,7 @@ Check changed files against project style rules:
 4. **Doc-code alignment** — If the change modifies a public function signature, struct field, module structure, or adds/removes/renames a public type or module, verify docs still match. Specifically check:
    - `CLAUDE.md` architecture table (subsystem paths, type names, dependency info)
    - `.claude/docs/review-core.md` subsystem path mappings
-   - `.claude/commands/mm-review.md` full-audit subsystem partitioning table
+   - `.claude/commands/x-review.md` full-audit subsystem partitioning table
    - `.claude/docs/patterns/` guides — referenced file lists and invariants
    - Doc comments and README
 
@@ -94,6 +94,41 @@ If ANY `unsafe` block is added or modified:
 2. Verify SAFETY comment exists and is accurate
 3. Check all prerequisites mentioned in the SAFETY comment
 4. Verify no undefined behavior (aliasing, alignment, validity)
+
+### Task 6: Audit Registry (.claude/audit.md)
+
+After completing the analysis:
+
+1. Read `.claude/audit.md` from the project root (create if absent).
+2. **Prune**: For each entry under `## Open`, verify against the current codebase. Remove entries that are 100% fixed.
+3. **Merge**: Add new findings from this review under `## Open`, deduplicating against existing entries. Sort by severity (CRITICAL → HIGH → MEDIUM → LOW).
+4. **Preserve**: Leave all `## Won't Fix` entries untouched.
+5. Write the updated `.claude/audit.md`.
+
+The file format:
+
+```markdown
+# Audit Findings
+
+> Auto-managed by /x-review and /x-fix.
+
+## Open
+
+### [SEVERITY] subsystem: one-line summary
+- **Where**: file:line_range
+- **What**: description
+- **Why**: invariant/pattern violated
+- **Suggested fix**: how to fix
+
+---
+
+## Won't Fix
+
+### [SEVERITY] subsystem: one-line summary
+- **Where**: file:line_range
+- **What**: description
+- **Reason**: why this cannot or should not be fixed
+```
 
 ## Output Format
 

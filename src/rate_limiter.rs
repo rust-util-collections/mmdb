@@ -54,9 +54,9 @@ impl RateLimiter {
             return;
         }
 
-        // Compute this caller's own deficit before deducting, so it
-        // only sleeps for its own share rather than the total accumulated debt.
-        let deficit = needed - inner.available.max(0.0);
+        // Compute deficit including accumulated debt from prior callers so
+        // concurrent threads collectively respect the configured rate.
+        let deficit = needed - inner.available;
         inner.available -= needed;
         let wait_secs = deficit / inner.rate_bytes_per_sec as f64;
         drop(inner);

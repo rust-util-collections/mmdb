@@ -32,7 +32,7 @@ use crate::options::{
     CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
 };
 use crate::rate_limiter::RateLimiter;
-use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+use crate::sst::table_builder::{TableBuildOptions, TableBuildResult, TableBuilder};
 use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
 use crate::types::{self, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex};
@@ -142,7 +142,7 @@ pub struct DB {
     options: DbOptions,
     inner: Arc<Mutex<DBInner>>,
     /// Global sequence number (next to assign).
-    sequence: AtomicU64,
+    sequence: Arc<AtomicU64>,
     /// Write queue and condvar for group commit.
     write_queue: Mutex<WriteQueueState>,
     write_cv: Condvar,
@@ -192,6 +192,7 @@ unsafe impl Sync for DB {}
 struct DBInner {
     active_memtable: Arc<MemTable>,
     immutable_memtables: Vec<Arc<MemTable>>,
+    frozen_memtables: VecDeque<FrozenMemtable>,
     wal_writer: Option<WalWriter>,
     wal_number: u64,
     versions: VersionSet,
@@ -373,6 +374,7 @@ impl DB {
                 },
             );
             versions.log_and_apply(edit).c(d!())?;
+            versions.sync_manifest().c(d!())?;
 
             // Reset the memtable — data is now safely in SST
             active_memtable = Arc::new(MemTable::new());
@@ -398,13 +400,15 @@ impl DB {
             edit.set_next_file_number(versions.next_file_number());
             edit.set_last_sequence(max_sequence);
             versions.log_and_apply(edit).c(d!())?;
+            versions.sync_manifest().c(d!())?;
         }
 
-        let sequence_start = max_sequence + 1;
+        let sequence_start = Arc::new(AtomicU64::new(max_sequence + 1));
 
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
             immutable_memtables: Vec::new(),
+            frozen_memtables: VecDeque::new(),
             wal_writer: Some(wal_writer),
             wal_number,
             versions,
@@ -425,6 +429,8 @@ impl DB {
             };
             options.compaction_filter = Some(Arc::new(lazy_filter));
         }
+
+        let l0_cv = Arc::new(Condvar::new());
 
         let (l0_file_count, super_version) = {
             let g = inner.lock();
@@ -457,6 +463,8 @@ impl DB {
             let bg_snapshot_list = snapshot_list.clone();
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
+            let bg_sequence = sequence_start.clone();
+            let bg_l0_cv = l0_cv.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -486,6 +494,127 @@ impl DB {
                         // thread death from panics in corrupt data paths.
                         let result = catch_unwind(AssertUnwindSafe(
                             || -> std::result::Result<(), String> {
+                                // Process pending memtable flushes (lock released during I/O)
+                                loop {
+                                    let frozen = {
+                                        let mut inner = bg_inner.lock();
+                                        inner.frozen_memtables.pop_front()
+                                    };
+                                    let Some(frozen) = frozen else { break };
+
+                                    // Slow I/O: write SST from frozen memtable
+                                    let compression =
+                                        if !bg_options.compression_per_level.is_empty() {
+                                            bg_options.compression_per_level[0]
+                                        } else {
+                                            bg_options.compression
+                                        };
+                                    let opts = TableBuildOptions {
+                                        block_size: bg_options.block_size,
+                                        block_restart_interval: bg_options.block_restart_interval,
+                                        bloom_bits_per_key: bg_options.bloom_bits_per_key,
+                                        internal_keys: true,
+                                        compression,
+                                        prefix_len: bg_options.prefix_len,
+                                        block_property_collectors: bg_options
+                                            .block_property_collectors
+                                            .iter()
+                                            .map(|f| f())
+                                            .collect(),
+                                    };
+
+                                    let build_result = (|| -> Result<TableBuildResult> {
+                                        let mut builder =
+                                            TableBuilder::new(&frozen.sst_path, opts).c(d!())?;
+                                        for (key, value) in frozen.old_mem.iter() {
+                                            builder.add(&key, &value).c(d!())?;
+                                        }
+                                        builder.finish()
+                                    })();
+
+                                    let build_result = match build_result {
+                                        Ok(r) => r,
+                                        Err(e) => {
+                                            return Err(format!("flush error: {}", e));
+                                        }
+                                    };
+
+                                    // Phase 3: install (short lock)
+                                    {
+                                        let mut inner = bg_inner.lock();
+                                        let mut edit = VersionEdit::new();
+                                        edit.set_log_number(frozen.new_wal_number);
+                                        edit.set_next_file_number(
+                                            inner.versions.next_file_number(),
+                                        );
+                                        let current_seq =
+                                            bg_sequence.load(Ordering::Acquire).saturating_sub(1);
+                                        edit.set_last_sequence(current_seq);
+                                        edit.add_file(
+                                            0, // L0
+                                            FileMetaData {
+                                                number: frozen.sst_number,
+                                                file_size: build_result.file_size,
+                                                smallest_key: build_result
+                                                    .smallest_key
+                                                    .unwrap_or_default(),
+                                                largest_key: build_result
+                                                    .largest_key
+                                                    .unwrap_or_default(),
+                                                has_range_deletions: build_result
+                                                    .has_range_deletions,
+                                            },
+                                        );
+                                        if let Err(e) = inner.versions.log_and_apply(edit) {
+                                            return Err(format!("flush install error: {}", e));
+                                        }
+                                        bg_stats.record_flush();
+
+                                        if bg_options.pin_l0_filter_and_index_blocks_in_cache {
+                                            let version = inner.versions.current();
+                                            for tf in version.level_files(0) {
+                                                if tf.meta.number == frozen.sst_number {
+                                                    tf.reader.pin_metadata_in_cache();
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        // Remove from immutable_memtables
+                                        inner
+                                            .immutable_memtables
+                                            .retain(|m| !Arc::ptr_eq(m, &frozen.old_mem));
+
+                                        bg_l0_count.store(
+                                            inner.versions.current().l0_file_count(),
+                                            Ordering::Relaxed,
+                                        );
+                                        bg_l0_cv.notify_all();
+                                        refresh_super_version(&bg_sv, &inner);
+                                    }
+                                    // Sync manifest outside the main lock before deleting old WAL.
+                                    {
+                                        let handle =
+                                            bg_inner.lock().versions.manifest_sync_handle();
+                                        let mut w = handle.lock();
+                                        if let Some(ref mut writer) = *w {
+                                            writer.sync().map_err(|e| {
+                                                format!("manifest sync error: {}", e)
+                                            })?;
+                                        }
+                                    }
+
+                                    let old_wal_path =
+                                        bg_path.join(format!("{:06}.wal", frozen.old_wal_number));
+                                    if let Err(e) = fs::remove_file(&old_wal_path) {
+                                        tracing::warn!(
+                                            "failed to remove old WAL {}: {}",
+                                            old_wal_path.display(),
+                                            e
+                                        );
+                                    }
+                                }
+
                                 // Drain read-compaction hints (lock released during I/O)
                                 {
                                     let hints: Vec<CompactionHint> =
@@ -508,11 +637,24 @@ impl DB {
                                                     let file_start = inner
                                                         .versions
                                                         .reserve_file_numbers(max_out);
-                                                    (task, file_start)
+                                                    let all_inputs: Vec<_> = task
+                                                        .input_files_level
+                                                        .iter()
+                                                        .chain(task.input_files_next.iter())
+                                                        .cloned()
+                                                        .collect();
+                                                    let is_bottom =
+                                                        LeveledCompaction::is_bottommost_level(
+                                                            &version,
+                                                            task.level + 1,
+                                                            bg_options.num_levels,
+                                                            &all_inputs,
+                                                        );
+                                                    (task, file_start, is_bottom)
                                                 })
                                             }; // lock released
 
-                                            if let Some((task, file_start)) = pick {
+                                            if let Some((task, file_start, is_bottom)) = pick {
                                                 // Phase 2: I/O (no lock)
                                                 let ctx = CompactionContext {
                                                     db_path: &bg_path,
@@ -523,30 +665,54 @@ impl DB {
                                                 };
                                                 let output =
                                                     LeveledCompaction::execute_compaction_io(
-                                                        &ctx, &task, file_start,
+                                                        &ctx, &task, file_start, is_bottom,
                                                     )
                                                     .map_err(|e| {
                                                         format!("hint compaction error: {}", e)
                                                     })?;
 
-                                                // Phase 3: install (short lock)
-                                                let mut inner = bg_inner.lock();
-                                                LeveledCompaction::install_compaction(
-                                                    output,
-                                                    &mut inner.versions,
-                                                    Some(&bg_table_cache),
-                                                    Some(&bg_block_cache),
-                                                    &bg_path,
-                                                    Some(&bg_stats),
-                                                )
-                                                .map_err(|e| {
-                                                    format!("hint compaction install error: {}", e)
-                                                })?;
-                                                bg_l0_count.store(
-                                                    inner.versions.current().l0_file_count(),
-                                                    Ordering::Relaxed,
+                                                // Phase 3: install (short lock, no fsync)
+                                                let cleanup = {
+                                                    let mut inner = bg_inner.lock();
+                                                    let cleanup =
+                                                        LeveledCompaction::install_compaction(
+                                                            output,
+                                                            &mut inner.versions,
+                                                            Some(&bg_table_cache),
+                                                            Some(&bg_block_cache),
+                                                            &bg_path,
+                                                            Some(&bg_stats),
+                                                        )
+                                                        .map_err(|e| {
+                                                            format!(
+                                                                "hint compaction install error: {}",
+                                                                e
+                                                            )
+                                                        })?;
+                                                    bg_l0_count.store(
+                                                        inner.versions.current().l0_file_count(),
+                                                        Ordering::Relaxed,
+                                                    );
+                                                    bg_l0_cv.notify_all();
+                                                    refresh_super_version(&bg_sv, &inner);
+                                                    cleanup
+                                                };
+                                                // Phase 4: sync manifest + cleanup (no lock)
+                                                {
+                                                    let handle = bg_inner
+                                                        .lock()
+                                                        .versions
+                                                        .manifest_sync_handle();
+                                                    let mut w = handle.lock();
+                                                    if let Some(ref mut writer) = *w {
+                                                        writer.sync().map_err(|e| {
+                                                            format!("manifest sync error: {}", e)
+                                                        })?;
+                                                    }
+                                                }
+                                                LeveledCompaction::run_post_compaction_cleanup(
+                                                    &cleanup, &bg_path,
                                                 );
-                                                refresh_super_version(&bg_sv, &inner);
                                             }
                                         }
                                     }
@@ -578,13 +744,27 @@ impl DB {
                                                     + bg_options.max_subcompactions.max(1) as u64;
                                                 let file_start =
                                                     inner.versions.reserve_file_numbers(max_out);
-                                                Some((task, file_start, l0_inputs))
+                                                let all_inputs: Vec<_> = task
+                                                    .input_files_level
+                                                    .iter()
+                                                    .chain(task.input_files_next.iter())
+                                                    .cloned()
+                                                    .collect();
+                                                let is_bottom =
+                                                    LeveledCompaction::is_bottommost_level(
+                                                        &version,
+                                                        task.level + 1,
+                                                        bg_options.num_levels,
+                                                        &all_inputs,
+                                                    );
+                                                Some((task, file_start, l0_inputs, is_bottom))
                                             }
                                             None => None,
                                         }
                                     }; // lock released
 
-                                    let Some((task, file_start, l0_inputs)) = pick else {
+                                    let Some((task, file_start, l0_inputs, is_bottom)) = pick
+                                    else {
                                         break;
                                     };
 
@@ -597,14 +777,14 @@ impl DB {
                                         active_snapshots: &active_snaps,
                                     };
                                     let output = LeveledCompaction::execute_compaction_io(
-                                        &ctx, &task, file_start,
+                                        &ctx, &task, file_start, is_bottom,
                                     )
                                     .map_err(|e| format!("compaction error: {}", e))?;
 
-                                    // Phase 3: install (short lock)
-                                    {
+                                    // Phase 3: install (short lock, no fsync)
+                                    let cleanup = {
                                         let mut inner = bg_inner.lock();
-                                        LeveledCompaction::install_compaction(
+                                        let cleanup = LeveledCompaction::install_compaction(
                                             output,
                                             &mut inner.versions,
                                             Some(&bg_table_cache),
@@ -620,8 +800,24 @@ impl DB {
                                             inner.versions.current().l0_file_count(),
                                             Ordering::Relaxed,
                                         );
+                                        bg_l0_cv.notify_all();
                                         refresh_super_version(&bg_sv, &inner);
+                                        cleanup
+                                    };
+                                    // Phase 4: sync manifest + delete old SSTs (no lock)
+                                    {
+                                        let handle =
+                                            bg_inner.lock().versions.manifest_sync_handle();
+                                        let mut w = handle.lock();
+                                        if let Some(ref mut writer) = *w {
+                                            writer.sync().map_err(|e| {
+                                                format!("manifest sync error: {}", e)
+                                            })?;
+                                        }
                                     }
+                                    LeveledCompaction::run_post_compaction_cleanup(
+                                        &cleanup, &bg_path,
+                                    );
                                 }
                                 Ok(())
                             },
@@ -655,7 +851,7 @@ impl DB {
             path,
             options,
             inner,
-            sequence: AtomicU64::new(sequence_start),
+            sequence: sequence_start.clone(),
             write_queue: Mutex::new(WriteQueueState {
                 queue: VecDeque::new(),
                 leader_active: false,
@@ -821,7 +1017,9 @@ impl DB {
             }
 
             // Check range tombstones in all files at this level that have them.
-            // Tombstones can span beyond their containing file's key range.
+            // We cannot filter by file key bounds because range tombstones can
+            // extend past the file's largest_key (table builder bounds only
+            // reflect point keys and tombstone start keys, not end keys).
             for tf in files {
                 if tf.meta.has_range_deletions {
                     let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq).c(d!())?;
@@ -1082,6 +1280,15 @@ impl DB {
             for level in 1..version.num_levels {
                 for tf in version.level_files(level) {
                     if tf.meta.has_range_deletions {
+                        // Only skip files whose smallest_key is past the
+                        // upper bound.  We cannot use largest_key < lower_bound
+                        // to skip because range tombstones can extend past the
+                        // file's largest_key.
+                        if let Some(hi) = upper_bound
+                            && types::user_key(&tf.meta.smallest_key) > hi
+                        {
+                            continue;
+                        }
                         let ts = tf.reader.get_range_tombstones().c(d!())?;
                         for (b, e, s) in ts {
                             all_tombstones.push((b, e, s, level));
@@ -1256,6 +1463,15 @@ impl DB {
             for level in 1..version.num_levels {
                 for tf in version.level_files(level) {
                     if tf.meta.has_range_deletions {
+                        // Only skip files whose smallest_key is past the prefix
+                        // upper bound.  We cannot use largest_key < prefix
+                        // to skip because range tombstones can extend past
+                        // the file's largest_key.
+                        if let Some(ref pu) = prefix_upper
+                            && types::user_key(&tf.meta.smallest_key) >= pu.as_slice()
+                        {
+                            continue;
+                        }
                         let ts = tf.reader.get_range_tombstones().c(d!())?;
                         for (b, e, s) in ts {
                             all_tombstones.push((b, e, s, level));
@@ -1503,23 +1719,26 @@ impl DB {
         if inner.active_memtable.is_empty() {
             return Ok(());
         }
-        let frozen = self.freeze_memtable(&mut inner).c(d!())?;
+        let frozen = self.freeze_memtable_sync(&mut inner).c(d!())?;
         drop(inner); // release lock during SST write
         let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
         let mut inner = self.inner.lock(); // reacquire
         self.install_flush(&mut inner, &frozen, build_result)
             .c(d!())?;
-        self.maybe_compact(&mut inner).c(d!())?;
+        let old_wal = frozen.old_wal_number;
+        drop(inner);
+        self.post_flush_cleanup(old_wal).c(d!())?;
+        if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger {
+            self.do_compaction().c(d!())?;
+        }
         Ok(())
     }
 
     /// Run compaction if needed (L0 → L1 or Ln → Ln+1).
-    /// Runs inline while holding locks for deterministic behavior.
     pub fn compact(&self) -> Result<()> {
         self.check_usable().c(d!())?;
         let _wg = self.write_queue.lock();
-        let mut inner = self.inner.lock();
-        self.do_compaction(&mut inner)
+        self.do_compaction()
     }
 
     /// Compact all keys in the given range across all levels.
@@ -1532,22 +1751,24 @@ impl DB {
             let _wg = self.write_queue.lock();
             let mut inner = self.inner.lock();
             if !inner.active_memtable.is_empty() {
-                let frozen = self.freeze_memtable(&mut inner).c(d!())?;
+                let frozen = self.freeze_memtable_sync(&mut inner).c(d!())?;
                 drop(inner);
                 let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
                 let mut inner = self.inner.lock();
                 self.install_flush(&mut inner, &frozen, build_result)
                     .c(d!())?;
+                let old_wal = frozen.old_wal_number;
+                drop(inner);
+                self.post_flush_cleanup(old_wal).c(d!())?;
             }
         }
 
         // Compact files overlapping the specified range
         let _wg = self.write_queue.lock();
-        let mut inner = self.inner.lock();
 
         // If no range specified, fall back to full compaction
         if begin.is_none() && end.is_none() {
-            return self.do_compaction(&mut inner);
+            return self.do_compaction();
         }
 
         // Range-filtered compaction: compact files overlapping [begin, end)
@@ -1560,33 +1781,78 @@ impl DB {
             active_snapshots: &active_snaps,
         };
         loop {
-            let version = inner.versions.current();
-            match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
-                Some(task) => {
-                    let l0_inputs: Vec<u64> = if task.level == 0 {
-                        task.input_files_level
+            let pick = {
+                let mut inner = self.inner.lock();
+                let version = inner.versions.current();
+                match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
+                    Some(task) => {
+                        let l0_inputs: Vec<u64> = if task.level == 0 {
+                            task.input_files_level
+                                .iter()
+                                .map(|f| f.meta.number)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let max_out = task.total_input_size() / self.options.target_file_size_base
+                            + self.options.max_subcompactions.max(1) as u64;
+                        let file_start = inner.versions.reserve_file_numbers(max_out);
+                        let all_inputs: Vec<_> = task
+                            .input_files_level
                             .iter()
-                            .map(|f| f.meta.number)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    LeveledCompaction::execute_compaction_with_cache(
-                        &ctx,
-                        &task,
-                        &mut inner.versions,
-                        Some(&self.table_cache),
-                    )
-                    .c(d!())?;
-                    for num in &l0_inputs {
-                        self.block_cache.unpin_file(*num);
+                            .chain(task.input_files_next.iter())
+                            .cloned()
+                            .collect();
+                        let is_bottom = LeveledCompaction::is_bottommost_level(
+                            &version,
+                            task.level + 1,
+                            self.options.num_levels,
+                            &all_inputs,
+                        );
+                        Some((task, file_start, l0_inputs, is_bottom))
                     }
+                    None => None,
                 }
-                None => break,
+            };
+
+            let Some((task, file_start, l0_inputs, is_bottom)) = pick else {
+                break;
+            };
+
+            let output =
+                LeveledCompaction::execute_compaction_io(&ctx, &task, file_start, is_bottom)
+                    .c(d!())?;
+
+            let cleanup = {
+                let mut inner = self.inner.lock();
+                let cleanup = LeveledCompaction::install_compaction(
+                    output,
+                    &mut inner.versions,
+                    Some(&self.table_cache),
+                    Some(&self.block_cache),
+                    &self.path,
+                    Some(&self.stats),
+                )
+                .c(d!())?;
+                for num in &l0_inputs {
+                    self.block_cache.unpin_file(*num);
+                }
+                cleanup
+            };
+            // Sync manifest + delete old SSTs outside the main lock
+            {
+                let handle = self.inner.lock().versions.manifest_sync_handle();
+                let mut w = handle.lock();
+                if let Some(ref mut writer) = *w {
+                    writer.sync().c(d!())?;
+                }
             }
+            LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
         }
+
         // Update cached L0 count and install new SuperVersion so readers
         // see the compacted state immediately.
+        let inner = self.inner.lock();
         self.l0_file_count
             .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
         self.install_super_version(&inner);
@@ -1789,16 +2055,12 @@ impl DB {
         let l0_count = self.l0_file_count.load(Ordering::Relaxed);
 
         if l0_count >= self.options.l0_stop_trigger {
-            // Slow path: lock inner and do inline compaction.
-            let mut inner = self.inner.lock();
-            while inner.versions.current().l0_file_count() >= self.options.l0_stop_trigger {
-                let _ = self.do_compaction(&mut inner);
-                if inner.versions.current().l0_file_count() >= self.options.l0_stop_trigger {
-                    break; // Can't compact further
-                }
-            }
-            self.l0_file_count
-                .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+            // Slow path: do inline compaction to reduce L0 count.
+            let _ = self.do_compaction();
+            self.l0_file_count.store(
+                self.inner.lock().versions.current().l0_file_count(),
+                Ordering::Relaxed,
+            );
         } else if l0_count >= self.options.l0_slowdown_trigger {
             // Progressive delay: more L0 files → longer sleep
             let delay_us = (l0_count - self.options.l0_slowdown_trigger + 1) as u64 * 1000;
@@ -1922,6 +2184,7 @@ impl DB {
         }
 
         if let Some((e, fail_idx)) = wal_add_error {
+            self.set_bg_error(format!("WAL write failed: {}", e));
             // Flush already-buffered WAL records for succeeded batches so
             // their data is durable even though later batches failed.
             let flush_ok = if fail_idx > 0 {
@@ -1979,16 +2242,17 @@ impl DB {
         }
 
         // Check memtable size threshold — release lock during SST I/O
-        let mut did_flush = false;
+        let mut flush_wal: Option<u64> = None;
         if inner.active_memtable.approximate_size() >= self.options.write_buffer_size {
-            match self.freeze_memtable(&mut inner) {
+            match self.freeze_memtable_sync(&mut inner) {
                 Ok(frozen) => {
+                    let old_wal = frozen.old_wal_number;
                     drop(inner); // release lock for slow SST write
                     match self.flush_frozen_memtable(&frozen) {
                         Ok(build_result) => {
                             let mut inner = self.inner.lock(); // reacquire
                             match self.install_flush(&mut inner, &frozen, build_result) {
-                                Ok(()) => did_flush = true,
+                                Ok(()) => flush_wal = Some(old_wal),
                                 Err(e) => tracing::error!("flush install failed: {}", e),
                             }
                             drop(inner);
@@ -2007,7 +2271,8 @@ impl DB {
             drop(inner);
         }
 
-        if did_flush {
+        if let Some(old_wal) = flush_wal {
+            self.post_flush_cleanup(old_wal).ok(); // best-effort sync
             self.signal_compaction();
         }
 
@@ -2018,14 +2283,21 @@ impl DB {
     /// Used by `close()` and `do_compaction` where lock is already held
     /// and releasing it would complicate the caller.
     fn freeze_and_flush(&self, inner: &mut DBInner) -> Result<()> {
-        let frozen = self.freeze_memtable(inner).c(d!())?;
+        let frozen = self.freeze_memtable_sync(inner).c(d!())?;
         let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
         self.install_flush(inner, &frozen, build_result).c(d!())?;
+        // Sync inline (close path, not performance-critical)
+        inner.versions.sync_manifest().c(d!())?;
+        let old_wal_path = self.path.join(format!("{:06}.wal", frozen.old_wal_number));
+        if let Err(e) = fs::remove_file(&old_wal_path) {
+            tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
+        }
         Ok(())
     }
 
     /// Phase 1 (under lock, fast): swap memtable, create WAL, allocate SST number.
-    fn freeze_memtable(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
+    /// Returns the FrozenMemtable for synchronous processing without queueing for background threads.
+    fn freeze_memtable_sync(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
         let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
 
         let new_wal_number = inner.versions.new_file_number();
@@ -2048,10 +2320,7 @@ impl DB {
     }
 
     /// Phase 2 (no lock needed, slow I/O): write SST from frozen memtable.
-    fn flush_frozen_memtable(
-        &self,
-        frozen: &FrozenMemtable,
-    ) -> Result<crate::sst::table_builder::TableBuildResult> {
+    fn flush_frozen_memtable(&self, frozen: &FrozenMemtable) -> Result<TableBuildResult> {
         self.write_memtable_to_sst(&frozen.old_mem, &frozen.sst_path)
     }
 
@@ -2060,7 +2329,7 @@ impl DB {
         &self,
         inner: &mut DBInner,
         frozen: &FrozenMemtable,
-        build_result: crate::sst::table_builder::TableBuildResult,
+        build_result: TableBuildResult,
     ) -> Result<()> {
         let mut edit = VersionEdit::new();
         edit.set_log_number(frozen.new_wal_number);
@@ -2093,23 +2362,29 @@ impl DB {
             .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
         self.install_super_version(inner);
 
-        let old_wal_path = self.path.join(format!("{:06}.wal", frozen.old_wal_number));
+        // WAL deletion is deferred: callers must sync the manifest first,
+        // then delete the old WAL file outside the main lock.
+        Ok(())
+    }
+
+    /// Sync the manifest and delete the old WAL after install_flush.
+    /// Must be called outside the main lock.
+    fn post_flush_cleanup(&self, old_wal_number: u64) -> Result<()> {
+        {
+            let handle = self.inner.lock().versions.manifest_sync_handle();
+            let mut w = handle.lock();
+            if let Some(ref mut writer) = *w {
+                writer.sync().c(d!())?;
+            }
+        }
+        let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
         if let Err(e) = fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
         }
-
         Ok(())
     }
 
-    fn maybe_compact(&self, inner: &mut DBInner) -> Result<()> {
-        let version = inner.versions.current();
-        if version.l0_file_count() >= self.options.l0_compaction_trigger {
-            self.do_compaction(inner).c(d!())?;
-        }
-        Ok(())
-    }
-
-    fn do_compaction(&self, inner: &mut DBInner) -> Result<()> {
+    fn do_compaction(&self) -> Result<()> {
         // Force-compact: use trigger=1 to compact any L0 files.
         let force_opts = DbOptions {
             l0_compaction_trigger: 1,
@@ -2123,11 +2398,12 @@ impl DB {
             stats: Some(&self.stats),
             active_snapshots: &active_snaps,
         };
+
+        let mut inner = self.inner.lock();
         loop {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction(&version, &force_opts) {
                 Some(task) => {
-                    // Collect L0 input files for cache unpinning after compaction
                     let l0_inputs: Vec<u64> = if task.level == 0 {
                         task.input_files_level
                             .iter()
@@ -2143,7 +2419,6 @@ impl DB {
                         Some(&self.table_cache),
                     )
                     .c(d!())?;
-                    // Unpin L0 files from block cache after compaction
                     for num in &l0_inputs {
                         self.block_cache.unpin_file(*num);
                     }
@@ -2151,9 +2426,6 @@ impl DB {
                 None => break,
             }
         }
-        // Force-merge levels that have multiple files (space reclamation).
-        // With background compaction, tombstones may end up in separate files
-        // from the data they cover. Merging fixes this.
         for level in 1..self.options.num_levels {
             LeveledCompaction::force_merge_level(
                 &ctx,
@@ -2164,10 +2436,9 @@ impl DB {
             )
             .c(d!())?;
         }
-        // Update cached L0 count after compaction
         self.l0_file_count
             .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
-        self.install_super_version(inner);
+        self.install_super_version(&inner);
         Ok(())
     }
 
@@ -2281,11 +2552,7 @@ impl DB {
         Ok(())
     }
 
-    fn write_memtable_to_sst(
-        &self,
-        mem: &MemTable,
-        path: &Path,
-    ) -> Result<crate::sst::table_builder::TableBuildResult> {
+    fn write_memtable_to_sst(&self, mem: &MemTable, path: &Path) -> Result<TableBuildResult> {
         let compression = if !self.options.compression_per_level.is_empty() {
             self.options.compression_per_level[0]
         } else {

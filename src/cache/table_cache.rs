@@ -42,23 +42,21 @@ impl TableCache {
     }
 
     /// Get or open a table reader for the given file number.
+    /// Uses moka's `try_get_with` to coalesce concurrent loads for the same file.
     pub fn get_reader(&self, file_number: u64) -> Result<Arc<TableReader>> {
-        if let Some(reader) = self.inner.get(&file_number) {
-            return Ok(reader);
-        }
-
-        let path = self.db_path.join(format!("{:06}.sst", file_number));
-        let reader = Arc::new(
-            TableReader::open_with_all(
-                &path,
-                file_number,
-                self.block_cache.clone(),
-                self.stats.clone(),
-            )
-            .c(d!())?,
-        );
-        self.inner.insert(file_number, reader.clone());
-        Ok(reader)
+        let db_path = self.db_path.clone();
+        let block_cache = self.block_cache.clone();
+        let stats = self.stats.clone();
+        self.inner
+            .try_get_with::<_, String>(file_number, || {
+                let path = db_path.join(format!("{:06}.sst", file_number));
+                let reader = Arc::new(
+                    TableReader::open_with_all(&path, file_number, block_cache, stats)
+                        .map_err(|e| format!("{}", e))?,
+                );
+                Ok(reader)
+            })
+            .map_err(|e| eg!(format!("table cache load failed: {}", e)))
     }
 
     /// Evict a file from the cache.

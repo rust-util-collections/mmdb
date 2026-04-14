@@ -31,8 +31,9 @@ pub struct VersionSet {
     last_sequence: SequenceNumber,
     /// Current MANIFEST file number.
     manifest_number: u64,
-    /// MANIFEST writer.
-    manifest_writer: Option<WalWriter>,
+    /// MANIFEST writer, behind its own lock so `sync` can be called
+    /// without holding the main DB mutex.
+    manifest_writer: Arc<parking_lot::Mutex<Option<WalWriter>>>,
     /// Table cache for opening SST readers.
     table_cache: Option<Arc<TableCache>>,
     /// Count of edits since last MANIFEST snapshot (for Phase I compaction).
@@ -66,7 +67,7 @@ impl VersionSet {
             log_number: 0,
             last_sequence: 0,
             manifest_number,
-            manifest_writer: Some(manifest_writer),
+            manifest_writer: Arc::new(parking_lot::Mutex::new(Some(manifest_writer))),
             table_cache,
             edits_since_snapshot: 0,
         };
@@ -76,6 +77,7 @@ impl VersionSet {
         edit.set_next_file_number(vs.next_file_number);
         edit.set_last_sequence(vs.last_sequence);
         vs.log_and_apply(edit).c(d!())?;
+        vs.sync_manifest().c(d!())?;
 
         Ok(vs)
     }
@@ -205,7 +207,7 @@ impl VersionSet {
             log_number,
             last_sequence,
             manifest_number,
-            manifest_writer: Some(manifest_writer),
+            manifest_writer: Arc::new(parking_lot::Mutex::new(Some(manifest_writer))),
             table_cache,
             edits_since_snapshot: 0,
         })
@@ -285,11 +287,15 @@ impl VersionSet {
             }
         }
 
-        // Version built successfully — now persist to MANIFEST
+        // Version built successfully — now persist to MANIFEST (write only, no sync).
+        // Callers on hot paths should release the main lock and call
+        // `sync_manifest()` separately to avoid stalling other operations.
         let encoded = edit.encode();
-        if let Some(ref mut writer) = self.manifest_writer {
-            writer.add_record(&encoded).c(d!())?;
-            writer.sync().c(d!())?;
+        {
+            let mut w = self.manifest_writer.lock();
+            if let Some(ref mut writer) = *w {
+                writer.add_record(&encoded).c(d!())?;
+            }
         }
 
         // Update bookkeeping
@@ -310,6 +316,22 @@ impl VersionSet {
         self.maybe_compact_manifest().c(d!())?;
 
         Ok(())
+    }
+
+    /// Sync the MANIFEST writer. Only acquires the internal manifest lock,
+    /// so callers can invoke this without holding the main DB mutex.
+    pub fn sync_manifest(&self) -> Result<()> {
+        let mut w = self.manifest_writer.lock();
+        if let Some(ref mut writer) = *w {
+            writer.sync().c(d!())?;
+        }
+        Ok(())
+    }
+
+    /// Return a handle for syncing the MANIFEST outside the main DB lock.
+    /// Clone the Arc, release the DB lock, then call `lock() → sync()`.
+    pub fn manifest_sync_handle(&self) -> Arc<parking_lot::Mutex<Option<WalWriter>>> {
+        Arc::clone(&self.manifest_writer)
     }
 
     /// Allocate a new file number.
@@ -404,7 +426,7 @@ impl VersionSet {
         }
 
         self.manifest_number = new_manifest_number;
-        self.manifest_writer = Some(new_writer);
+        *self.manifest_writer.lock() = Some(new_writer);
         self.edits_since_snapshot = 0;
 
         Ok(())
@@ -472,7 +494,7 @@ mod tests {
 
         // Create and write a MANIFEST edit referencing a non-existent SST
         {
-            let mut vs = VersionSet::create(path, 7).unwrap();
+            let vs = VersionSet::create(path, 7).unwrap();
             let mut edit = VersionEdit::new();
             edit.set_last_sequence(100);
             edit.add_file(
@@ -486,9 +508,12 @@ mod tests {
                 },
             );
             let encoded = edit.encode();
-            if let Some(ref mut writer) = vs.manifest_writer {
-                writer.add_record(&encoded).unwrap();
-                writer.sync().unwrap();
+            {
+                let mut w = vs.manifest_writer.lock();
+                if let Some(ref mut writer) = *w {
+                    writer.add_record(&encoded).unwrap();
+                    writer.sync().unwrap();
+                }
             }
         }
 

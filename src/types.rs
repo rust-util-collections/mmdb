@@ -76,13 +76,21 @@ impl InternalKey {
 
     /// Wrap already-encoded bytes (must include the 8-byte trailer).
     pub fn from_encoded(encoded: Vec<u8>) -> Self {
-        debug_assert!(encoded.len() >= 8);
+        assert!(
+            encoded.len() >= 8,
+            "InternalKey requires at least 8 bytes, got {}",
+            encoded.len()
+        );
         Self { encoded }
     }
 
     /// Wrap a reference to already-encoded bytes.
     pub fn from_encoded_slice(encoded: &[u8]) -> InternalKeyRef<'_> {
-        debug_assert!(encoded.len() >= 8);
+        assert!(
+            encoded.len() >= 8,
+            "InternalKey requires at least 8 bytes, got {}",
+            encoded.len()
+        );
         InternalKeyRef { encoded }
     }
 
@@ -138,7 +146,11 @@ pub struct InternalKeyRef<'a> {
 
 impl<'a> InternalKeyRef<'a> {
     pub fn new(encoded: &'a [u8]) -> Self {
-        debug_assert!(encoded.len() >= 8);
+        assert!(
+            encoded.len() >= 8,
+            "InternalKeyRef requires at least 8 bytes, got {}",
+            encoded.len()
+        );
         Self { encoded }
     }
 

@@ -33,13 +33,12 @@ MSRV: Rust 1.89 (edition 2024)
 | Manifest | `src/manifest/` | VersionSet, atomic version edits |
 | Cache | `src/cache/` | Block cache (moka LRU), table handle cache |
 
-## Code Review Commands
+## Commands
 
-Custom slash commands for AI-assisted code review:
-
-- `/mm-review` — deep regression analysis of recent changes
-- `/mm-debug` — crash/corruption root cause investigation
-- `/mm-verify` — validate whether a reported finding is a true bug or false positive
+- `/x-review` — deep regression analysis of recent changes
+- `/x-fix` — resolve all open findings in `.claude/audit.md`
+- `/x-commit` — self-reviewing commit (review, fix, format, commit)
+- `/x-auto` — full pipeline: review → fix → commit
 
 Supporting documentation in `.claude/docs/`:
 - `technical-patterns.md` — cataloged bug patterns for LSM-Tree/Rust

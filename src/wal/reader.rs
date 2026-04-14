@@ -160,6 +160,15 @@ impl WalReader {
             };
             let length = length as usize;
 
+            // Validate that the record payload fits within the current block.
+            let remaining = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
+            if length > remaining {
+                return Err(eg!(Error::Corruption(format!(
+                    "WAL record length {} exceeds remaining block space {}",
+                    length, remaining
+                ))));
+            }
+
             // Read the data
             let mut data = vec![0u8; length];
             match self.reader.read_exact(&mut data) {

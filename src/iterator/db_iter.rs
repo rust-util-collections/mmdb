@@ -677,7 +677,9 @@ impl DBIterator {
 
                 // Track the highest-seq visible version for this user key.
                 // Backward order = seq ascending, so each new entry has higher seq.
-                if seq <= self.sequence && seq > best_seq {
+                // Use >= so that sequence-0 entries (produced by bottommost compaction)
+                // are correctly picked up when best_seq starts at 0.
+                if seq <= self.sequence && seq >= best_seq {
                     best_seq = seq;
                     best_is_deletion = vt == ValueType::Deletion;
                     if !best_is_deletion {

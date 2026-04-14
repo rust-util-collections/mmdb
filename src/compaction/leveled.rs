@@ -76,6 +76,13 @@ pub struct CompactionOutput {
     pub next_file_number_hint: u64,
 }
 
+/// Deferred cleanup actions that must be performed AFTER the manifest is
+/// synced to disk. Executing these before sync risks data loss on crash.
+pub struct PostCompactionCleanup {
+    /// Old SST file numbers to delete from disk.
+    pub files_to_delete: HashSet<u64>,
+}
+
 impl CompactionTask {
     /// Total size of all input files (both levels).
     pub fn total_input_size(&self) -> u64 {
@@ -682,10 +689,26 @@ impl LeveledCompaction {
             + ctx.options.max_subcompactions.max(1) as u64;
         let file_number_start = versions.reserve_file_numbers(max_outputs);
 
-        let output = Self::execute_compaction_io(ctx, task, file_number_start).c(d!())?;
+        let version = versions.current();
+        let all_inputs: Vec<_> = task
+            .input_files_level
+            .iter()
+            .chain(task.input_files_next.iter())
+            .cloned()
+            .collect();
+        let is_bottom =
+            Self::is_bottommost_level(&version, target_level, ctx.options.num_levels, &all_inputs);
 
-        Self::install_compaction(output, versions, table_cache, None, ctx.db_path, ctx.stats)
-            .c(d!())
+        let output =
+            Self::execute_compaction_io(ctx, task, file_number_start, is_bottom).c(d!())?;
+
+        let cleanup =
+            Self::install_compaction(output, versions, table_cache, None, ctx.db_path, ctx.stats)
+                .c(d!())?;
+        // This path holds &mut VersionSet for the duration, so sync here.
+        versions.sync_manifest().c(d!())?;
+        Self::run_post_compaction_cleanup(&cleanup, ctx.db_path);
+        Ok(())
     }
 
     /// Pure I/O phase of compaction — does NOT require any lock.
@@ -700,9 +723,9 @@ impl LeveledCompaction {
         ctx: &CompactionContext<'_>,
         task: &CompactionTask,
         file_number_start: u64,
+        is_bottommost: bool,
     ) -> Result<CompactionOutput> {
         let target_level = task.level + 1;
-        let is_bottommost = target_level >= ctx.options.num_levels - 1;
         let min_unflushed_seq = ctx
             .active_snapshots
             .iter()
@@ -853,7 +876,7 @@ impl LeveledCompaction {
         block_cache: Option<&Arc<BlockCache>>,
         db_path: &Path,
         stats: Option<&Arc<DbStats>>,
-    ) -> Result<()> {
+    ) -> Result<PostCompactionCleanup> {
         // Guard against stale compaction results: if any input file has already
         // been removed from the current version (e.g. by a concurrent inline
         // compaction), this output is based on outdated data and must be
@@ -879,7 +902,9 @@ impl LeveledCompaction {
                         cache.evict(meta.number);
                     }
                 }
-                return Ok(());
+                return Ok(PostCompactionCleanup {
+                    files_to_delete: HashSet::new(),
+                });
             }
         }
 
@@ -892,7 +917,7 @@ impl LeveledCompaction {
             .set_next_file_number(versions.next_file_number());
         versions.log_and_apply(output.edit).c(d!())?;
 
-        // Evict from caches before deleting SST files
+        // Evict from caches (fast, safe before sync)
         for num in &output.input_file_numbers {
             if let Some(cache) = table_cache {
                 cache.evict(*num);
@@ -902,19 +927,24 @@ impl LeveledCompaction {
             }
         }
 
-        // Delete old SST files
-        for num in &output.input_file_numbers {
+        if let Some(s) = stats {
+            s.record_compaction_completed();
+        }
+
+        // Return the file numbers that need deletion AFTER manifest sync
+        Ok(PostCompactionCleanup {
+            files_to_delete: output.input_file_numbers,
+        })
+    }
+
+    /// Delete old SST files after manifest has been synced.
+    pub fn run_post_compaction_cleanup(cleanup: &PostCompactionCleanup, db_path: &Path) {
+        for num in &cleanup.files_to_delete {
             let old_path = db_path.join(format!("{:06}.sst", num));
             if let Err(e) = remove_file(&old_path) {
                 tracing::warn!("failed to remove old SST {}: {}", old_path.display(), e);
             }
         }
-
-        if let Some(s) = stats {
-            s.record_compaction_completed();
-        }
-
-        Ok(())
     }
 
     /// Force-merge all files at a given level into one output at the same level.
@@ -926,7 +956,6 @@ impl LeveledCompaction {
         table_cache: Option<&Arc<TableCache>>,
         block_cache: Option<&Arc<BlockCache>>,
     ) -> Result<()> {
-        let is_bottommost = level >= ctx.options.num_levels - 1;
         let min_unflushed_seq = ctx
             .active_snapshots
             .iter()
@@ -938,6 +967,8 @@ impl LeveledCompaction {
         if files.len() <= 1 {
             return Ok(());
         }
+        let is_bottommost =
+            Self::is_bottommost_level(&version, level, ctx.options.num_levels, files);
 
         let mut sources: Vec<IterSource> = Vec::new();
         for tf in files {
@@ -1151,6 +1182,8 @@ impl LeveledCompaction {
 
         edit.set_next_file_number(versions.next_file_number());
         versions.log_and_apply(edit).c(d!())?;
+        // force_merge_level holds &mut VersionSet for the duration, sync here.
+        versions.sync_manifest().c(d!())?;
 
         if let Some(cache) = table_cache {
             for num in &input_file_numbers {
@@ -1163,6 +1196,7 @@ impl LeveledCompaction {
             }
         }
 
+        // Safe to delete old SSTs after manifest is synced
         for num in &input_file_numbers {
             let old_path = ctx.db_path.join(format!("{:06}.sst", num));
             if let Err(e) = remove_file(&old_path) {
@@ -1225,6 +1259,38 @@ impl LeveledCompaction {
         }
 
         (smallest, largest)
+    }
+
+    /// Check whether `target_level` is the effective bottommost level for a given
+    /// compaction range. A level is bottommost if no deeper level contains files
+    /// that overlap the compaction's user-key range. This allows tombstones to be
+    /// dropped early instead of being retained until the statically configured
+    /// last level.
+    pub(crate) fn is_bottommost_level(
+        version: &Version,
+        target_level: usize,
+        num_levels: usize,
+        all_inputs: &[TableFile],
+    ) -> bool {
+        if target_level >= num_levels - 1 {
+            return true;
+        }
+        let (smallest, largest) = Self::total_key_range(all_inputs);
+        if smallest.is_empty() {
+            return true;
+        }
+        let smallest_uk = user_key(&smallest);
+        let largest_uk = user_key(&largest);
+        for level in (target_level + 1)..num_levels {
+            for f in version.level_files(level) {
+                let f_smallest = user_key(&f.meta.smallest_key);
+                let f_largest = user_key(&f.meta.largest_key);
+                if f_largest >= smallest_uk && f_smallest <= largest_uk {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Find files in a level that overlap with the given key range.
