@@ -200,7 +200,6 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 let mut next = self.head[level].load(Ordering::Acquire);
                 while !next.is_null() {
                     // SAFETY: next is a valid node published via Release.
-                    // SAFETY: next is a valid node published via Release.
                     let node = unsafe { &*next };
                     if node.key >= key {
                         break;
@@ -289,7 +288,6 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             let mut next = if current.is_null() {
                 self.head[level].load(Ordering::Acquire)
             } else {
-                // SAFETY: current is a valid published node.
                 // SAFETY: current is a valid published predecessor.
                 unsafe { &*current }.next[level].load(Ordering::Acquire)
             };

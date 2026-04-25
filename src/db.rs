@@ -203,7 +203,6 @@ unsafe impl Sync for DB {}
 struct DBInner {
     active_memtable: Arc<MemTable>,
     immutable_memtables: Vec<Arc<MemTable>>,
-    frozen_memtables: VecDeque<FrozenMemtable>,
     wal_writer: Option<WalWriter>,
     wal_number: u64,
     versions: VersionSet,
@@ -427,7 +426,6 @@ impl DB {
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
             immutable_memtables: Vec::new(),
-            frozen_memtables: VecDeque::new(),
             wal_writer: Some(wal_writer),
             wal_number,
             versions,
@@ -482,7 +480,7 @@ impl DB {
             let bg_snapshot_list = snapshot_list.clone();
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
-            let bg_committed_sequence = committed_sequence.clone();
+
             let bg_l0_cv = l0_cv.clone();
 
             let handle = thread::Builder::new()
@@ -513,128 +511,6 @@ impl DB {
                         // thread death from panics in corrupt data paths.
                         let result = catch_unwind(AssertUnwindSafe(
                             || -> std::result::Result<(), String> {
-                                // Process pending memtable flushes (lock released during I/O)
-                                loop {
-                                    let frozen = {
-                                        let mut inner = bg_inner.lock();
-                                        inner.frozen_memtables.pop_front()
-                                    };
-                                    let Some(frozen) = frozen else { break };
-
-                                    // Slow I/O: write SST from frozen memtable
-                                    // Flush always targets L0, so index 0 is safe.
-                                    let compression =
-                                        if !bg_options.compression_per_level.is_empty() {
-                                            bg_options.compression_per_level[0]
-                                        } else {
-                                            bg_options.compression
-                                        };
-                                    let opts = TableBuildOptions {
-                                        block_size: bg_options.block_size,
-                                        block_restart_interval: bg_options.block_restart_interval,
-                                        bloom_bits_per_key: bg_options.bloom_bits_per_key,
-                                        internal_keys: true,
-                                        compression,
-                                        prefix_len: bg_options.prefix_len,
-                                        block_property_collectors: bg_options
-                                            .block_property_collectors
-                                            .iter()
-                                            .map(|f| f())
-                                            .collect(),
-                                    };
-
-                                    let build_result = (|| -> Result<TableBuildResult> {
-                                        let mut builder =
-                                            TableBuilder::new(&frozen.sst_path, opts).c(d!())?;
-                                        for (key, value) in frozen.old_mem.iter() {
-                                            builder.add(&key, &value).c(d!())?;
-                                        }
-                                        builder.finish()
-                                    })();
-
-                                    let build_result = match build_result {
-                                        Ok(r) => r,
-                                        Err(e) => {
-                                            return Err(format!("flush error: {}", e));
-                                        }
-                                    };
-
-                                    // Phase 3: install (short lock)
-                                    {
-                                        let mut inner = bg_inner.lock();
-                                        let mut edit = VersionEdit::new();
-                                        edit.set_log_number(frozen.new_wal_number);
-                                        edit.set_next_file_number(
-                                            inner.versions.next_file_number(),
-                                        );
-                                        let current_seq =
-                                            bg_committed_sequence.load(Ordering::Acquire);
-                                        edit.set_last_sequence(current_seq);
-                                        edit.add_file(
-                                            0, // L0
-                                            FileMetaData {
-                                                number: frozen.sst_number,
-                                                file_size: build_result.file_size,
-                                                smallest_key: build_result
-                                                    .smallest_key
-                                                    .unwrap_or_default(),
-                                                largest_key: build_result
-                                                    .largest_key
-                                                    .unwrap_or_default(),
-                                                has_range_deletions: build_result
-                                                    .has_range_deletions,
-                                            },
-                                        );
-                                        if let Err(e) = inner.versions.log_and_apply(edit) {
-                                            return Err(format!("flush install error: {}", e));
-                                        }
-                                        bg_stats.record_flush();
-
-                                        if bg_options.pin_l0_filter_and_index_blocks_in_cache {
-                                            let version = inner.versions.current();
-                                            for tf in version.level_files(0) {
-                                                if tf.meta.number == frozen.sst_number {
-                                                    tf.reader.pin_metadata_in_cache();
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        // Remove from immutable_memtables
-                                        inner
-                                            .immutable_memtables
-                                            .retain(|m| !Arc::ptr_eq(m, &frozen.old_mem));
-
-                                        bg_l0_count.store(
-                                            inner.versions.current().l0_file_count(),
-                                            Ordering::Relaxed,
-                                        );
-                                        bg_l0_cv.notify_all();
-                                        refresh_super_version(&bg_sv, &inner);
-                                    }
-                                    // Sync manifest outside the main lock before deleting old WAL.
-                                    {
-                                        let handle =
-                                            bg_inner.lock().versions.manifest_sync_handle();
-                                        let mut w = handle.lock();
-                                        if let Some(ref mut writer) = *w {
-                                            writer.sync().map_err(|e| {
-                                                format!("manifest sync error: {}", e)
-                                            })?;
-                                        }
-                                    }
-
-                                    let old_wal_path =
-                                        bg_path.join(format!("{:06}.wal", frozen.old_wal_number));
-                                    if let Err(e) = fs::remove_file(&old_wal_path) {
-                                        tracing::warn!(
-                                            "failed to remove old WAL {}: {}",
-                                            old_wal_path.display(),
-                                            e
-                                        );
-                                    }
-                                }
-
                                 // Drain read-compaction hints (lock released during I/O)
                                 {
                                     let hints: Vec<CompactionHint> =
@@ -2200,6 +2076,7 @@ impl DB {
 
     /// Process a batch group: assign sequences, write+flush WAL, then publish to MemTable.
     fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<()> {
+        self.check_usable()?;
         let mut need_sync = false;
         let mut inner = self.inner.lock();
 

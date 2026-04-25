@@ -674,18 +674,15 @@ impl LeveledCompaction {
             let file_largest = user_key(&tf.meta.largest_key);
             let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
             let overlaps_end = end.is_none_or(|e| file_smallest < e);
-            if tf.meta.has_range_deletions || (overlaps_begin && overlaps_end) {
+            if overlaps_begin && overlaps_end {
                 input_l0.push(tf.clone());
             }
         }
 
         if !input_l0.is_empty() {
             let (smallest, largest) = Self::total_key_range(&input_l0);
-            let input_l1 = if input_l0.iter().any(|tf| tf.meta.has_range_deletions) {
-                version.level_files(1).to_vec()
-            } else {
-                Self::overlapping_files(version.level_files(1), &smallest, &largest)
-            };
+            let input_l1 =
+                Self::overlapping_files(version.level_files(1), &smallest, &largest);
             return Some(CompactionTask {
                 level: 0,
                 input_files_level: input_l0,
@@ -702,7 +699,7 @@ impl LeveledCompaction {
                 let file_largest = user_key(&tf.meta.largest_key);
                 let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
                 let overlaps_end = end.is_none_or(|e| file_smallest < e);
-                if tf.meta.has_range_deletions || (overlaps_begin && overlaps_end) {
+                if overlaps_begin && overlaps_end {
                     input_level.push(tf.clone());
                 }
             }
@@ -711,15 +708,11 @@ impl LeveledCompaction {
                 let (smallest, largest) = Self::total_key_range(&input_level);
                 let next_level = level + 1;
                 let input_next = if next_level < version.num_levels {
-                    if input_level.iter().any(|tf| tf.meta.has_range_deletions) {
-                        version.level_files(next_level).to_vec()
-                    } else {
-                        Self::overlapping_files(
-                            version.level_files(next_level),
-                            &smallest,
-                            &largest,
-                        )
-                    }
+                    Self::overlapping_files(
+                        version.level_files(next_level),
+                        &smallest,
+                        &largest,
+                    )
                 } else {
                     Vec::new()
                 };
@@ -1437,11 +1430,11 @@ impl LeveledCompaction {
         let largest_uk = user_key(&largest);
         for level in (target_level + 1)..num_levels {
             for f in version.level_files(level) {
-                if f.meta.has_range_deletions {
-                    return false;
-                }
                 let f_smallest = user_key(&f.meta.smallest_key);
                 let f_largest = user_key(&f.meta.largest_key);
+                // Any overlapping file at a lower level means this is not bottommost.
+                // Range deletion boundaries are included in file metadata, so the
+                // standard overlap check is sufficient for range-deletion files too.
                 if f_largest >= smallest_uk && f_smallest <= largest_uk {
                     return false;
                 }
@@ -1465,12 +1458,11 @@ impl LeveledCompaction {
         files
             .iter()
             .filter(|f| {
-                if f.meta.has_range_deletions {
-                    return true;
-                }
                 let file_largest_uk = user_key(&f.meta.largest_key);
                 let file_smallest_uk = user_key(&f.meta.smallest_key);
                 // File overlaps if: file.largest_uk >= smallest_uk AND file.smallest_uk <= largest_uk
+                // Range deletion boundaries are included in file metadata key range,
+                // so the standard overlap check is sufficient even for files with range deletions.
                 file_largest_uk >= smallest_uk && file_smallest_uk <= largest_uk
             })
             .cloned()
