@@ -1,5 +1,6 @@
 //! Version: an immutable snapshot of which SST files exist at each level.
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::manifest::version_edit::FileMetaData;
@@ -51,8 +52,8 @@ impl Version {
     }
 }
 
-impl std::fmt::Debug for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Version {{ levels: [")?;
         for (i, level) in self.files.iter().enumerate() {
             if !level.is_empty() {

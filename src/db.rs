@@ -35,7 +35,9 @@ use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{TableBuildOptions, TableBuildResult, TableBuilder};
 use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
-use crate::types::{self, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex};
+use crate::types::{
+    self, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex,
+};
 use crate::wal::{WalReader, WalWriter};
 use ruc::*;
 
@@ -146,6 +148,8 @@ pub struct DB {
     inner: Arc<Mutex<DBInner>>,
     /// Global sequence number (next to assign).
     sequence: Arc<AtomicU64>,
+    /// Last sequence number committed and visible to readers/snapshots.
+    committed_sequence: Arc<AtomicU64>,
     /// Write queue and condvar for group commit.
     write_queue: Mutex<WriteQueueState>,
     write_cv: Condvar,
@@ -189,7 +193,11 @@ pub struct DB {
 }
 
 // SAFETY: WriteRequest pointers are only accessed under write_queue lock.
+// SAFETY: DB's shared mutable state is behind Arc + parking_lot locks or atomics;
+// raw request pointers are stack-local to write_queue waiters and never stored in DB.
 unsafe impl Send for DB {}
+// SAFETY: all cross-thread access is synchronized by locks/atomics; public methods
+// do not expose interior raw pointers or unsynchronized mutable references.
 unsafe impl Sync for DB {}
 
 struct DBInner {
@@ -272,6 +280,7 @@ impl DB {
             #[cfg(unix)]
             {
                 use std::os::fd::AsRawFd;
+                // SAFETY: flock only observes the valid fd borrowed from `file`.
                 let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if ret != 0 {
                     let err = io::Error::last_os_error();
@@ -322,18 +331,19 @@ impl DB {
 
         for wal_num in &wal_numbers {
             let wal_path = path.join(format!("{:06}.wal", wal_num));
-            if let Ok(mut reader) = WalReader::new(&wal_path) {
-                for record in reader.iter() {
-                    match record {
-                        Ok(data) => {
-                            Self::replay_wal_record(&data, &active_memtable, &mut max_sequence)
-                                .c(d!())?;
-                        }
-                        Err(e) => {
-                            tracing::warn!("WAL {} recovery error: {}", wal_num, e);
-                            break;
-                        }
+            let mut reader = WalReader::new(&wal_path).c(d!())?;
+            loop {
+                match reader.read_record() {
+                    Ok(Some(data)) => {
+                        Self::replay_wal_record(&data, &active_memtable, &mut max_sequence)
+                            .c(d!())?;
                     }
+                    Ok(None) => break,
+                    Err(e) if reader.is_at_file_end().unwrap_or(false) => {
+                        tracing::warn!("WAL {} has corrupt tail: {}", wal_num, e);
+                        break;
+                    }
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -406,7 +416,13 @@ impl DB {
             versions.sync_manifest().c(d!())?;
         }
 
-        let sequence_start = Arc::new(AtomicU64::new(max_sequence + 1));
+        let next_sequence = max_sequence.checked_add(1).ok_or_else(|| {
+            eg!(Error::InvalidArgument(
+                "sequence number space exhausted".to_string()
+            ))
+        })?;
+        let sequence_start = Arc::new(AtomicU64::new(next_sequence));
+        let committed_sequence = Arc::new(AtomicU64::new(max_sequence));
 
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
@@ -466,7 +482,7 @@ impl DB {
             let bg_snapshot_list = snapshot_list.clone();
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
-            let bg_sequence = sequence_start.clone();
+            let bg_committed_sequence = committed_sequence.clone();
             let bg_l0_cv = l0_cv.clone();
 
             let handle = thread::Builder::new()
@@ -475,8 +491,8 @@ impl DB {
                     // Helper: set background error and log it.
                     let set_error = |msg: String| {
                         tracing::error!("{}", msg);
-                        bg_has_error.store(true, Ordering::Release);
                         *bg_error_msg.lock() = Some(msg);
+                        bg_has_error.store(true, Ordering::Release);
                     };
 
                     loop {
@@ -552,7 +568,7 @@ impl DB {
                                             inner.versions.next_file_number(),
                                         );
                                         let current_seq =
-                                            bg_sequence.load(Ordering::Acquire).saturating_sub(1);
+                                            bg_committed_sequence.load(Ordering::Acquire);
                                         edit.set_last_sequence(current_seq);
                                         edit.add_file(
                                             0, // L0
@@ -634,13 +650,16 @@ impl DB {
                                                     &version, hint,
                                                 )
                                                 .map(|task| {
-                                                    let max_out = task.total_input_size()
-                                                        / bg_options.target_file_size_base
-                                                        + bg_options.max_subcompactions.max(1)
-                                                            as u64;
+                                                    let max_out =
+                                                        LeveledCompaction::max_output_files(
+                                                            &task,
+                                                            &bg_options,
+                                                        );
                                                     let file_start = inner
                                                         .versions
                                                         .reserve_file_numbers(max_out);
+                                                    let file_limit =
+                                                        file_start.saturating_add(max_out);
                                                     let all_inputs: Vec<_> = task
                                                         .input_files_level
                                                         .iter()
@@ -654,11 +673,13 @@ impl DB {
                                                             bg_options.num_levels,
                                                             &all_inputs,
                                                         );
-                                                    (task, file_start, is_bottom)
+                                                    (task, file_start, file_limit, is_bottom)
                                                 })
                                             }; // lock released
 
-                                            if let Some((task, file_start, is_bottom)) = pick {
+                                            if let Some((task, file_start, file_limit, is_bottom)) =
+                                                pick
+                                            {
                                                 // Phase 2: I/O (no lock)
                                                 let ctx = CompactionContext {
                                                     db_path: &bg_path,
@@ -669,7 +690,8 @@ impl DB {
                                                 };
                                                 let output =
                                                     LeveledCompaction::execute_compaction_io(
-                                                        &ctx, &task, file_start, is_bottom,
+                                                        &ctx, &task, file_start, file_limit,
+                                                        is_bottom,
                                                     )
                                                     .map_err(|e| {
                                                         format!("hint compaction error: {}", e)
@@ -743,11 +765,13 @@ impl DB {
                                                 } else {
                                                     Vec::new()
                                                 };
-                                                let max_out = task.total_input_size()
-                                                    / bg_options.target_file_size_base
-                                                    + bg_options.max_subcompactions.max(1) as u64;
+                                                let max_out = LeveledCompaction::max_output_files(
+                                                    &task,
+                                                    &bg_options,
+                                                );
                                                 let file_start =
                                                     inner.versions.reserve_file_numbers(max_out);
+                                                let file_limit = file_start.saturating_add(max_out);
                                                 let all_inputs: Vec<_> = task
                                                     .input_files_level
                                                     .iter()
@@ -761,13 +785,17 @@ impl DB {
                                                         bg_options.num_levels,
                                                         &all_inputs,
                                                     );
-                                                Some((task, file_start, l0_inputs, is_bottom))
+                                                Some((
+                                                    task, file_start, file_limit, l0_inputs,
+                                                    is_bottom,
+                                                ))
                                             }
                                             None => None,
                                         }
                                     }; // lock released
 
-                                    let Some((task, file_start, l0_inputs, is_bottom)) = pick
+                                    let Some((task, file_start, file_limit, l0_inputs, is_bottom)) =
+                                        pick
                                     else {
                                         break;
                                     };
@@ -781,7 +809,7 @@ impl DB {
                                         active_snapshots: &active_snaps,
                                     };
                                     let output = LeveledCompaction::execute_compaction_io(
-                                        &ctx, &task, file_start, is_bottom,
+                                        &ctx, &task, file_start, file_limit, is_bottom,
                                     )
                                     .map_err(|e| format!("compaction error: {}", e))?;
 
@@ -856,6 +884,7 @@ impl DB {
             options,
             inner,
             sequence: sequence_start.clone(),
+            committed_sequence,
             write_queue: Mutex::new(WriteQueueState {
                 queue: VecDeque::new(),
                 leader_active: false,
@@ -1516,8 +1545,27 @@ impl DB {
         self.check_usable().c(d!())?;
 
         let seq = self.current_sequence();
-        let batch_entries = batch.sorted_entries(seq + 1);
         let batch_count = batch.operation_count();
+        let batch_base_seq = seq.checked_add(1).ok_or_else(|| {
+            eg!(Error::InvalidArgument(
+                "sequence number space exhausted".to_string()
+            ))
+        })?;
+        let batch_last_seq = if batch_count == 0 {
+            seq
+        } else {
+            batch_base_seq.checked_add(batch_count - 1).ok_or_else(|| {
+                eg!(Error::InvalidArgument(
+                    "sequence number space exhausted".to_string()
+                ))
+            })?
+        };
+        if batch_last_seq > MAX_SEQUENCE_NUMBER {
+            return Err(eg!(Error::InvalidArgument(
+                "sequence number space exhausted".to_string()
+            )));
+        }
+        let batch_entries = batch.sorted_entries(batch_base_seq).c(d!())?;
 
         // Lock-free read via SuperVersion.
         let sv = self.get_super_version();
@@ -1556,13 +1604,13 @@ impl DB {
             sources.push(IterSource::from_level_iter(level_iter));
         }
 
-        let mut db_iter = DBIterator::from_sources(sources, seq + batch_count);
+        let mut db_iter = DBIterator::from_sources(sources, batch_last_seq);
 
         // Collect range tombstones (same as iter_with_range).
         let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
         // Batch range tombstones use position-based sequences (preserving write order).
         for &(ref b, ref e, pos) in batch.range_tombstones() {
-            all_tombstones.push((b.clone(), e.clone(), seq + 1 + pos, 0));
+            all_tombstones.push((b.clone(), e.clone(), batch_base_seq + pos, 0));
         }
         if active_mem.has_range_deletions() {
             for (b, e, s) in active_mem.get_range_tombstones() {
@@ -1798,9 +1846,9 @@ impl DB {
                         } else {
                             Vec::new()
                         };
-                        let max_out = task.total_input_size() / self.options.target_file_size_base
-                            + self.options.max_subcompactions.max(1) as u64;
+                        let max_out = LeveledCompaction::max_output_files(&task, &self.options);
                         let file_start = inner.versions.reserve_file_numbers(max_out);
+                        let file_limit = file_start.saturating_add(max_out);
                         let all_inputs: Vec<_> = task
                             .input_files_level
                             .iter()
@@ -1813,19 +1861,20 @@ impl DB {
                             self.options.num_levels,
                             &all_inputs,
                         );
-                        Some((task, file_start, l0_inputs, is_bottom))
+                        Some((task, file_start, file_limit, l0_inputs, is_bottom))
                     }
                     None => None,
                 }
             };
 
-            let Some((task, file_start, l0_inputs, is_bottom)) = pick else {
+            let Some((task, file_start, file_limit, l0_inputs, is_bottom)) = pick else {
                 break;
             };
 
-            let output =
-                LeveledCompaction::execute_compaction_io(&ctx, &task, file_start, is_bottom)
-                    .c(d!())?;
+            let output = LeveledCompaction::execute_compaction_io(
+                &ctx, &task, file_start, file_limit, is_bottom,
+            )
+            .c(d!())?;
 
             let cleanup = {
                 let mut inner = self.inner.lock();
@@ -2005,8 +2054,8 @@ impl DB {
     /// Record a background error, setting the fast-path flag and the detailed message.
     /// All subsequent `check_usable()` calls will return this error.
     fn set_bg_error(&self, msg: String) {
-        self.has_bg_error.store(true, Ordering::Release);
         *self.bg_error.lock() = Some(msg);
+        self.has_bg_error.store(true, Ordering::Release);
     }
 
     /// Periodically check read-level samples and generate compaction hints.
@@ -2050,7 +2099,7 @@ impl DB {
     }
 
     fn current_sequence(&self) -> SequenceNumber {
-        self.sequence.load(Ordering::Acquire).saturating_sub(1)
+        self.committed_sequence.load(Ordering::Acquire)
     }
 
     /// Apply write backpressure based on L0 file count.
@@ -2122,6 +2171,8 @@ impl DB {
             // Signal everyone in this batch
             let mut wq_inner = self.write_queue.lock();
             for &rp in &batch_group {
+                // SAFETY: all request pointers came from queue entries whose
+                // callers are blocked until this leader sets `done`.
                 let r = unsafe { &mut *rp };
                 if r.result.is_none() {
                     r.result = match &result {
@@ -2147,84 +2198,68 @@ impl DB {
         req.result.take().unwrap_or(Ok(()))
     }
 
-    /// Process a batch group: write WAL, apply to memtable, sync, flush if needed.
-    /// Returns Ok(()) if all batches succeeded. On WAL add_record failure,
-    /// sets result on each request (Ok for succeeded, Err for failed+later).
+    /// Process a batch group: assign sequences, write+flush WAL, then publish to MemTable.
     fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<()> {
         let mut need_sync = false;
         let mut inner = self.inner.lock();
-        let mut wal_add_error: Option<(Box<dyn ruc::RucError>, usize)> = None;
 
-        for (batch_idx, &req_ptr) in batch_group.iter().enumerate() {
-            let r = unsafe { &mut *req_ptr };
-            let first_seq = self
-                .sequence
-                .fetch_add(r.batch.len() as u64, Ordering::AcqRel);
-            need_sync |= r.sync;
+        let total_ops: u64 = batch_group
+            .iter()
+            .map(|&req_ptr| {
+                // SAFETY: request pointers remain valid until the leader marks
+                // them done; callers wait on the write queue for that signal.
+                unsafe { (&*req_ptr).batch.len() as u64 }
+            })
+            .sum();
+        if total_ops == 0 {
+            return Ok(());
+        }
+
+        let first_group_seq = self.sequence.load(Ordering::Acquire);
+        let last_group_seq = first_group_seq
+            .checked_add(total_ops)
+            .and_then(|next| next.checked_sub(1))
+            .ok_or_else(|| {
+                eg!(Error::InvalidArgument(
+                    "sequence number space exhausted".to_string()
+                ))
+            })?;
+        if last_group_seq > MAX_SEQUENCE_NUMBER {
+            return Err(eg!(Error::InvalidArgument(
+                "sequence number space exhausted".to_string()
+            )));
+        }
+        self.sequence.store(last_group_seq + 1, Ordering::Release);
+
+        let mut assigned = Vec::with_capacity(batch_group.len());
+        let mut append_error: Option<String> = None;
+        let mut next_seq = first_group_seq;
+
+        for &req_ptr in batch_group {
+            // SAFETY: request pointers are owned by waiting writer stack frames
+            // and are only accessed by the active leader until completion.
+            let r = unsafe { &*req_ptr };
+            let first_seq = next_seq;
+            next_seq += r.batch.len() as u64;
 
             if !r.disable_wal {
                 let wal_record = Self::encode_wal_record(first_seq, &r.batch);
                 if let Some(ref mut wal) = inner.wal_writer
                     && let Err(e) = wal.add_record(&wal_record)
                 {
-                    wal_add_error = Some((e, batch_idx));
+                    append_error = Some(format!("WAL write failed: {}", e));
                     break;
                 }
             }
-
-            let mut batch_bytes = 0u64;
-            for (i, entry) in r.batch.entries.iter().enumerate() {
-                let seq = first_seq + i as u64;
-                inner.active_memtable.put(
-                    &entry.key,
-                    entry.value.as_deref().unwrap_or(&[]),
-                    seq,
-                    entry.value_type,
-                );
-                batch_bytes +=
-                    entry.key.len() as u64 + entry.value.as_ref().map_or(0, |v| v.len()) as u64;
-            }
-            self.stats.record_write(batch_bytes);
-        }
-
-        if let Some((e, fail_idx)) = wal_add_error {
-            self.set_bg_error(format!("WAL write failed: {}", e));
-            // Flush already-buffered WAL records for succeeded batches so
-            // their data is durable even though later batches failed.
-            let flush_ok = if fail_idx > 0 {
-                if let Some(ref mut wal) = inner.wal_writer {
-                    wal.flush().is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-
-            if flush_ok {
-                // Flush succeeded: earlier batches are durable
-                for &rp in &batch_group[..fail_idx] {
-                    let rr = unsafe { &mut *rp };
-                    rr.result = Some(Ok(()));
-                }
-            } else if fail_idx > 0 {
-                // Flush failed: earlier batches are NOT durable either
-                for &rp in &batch_group[..fail_idx] {
-                    let rr = unsafe { &mut *rp };
-                    rr.result = Some(Err(eg!(Error::Io(io::Error::other(
-                        "WAL flush failed after partial batch group write"
-                    )))));
-                }
-            }
-            for &rp in &batch_group[fail_idx..] {
-                let rr = unsafe { &mut *rp };
-                rr.result = Some(Err(eg!(Error::Io(io::Error::other(format!("{}", e))))));
-            }
-            return Err(eg!(Error::Io(io::Error::other(format!("{}", e)))));
+            assigned.push((req_ptr, first_seq));
+            need_sync |= r.sync;
         }
 
         // Single fsync for all batches
-        let any_wal = batch_group.iter().any(|&p| !unsafe { &*p }.disable_wal);
+        let any_wal = assigned.iter().any(|&(p, _)| {
+            // SAFETY: request pointers are still owned by this leader.
+            !unsafe { &*p }.disable_wal
+        });
         let wal_sync_err = if any_wal {
             match inner.wal_writer {
                 Some(ref mut wal) => {
@@ -2239,10 +2274,53 @@ impl DB {
         if let Some(e) = wal_sync_err {
             self.set_bg_error(format!("WAL sync failed: {}", e));
             for &rp in batch_group {
+                // SAFETY: request pointers are still owned by this leader.
                 let rr = unsafe { &mut *rp };
                 rr.result = Some(Err(eg!(Error::Io(io::Error::other(format!("{}", e))))));
             }
             return Err(eg!(Error::Io(io::Error::other(format!("{}", e)))));
+        }
+
+        let mut applied_last_seq = None;
+        for &(req_ptr, first_seq) in &assigned {
+            // SAFETY: request pointers are still owned by this leader.
+            let r = unsafe { &*req_ptr };
+            let mut batch_bytes = 0u64;
+            for (i, entry) in r.batch.entries.iter().enumerate() {
+                let seq = first_seq + i as u64;
+                inner.active_memtable.put(
+                    &entry.key,
+                    entry.value.as_deref().unwrap_or(&[]),
+                    seq,
+                    entry.value_type,
+                );
+                batch_bytes +=
+                    entry.key.len() as u64 + entry.value.as_ref().map_or(0, |v| v.len()) as u64;
+            }
+            if !r.batch.is_empty() {
+                applied_last_seq = Some(first_seq + r.batch.len() as u64 - 1);
+            }
+            self.stats.record_write(batch_bytes);
+        }
+        if let Some(last_seq) = applied_last_seq {
+            self.committed_sequence.store(last_seq, Ordering::Release);
+        }
+
+        if let Some(msg) = append_error {
+            self.set_bg_error(msg.clone());
+            let mut assigned_iter = assigned.iter().map(|&(p, _)| p);
+            for &rp in batch_group {
+                if assigned_iter.next().is_some_and(|p| p == rp) {
+                    // SAFETY: request pointers are still owned by this leader.
+                    let rr = unsafe { &mut *rp };
+                    rr.result = Some(Ok(()));
+                } else {
+                    // SAFETY: request pointers are still owned by this leader.
+                    let rr = unsafe { &mut *rp };
+                    rr.result = Some(Err(eg!(Error::Io(io::Error::other(msg.clone())))));
+                }
+            }
+            return Ok(());
         }
 
         // Check memtable size threshold — release lock during SST I/O
@@ -2302,17 +2380,18 @@ impl DB {
     /// Phase 1 (under lock, fast): swap memtable, create WAL, allocate SST number.
     /// Returns the FrozenMemtable for synchronous processing without queueing for background threads.
     fn freeze_memtable_sync(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
-        let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
-
         let new_wal_number = inner.versions.new_file_number();
         let new_wal_path = self.path.join(format!("{:06}.wal", new_wal_number));
         let new_wal = WalWriter::new(&new_wal_path).c(d!())?;
+        let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
         let old_wal_number = inner.wal_number;
         inner.wal_writer = Some(new_wal);
         inner.wal_number = new_wal_number;
+        inner.immutable_memtables.push(old_mem.clone());
 
         let sst_number = inner.versions.new_file_number();
         let sst_path = self.path.join(format!("{:06}.sst", sst_number));
+        self.install_super_version(inner);
 
         Ok(FrozenMemtable {
             old_mem,
@@ -2351,6 +2430,9 @@ impl DB {
         );
         inner.versions.log_and_apply(edit).c(d!())?;
         self.stats.record_flush();
+        inner
+            .immutable_memtables
+            .retain(|m| !Arc::ptr_eq(m, &frozen.old_mem));
 
         if self.options.pin_l0_filter_and_index_blocks_in_cache {
             let version = inner.versions.current();
@@ -2421,6 +2503,7 @@ impl DB {
                         &task,
                         &mut inner.versions,
                         Some(&self.table_cache),
+                        Some(&self.block_cache),
                     )
                     .c(d!())?;
                     for num in &l0_inputs {
@@ -2483,7 +2566,17 @@ impl DB {
             if offset >= data.len() {
                 return Err(eg!("WAL record truncated at entry {}/{}", i, count));
             }
-            let entry_seq = seq + i as u64;
+            let entry_seq = seq.checked_add(i as u64).ok_or_else(|| {
+                eg!(Error::Corruption(
+                    "WAL record sequence number overflow".to_string()
+                ))
+            })?;
+            if entry_seq > MAX_SEQUENCE_NUMBER {
+                return Err(eg!(Error::Corruption(format!(
+                    "WAL record sequence {} exceeds max {}",
+                    entry_seq, MAX_SEQUENCE_NUMBER
+                ))));
+            }
             *max_sequence = (*max_sequence).max(entry_seq);
 
             let vt = data[offset];

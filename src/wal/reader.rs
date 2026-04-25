@@ -20,17 +20,20 @@ pub struct WalReader {
     /// After iterating all records, this is the safe truncation point for
     /// append-after-crash (any bytes beyond this are corrupt/partial).
     last_valid_offset: u64,
+    file_size: u64,
 }
 
 impl WalReader {
     /// Open a WAL file for reading.
     pub fn new(path: &Path) -> Result<Self> {
         let file = File::open(path).c(d!())?;
+        let file_size = file.metadata().c(d!())?.len();
         Ok(Self {
             reader: BufReader::new(file),
             block_offset: 0,
             eof: false,
             last_valid_offset: 0,
+            file_size,
         })
     }
 
@@ -47,6 +50,11 @@ impl WalReader {
     /// Use this as the truncation point when reopening for append after a crash.
     pub fn last_valid_offset(&self) -> u64 {
         self.last_valid_offset
+    }
+
+    /// Whether the underlying reader is positioned at the physical end of file.
+    pub fn is_at_file_end(&mut self) -> Result<bool> {
+        Ok(self.reader.stream_position().c(d!())? >= self.file_size)
     }
 
     /// Return an iterator over all records in the WAL.
@@ -112,9 +120,7 @@ impl WalReader {
                         self.last_valid_offset = self.reader.stream_position().c(d!())?;
                         return Ok(Some(result));
                     }
-                    RecordType::Zero => {
-                        // Skip zero/padding records
-                    }
+                    RecordType::Zero => unreachable!("zero records are handled as padding"),
                 },
             }
         }
@@ -182,12 +188,15 @@ impl WalReader {
 
             self.block_offset += HEADER_SIZE + length;
 
-            // Skip zero-padding and Zero-type records uniformly.
-            // All-zero headers come from pre-allocated or crash-zeroed regions;
-            // decoded Zero-type with non-zero fields comes from partial corruption.
-            // Both are treated as padding — no CRC check, no error.
-            if header_buf == [0u8; HEADER_SIZE] || matches!(record_type, RecordType::Zero) {
+            // All-zero physical headers are block padding. A decoded Zero record
+            // with any non-zero header field is corruption and must not bypass CRC.
+            if header_buf == [0u8; HEADER_SIZE] {
                 continue;
+            }
+            if matches!(record_type, RecordType::Zero) {
+                return Err(eg!(Error::Corruption(
+                    "non-padding WAL zero record".to_string()
+                )));
             }
 
             // Verify checksum

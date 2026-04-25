@@ -210,6 +210,8 @@ impl DBIterator {
         self.merger
             .set_bounds(Some(&bound), self.iterate_upper_bound.as_deref());
         self.iterate_lower_bound = Some(bound);
+        self.current = None;
+        self.needs_advance = true;
     }
 
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
@@ -334,21 +336,24 @@ impl DBIterator {
                     } else {
                         let uk_len = ikey_ref.len() - 8;
 
+                        // Lower bound check
+                        if let Some(ref lb) = self.iterate_lower_bound
+                            && ikey_ref[..uk_len] < **lb
+                        {
+                            Action::Skip
+                        }
                         // Prefix boundary check
-                        if let Some(ref pfx) = self.prefix
+                        else if let Some(ref pfx) = self.prefix
                             && !ikey_ref[..uk_len].starts_with(pfx)
                         {
                             return None;
                         }
-
                         // Upper bound check
-                        if let Some(ref ub) = self.iterate_upper_bound
+                        else if let Some(ref ub) = self.iterate_upper_bound
                             && ikey_ref[..uk_len] >= **ub
                         {
                             return None;
-                        }
-
-                        if vt == ValueType::RangeDeletion {
+                        } else if vt == ValueType::RangeDeletion {
                             // Skip RangeDeletion entries — tombstones are pre-loaded.
                             // Do NOT update last_user_key: RangeDeletion is not a point
                             // mutation for this user key. Updating it would suppress a
@@ -456,6 +461,14 @@ impl DBIterator {
                 continue;
             }
 
+            // Lower bound
+            if let Some(ref lb) = self.iterate_lower_bound
+                && ikey_ref[..uk_len] < **lb
+            {
+                self.merger.advance_entry();
+                continue;
+            }
+
             // Prefix boundary
             if let Some(ref pfx) = self.prefix
                 && !ikey_ref[..uk_len].starts_with(pfx)
@@ -529,14 +542,19 @@ impl DBIterator {
     /// Seek to the first key >= target.
     pub fn seek(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
+        let target = self
+            .iterate_lower_bound
+            .as_deref()
+            .filter(|lb| target < *lb)
+            .unwrap_or(target);
         // Seek the merger to a synthetic internal key with max sequence
         let seek_key = InternalKey::new(target, MAX_SEQUENCE_NUMBER, ValueType::Value);
-        // TrySeekUsingNext: if the new target >= the last seek target, use
+        // TrySeekUsingNext: if the new target is strictly after the last seek target, use
         // incremental advancement instead of full re-seek.
         let try_next = self
             .last_seek_key
             .as_ref()
-            .is_some_and(|prev| target >= prev.as_slice());
+            .is_some_and(|prev| target > prev.as_slice());
         self.merger.seek_opt(seek_key.as_bytes(), try_next);
         self.last_seek_key = Some(target.to_vec());
         self.has_last_key = false;
@@ -574,18 +592,30 @@ impl DBIterator {
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
 
-        // Use merger backward seek to find the last internal key <= target
-        let seek_key = InternalKey::new(target, 0, ValueType::Deletion);
+        let upper_clamps_target = self
+            .iterate_upper_bound
+            .as_deref()
+            .is_some_and(|ub| ub <= target);
+        let (seek_key, bound) = if upper_clamps_target {
+            let ub = self.iterate_upper_bound.as_deref().unwrap();
+            (
+                InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::Value),
+                ub.to_vec(),
+            )
+        } else {
+            let mut bound = target.to_vec();
+            bound.push(0x00);
+            (InternalKey::new(target, 0, ValueType::Deletion), bound)
+        };
+
+        // Use merger backward seek to find the last internal key below the effective bound.
         self.merger.seek_for_prev(seek_key.as_bytes());
         self.prev_overshoot = None;
         self.has_last_key = false;
 
         // Walk backward with inline resolution.
-        // Use bound = target + \0 so that target itself is included in the search
-        // (resolve_prev_user_key looks for user keys strictly < bound).
-        let mut bound = target.to_vec();
-        bound.push(0x00);
-        self.resolve_prev_user_key(&bound);
+        // For an unclamped target, bound = target + \0 includes target itself.
+        self.resolve_prev_user_key(Some(&bound));
     }
 
     /// Internal: given the merger positioned backward at or before target,
@@ -598,8 +628,8 @@ impl DBIterator {
     /// Internal key ordering: user_key ASC, seq DESC. When walking backward,
     /// entries for the same user_key appear in seq ascending order (low→high).
     /// The LAST entry with seq <= snapshot is the newest visible version.
-    fn resolve_prev_user_key(&mut self, skip_bound: &[u8]) {
-        let mut current_bound: Vec<u8> = skip_bound.to_vec();
+    fn resolve_prev_user_key(&mut self, skip_bound: Option<&[u8]>) {
+        let mut current_bound: Option<Vec<u8>> = skip_bound.map(|b| b.to_vec());
 
         loop {
             // Collect all entries for the first user_key < current_bound.
@@ -644,7 +674,9 @@ impl DBIterator {
                 }
 
                 // Skip entries >= current_bound (same or later user key)
-                if uk >= current_bound.as_slice() {
+                if let Some(ref bound) = current_bound
+                    && uk >= bound.as_slice()
+                {
                     iter_entry = self.merger.prev_entry();
                     continue;
                 }
@@ -698,7 +730,7 @@ impl DBIterator {
                 Some(cuk) => {
                     if best_is_deletion {
                         // Newest visible version is a deletion — skip this user key
-                        current_bound = cuk;
+                        current_bound = Some(cuk);
                         continue;
                     }
                     match best_entry {
@@ -709,14 +741,14 @@ impl DBIterator {
                             // correspond to the winning entry's source.
                             if self.is_range_deleted_no_level_filter(&uk, best_seq) {
                                 // Covered by range tombstone — skip
-                                current_bound = cuk;
+                                current_bound = Some(cuk);
                                 continue;
                             }
                             // Check skip_point callback
                             if let Some(ref sp) = self.skip_point
                                 && sp(&uk)
                             {
-                                current_bound = cuk;
+                                current_bound = Some(cuk);
                                 continue;
                             }
                             // Save user key for forward re-seek on direction change
@@ -730,7 +762,7 @@ impl DBIterator {
                         }
                         None => {
                             // No visible version (all entries too new) — skip
-                            current_bound = cuk;
+                            current_bound = Some(cuk);
                             continue;
                         }
                     }
@@ -760,7 +792,7 @@ impl DBIterator {
             }
         };
 
-        self.resolve_prev_user_key(&saved_key);
+        self.resolve_prev_user_key(Some(&saved_key));
     }
 
     /// Seek to the last visible key. Positions the iterator on the very last entry.
@@ -772,11 +804,11 @@ impl DBIterator {
         use crate::types::InternalKey;
 
         // Determine the effective upper bound for backward seek.
-        // Priority: prefix upper bound > iterate_upper_bound > seek_to_last_merge.
+        let mut resolve_bound = self.iterate_upper_bound.clone();
         if let Some(ref pfx) = self.prefix {
             // Prefix-bounded: seek backward from prefix upper bound.
             let mut upper = pfx.clone();
-            let has_upper = {
+            if {
                 let mut carry = true;
                 for byte in upper.iter_mut().rev() {
                     if carry {
@@ -789,14 +821,13 @@ impl DBIterator {
                     }
                 }
                 !carry
-            };
-            if has_upper {
-                let seek_key = InternalKey::new(&upper, MAX_SEQUENCE_NUMBER, ValueType::Value);
-                self.merger.seek_for_prev(seek_key.as_bytes());
-            } else {
-                self.merger.seek_to_last_merge();
+            } && resolve_bound.as_ref().is_none_or(|bound| upper < *bound)
+            {
+                resolve_bound = Some(upper);
             }
-        } else if let Some(ref ub) = self.iterate_upper_bound {
+        }
+
+        if let Some(ref ub) = resolve_bound {
             // Upper-bound constrained: seek backward from upper bound.
             let seek_key = InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::Value);
             self.merger.seek_for_prev(seek_key.as_bytes());
@@ -807,17 +838,8 @@ impl DBIterator {
         self.has_last_key = false;
         self.prev_overshoot = None;
 
-        // Compute an effective upper bound for resolve_prev_user_key.
-        // We need a key that's larger than any valid user key in the iteration range.
-        let upper_bound = if let Some(ref ub) = self.iterate_upper_bound {
-            ub.clone()
-        } else {
-            // Use a key larger than anything possible: [0xFF; 256]
-            vec![0xFF; 256]
-        };
-
         // Use inline backward resolution to find the last visible key
-        self.resolve_prev_user_key(&upper_bound);
+        self.resolve_prev_user_key(resolve_bound.as_deref());
     }
 
     /// Return the last user key seen by next_visible(), if any.

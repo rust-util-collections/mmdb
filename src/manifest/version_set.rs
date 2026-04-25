@@ -13,6 +13,7 @@ use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::sst::table_reader::TableReader;
 use crate::types::{SequenceNumber, compare_internal_key};
 use crate::wal::{WalReader, WalWriter};
+use parking_lot::Mutex;
 use ruc::*;
 
 /// Manages the MANIFEST file and the current Version.
@@ -33,7 +34,7 @@ pub struct VersionSet {
     manifest_number: u64,
     /// MANIFEST writer, behind its own lock so `sync` can be called
     /// without holding the main DB mutex.
-    manifest_writer: Arc<parking_lot::Mutex<Option<WalWriter>>>,
+    manifest_writer: Arc<Mutex<Option<WalWriter>>>,
     /// Table cache for opening SST readers.
     table_cache: Option<Arc<TableCache>>,
     /// Count of edits since last MANIFEST snapshot (for Phase I compaction).
@@ -67,7 +68,7 @@ impl VersionSet {
             log_number: 0,
             last_sequence: 0,
             manifest_number,
-            manifest_writer: Arc::new(parking_lot::Mutex::new(Some(manifest_writer))),
+            manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
             table_cache,
             edits_since_snapshot: 0,
         };
@@ -120,17 +121,15 @@ impl VersionSet {
         // (level, meta) pairs for files that are still live after all edits.
         let mut live_files: HashMap<u64, (usize, FileMetaData)> = HashMap::new();
 
-        for record in reader.iter() {
-            let data = match record {
-                Ok(d) => d,
-                Err(e) => {
-                    // Tolerate a truncated tail record: this is expected when the
-                    // previous process exited without syncing the MANIFEST writer
-                    // (e.g. Box::leak singleton pattern, kill -9, power loss).
-                    // Matches the WAL recovery strategy in db.rs.
-                    tracing::warn!("MANIFEST: skipping truncated tail record: {}", e);
+        loop {
+            let data = match reader.read_record() {
+                Ok(Some(data)) => data,
+                Ok(None) => break,
+                Err(e) if reader.is_at_file_end().unwrap_or(false) => {
+                    tracing::warn!("MANIFEST {} has corrupt tail: {}", manifest_name, e);
                     break;
                 }
+                Err(e) => return Err(e),
             };
             let edit = VersionEdit::decode(&data).c(d!())?;
 
@@ -207,7 +206,7 @@ impl VersionSet {
             log_number,
             last_sequence,
             manifest_number,
-            manifest_writer: Arc::new(parking_lot::Mutex::new(Some(manifest_writer))),
+            manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
             table_cache,
             edits_since_snapshot: 0,
         })
@@ -313,7 +312,9 @@ impl VersionSet {
         self.edits_since_snapshot += 1;
 
         // Check if MANIFEST needs compaction
-        self.maybe_compact_manifest().c(d!())?;
+        if let Err(e) = self.maybe_compact_manifest() {
+            tracing::warn!("MANIFEST compaction deferred after edit install: {}", e);
+        }
 
         Ok(())
     }
@@ -330,7 +331,7 @@ impl VersionSet {
 
     /// Return a handle for syncing the MANIFEST outside the main DB lock.
     /// Clone the Arc, release the DB lock, then call `lock() → sync()`.
-    pub fn manifest_sync_handle(&self) -> Arc<parking_lot::Mutex<Option<WalWriter>>> {
+    pub fn manifest_sync_handle(&self) -> Arc<Mutex<Option<WalWriter>>> {
         Arc::clone(&self.manifest_writer)
     }
 

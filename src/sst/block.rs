@@ -76,10 +76,25 @@ impl Block {
         }
         let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
         let restarts_size = (num_restarts as usize) * 4 + 4; // restart array + count
+        if num_restarts == 0 {
+            return Err(eg!(Error::Corruption("bad restart count".to_string())));
+        }
         if restarts_size > data.len() {
             return Err(eg!(Error::Corruption("bad restart count".to_string())));
         }
         let restart_offset = data.len() - restarts_size;
+        let mut prev_restart = 0usize;
+        for i in 0..num_restarts {
+            let offset = restart_offset + (i as usize) * 4;
+            let restart = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            if (i == 0 && restart != 0)
+                || restart > restart_offset
+                || (i > 0 && restart < prev_restart)
+            {
+                return Err(eg!(Error::Corruption("bad restart offset".to_string())));
+            }
+            prev_restart = restart;
+        }
 
         Ok(Self {
             data,
@@ -406,12 +421,21 @@ fn decode_entry_at(
     offset: usize,
     prev_key: &[u8],
 ) -> Option<(Vec<u8>, Vec<u8>, usize)> {
+    if offset > data.len() {
+        return None;
+    }
     let mut pos = offset;
 
     let (shared_len, n) = decode_varint(&data[pos..]).ok()?;
     pos += n;
+    if pos > data.len() {
+        return None;
+    }
     let (unshared_len, n) = decode_varint(&data[pos..]).ok()?;
     pos += n;
+    if pos > data.len() {
+        return None;
+    }
     let (value_len, n) = decode_varint(&data[pos..]).ok()?;
     pos += n;
 
@@ -419,7 +443,9 @@ fn decode_entry_at(
     let unshared = unshared_len as usize;
     let vlen = value_len as usize;
 
-    if pos + unshared + vlen > data.len() {
+    let key_end = pos.checked_add(unshared)?;
+    let value_end = key_end.checked_add(vlen)?;
+    if value_end > data.len() {
         return None;
     }
     if shared > prev_key.len() {
@@ -428,13 +454,11 @@ fn decode_entry_at(
 
     let mut key = Vec::with_capacity(shared + unshared);
     key.extend_from_slice(&prev_key[..shared]);
-    key.extend_from_slice(&data[pos..pos + unshared]);
-    pos += unshared;
+    key.extend_from_slice(&data[pos..key_end]);
 
-    let value = data[pos..pos + vlen].to_vec();
-    pos += vlen;
+    let value = data[key_end..value_end].to_vec();
 
-    Some((key, value, pos))
+    Some((key, value, value_end))
 }
 
 /// Decode one entry at `offset`, reusing `key_buf` for the key (zero-alloc for key).
@@ -445,12 +469,21 @@ pub(crate) fn decode_entry_reuse(
     offset: usize,
     key_buf: &mut Vec<u8>,
 ) -> Option<(usize, usize, usize)> {
+    if offset > data.len() {
+        return None;
+    }
     let mut pos = offset;
 
     let (shared_len, n) = decode_varint(&data[pos..]).ok()?;
     pos += n;
+    if pos > data.len() {
+        return None;
+    }
     let (unshared_len, n) = decode_varint(&data[pos..]).ok()?;
     pos += n;
+    if pos > data.len() {
+        return None;
+    }
     let (value_len, n) = decode_varint(&data[pos..]).ok()?;
     pos += n;
 
@@ -458,7 +491,9 @@ pub(crate) fn decode_entry_reuse(
     let unshared = unshared_len as usize;
     let vlen = value_len as usize;
 
-    if pos + unshared + vlen > data.len() {
+    let key_end = pos.checked_add(unshared)?;
+    let value_end = key_end.checked_add(vlen)?;
+    if value_end > data.len() {
         return None;
     }
     if shared > key_buf.len() {
@@ -467,11 +502,10 @@ pub(crate) fn decode_entry_reuse(
 
     // Reconstruct key in-place: truncate to shared prefix, append unshared suffix
     key_buf.truncate(shared);
-    key_buf.extend_from_slice(&data[pos..pos + unshared]);
-    let value_start = pos + unshared;
-    let next_offset = value_start + vlen;
+    key_buf.extend_from_slice(&data[pos..key_end]);
+    let value_start = key_end;
 
-    Some((value_start, vlen, next_offset))
+    Some((value_start, vlen, value_end))
 }
 
 /// Iterator over entries in a block.

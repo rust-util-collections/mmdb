@@ -25,6 +25,7 @@ impl WalWriter {
             .write(true)
             .open(path)
             .c(d!())?;
+        Self::sync_parent_dir(path).c(d!())?;
         Ok(Self {
             writer: BufWriter::new(file),
             block_offset: 0,
@@ -122,12 +123,18 @@ impl WalWriter {
 
         Ok(())
     }
+
+    fn sync_parent_dir(path: &Path) -> Result<()> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        File::open(parent).and_then(|dir| dir.sync_all()).c(d!())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wal::reader::WalReader;
+    use std::result::Result as StdResult;
 
     #[test]
     fn test_write_and_read_single_record() {
@@ -141,10 +148,7 @@ mod tests {
         }
 
         let mut reader = WalReader::new(&path).unwrap();
-        let records: Vec<Vec<u8>> = reader
-            .iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<Vec<u8>> = reader.iter().collect::<StdResult<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0], b"hello world");
     }
@@ -164,10 +168,7 @@ mod tests {
         }
 
         let mut reader = WalReader::new(&path).unwrap();
-        let records: Vec<Vec<u8>> = reader
-            .iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<Vec<u8>> = reader.iter().collect::<StdResult<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 100);
         for (i, rec) in records.iter().enumerate() {
             assert_eq!(rec, format!("record_{}", i).as_bytes());
@@ -190,10 +191,7 @@ mod tests {
         }
 
         let mut reader = WalReader::new(&path).unwrap();
-        let records: Vec<Vec<u8>> = reader
-            .iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<Vec<u8>> = reader.iter().collect::<StdResult<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0], large_data);
         assert_eq!(records[1], b"small");
@@ -212,10 +210,7 @@ mod tests {
         }
 
         let mut reader = WalReader::new(&path).unwrap();
-        let records: Vec<Vec<u8>> = reader
-            .iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<Vec<u8>> = reader.iter().collect::<StdResult<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0], b"");
         assert_eq!(records[1], b"after_empty");
@@ -240,10 +235,7 @@ mod tests {
         }
 
         let mut reader = WalReader::new(&path).unwrap();
-        let records: Vec<Vec<u8>> = reader
-            .iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<Vec<u8>> = reader.iter().collect::<StdResult<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0], payload);
         assert_eq!(records[1], b"next_block");
@@ -274,10 +266,7 @@ mod tests {
         }
 
         let mut reader = WalReader::new(&path).unwrap();
-        let records: Vec<Vec<u8>> = reader
-            .iter()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<Vec<u8>> = reader.iter().collect::<StdResult<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 5);
         assert_eq!(records[0], b"batch1_rec1");
         assert_eq!(records[1], b"batch1_rec2");

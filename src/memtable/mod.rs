@@ -75,6 +75,7 @@ impl MemTable {
     /// Look up a user key at or below the given sequence number.
     /// Returns `Some(Some(value))` for a found value, `Some(None)` for a deletion tombstone,
     /// or `None` if the key is not in this MemTable.
+    #[cfg(test)]
     pub fn get(&self, key: &[u8], sequence: SequenceNumber) -> Option<Option<Vec<u8>>> {
         self.get_with_seq(key, sequence).map(|(result, _)| result)
     }
@@ -98,11 +99,6 @@ impl MemTable {
     /// Each item is (encoded_internal_key, value).
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.inner.iter()
-    }
-
-    /// Return an iterator over all entries in reverse order.
-    pub fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
-        self.inner.iter_rev()
     }
 
     /// Get a raw pointer to the underlying skiplist for cursor-based iteration.

@@ -1,5 +1,6 @@
 //! Configuration options for MMDB.
 
+use std::fmt;
 use std::sync::Arc;
 
 use crate::sst::format::CompressionType;
@@ -186,8 +187,8 @@ impl Clone for DbOptions {
     }
 }
 
-impl std::fmt::Debug for DbOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for DbOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DbOptions")
             .field("create_if_missing", &self.create_if_missing)
             .field("error_if_exists", &self.error_if_exists)
@@ -293,8 +294,8 @@ pub struct ReadOptions {
     pub iterate_upper_bound: Option<Vec<u8>>,
 }
 
-impl std::fmt::Debug for ReadOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ReadOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadOptions")
             .field("snapshot", &self.snapshot)
             .field("fill_cache", &self.fill_cache)
@@ -360,8 +361,8 @@ pub trait CompactionFilter: Send + Sync {
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionFilterDecision;
 }
 
-impl std::fmt::Debug for dyn CompactionFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for dyn CompactionFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "CompactionFilter")
     }
 }

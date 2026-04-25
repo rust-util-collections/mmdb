@@ -68,6 +68,8 @@ pub struct CompactionTask {
 pub struct CompactionOutput {
     /// The version edit with new files added and old files deleted.
     pub edit: VersionEdit,
+    /// Exact input files and levels the output was built from.
+    pub input_files: Vec<(u32, FileMetaData)>,
     /// File numbers of all input files (for cache eviction and deletion).
     pub input_file_numbers: HashSet<u64>,
     /// Number of output files produced.
@@ -136,6 +138,7 @@ struct SubCompactionParams<'a> {
     build_opts: &'a TableBuildOptions,
     oldest_snapshot_seq: SequenceNumber,
     file_number_counter: &'a AtomicU64,
+    file_number_limit: u64,
     all_range_del_entries: &'a [(Vec<u8>, Vec<u8>)],
     all_raw_tombstones: &'a [(Vec<u8>, Vec<u8>, SequenceNumber)],
 }
@@ -257,6 +260,53 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
 
 /// Collect raw tombstone triples from input files.
 type RawTombstone = (Vec<u8>, Vec<u8>, SequenceNumber);
+
+fn task_has_range_deletions(task: &CompactionTask) -> bool {
+    task.input_files_level
+        .iter()
+        .chain(task.input_files_next.iter())
+        .any(|tf| tf.meta.has_range_deletions)
+}
+
+fn cleanup_output_files(
+    db_path: &Path,
+    new_files: &[(u32, FileMetaData)],
+    active_file_number: Option<u64>,
+) {
+    for (_, meta) in new_files {
+        let orphan = db_path.join(format!("{:06}.sst", meta.number));
+        let _ = remove_file(&orphan);
+    }
+    if let Some(number) = active_file_number {
+        let orphan = db_path.join(format!("{:06}.sst", number));
+        let _ = remove_file(&orphan);
+    }
+}
+
+fn allocate_output_file_number(params: &SubCompactionParams<'_>) -> Result<u64> {
+    let mut current = params.file_number_counter.load(Ordering::Relaxed);
+    loop {
+        if current >= params.file_number_limit {
+            return Err(eg!(
+                "reserved compaction output file numbers exhausted: next={}, limit={}",
+                current,
+                params.file_number_limit
+            ));
+        }
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| eg!("compaction output file number overflow"))?;
+        match params.file_number_counter.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Ok(current),
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<RawTombstone>> {
     let mut tombstones = Vec::new();
@@ -382,7 +432,9 @@ fn execute_sub_compaction_io(
 
         // Apply compaction filter
         let mut final_value = value;
-        if let Some(ref filter) = ctx.options.compaction_filter
+        if params.is_bottommost
+            && ctx.active_snapshots.is_empty()
+            && let Some(ref filter) = ctx.options.compaction_filter
             && ikr.value_type() == ValueType::Value
         {
             match filter.filter(params.target_level, user_key, final_value.as_slice()) {
@@ -396,7 +448,13 @@ fn execute_sub_compaction_io(
 
         // Create new output file if needed
         if builder.is_none() {
-            current_file_number = params.file_number_counter.fetch_add(1, Ordering::Relaxed);
+            current_file_number = match allocate_output_file_number(params).c(d!()) {
+                Ok(number) => number,
+                Err(e) => {
+                    cleanup_output_files(ctx.db_path, &new_files, None);
+                    return Err(e);
+                }
+            };
             next_file_idx += 1;
             let sst_path = ctx.db_path.join(format!("{:06}.sst", current_file_number));
             let mut opts = params.build_opts.clone();
@@ -406,7 +464,13 @@ fn execute_sub_compaction_io(
                 .iter()
                 .map(|f| f())
                 .collect();
-            builder = Some(TableBuilder::new(&sst_path, opts).c(d!())?);
+            builder = match TableBuilder::new(&sst_path, opts).c(d!()) {
+                Ok(builder) => Some(builder),
+                Err(e) => {
+                    cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
+                    return Err(e);
+                }
+            };
             current_size = 0;
         }
 
@@ -425,11 +489,15 @@ fn execute_sub_compaction_io(
         };
 
         let entry_bytes = ikey_ref.len() + final_value.len();
-        builder
+        if let Err(e) = builder
             .as_mut()
             .unwrap()
             .add(ikey_ref, final_value.as_slice())
-            .c(d!())?;
+            .c(d!())
+        {
+            cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
+            return Err(e);
+        }
         current_size += entry_bytes;
 
         if let Some(rl) = ctx.rate_limiter {
@@ -437,7 +505,13 @@ fn execute_sub_compaction_io(
         }
 
         if current_size >= ctx.options.target_file_size_base as usize {
-            let result = builder.take().unwrap().finish().c(d!())?;
+            let result = match builder.take().unwrap().finish().c(d!()) {
+                Ok(result) => result,
+                Err(e) => {
+                    cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
+                    return Err(e);
+                }
+            };
             if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
             }
@@ -456,7 +530,13 @@ fn execute_sub_compaction_io(
 
     // Flush remaining builder
     if let Some(b) = builder {
-        let result = b.finish().c(d!())?;
+        let result = match b.finish().c(d!()) {
+            Ok(result) => result,
+            Err(e) => {
+                cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
+                return Err(e);
+            }
+        };
         if let Some(s) = ctx.stats {
             s.record_compaction_bytes(result.file_size);
         }
@@ -474,10 +554,7 @@ fn execute_sub_compaction_io(
 
     if let Some(e) = merger.error() {
         // Clean up orphan SST files written during the failed merge
-        for (_, meta) in &new_files {
-            let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
-            let _ = remove_file(&orphan);
-        }
+        cleanup_output_files(ctx.db_path, &new_files, None);
         return Err(eg!("sub-compaction merge error: {}", e));
     }
 
@@ -488,6 +565,20 @@ fn execute_sub_compaction_io(
 }
 
 impl LeveledCompaction {
+    pub(crate) fn max_output_files(task: &CompactionTask, options: &DbOptions) -> u64 {
+        let target_size = options.target_file_size_base.max(1);
+        let size_outputs = task.total_input_size().saturating_add(target_size - 1) / target_size;
+        let input_count = task
+            .input_files_level
+            .len()
+            .saturating_add(task.input_files_next.len()) as u64;
+        size_outputs
+            .saturating_add(input_count)
+            .saturating_add(options.max_subcompactions.max(1) as u64)
+            .saturating_add(16)
+            .max(1)
+    }
+
     /// Check if compaction is needed and return a task if so.
     pub fn pick_compaction(version: &Version, options: &DbOptions) -> Option<CompactionTask> {
         // Priority 1: L0 → L1 when L0 has too many files
@@ -525,7 +616,11 @@ impl LeveledCompaction {
         let (smallest, largest) = Self::total_key_range(&input_l0);
 
         // Find overlapping L1 files
-        let input_l1 = Self::overlapping_files(version.level_files(1), &smallest, &largest);
+        let input_l1 = if input_l0.iter().any(|tf| tf.meta.has_range_deletions) {
+            version.level_files(1).to_vec()
+        } else {
+            Self::overlapping_files(version.level_files(1), &smallest, &largest)
+        };
 
         Some(CompactionTask {
             level: 0,
@@ -548,7 +643,11 @@ impl LeveledCompaction {
         let (smallest, largest) = Self::total_key_range(&input_level);
         let next_level = level + 1;
         let input_next = if next_level < version.num_levels {
-            Self::overlapping_files(version.level_files(next_level), &smallest, &largest)
+            if input_level.iter().any(|tf| tf.meta.has_range_deletions) {
+                version.level_files(next_level).to_vec()
+            } else {
+                Self::overlapping_files(version.level_files(next_level), &smallest, &largest)
+            }
         } else {
             Vec::new()
         };
@@ -575,14 +674,18 @@ impl LeveledCompaction {
             let file_largest = user_key(&tf.meta.largest_key);
             let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
             let overlaps_end = end.is_none_or(|e| file_smallest < e);
-            if overlaps_begin && overlaps_end {
+            if tf.meta.has_range_deletions || (overlaps_begin && overlaps_end) {
                 input_l0.push(tf.clone());
             }
         }
 
         if !input_l0.is_empty() {
             let (smallest, largest) = Self::total_key_range(&input_l0);
-            let input_l1 = Self::overlapping_files(version.level_files(1), &smallest, &largest);
+            let input_l1 = if input_l0.iter().any(|tf| tf.meta.has_range_deletions) {
+                version.level_files(1).to_vec()
+            } else {
+                Self::overlapping_files(version.level_files(1), &smallest, &largest)
+            };
             return Some(CompactionTask {
                 level: 0,
                 input_files_level: input_l0,
@@ -599,7 +702,7 @@ impl LeveledCompaction {
                 let file_largest = user_key(&tf.meta.largest_key);
                 let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
                 let overlaps_end = end.is_none_or(|e| file_smallest < e);
-                if overlaps_begin && overlaps_end {
+                if tf.meta.has_range_deletions || (overlaps_begin && overlaps_end) {
                     input_level.push(tf.clone());
                 }
             }
@@ -608,7 +711,15 @@ impl LeveledCompaction {
                 let (smallest, largest) = Self::total_key_range(&input_level);
                 let next_level = level + 1;
                 let input_next = if next_level < version.num_levels {
-                    Self::overlapping_files(version.level_files(next_level), &smallest, &largest)
+                    if input_level.iter().any(|tf| tf.meta.has_range_deletions) {
+                        version.level_files(next_level).to_vec()
+                    } else {
+                        Self::overlapping_files(
+                            version.level_files(next_level),
+                            &smallest,
+                            &largest,
+                        )
+                    }
                 } else {
                     Vec::new()
                 };
@@ -638,7 +749,7 @@ impl LeveledCompaction {
             stats: None,
             active_snapshots: &[],
         };
-        Self::execute_compaction_with_cache(&ctx, task, versions, None)
+        Self::execute_compaction_with_cache(&ctx, task, versions, None, None)
     }
 
     /// Execute compaction with optional table cache for eviction and rate limiter.
@@ -656,6 +767,7 @@ impl LeveledCompaction {
         task: &CompactionTask,
         versions: &mut VersionSet,
         table_cache: Option<&Arc<TableCache>>,
+        block_cache: Option<&Arc<BlockCache>>,
     ) -> Result<()> {
         let target_level = task.level + 1;
 
@@ -679,8 +791,7 @@ impl LeveledCompaction {
             return Ok(());
         }
 
-        let max_outputs = task.total_input_size() / ctx.options.target_file_size_base
-            + ctx.options.max_subcompactions.max(1) as u64;
+        let max_outputs = Self::max_output_files(task, ctx.options);
         let file_number_start = versions.reserve_file_numbers(max_outputs);
 
         let version = versions.current();
@@ -693,12 +804,24 @@ impl LeveledCompaction {
         let is_bottom =
             Self::is_bottommost_level(&version, target_level, ctx.options.num_levels, &all_inputs);
 
-        let output =
-            Self::execute_compaction_io(ctx, task, file_number_start, is_bottom).c(d!())?;
+        let output = Self::execute_compaction_io(
+            ctx,
+            task,
+            file_number_start,
+            file_number_start.saturating_add(max_outputs),
+            is_bottom,
+        )
+        .c(d!())?;
 
-        let cleanup =
-            Self::install_compaction(output, versions, table_cache, None, ctx.db_path, ctx.stats)
-                .c(d!())?;
+        let cleanup = Self::install_compaction(
+            output,
+            versions,
+            table_cache,
+            block_cache,
+            ctx.db_path,
+            ctx.stats,
+        )
+        .c(d!())?;
         // This path holds &mut VersionSet for the duration, so sync here.
         versions.sync_manifest().c(d!())?;
         Self::run_post_compaction_cleanup(&cleanup, ctx.db_path);
@@ -717,6 +840,7 @@ impl LeveledCompaction {
         ctx: &CompactionContext<'_>,
         task: &CompactionTask,
         file_number_start: u64,
+        file_number_limit: u64,
         is_bottommost: bool,
     ) -> Result<CompactionOutput> {
         let target_level = task.level + 1;
@@ -748,7 +872,7 @@ impl LeveledCompaction {
         // L0 files overlap arbitrarily, so every sub-task would have to
         // include all L0 sources — redundant I/O with no benefit.
         // Sub-compaction is only useful for Ln→Ln+1 (level >= 1).
-        let max_subs = if task.level == 0 {
+        let max_subs = if task.level == 0 || task_has_range_deletions(task) {
             1
         } else {
             ctx.options.max_subcompactions.max(1)
@@ -780,6 +904,7 @@ impl LeveledCompaction {
             build_opts: &build_opts,
             oldest_snapshot_seq,
             file_number_counter: &file_counter,
+            file_number_limit,
             all_range_del_entries: &all_range_del_entries,
             all_raw_tombstones: &all_raw_tombstones,
         };
@@ -838,12 +963,18 @@ impl LeveledCompaction {
         }
 
         // Record deletions (orchestrator responsibility)
-        let input_file_numbers: HashSet<u64> = task
+        let input_files: Vec<(u32, FileMetaData)> = task
             .input_files_level
             .iter()
-            .map(|f| f.meta.number)
-            .chain(task.input_files_next.iter().map(|f| f.meta.number))
+            .map(|f| (task.level as u32, f.meta.clone()))
+            .chain(
+                task.input_files_next
+                    .iter()
+                    .map(|f| (target_level as u32, f.meta.clone())),
+            )
             .collect();
+        let input_file_numbers: HashSet<u64> =
+            input_files.iter().map(|(_, meta)| meta.number).collect();
 
         for tf in &task.input_files_level {
             edit.delete_file(task.level as u32, tf.meta.number);
@@ -854,6 +985,7 @@ impl LeveledCompaction {
 
         Ok(CompactionOutput {
             edit,
+            input_files,
             input_file_numbers,
             files_produced: total_files_produced,
             next_file_number_hint: file_counter.load(Ordering::Relaxed),
@@ -877,13 +1009,14 @@ impl LeveledCompaction {
         // discarded.  Delete orphaned output SSTs and return early.
         {
             let version = versions.current();
-            let all_file_numbers: HashSet<u64> = (0..version.num_levels)
-                .flat_map(|l| version.level_files(l).iter().map(|f| f.meta.number))
-                .collect();
-            let stale = output
-                .input_file_numbers
-                .iter()
-                .any(|n| !all_file_numbers.contains(n));
+            let stale = output.input_files.iter().any(|(level, expected)| {
+                let level = *level as usize;
+                level >= version.num_levels
+                    || !version
+                        .level_files(level)
+                        .iter()
+                        .any(|tf| tf.meta == *expected)
+            });
             if stale {
                 // Clean up output SST files that were written during the
                 // (now-invalidated) I/O phase.
@@ -1061,7 +1194,9 @@ impl LeveledCompaction {
 
             // Apply compaction filter
             let mut final_value = value;
-            if let Some(ref filter) = ctx.options.compaction_filter
+            if is_bottommost
+                && ctx.active_snapshots.is_empty()
+                && let Some(ref filter) = ctx.options.compaction_filter
                 && ikr.value_type() == ValueType::Value
             {
                 match filter.filter(level, user_key, final_value.as_slice()) {
@@ -1083,7 +1218,17 @@ impl LeveledCompaction {
                     .iter()
                     .map(|f| f())
                     .collect();
-                builder = Some(TableBuilder::new(&sst_path, opts).c(d!())?);
+                builder = match TableBuilder::new(&sst_path, opts).c(d!()) {
+                    Ok(builder) => Some(builder),
+                    Err(e) => {
+                        cleanup_output_files(
+                            ctx.db_path,
+                            &edit.new_files,
+                            Some(current_file_number),
+                        );
+                        return Err(e);
+                    }
+                };
                 current_size = 0;
             }
 
@@ -1103,11 +1248,15 @@ impl LeveledCompaction {
                 &ikey
             };
 
-            builder
+            if let Err(e) = builder
                 .as_mut()
                 .unwrap()
                 .add(ikey_ref, final_value.as_slice())
-                .c(d!())?;
+                .c(d!())
+            {
+                cleanup_output_files(ctx.db_path, &edit.new_files, Some(current_file_number));
+                return Err(e);
+            }
             let entry_bytes = ikey_ref.len() + final_value.len();
             current_size += entry_bytes;
 
@@ -1117,7 +1266,17 @@ impl LeveledCompaction {
             }
 
             if current_size >= ctx.options.target_file_size_base as usize {
-                let result = builder.take().unwrap().finish().c(d!())?;
+                let result = match builder.take().unwrap().finish().c(d!()) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        cleanup_output_files(
+                            ctx.db_path,
+                            &edit.new_files,
+                            Some(current_file_number),
+                        );
+                        return Err(e);
+                    }
+                };
                 if let Some(s) = ctx.stats {
                     s.record_compaction_bytes(result.file_size);
                 }
@@ -1135,7 +1294,13 @@ impl LeveledCompaction {
         }
 
         if let Some(b) = builder {
-            let result = b.finish().c(d!())?;
+            let result = match b.finish().c(d!()) {
+                Ok(result) => result,
+                Err(e) => {
+                    cleanup_output_files(ctx.db_path, &edit.new_files, Some(current_file_number));
+                    return Err(e);
+                }
+            };
             if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
             }
@@ -1261,6 +1426,9 @@ impl LeveledCompaction {
         if target_level >= num_levels - 1 {
             return true;
         }
+        if all_inputs.iter().any(|tf| tf.meta.has_range_deletions) {
+            return false;
+        }
         let (smallest, largest) = Self::total_key_range(all_inputs);
         if smallest.is_empty() {
             return true;
@@ -1269,6 +1437,9 @@ impl LeveledCompaction {
         let largest_uk = user_key(&largest);
         for level in (target_level + 1)..num_levels {
             for f in version.level_files(level) {
+                if f.meta.has_range_deletions {
+                    return false;
+                }
                 let f_smallest = user_key(&f.meta.smallest_key);
                 let f_largest = user_key(&f.meta.largest_key);
                 if f_largest >= smallest_uk && f_smallest <= largest_uk {
@@ -1294,6 +1465,9 @@ impl LeveledCompaction {
         files
             .iter()
             .filter(|f| {
+                if f.meta.has_range_deletions {
+                    return true;
+                }
                 let file_largest_uk = user_key(&f.meta.largest_key);
                 let file_smallest_uk = user_key(&f.meta.smallest_key);
                 // File overlaps if: file.largest_uk >= smallest_uk AND file.smallest_uk <= largest_uk

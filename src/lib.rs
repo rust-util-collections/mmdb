@@ -8,7 +8,7 @@ pub mod db;
 pub mod error;
 pub mod iterator;
 pub mod manifest;
-pub mod memtable;
+mod memtable;
 pub mod options;
 pub mod sst;
 pub mod types;

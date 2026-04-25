@@ -9,6 +9,9 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::error::{Error, Result};
+use ruc::*;
+
 /// Global monotonically increasing sequence number.
 pub type SequenceNumber = u64;
 
@@ -39,6 +42,12 @@ impl ValueType {
 /// Layout: `(sequence << 8) | value_type`
 #[inline]
 pub fn pack_sequence_and_type(seq: SequenceNumber, vt: ValueType) -> u64 {
+    assert!(
+        seq <= MAX_SEQUENCE_NUMBER,
+        "sequence {} exceeds max {}",
+        seq,
+        MAX_SEQUENCE_NUMBER
+    );
     (seq << 8) | (vt as u64)
 }
 
@@ -364,15 +373,28 @@ impl WriteBatchWithIndex {
     ///
     /// Sequence numbers are assigned as `base_seq + write_position`,
     /// preserving temporal ordering regardless of key sort order.
-    pub(crate) fn sorted_entries(&self, base_seq: SequenceNumber) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub(crate) fn sorted_entries(
+        &self,
+        base_seq: SequenceNumber,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut result = Vec::with_capacity(self.index.len());
         for (user_key, &(entry_idx, pos)) in &self.index {
             let entry = &self.batch.entries[entry_idx];
-            let ikey = InternalKey::new(user_key, base_seq + pos, entry.value_type);
+            let seq = base_seq.checked_add(pos).ok_or_else(|| {
+                eg!(Error::InvalidArgument(
+                    "sequence number space exhausted".to_string()
+                ))
+            })?;
+            if seq > MAX_SEQUENCE_NUMBER {
+                return Err(eg!(Error::InvalidArgument(
+                    "sequence number space exhausted".to_string()
+                )));
+            }
+            let ikey = InternalKey::new(user_key, seq, entry.value_type);
             let value = entry.value.clone().unwrap_or_default();
             result.push((ikey.into_bytes(), value));
         }
-        result
+        Ok(result)
     }
 }
 

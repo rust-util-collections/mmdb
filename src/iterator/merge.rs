@@ -155,7 +155,7 @@ impl IterSource {
         }
     }
 
-    pub fn from_memtable(iter: crate::memtable::skiplist::MemTableCursorIter) -> Self {
+    pub(crate) fn from_memtable(iter: crate::memtable::skiplist::MemTableCursorIter) -> Self {
         Self {
             inner: IterSourceInner::Memtable { iter },
             peeked_key: Vec::new(),
@@ -971,11 +971,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// search + I/O when keys are nearby (e.g. sequential prefix scans).
     pub fn seek_opt(&mut self, target: &[u8], try_next: bool) {
         // Fast path: if we can try seek-using-next and we're already forward
-        // with a known position <= target, attempt incremental advancement.
+        // with a known position strictly before target, attempt incremental advancement.
         if try_next
             && self.direction == Direction::Forward
             && !self.current_key.is_empty()
-            && (self.compare)(self.current_key.as_slice(), target) != Ordering::Greater
+            && (self.compare)(self.current_key.as_slice(), target) == Ordering::Less
         {
             const MAX_STEPS: usize = 4;
 

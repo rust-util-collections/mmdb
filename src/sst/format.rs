@@ -20,6 +20,8 @@ pub const FOOTER_SIZE: usize = 48;
 
 /// Metaindex key for the range-deletion block.
 pub const RANGE_DEL_BLOCK_NAME: &str = "rangedelblock";
+/// Metaindex key storing the fixed prefix length used by the prefix bloom.
+pub const PREFIX_FILTER_LEN_NAME: &str = "filter.prefix_len";
 
 /// A handle pointing to a block within an SST file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -129,17 +131,29 @@ pub fn encode_index_value_with_props(
     handle: &BlockHandle,
     first_key: &[u8],
     properties: &[(&str, &[u8])],
-) -> Vec<u8> {
+) -> crate::error::Result<Vec<u8>> {
     let mut buf = encode_index_value(handle, first_key);
-    let num_props = properties.len() as u16;
+    let num_props = u16::try_from(properties.len())
+        .map_err(|_| crate::error::Error::InvalidArgument("too many block properties".into()))
+        .c(d!())?;
     buf.extend_from_slice(&num_props.to_le_bytes());
     for (name, data) in properties {
-        buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        let name_len = u16::try_from(name.len()).map_err(|_| {
+            eg!(crate::error::Error::InvalidArgument(
+                "block property name too large".into()
+            ))
+        })?;
+        let data_len = u16::try_from(data.len()).map_err(|_| {
+            eg!(crate::error::Error::InvalidArgument(
+                "block property data too large".into()
+            ))
+        })?;
+        buf.extend_from_slice(&name_len.to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
-        buf.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&data_len.to_le_bytes());
         buf.extend_from_slice(data);
     }
-    buf
+    Ok(buf)
 }
 
 /// Decoded extended index value with optional block properties.
@@ -169,10 +183,19 @@ pub fn decode_index_value_with_props(data: &[u8]) -> crate::error::Result<Decode
     if data.len() >= offset + 4 {
         let fk_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
-        if fk_len > 0 && data.len() >= offset + fk_len {
-            first_key = Some(&data[offset..offset + fk_len]);
-            offset += fk_len;
+        if data.len() < offset + fk_len {
+            return Err(eg!(crate::error::Error::Corruption(
+                "truncated index first_key".into()
+            )));
         }
+        if fk_len > 0 {
+            first_key = Some(&data[offset..offset + fk_len]);
+        }
+        offset += fk_len;
+    } else if data.len() > 16 {
+        return Err(eg!(crate::error::Error::Corruption(
+            "truncated index first_key length".into()
+        )));
     }
 
     // Parse properties (if present)
@@ -181,29 +204,46 @@ pub fn decode_index_value_with_props(data: &[u8]) -> crate::error::Result<Decode
         offset += 2;
         for _ in 0..num_props {
             if data.len() < offset + 2 {
-                break;
+                return Err(eg!(crate::error::Error::Corruption(
+                    "truncated block property name length".into()
+                )));
             }
             let name_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
             if data.len() < offset + name_len {
-                break;
+                return Err(eg!(crate::error::Error::Corruption(
+                    "truncated block property name".into()
+                )));
             }
             let name = &data[offset..offset + name_len];
             offset += name_len;
             if data.len() < offset + 2 {
-                break;
+                return Err(eg!(crate::error::Error::Corruption(
+                    "truncated block property data length".into()
+                )));
             }
             let data_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
             if data.len() < offset + data_len {
-                break;
+                return Err(eg!(crate::error::Error::Corruption(
+                    "truncated block property data".into()
+                )));
             }
             let prop_data = &data[offset..offset + data_len];
             offset += data_len;
             props.push((name, prop_data));
         }
+        if offset != data.len() {
+            return Err(eg!(crate::error::Error::Corruption(
+                "trailing bytes after block properties".into()
+            )));
+        }
+    } else if data.len() > offset {
+        return Err(eg!(crate::error::Error::Corruption(
+            "truncated block property count".into()
+        )));
     }
 
     Ok(DecodedIndexValue {

@@ -13,7 +13,9 @@
 //! Max height 12, probability p = 0.25.
 
 use std::cell::UnsafeCell;
+#[cfg(test)]
 use std::cmp::Ordering as CmpOrdering;
+#[cfg(test)]
 use std::ops::RangeBounds;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
@@ -55,6 +57,8 @@ impl Arena {
     /// # Safety
     /// Must be called under external write serialization (single-writer).
     unsafe fn alloc(&self, size: usize, align: usize) -> *mut u8 {
+        // SAFETY: the caller provides single-writer access, so mutating the
+        // UnsafeCell-backed arena metadata cannot race with another mutation.
         unsafe {
             let blocks = &mut *self.blocks.get();
             let offset = &mut *self.current_offset.get();
@@ -97,6 +101,7 @@ impl Arena {
     /// # Safety
     /// Same single-writer requirement as `alloc`.
     unsafe fn alloc_node<K, V>(&self) -> *mut Node<K, V> {
+        // SAFETY: forwarded to `alloc` under the same single-writer precondition.
         unsafe {
             self.alloc(
                 std::mem::size_of::<Node<K, V>>(),
@@ -122,9 +127,6 @@ struct Node<K, V> {
     /// next[i] is the pointer to the next node at level i.
     /// Levels `height..MAX_HEIGHT` are unused (always null).
     next: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
-    /// Backward pointer at level 0 only. Enables O(1) `prev()` instead
-    /// of O(log N) `seek_lt_raw()`.
-    prev0: AtomicPtr<Node<K, V>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +200,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 let mut next = self.head[level].load(Ordering::Acquire);
                 while !next.is_null() {
                     // SAFETY: next is a valid node published via Release.
+                    // SAFETY: next is a valid node published via Release.
                     let node = unsafe { &*next };
                     if node.key >= key {
                         break;
@@ -211,6 +214,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 // SAFETY: current is a valid node (was set above or from upper level).
                 let mut next = unsafe { &*current }.next[level].load(Ordering::Acquire);
                 while !next.is_null() {
+                    // SAFETY: next is a valid node published via Release.
                     let node = unsafe { &*next };
                     if node.key >= key {
                         break;
@@ -223,7 +227,9 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         }
 
         // Arena-allocate and initialize the new node.
+        // SAFETY: insert is externally serialized, satisfying the arena allocator contract.
         let new_node: *mut Node<K, V> = unsafe { self.arena.alloc_node() };
+        // SAFETY: new_node points to uninitialized arena storage sized/aligned for Node.
         unsafe {
             ptr::write(
                 new_node,
@@ -232,7 +238,6 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                     value,
                     height: height as u8,
                     next: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-                    prev0: AtomicPtr::new(ptr::null_mut()),
                 },
             );
         }
@@ -243,37 +248,20 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             (*self.all_nodes.get()).push(new_node);
         }
 
-        // Link the new node into each level (and maintain prev0 at level 0).
+        // Link the new node into each level.
+        // SAFETY: new_node was initialized above and remains arena-owned until drop.
         let new_ref = unsafe { &*new_node };
         for (level, &prev_node) in prev[..height].iter().enumerate() {
             if prev_node.is_null() {
                 // New node becomes the first at this level.
                 let old_head = self.head[level].load(Ordering::Relaxed);
                 new_ref.next[level].store(old_head, Ordering::Relaxed);
-                // Level-0 backward pointer maintenance
-                if level == 0 {
-                    new_ref.prev0.store(ptr::null_mut(), Ordering::Relaxed);
-                    if !old_head.is_null() {
-                        unsafe { &*old_head }
-                            .prev0
-                            .store(new_node, Ordering::Release);
-                    }
-                }
                 self.head[level].store(new_node, Ordering::Release);
             } else {
                 // SAFETY: prev_node is a valid node.
                 let p = unsafe { &*prev_node };
                 let old_next = p.next[level].load(Ordering::Relaxed);
                 new_ref.next[level].store(old_next, Ordering::Relaxed);
-                // Level-0 backward pointer maintenance
-                if level == 0 {
-                    new_ref.prev0.store(prev_node, Ordering::Relaxed);
-                    if !old_next.is_null() {
-                        unsafe { &*old_next }
-                            .prev0
-                            .store(new_node, Ordering::Release);
-                    }
-                }
                 p.next[level].store(new_node, Ordering::Release);
             }
         }
@@ -288,6 +276,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     }
 
     /// Look up a key. Lock-free.
+    #[cfg(test)]
     pub fn get<Q>(&self, key: &Q) -> Option<V>
     where
         K: std::borrow::Borrow<Q>,
@@ -301,10 +290,12 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 self.head[level].load(Ordering::Acquire)
             } else {
                 // SAFETY: current is a valid published node.
+                // SAFETY: current is a valid published predecessor.
                 unsafe { &*current }.next[level].load(Ordering::Acquire)
             };
 
             while !next.is_null() {
+                // SAFETY: next is a valid node published via Release.
                 let n = unsafe { &*next };
                 match n.key.borrow().cmp(key) {
                     CmpOrdering::Less => {
@@ -330,10 +321,12 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             let mut next = if current.is_null() {
                 self.head[level].load(Ordering::Acquire)
             } else {
+                // SAFETY: current is a valid published predecessor.
                 unsafe { &*current }.next[level].load(Ordering::Acquire)
             };
 
             while !next.is_null() {
+                // SAFETY: next is a valid node published via Release.
                 let n = unsafe { &*next };
                 if n.key < *target {
                     current = next;
@@ -351,11 +344,13 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         let start = if current.is_null() {
             self.head[0].load(Ordering::Acquire)
         } else {
+            // SAFETY: current is a valid published predecessor.
             unsafe { &*current }.next[0].load(Ordering::Acquire)
         };
 
         let mut ptr = start;
         while !ptr.is_null() {
+            // SAFETY: ptr is reached through acquired level-0 links.
             let n = unsafe { &*ptr };
             if n.key >= *target {
                 return Some((n.key.clone(), n.value.clone()));
@@ -365,56 +360,12 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
 
         // Fall back to candidate if the level-0 walk didn't find anything
         if !candidate.is_null() {
+            // SAFETY: candidate is a node pointer observed from an acquired link.
             let n = unsafe { &*candidate };
             return Some((n.key.clone(), n.value.clone()));
         }
 
         None
-    }
-
-    /// Iterate forward from the first entry with key >= `target`.
-    /// Uses O(log N) seek then O(1) per-entry level-0 traversal.
-    /// Collects entries starting from the seek point (not the entire list).
-    pub fn range_from(&self, target: &K) -> Vec<(K, V)> {
-        let max_h = self.max_height.load(Ordering::Acquire);
-        let mut current: *const Node<K, V> = ptr::null();
-
-        // Seek using skip list levels
-        for level in (0..max_h).rev() {
-            let mut next = if current.is_null() {
-                self.head[level].load(Ordering::Acquire)
-            } else {
-                unsafe { &*current }.next[level].load(Ordering::Acquire)
-            };
-
-            while !next.is_null() {
-                let n = unsafe { &*next };
-                if n.key < *target {
-                    current = next;
-                    next = n.next[level].load(Ordering::Acquire);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // Walk level 0 from the found position
-        let start = if current.is_null() {
-            self.head[0].load(Ordering::Acquire)
-        } else {
-            unsafe { &*current }.next[0].load(Ordering::Acquire)
-        };
-
-        let mut result = Vec::new();
-        let mut ptr = start;
-        while !ptr.is_null() {
-            let n = unsafe { &*ptr };
-            if n.key >= *target {
-                result.push((n.key.clone(), n.value.clone()));
-            }
-            ptr = n.next[0].load(Ordering::Acquire);
-        }
-        result
     }
 
     /// Return a snapshot iterator over all entries, sorted by key.
@@ -430,6 +381,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     }
 
     /// Return a snapshot iterator over the given range, sorted by key.
+    #[cfg(test)]
     pub fn range<R: RangeBounds<K>>(&self, bounds: R) -> SkipListIter<K, V> {
         let all = self.collect_all();
         let entries: Vec<(K, V)> = all
@@ -449,6 +401,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     /// # Safety
     /// `ptr` must be a valid non-null node pointer from this skiplist.
     pub unsafe fn node_kv(&self, ptr: *const ()) -> (&K, &V) {
+        // SAFETY: caller guarantees ptr is a valid node pointer from this skiplist.
         unsafe {
             let node = &*(ptr as *const Node<K, V>);
             (&node.key, &node.value)
@@ -460,20 +413,10 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     /// # Safety
     /// `ptr` must be a valid non-null node pointer from this skiplist.
     pub unsafe fn node_next0(&self, ptr: *const ()) -> *const () {
+        // SAFETY: caller guarantees ptr is a valid node pointer from this skiplist.
         unsafe {
             let node = &*(ptr as *const Node<K, V>);
             node.next[0].load(Ordering::Acquire) as *const ()
-        }
-    }
-
-    /// Follow the level-0 backward pointer. O(1).
-    ///
-    /// # Safety
-    /// `ptr` must be a valid node pointer obtained from this skiplist.
-    pub unsafe fn node_prev0(&self, ptr: *const ()) -> *const () {
-        unsafe {
-            let node = &*(ptr as *const Node<K, V>);
-            node.prev0.load(Ordering::Acquire) as *const ()
         }
     }
 
@@ -491,10 +434,12 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             let mut next = if current.is_null() {
                 self.head[level].load(Ordering::Acquire)
             } else {
+                // SAFETY: current is a valid published predecessor.
                 unsafe { &*current }.next[level].load(Ordering::Acquire)
             };
 
             while !next.is_null() {
+                // SAFETY: next is a valid node published via Release.
                 let n = unsafe { &*next };
                 if n.key < *target {
                     current = next;
@@ -508,12 +453,14 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         let start = if current.is_null() {
             self.head[0].load(Ordering::Acquire)
         } else {
+            // SAFETY: current is a valid published predecessor.
             unsafe { &*current }.next[0].load(Ordering::Acquire)
         };
 
         // Walk level-0 to find exact first >= target
         let mut ptr = start;
         while !ptr.is_null() {
+            // SAFETY: ptr is reached through acquired level-0 links.
             let n = unsafe { &*ptr };
             if n.key >= *target {
                 return ptr as *const ();
@@ -540,10 +487,12 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             let mut next = if current.is_null() {
                 self.head[level].load(Ordering::Acquire)
             } else {
+                // SAFETY: current is a valid published predecessor.
                 unsafe { &*current }.next[level].load(Ordering::Acquire)
             };
 
             while !next.is_null() {
+                // SAFETY: next is a valid node published via Release.
                 let n = unsafe { &*next };
                 if n.key < *target {
                     current = next;
@@ -568,6 +517,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         // First try exact seek_ge
         let ge_ptr = self.seek_ge_raw(target);
         if !ge_ptr.is_null() {
+            // SAFETY: ge_ptr was returned by this skiplist's seek_ge_raw.
             let (k, _) = unsafe { self.node_kv(ge_ptr) };
             if k == target {
                 return ge_ptr;
@@ -585,10 +535,12 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     }
 
     /// Number of entries.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -621,6 +573,8 @@ impl<K: Ord + Clone, V: Clone> Drop for ConcurrentSkipList<K, V> {
         // Arena frees the node memory itself when it drops.
         let nodes = self.all_nodes.get_mut();
         for &node_ptr in nodes.iter() {
+            // SAFETY: all_nodes contains each initialized Node exactly once; drop has
+            // exclusive &mut self access and the arena storage outlives this loop.
             unsafe {
                 ptr::drop_in_place(node_ptr);
             }

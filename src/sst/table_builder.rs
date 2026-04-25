@@ -378,6 +378,10 @@ impl TableBuilder {
         if prefix_filter_handle.size > 0 {
             let handle_bytes = prefix_filter_handle.encode();
             builder.add(b"filter.prefix", &handle_bytes);
+            builder.add(
+                PREFIX_FILTER_LEN_NAME.as_bytes(),
+                &(self.options.prefix_len as u64).to_le_bytes(),
+            );
         }
 
         if range_del_handle.size > 0 {
@@ -402,6 +406,7 @@ impl TableBuilder {
                     .map(|(n, d)| (n.as_str(), d.as_slice()))
                     .collect();
                 encode_index_value_with_props(&entry.handle, &entry.first_key, &prop_refs)
+                    .c(d!())?
             };
             builder.add(&entry.last_key, &value);
         }

@@ -77,6 +77,7 @@ impl SkipListMemTable {
     /// - `Some(Some(value))` if a Value entry is found
     /// - `Some(None)` if a Deletion entry is found
     /// - `None` if no entry for this user key exists at or below the search sequence
+    #[cfg(test)]
     pub fn get(&self, search_key: &[u8], user_key: &[u8]) -> Option<Option<Vec<u8>>> {
         self.get_with_seq(search_key, user_key)
             .map(|(result, _seq)| result)
@@ -118,16 +119,9 @@ impl SkipListMemTable {
     }
 
     /// Iterate over all entries in reverse internal key order.
+    #[cfg(test)]
     pub fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.map.iter().rev().map(|(k, v)| (k.0, v))
-    }
-
-    /// Iterate over a range of entries by OrdInternalKey bounds.
-    pub fn range(
-        &self,
-        bounds: impl std::ops::RangeBounds<OrdInternalKey>,
-    ) -> impl DoubleEndedIterator<Item = (Vec<u8>, Vec<u8>)> {
-        self.map.range(bounds).map(|(k, v)| (k.0, v))
     }
 }
 
@@ -154,6 +148,8 @@ unsafe impl Send for MemTableCursorIter {}
 impl MemTableCursorIter {
     pub fn new(memtable: Arc<crate::memtable::MemTable>) -> Self {
         let skiplist = memtable.skiplist_ref();
+        // SAFETY: skiplist_ref points into `memtable`; the Arc stored in the
+        // iterator keeps that MemTable alive for at least this iterator's lifetime.
         let head = unsafe { &*skiplist }.head_ptr();
         Self {
             _memtable: memtable,
@@ -164,6 +160,7 @@ impl MemTableCursorIter {
 
     #[inline]
     fn sl(&self) -> &ConcurrentSkipList<OrdInternalKey, Vec<u8>> {
+        // SAFETY: `self._memtable` owns the skiplist and keeps this raw pointer valid.
         unsafe { &*self.skiplist }
     }
 
@@ -180,8 +177,10 @@ impl Iterator for MemTableCursorIter {
         if self.cursor.is_null() {
             return None;
         }
+        // SAFETY: cursor is either null or a node pointer returned by this skiplist.
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         let result = (k.as_bytes().to_vec(), v.clone());
+        // SAFETY: same cursor validity as above; node_next0 only reads an atomic link.
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
         Some(result)
     }
@@ -196,6 +195,7 @@ impl SeekableIterator for MemTableCursorIter {
         if self.cursor.is_null() {
             return None;
         }
+        // SAFETY: cursor is non-null and comes from this skiplist.
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         Some((k.as_bytes().to_vec(), LazyValue::Inline(v.clone())))
     }
@@ -206,11 +206,13 @@ impl SeekableIterator for MemTableCursorIter {
         if self.cursor.is_null() {
             return false;
         }
+        // SAFETY: cursor is non-null and comes from this skiplist.
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
         key_buf.extend_from_slice(k.as_bytes());
         value_buf.clear();
         value_buf.extend_from_slice(v);
+        // SAFETY: cursor is still the same valid node pointer.
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
         true
     }
@@ -221,38 +223,32 @@ impl SeekableIterator for MemTableCursorIter {
         if self.cursor.is_null() {
             return None;
         }
+        // SAFETY: cursor is non-null and comes from this skiplist.
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
         key_buf.extend_from_slice(k.as_bytes());
         let lv = LazyValue::Inline(v.clone());
+        // SAFETY: cursor is still the same valid node pointer.
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
         Some(lv)
     }
 
     fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
-        if self.cursor.is_null() {
-            // Exhausted forward — seek to last for backward iteration.
-            // O(1) via cached tail pointer.
-            let ptr = self.sl().tail_ptr();
-            if ptr.is_null() {
-                return None;
-            }
-            let (k, v) = unsafe { self.sl().node_kv(ptr) };
-            let result = (k.as_bytes().to_vec(), LazyValue::Inline(v.clone()));
-            // Follow prev0 for the next prev() call — O(1).
-            self.cursor = unsafe { self.sl().node_prev0(ptr) };
-            return Some(result);
-        }
-        // We have a current cursor position. Follow the backward pointer.
-        // O(1) via prev0 instead of O(log N) seek_lt_raw.
-        let prev_ptr = unsafe { self.sl().node_prev0(self.cursor) };
-        if prev_ptr.is_null() {
+        let ptr = if self.cursor.is_null() {
+            self.sl().tail_ptr()
+        } else {
+            // SAFETY: cursor is non-null and comes from this skiplist.
+            let (k, _) = unsafe { self.sl().node_kv(self.cursor) };
+            self.sl().seek_lt_raw(k)
+        };
+        if ptr.is_null() {
             self.cursor = std::ptr::null();
             return None;
         }
-        let (pk, pv) = unsafe { self.sl().node_kv(prev_ptr) };
-        let result = (pk.as_bytes().to_vec(), LazyValue::Inline(pv.clone()));
-        self.cursor = prev_ptr;
+        // SAFETY: ptr is non-null and either the previous node or skiplist tail.
+        let (k, v) = unsafe { self.sl().node_kv(ptr) };
+        let result = (k.as_bytes().to_vec(), LazyValue::Inline(v.clone()));
+        self.cursor = ptr;
         Some(result)
     }
 

@@ -13,8 +13,8 @@ use crate::error::{Error, Result};
 use crate::sst::block::{Block, decode_entry_reuse};
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::{
-    BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, RANGE_DEL_BLOCK_NAME,
-    decode_footer, decode_index_value_with_props,
+    BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, PREFIX_FILTER_LEN_NAME,
+    RANGE_DEL_BLOCK_NAME, decode_footer, decode_index_value_with_props,
 };
 use crate::stats::DbStats;
 use crate::types::{
@@ -44,6 +44,7 @@ type IndexEntries = Arc<Vec<IndexEntry>>;
 struct MetaIndexData {
     bloom: Option<Vec<u8>>,
     prefix: Option<Vec<u8>>,
+    prefix_len: Option<usize>,
     range_del_handle: Option<BlockHandle>,
 }
 
@@ -55,6 +56,7 @@ pub struct TableReader {
     index_block: Block,
     filter_data: Option<Vec<u8>>,
     prefix_filter_data: Option<Vec<u8>>,
+    prefix_filter_len: Option<usize>,
     file: Mutex<File>,
     block_cache: Option<Arc<BlockCache>>,
     stats: Option<Arc<DbStats>>,
@@ -113,11 +115,12 @@ impl TableReader {
         let (metaindex_handle, index_handle) = decode_footer(&footer_buf).c(d!())?;
 
         // Read index block
-        let index_data = Self::read_block_data(&mut file, &index_handle).c(d!())?;
+        let index_data =
+            Self::read_block_data_with_size(&mut file, &index_handle, file_size).c(d!())?;
         let index_block = Block::from_vec(index_data).c(d!())?;
 
         // Read filters and range-del handle from metaindex
-        let meta = Self::read_metaindex(&mut file, &metaindex_handle).c(d!())?;
+        let meta = Self::read_metaindex(&mut file, &metaindex_handle, file_size).c(d!())?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -126,6 +129,7 @@ impl TableReader {
             index_block,
             filter_data: meta.bloom,
             prefix_filter_data: meta.prefix,
+            prefix_filter_len: meta.prefix_len,
             file: Mutex::new(file),
             block_cache,
             stats,
@@ -395,6 +399,34 @@ impl TableReader {
     }
 
     fn read_block_data(file: &mut File, handle: &BlockHandle) -> Result<Vec<u8>> {
+        let file_size = file.metadata().c(d!())?.len();
+        Self::read_block_data_with_size(file, handle, file_size)
+    }
+
+    fn read_block_data_with_size(
+        file: &mut File,
+        handle: &BlockHandle,
+        file_size: u64,
+    ) -> Result<Vec<u8>> {
+        const MAX_COMPRESSED_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+        let end = handle
+            .offset
+            .checked_add(handle.size)
+            .and_then(|n| n.checked_add(BLOCK_TRAILER_SIZE as u64))
+            .ok_or_else(|| Error::Corruption("block handle range overflow".to_string()))
+            .c(d!())?;
+        if end > file_size {
+            return Err(eg!(Error::Corruption(format!(
+                "block handle out of bounds: offset={}, size={}, file_size={}",
+                handle.offset, handle.size, file_size
+            ))));
+        }
+        if handle.size > MAX_COMPRESSED_BLOCK_SIZE {
+            return Err(eg!(Error::Corruption(format!(
+                "compressed block size {} exceeds limit {}",
+                handle.size, MAX_COMPRESSED_BLOCK_SIZE
+            ))));
+        }
         file.seek(SeekFrom::Start(handle.offset)).c(d!())?;
         let mut data = vec![0u8; handle.size as usize];
         file.read_exact(&mut data).c(d!())?;
@@ -452,29 +484,48 @@ impl TableReader {
         Ok(data)
     }
 
-    fn read_metaindex(file: &mut File, metaindex_handle: &BlockHandle) -> Result<MetaIndexData> {
+    fn read_metaindex(
+        file: &mut File,
+        metaindex_handle: &BlockHandle,
+        file_size: u64,
+    ) -> Result<MetaIndexData> {
         if metaindex_handle.size == 0 {
             return Ok(MetaIndexData {
                 bloom: None,
                 prefix: None,
+                prefix_len: None,
                 range_del_handle: None,
             });
         }
 
-        let metaindex_data = Self::read_block_data(file, metaindex_handle).c(d!())?;
+        let metaindex_data =
+            Self::read_block_data_with_size(file, metaindex_handle, file_size).c(d!())?;
         let metaindex = Block::from_vec(metaindex_data).c(d!())?;
 
         let mut bloom = None;
         let mut prefix = None;
+        let mut prefix_len = None;
         let mut range_del_handle = None;
 
         for (key, value) in metaindex.iter() {
             if key == b"filter.bloom" {
                 let handle = BlockHandle::decode(&value).c(d!())?;
-                bloom = Some(Self::read_block_data(file, &handle).c(d!())?);
+                bloom = Some(Self::read_block_data_with_size(file, &handle, file_size).c(d!())?);
             } else if key == b"filter.prefix" {
                 let handle = BlockHandle::decode(&value).c(d!())?;
-                prefix = Some(Self::read_block_data(file, &handle).c(d!())?);
+                prefix = Some(Self::read_block_data_with_size(file, &handle, file_size).c(d!())?);
+            } else if key == PREFIX_FILTER_LEN_NAME.as_bytes() {
+                if value.len() != 8 {
+                    return Err(eg!(Error::Corruption(
+                        "bad prefix filter length metadata".to_string()
+                    )));
+                }
+                let len = u64::from_le_bytes(value.as_slice().try_into().unwrap());
+                prefix_len = Some(usize::try_from(len).map_err(|_| {
+                    eg!(Error::Corruption(
+                        "prefix filter length overflows usize".to_string()
+                    ))
+                })?);
             } else if key == RANGE_DEL_BLOCK_NAME.as_bytes() {
                 range_del_handle = Some(BlockHandle::decode(&value).c(d!())?);
             }
@@ -483,6 +534,7 @@ impl TableReader {
         Ok(MetaIndexData {
             bloom,
             prefix,
+            prefix_len,
             range_del_handle,
         })
     }
@@ -490,9 +542,11 @@ impl TableReader {
     /// Check if a prefix may exist in this SST file using the prefix bloom filter.
     /// Returns `true` if the prefix might be present (or if no prefix bloom exists).
     pub fn prefix_may_match(&self, prefix: &[u8]) -> bool {
-        match self.prefix_filter_data {
-            Some(ref filter) => BloomFilter::key_may_match(prefix, filter),
-            None => true, // No prefix bloom — conservatively assume present
+        match (self.prefix_filter_data.as_ref(), self.prefix_filter_len) {
+            (Some(filter), Some(prefix_len)) if prefix.len() >= prefix_len => {
+                BloomFilter::key_may_match(&prefix[..prefix_len], filter)
+            }
+            _ => true, // Missing/incompatible metadata — conservatively assume present.
         }
     }
 
@@ -716,6 +770,42 @@ impl TableIterator {
         self.block_pos = 0;
     }
 
+    fn reset_positioning_state(&mut self) {
+        self.current_block = None;
+        self.block_cursor_offset = 0;
+        self.block_data_end = 0;
+        self.block_cursor_key.clear();
+        self.at_first_key_from_index = false;
+        self.deferred_index_pos = 0;
+        self.current_block_entries.clear();
+        self.block_pos = 0;
+        self.current_restart_index = 0;
+        self.backward_block = None;
+        self.backward_block_index = usize::MAX;
+    }
+
+    fn block_properties_should_skip(&self, entry: &IndexEntry) -> bool {
+        if self.block_property_filters.is_empty() {
+            return false;
+        }
+        self.block_property_filters.iter().any(|filter| {
+            let filter_name = filter.name().as_bytes();
+            entry
+                .properties
+                .iter()
+                .any(|(name, data)| name.as_slice() == filter_name && filter.should_skip(data))
+        })
+    }
+
+    fn block_exceeds_upper_bound(&self, entry: &IndexEntry) -> bool {
+        self.upper_bound.as_ref().is_some_and(|ub| {
+            entry
+                .first_key
+                .as_ref()
+                .is_some_and(|fk| user_key(fk) >= ub.as_slice())
+        })
+    }
+
     /// Materialize the deferred block: load the data block for deferred_index_pos.
     fn materialize_deferred_block(&mut self) {
         if let Some(ref index_entries) = self.index_entries {
@@ -773,6 +863,7 @@ impl TableIterator {
     /// Seek to the first entry >= target using the index block for O(log N) lookup.
     pub fn seek(&mut self, target: &[u8]) {
         self.ensure_index();
+        self.reset_positioning_state();
         let index_entries = self.index_entries.as_ref().unwrap();
 
         // Quick check: if target > file's largest key, mark exhausted.
@@ -780,8 +871,6 @@ impl TableIterator {
             && compare_internal_key(target, &last.separator_key) == Ordering::Greater
         {
             self.index_pos = index_entries.len();
-            self.current_block_entries.clear();
-            self.block_pos = 0;
             return;
         }
 
@@ -791,14 +880,18 @@ impl TableIterator {
         });
 
         self.index_pos = idx;
-        self.current_block = None;
-        self.current_block_entries.clear();
-        self.block_pos = 0;
 
         // Load the found block and seek within it using the cursor
-        if self.index_pos < index_entries.len() {
+        while self.index_pos < index_entries.len() {
             let entry = &index_entries[self.index_pos];
+            if self.block_exceeds_upper_bound(entry) {
+                self.index_pos = index_entries.len();
+                return;
+            }
             self.index_pos += 1;
+            if self.block_properties_should_skip(entry) {
+                continue;
+            }
 
             // Deferred block read: if target <= first_key, position without I/O
             if let Some(ref first_key) = entry.first_key
@@ -825,6 +918,7 @@ impl TableIterator {
                     self.err = Some(format!("block read error in seek: {e}"));
                 }
             }
+            return;
         }
     }
 
@@ -913,9 +1007,7 @@ impl TableIterator {
     /// the target entry, not the entire block.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         self.ensure_index();
-        // Clear forward-iteration cursor state so a subsequent next() doesn't
-        // yield stale entries from the previous forward block.
-        self.current_block = None;
+        self.reset_positioning_state();
         let index_entries = self.index_entries.as_ref().unwrap();
 
         let idx = index_entries.partition_point(|entry| {
@@ -935,7 +1027,15 @@ impl TableIterator {
                 continue;
             }
 
-            let handle = index_entries[try_idx].handle;
+            let entry = &index_entries[try_idx];
+            if self.block_properties_should_skip(entry) {
+                if try_idx == 0 {
+                    break;
+                }
+                try_idx -= 1;
+                continue;
+            }
+            let handle = entry.handle;
 
             let block_result = self.reader.read_block_cached(&handle).and_then(Block::new);
             match block_result {
@@ -1103,32 +1203,18 @@ impl TableIterator {
         while self.index_pos < index_entries.len() {
             let block_idx = self.index_pos;
 
+            let entry = &index_entries[block_idx];
+
             // Skip blocks whose first_key user key >= upper_bound
-            if let Some(ref ub) = self.upper_bound
-                && let Some(ref fk) = index_entries[block_idx].first_key
-                && user_key(fk) >= ub.as_slice()
-            {
+            if self.block_exceeds_upper_bound(entry) {
                 self.index_pos = index_entries.len();
                 return false;
             }
 
             // Skip blocks based on block property filters
-            if !self.block_property_filters.is_empty() {
-                let props = &index_entries[block_idx].properties;
-                let mut skip = false;
-                'filter_check: for filter in &self.block_property_filters {
-                    let filter_name = filter.name().as_bytes();
-                    for (name, data) in props {
-                        if name.as_slice() == filter_name && filter.should_skip(data) {
-                            skip = true;
-                            break 'filter_check;
-                        }
-                    }
-                }
-                if skip {
-                    self.index_pos += 1;
-                    continue;
-                }
+            if self.block_properties_should_skip(entry) {
+                self.index_pos += 1;
+                continue;
             }
 
             let handle = index_entries[self.index_pos].handle;
@@ -1243,21 +1329,25 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     fn seek_to_first(&mut self) {
         // Reset to the beginning of the table
         self.ensure_index();
+        self.reset_positioning_state();
         self.index_pos = 0;
-        self.current_block_entries.clear();
-        self.block_pos = 0;
-        self.current_block = None;
-        self.at_first_key_from_index = false;
     }
 
     fn seek_to_last(&mut self) {
         self.ensure_index();
+        self.reset_positioning_state();
         let index_entries = self.index_entries.as_ref().unwrap();
         if index_entries.is_empty() {
             return;
         }
         // Load only the last restart segment of the last block
-        let last_idx = index_entries.len() - 1;
+        let mut last_idx = index_entries.len() - 1;
+        while self.block_properties_should_skip(&index_entries[last_idx]) {
+            if last_idx == 0 {
+                return;
+            }
+            last_idx -= 1;
+        }
         let handle = index_entries[last_idx].handle;
         match self.reader.read_block_cached(&handle) {
             Ok(data) => match Block::new(data) {
@@ -1280,8 +1370,6 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 self.err = Some(format!("block read error in seek_to_last: {e}"));
             }
         }
-        self.current_block = None;
-        self.at_first_key_from_index = false;
     }
 
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
