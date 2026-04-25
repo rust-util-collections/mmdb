@@ -28,7 +28,7 @@ use crate::manifest::version_set::VersionSet;
 use crate::options::{CompactionFilterDecision, DbOptions};
 use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
-use crate::sst::table_reader::TableIterator;
+use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator};
 use crate::stats::DbStats;
 use crate::types::{
     InternalKey, InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType,
@@ -117,6 +117,198 @@ fn collect_range_del_entries(files: &[TableFile]) -> Result<Vec<(Vec<u8>, Vec<u8
     }
     entries.sort_by(|a, b| compare_internal_key(&a.0, &b.0));
     Ok(entries)
+}
+
+enum UserKeyRange {
+    /// Inclusive file metadata range.
+    File { smallest: Vec<u8>, largest: Vec<u8> },
+    /// Half-open range tombstone extent.
+    Tombstone { begin: Vec<u8>, end: Vec<u8> },
+}
+
+fn file_metadata_overlaps_bounds(
+    tf: &TableFile,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> bool {
+    let file_smallest = user_key(&tf.meta.smallest_key);
+    let file_largest = user_key(&tf.meta.largest_key);
+    let above_lower = lower.is_none_or(|lo| file_largest >= lo);
+    let below_upper = upper.is_none_or(|hi| file_smallest < hi);
+    above_lower && below_upper
+}
+
+fn tombstone_overlaps_bounds(
+    begin: &[u8],
+    end: &[u8],
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> bool {
+    let above_lower = lower.is_none_or(|lo| end > lo);
+    let below_upper = upper.is_none_or(|hi| begin < hi);
+    above_lower && below_upper
+}
+
+fn file_overlaps_compact_bounds(
+    tf: &TableFile,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> bool {
+    if file_metadata_overlaps_bounds(tf, lower, upper) {
+        return true;
+    }
+    if !tf.meta.has_range_deletions {
+        return false;
+    }
+    match tf.reader.get_range_tombstones() {
+        Ok(tombstones) => tombstones
+            .iter()
+            .any(|(begin, end, _)| tombstone_overlaps_bounds(begin, end, lower, upper)),
+        Err(e) => {
+            tracing::warn!(
+                "failed to read range tombstones from SST {} while picking compact_range: {}",
+                tf.meta.number,
+                e
+            );
+            true
+        }
+    }
+}
+
+fn add_file_extents(tf: &TableFile, extents: &mut Vec<UserKeyRange>) -> bool {
+    if !tf.meta.smallest_key.is_empty() && !tf.meta.largest_key.is_empty() {
+        extents.push(UserKeyRange::File {
+            smallest: user_key(&tf.meta.smallest_key).to_vec(),
+            largest: user_key(&tf.meta.largest_key).to_vec(),
+        });
+    }
+    if tf.meta.has_range_deletions {
+        match tf.reader.get_range_tombstones() {
+            Ok(tombstones) => {
+                extents.extend(
+                    tombstones
+                        .into_iter()
+                        .map(|(begin, end, _)| UserKeyRange::Tombstone { begin, end }),
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to read range tombstones from SST {} while expanding compaction range: {}",
+                    tf.meta.number,
+                    e
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn file_metadata_overlaps_extent(tf: &TableFile, extent: &UserKeyRange) -> bool {
+    let file_smallest = user_key(&tf.meta.smallest_key);
+    let file_largest = user_key(&tf.meta.largest_key);
+    match extent {
+        UserKeyRange::File { smallest, largest } => {
+            file_largest >= smallest.as_slice() && file_smallest <= largest.as_slice()
+        }
+        UserKeyRange::Tombstone { begin, end } => {
+            file_largest >= begin.as_slice() && file_smallest < end.as_slice()
+        }
+    }
+}
+
+fn tombstone_overlaps_extent(begin: &[u8], end: &[u8], extent: &UserKeyRange) -> bool {
+    match extent {
+        UserKeyRange::File { smallest, largest } => {
+            end > smallest.as_slice() && begin <= largest.as_slice()
+        }
+        UserKeyRange::Tombstone {
+            begin: other_begin,
+            end: other_end,
+        } => end > other_begin.as_slice() && begin < other_end.as_slice(),
+    }
+}
+
+fn file_overlaps_extent(tf: &TableFile, extent: &UserKeyRange) -> bool {
+    if file_metadata_overlaps_extent(tf, extent) {
+        return true;
+    }
+    if !tf.meta.has_range_deletions {
+        return false;
+    }
+    match tf.reader.get_range_tombstones() {
+        Ok(tombstones) => tombstones
+            .iter()
+            .any(|(begin, end, _)| tombstone_overlaps_extent(begin, end, extent)),
+        Err(e) => {
+            tracing::warn!(
+                "failed to read range tombstones from SST {} while checking overlap: {}",
+                tf.meta.number,
+                e
+            );
+            true
+        }
+    }
+}
+
+fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Vec<TableFile> {
+    let mut extents = Vec::new();
+    for tf in inputs {
+        if !add_file_extents(tf, &mut extents) {
+            return files.to_vec();
+        }
+    }
+
+    let mut selected = Vec::new();
+    let mut selected_numbers = HashSet::new();
+    loop {
+        let mut changed = false;
+        for tf in files {
+            if selected_numbers.contains(&tf.meta.number) {
+                continue;
+            }
+            if extents
+                .iter()
+                .any(|extent| file_overlaps_extent(tf, extent))
+            {
+                selected_numbers.insert(tf.meta.number);
+                selected.push(tf.clone());
+                if !add_file_extents(tf, &mut extents) {
+                    return files.to_vec();
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    selected
+}
+
+fn estimated_uncompressed_file_size(tf: &TableFile) -> u64 {
+    let data_blocks = tf
+        .reader
+        .cached_index_entries()
+        .map(|entries| entries.len() as u64)
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "failed to parse index entries from SST {} while estimating compaction outputs: {}",
+                tf.meta.number,
+                e
+            );
+            1
+        });
+    let data_bound = data_blocks.saturating_mul(MAX_DECOMPRESSED_BLOCK_SIZE as u64);
+    let range_del_bound = if tf.meta.has_range_deletions {
+        MAX_DECOMPRESSED_BLOCK_SIZE as u64
+    } else {
+        0
+    };
+    data_bound
+        .saturating_add(range_del_bound)
+        .max(tf.meta.file_size)
 }
 
 /// A sub-task covering a key range within a compaction.
@@ -567,7 +759,14 @@ fn execute_sub_compaction_io(
 impl LeveledCompaction {
     pub(crate) fn max_output_files(task: &CompactionTask, options: &DbOptions) -> u64 {
         let target_size = options.target_file_size_base.max(1);
-        let size_outputs = task.total_input_size().saturating_add(target_size - 1) / target_size;
+        let estimated_input_size = task
+            .input_files_level
+            .iter()
+            .chain(task.input_files_next.iter())
+            .fold(0u64, |acc, tf| {
+                acc.saturating_add(estimated_uncompressed_file_size(tf))
+            });
+        let size_outputs = estimated_input_size.saturating_add(target_size - 1) / target_size;
         let input_count = task
             .input_files_level
             .len()
@@ -670,19 +869,13 @@ impl LeveledCompaction {
         let l0_files = version.level_files(0);
         let mut input_l0: Vec<TableFile> = Vec::new();
         for tf in l0_files {
-            let file_smallest = user_key(&tf.meta.smallest_key);
-            let file_largest = user_key(&tf.meta.largest_key);
-            let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
-            let overlaps_end = end.is_none_or(|e| file_smallest < e);
-            if overlaps_begin && overlaps_end {
+            if file_overlaps_compact_bounds(tf, begin, end) {
                 input_l0.push(tf.clone());
             }
         }
 
         if !input_l0.is_empty() {
-            let (smallest, largest) = Self::total_key_range(&input_l0);
-            let input_l1 =
-                Self::overlapping_files(version.level_files(1), &smallest, &largest);
+            let input_l1 = overlapping_files_for_inputs(version.level_files(1), &input_l0);
             return Some(CompactionTask {
                 level: 0,
                 input_files_level: input_l0,
@@ -695,24 +888,15 @@ impl LeveledCompaction {
             let files = version.level_files(level);
             let mut input_level: Vec<TableFile> = Vec::new();
             for tf in files {
-                let file_smallest = user_key(&tf.meta.smallest_key);
-                let file_largest = user_key(&tf.meta.largest_key);
-                let overlaps_begin = begin.is_none_or(|b| file_largest >= b);
-                let overlaps_end = end.is_none_or(|e| file_smallest < e);
-                if overlaps_begin && overlaps_end {
+                if file_overlaps_compact_bounds(tf, begin, end) {
                     input_level.push(tf.clone());
                 }
             }
 
             if !input_level.is_empty() {
-                let (smallest, largest) = Self::total_key_range(&input_level);
                 let next_level = level + 1;
                 let input_next = if next_level < version.num_levels {
-                    Self::overlapping_files(
-                        version.level_files(next_level),
-                        &smallest,
-                        &largest,
-                    )
+                    overlapping_files_for_inputs(version.level_files(next_level), &input_level)
                 } else {
                     Vec::new()
                 };
@@ -1416,26 +1600,23 @@ impl LeveledCompaction {
         num_levels: usize,
         all_inputs: &[TableFile],
     ) -> bool {
-        if target_level >= num_levels - 1 {
+        let mut extents = Vec::new();
+        for tf in all_inputs {
+            if !add_file_extents(tf, &mut extents) {
+                return false;
+            }
+        }
+        if extents.is_empty() {
             return true;
         }
-        if all_inputs.iter().any(|tf| tf.meta.has_range_deletions) {
-            return false;
-        }
-        let (smallest, largest) = Self::total_key_range(all_inputs);
-        if smallest.is_empty() {
-            return true;
-        }
-        let smallest_uk = user_key(&smallest);
-        let largest_uk = user_key(&largest);
-        for level in (target_level + 1)..num_levels {
+
+        let input_numbers: HashSet<u64> = all_inputs.iter().map(|tf| tf.meta.number).collect();
+        for level in target_level..num_levels {
             for f in version.level_files(level) {
-                let f_smallest = user_key(&f.meta.smallest_key);
-                let f_largest = user_key(&f.meta.largest_key);
-                // Any overlapping file at a lower level means this is not bottommost.
-                // Range deletion boundaries are included in file metadata, so the
-                // standard overlap check is sufficient for range-deletion files too.
-                if f_largest >= smallest_uk && f_smallest <= largest_uk {
+                if input_numbers.contains(&f.meta.number) {
+                    continue;
+                }
+                if extents.iter().any(|extent| file_overlaps_extent(f, extent)) {
                     return false;
                 }
             }
@@ -1460,9 +1641,8 @@ impl LeveledCompaction {
             .filter(|f| {
                 let file_largest_uk = user_key(&f.meta.largest_key);
                 let file_smallest_uk = user_key(&f.meta.smallest_key);
-                // File overlaps if: file.largest_uk >= smallest_uk AND file.smallest_uk <= largest_uk
-                // Range deletion boundaries are included in file metadata key range,
-                // so the standard overlap check is sufficient even for files with range deletions.
+                // File overlaps if: file.largest_uk >= smallest_uk AND file.smallest_uk <= largest_uk.
+                // This is metadata-only; range-aware callers use `overlapping_files_for_inputs`.
                 file_largest_uk >= smallest_uk && file_smallest_uk <= largest_uk
             })
             .cloned()
@@ -1798,6 +1978,44 @@ mod tests {
                 None,
                 "key {} should be deleted",
                 i
+            );
+        }
+    }
+
+    #[test]
+    fn test_compact_range_keeps_range_tombstone_until_covered_files_included() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let opts = DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 1024 * 1024,
+            l0_compaction_trigger: 100,
+            target_file_size_base: 512,
+            num_levels: 2,
+            ..Default::default()
+        };
+        let db = DB::open(opts, dir.path()).unwrap();
+
+        let value = vec![b'v'; 96];
+        for i in 0..200 {
+            let key = format!("key_{:03}", i);
+            db.put(key.as_bytes(), &value).unwrap();
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+
+        db.delete_range(b"key_000", b"key_200").unwrap();
+        db.flush().unwrap();
+
+        db.compact_range(Some(b"key_000"), Some(b"key_001"))
+            .unwrap();
+
+        for i in [0, 1, 50, 150, 199] {
+            let key = format!("key_{:03}", i);
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap(),
+                None,
+                "range-compacted tombstone must continue deleting {key}"
             );
         }
     }

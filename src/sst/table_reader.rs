@@ -25,6 +25,11 @@ use ruc::*;
 /// A range tombstone: (begin_key, end_key, sequence_number).
 type RangeTombstoneEntry = (Vec<u8>, Vec<u8>, SequenceNumber);
 
+/// Maximum allowed decompressed block size. Used by readers to reject
+/// allocation bombs and by compaction to reserve enough output file numbers
+/// when compacting compressed inputs.
+pub(crate) const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
+
 /// Parsed index entry: separator key + block handle + optional first key + block properties.
 pub struct IndexEntry {
     /// Separator key (last key of the data block).
@@ -453,7 +458,6 @@ impl TableReader {
         }
 
         // Decompress if needed (with size bound to prevent allocation bombs)
-        const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
         let data = match compression_type {
             CompressionType::Lz4 => {
                 if data.len() < 4 {
@@ -1157,35 +1161,50 @@ impl TableIterator {
             return None; // Already at first block
         }
 
-        let prev_block_index = current_block_index - 1;
         self.ensure_index();
-        let handle = self.index_entries.as_ref().unwrap()[prev_block_index].handle;
+        let index_entries = self.index_entries.as_ref().unwrap();
+        let mut prev_block_index = current_block_index - 1;
 
-        match self.reader.read_block_cached(&handle) {
-            Ok(data) => match Block::new(data) {
-                Ok(block) => {
-                    let last_restart = block.num_restarts().saturating_sub(1);
-                    self.current_block_entries = block.iter_restart_segment(last_restart);
-                    if self.current_block_entries.is_empty() {
-                        return None;
-                    }
-                    self.block_pos = self.current_block_entries.len() - 1;
-                    self.index_pos = prev_block_index + 1;
-                    self.current_restart_index = last_restart;
-                    self.backward_block = Some(block);
-                    self.backward_block_index = prev_block_index;
-                    return Some(self.current_block_entries[self.block_pos].clone());
+        loop {
+            let entry = &index_entries[prev_block_index];
+            if self.block_properties_should_skip(entry) {
+                if prev_block_index == 0 {
+                    return None;
                 }
-                Err(e) => {
-                    self.err = Some(format!("block decode error in prev: {e}"));
-                }
-            },
-            Err(e) => {
-                self.err = Some(format!("block read error in prev: {e}"));
+                prev_block_index -= 1;
+                continue;
             }
-        }
 
-        None
+            match self.reader.read_block_cached(&entry.handle) {
+                Ok(data) => match Block::new(data) {
+                    Ok(block) => {
+                        let last_restart = block.num_restarts().saturating_sub(1);
+                        self.current_block_entries = block.iter_restart_segment(last_restart);
+                        if self.current_block_entries.is_empty() {
+                            if prev_block_index == 0 {
+                                return None;
+                            }
+                            prev_block_index -= 1;
+                            continue;
+                        }
+                        self.block_pos = self.current_block_entries.len() - 1;
+                        self.index_pos = prev_block_index + 1;
+                        self.current_restart_index = last_restart;
+                        self.backward_block = Some(block);
+                        self.backward_block_index = prev_block_index;
+                        return Some(self.current_block_entries[self.block_pos].clone());
+                    }
+                    Err(e) => {
+                        self.err = Some(format!("block decode error in prev: {e}"));
+                    }
+                },
+                Err(e) => {
+                    self.err = Some(format!("block read error in prev: {e}"));
+                }
+            }
+
+            return None;
+        }
     }
 
     /// Return the current entry without advancing, or None if not positioned.
@@ -1509,7 +1528,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::options::{BlockPropertyCollector, BlockPropertyFilter};
     use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
 
     fn build_test_table(dir: &Path, count: usize) -> PathBuf {
@@ -1827,5 +1849,101 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 100, "should be able to prev through all 100 entries");
+    }
+
+    #[derive(Default)]
+    struct FirstPrefixCollector {
+        skip_block: bool,
+        seen: bool,
+    }
+
+    impl BlockPropertyCollector for FirstPrefixCollector {
+        fn add(&mut self, key: &[u8], _value: &[u8]) {
+            if self.seen {
+                return;
+            }
+            self.seen = true;
+            self.skip_block = crate::types::InternalKeyRef::new(key)
+                .user_key()
+                .starts_with(b"a_skip_");
+        }
+
+        fn finish_block(&mut self) -> Vec<u8> {
+            let result = if self.skip_block {
+                b"skip".to_vec()
+            } else {
+                b"keep".to_vec()
+            };
+            self.skip_block = false;
+            self.seen = false;
+            result
+        }
+
+        fn name(&self) -> &str {
+            "first-prefix"
+        }
+    }
+
+    struct SkipBlocksFilter;
+
+    impl BlockPropertyFilter for SkipBlocksFilter {
+        fn should_skip(&self, properties: &[u8]) -> bool {
+            properties == b"skip"
+        }
+
+        fn name(&self) -> &str {
+            "first-prefix"
+        }
+    }
+
+    #[test]
+    fn test_table_iterator_prev_skips_filtered_blocks() {
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("filtered_prev.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                block_property_collectors: vec![Box::<FirstPrefixCollector>::default()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        for prefix in ["a_skip", "z_keep"] {
+            for i in 0..20 {
+                let user_key = format!("{}_{:03}", prefix, i);
+                let ikey = InternalKey::new(user_key.as_bytes(), 100 - i, ValueType::Value);
+                builder
+                    .add(ikey.as_bytes(), format!("value_{prefix}_{i}").as_bytes())
+                    .unwrap();
+            }
+        }
+        builder.finish().unwrap();
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let mut iter =
+            TableIterator::new(reader).with_block_filters(vec![Arc::new(SkipBlocksFilter)]);
+        let seek_key = InternalKey::new(b"zzzz", 0, ValueType::Deletion);
+        iter.seek_for_prev(seek_key.as_bytes());
+
+        let mut seen = 0;
+        while let Some((key, _)) = iter.current() {
+            let user_key = crate::types::InternalKeyRef::new(&key).user_key().to_vec();
+            assert!(
+                user_key.starts_with(b"z_keep_"),
+                "filtered reverse scan yielded skipped key {:?}",
+                String::from_utf8_lossy(&user_key)
+            );
+            seen += 1;
+            if iter.prev().is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(seen, 20);
     }
 }

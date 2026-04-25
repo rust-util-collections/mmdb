@@ -311,10 +311,10 @@ impl VersionSet {
         self.current = Arc::new(new_version);
         self.edits_since_snapshot += 1;
 
-        // Check if MANIFEST needs compaction
-        if let Err(e) = self.maybe_compact_manifest() {
-            tracing::warn!("MANIFEST compaction deferred after edit install: {}", e);
-        }
+        // Check if MANIFEST needs compaction. Safe pre-publish failures are
+        // deferred inside `maybe_compact_manifest`; post-CURRENT failures are
+        // propagated because durability is no longer guaranteed.
+        self.maybe_compact_manifest().c(d!())?;
 
         Ok(())
     }
@@ -404,20 +404,56 @@ impl VersionSet {
         let new_manifest_path = self
             .db_path
             .join(format!("MANIFEST-{:06}", new_manifest_number));
-        let mut new_writer = WalWriter::new(&new_manifest_path).c(d!())?;
+        let mut new_writer = match WalWriter::new(&new_manifest_path).c(d!()) {
+            Ok(writer) => writer,
+            Err(e) => {
+                tracing::warn!("MANIFEST compaction deferred creating snapshot: {}", e);
+                return Ok(());
+            }
+        };
 
         // Write the snapshot edit
         let encoded = snapshot_edit.encode();
-        new_writer.add_record(&encoded).c(d!())?;
-        new_writer.sync().c(d!())?;
+        if let Err(e) = new_writer.add_record(&encoded).c(d!()) {
+            drop(new_writer);
+            let _ = fs::remove_file(&new_manifest_path);
+            tracing::warn!("MANIFEST compaction deferred writing snapshot: {}", e);
+            return Ok(());
+        }
+        if let Err(e) = new_writer.sync().c(d!()) {
+            drop(new_writer);
+            let _ = fs::remove_file(&new_manifest_path);
+            tracing::warn!("MANIFEST compaction deferred syncing snapshot: {}", e);
+            return Ok(());
+        }
 
-        // Update CURRENT to point to new manifest
-        Self::set_current_file(&self.db_path, new_manifest_number).c(d!())?;
+        // Publish CURRENT in two phases so a post-rename fsync failure cannot
+        // leave the live process appending to a different MANIFEST than CURRENT.
+        if let Err(e) = Self::write_current_file_tmp(&self.db_path, new_manifest_number).c(d!()) {
+            drop(new_writer);
+            let _ = fs::remove_file(&new_manifest_path);
+            tracing::warn!("MANIFEST compaction deferred writing CURRENT: {}", e);
+            return Ok(());
+        }
+        if let Err(e) = Self::rename_current_file(&self.db_path).c(d!()) {
+            drop(new_writer);
+            let _ = fs::remove_file(&new_manifest_path);
+            let _ = fs::remove_file(self.db_path.join("CURRENT.tmp"));
+            tracing::warn!("MANIFEST compaction deferred publishing CURRENT: {}", e);
+            return Ok(());
+        }
+
+        let old_manifest_number = self.manifest_number;
+        self.manifest_number = new_manifest_number;
+        *self.manifest_writer.lock() = Some(new_writer);
+        self.edits_since_snapshot = 0;
+
+        Self::fsync_directory(&self.db_path).c(d!())?;
 
         // Delete old manifest
         let old_manifest_path = self
             .db_path
-            .join(format!("MANIFEST-{:06}", self.manifest_number));
+            .join(format!("MANIFEST-{:06}", old_manifest_number));
         if let Err(e) = fs::remove_file(&old_manifest_path) {
             tracing::warn!(
                 "failed to remove old manifest {}: {}",
@@ -426,32 +462,34 @@ impl VersionSet {
             );
         }
 
-        self.manifest_number = new_manifest_number;
-        *self.manifest_writer.lock() = Some(new_writer);
-        self.edits_since_snapshot = 0;
-
         Ok(())
     }
 
     fn set_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {
+        Self::write_current_file_tmp(db_path, manifest_number).c(d!())?;
+        Self::rename_current_file(db_path).c(d!())?;
+        Self::fsync_directory(db_path).c(d!())?;
+        Ok(())
+    }
+
+    fn write_current_file_tmp(db_path: &Path, manifest_number: u64) -> Result<()> {
         let contents = format!("MANIFEST-{:06}\n", manifest_number);
         let tmp_path = db_path.join("CURRENT.tmp");
 
         // Write and fsync the temp file before rename to ensure durability
-        {
-            let file = fs::File::create(&tmp_path).c(d!())?;
-            let mut writer = BufWriter::new(file);
-            writer.write_all(contents.as_bytes()).c(d!())?;
-            writer.flush().c(d!())?;
-            writer.get_ref().sync_all().c(d!())?;
-        }
+        let file = fs::File::create(&tmp_path).c(d!())?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(contents.as_bytes()).c(d!())?;
+        writer.flush().c(d!())?;
+        writer.get_ref().sync_all().c(d!())?;
 
+        Ok(())
+    }
+
+    fn rename_current_file(db_path: &Path) -> Result<()> {
+        let tmp_path = db_path.join("CURRENT.tmp");
         // Atomic rename
         fs::rename(&tmp_path, db_path.join("CURRENT")).c(d!())?;
-
-        // Fsync the directory to persist the rename metadata
-        Self::fsync_directory(db_path).c(d!())?;
-
         Ok(())
     }
 
