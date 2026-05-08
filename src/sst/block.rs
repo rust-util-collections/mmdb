@@ -145,14 +145,10 @@ impl Block {
             let rp = self.restart_point(mid) as usize;
 
             match decode_entry_at(&self.data, rp, &[]) {
-                Some((key, _, _)) => {
-                    if compare(&key, target) == Ordering::Less {
-                        left = mid + 1;
-                    } else {
-                        right = mid;
-                    }
+                Some((key, _, _)) if compare(&key, target) == Ordering::Less => {
+                    left = mid + 1;
                 }
-                None => {
+                Some(_) | None => {
                     right = mid;
                 }
             }
@@ -204,14 +200,10 @@ impl Block {
             let rp = self.restart_point(mid) as usize;
 
             match decode_entry_at(&self.data, rp, &[]) {
-                Some((key, _, _)) => {
-                    if compare(&key, target) != Ordering::Greater {
-                        left = mid + 1;
-                    } else {
-                        right = mid;
-                    }
+                Some((key, _, _)) if compare(&key, target) != Ordering::Greater => {
+                    left = mid + 1;
                 }
-                None => {
+                Some(_) | None => {
                     right = mid;
                 }
             }

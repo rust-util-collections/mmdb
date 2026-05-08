@@ -214,7 +214,7 @@ impl FragmentedRangeTombstoneList {
             // Collect (seq, level) pairs from active tombstones, sorted by seq descending.
             let mut seq_levels: Vec<(SequenceNumber, usize)> =
                 active.iter().map(|&idx| (raw[idx].2, raw[idx].3)).collect();
-            seq_levels.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            seq_levels.sort_unstable_by_key(|sl| std::cmp::Reverse(sl.0));
             seq_levels.dedup_by_key(|sl| sl.0);
 
             fragments.push(TombstoneFragment {

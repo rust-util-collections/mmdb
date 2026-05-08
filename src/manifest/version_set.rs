@@ -186,7 +186,7 @@ impl VersionSet {
         }
 
         // Sort L0 by file number descending (newest first)
-        version.files[0].sort_by(|a, b| b.meta.number.cmp(&a.meta.number));
+        version.files[0].sort_by_key(|file| std::cmp::Reverse(file.meta.number));
         // Sort L1+ by smallest key
         for level in 1..num_levels {
             version.files[level]
