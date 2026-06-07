@@ -14,10 +14,11 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::sst::block_builder::BlockBuilder;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::*;
+use crate::sst::table_reader::MAX_DECOMPRESSED_BLOCK_SIZE;
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
 use ruc::*;
 
@@ -159,6 +160,21 @@ impl TableBuilder {
         }
         self.largest_key = Some(key.to_vec());
 
+        // A single entry (plus block framing) must fit within the reader's maximum
+        // decompressed block size; otherwise the SST written here would be rejected
+        // as unreadable on read-back, silently losing the data. Reject oversized
+        // entries up front. The margin covers the block's restart array and the
+        // per-entry varint headers.
+        const BLOCK_FRAMING_MARGIN: usize = 64;
+        let entry_size = key.len().saturating_add(value.len());
+        if entry_size > MAX_DECOMPRESSED_BLOCK_SIZE - BLOCK_FRAMING_MARGIN {
+            return Err(eg!(Error::InvalidArgument(format!(
+                "entry size {} exceeds maximum block size {}",
+                entry_size,
+                MAX_DECOMPRESSED_BLOCK_SIZE - BLOCK_FRAMING_MARGIN
+            ))));
+        }
+
         // Buffer range deletions into a separate block
         if self.options.internal_keys && key.len() >= 8 {
             let ikr = InternalKeyRef::new(key);
@@ -185,9 +201,12 @@ impl TableBuilder {
                 .insert(user_key_for_bloom[..self.options.prefix_len].to_vec());
         }
 
-        // Check if we need to flush the current data block
-        if self.data_block.estimated_size() >= self.options.block_size
-            && !self.data_block.is_empty()
+        // Flush the current data block if it is full, or if adding this entry would
+        // push the finished block past the reader's maximum decompressed block size.
+        let projected = self.data_block.estimated_size().saturating_add(entry_size);
+        if !self.data_block.is_empty()
+            && (self.data_block.estimated_size() >= self.options.block_size
+                || projected > MAX_DECOMPRESSED_BLOCK_SIZE - BLOCK_FRAMING_MARGIN)
         {
             self.flush_data_block().c(d!())?;
         }

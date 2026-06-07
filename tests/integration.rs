@@ -2113,3 +2113,78 @@ fn test_compact_range_then_iter() {
         assert_eq!(entry, expected.as_bytes());
     }
 }
+
+// ---- Regression tests for audit fixes ----
+
+#[test]
+fn test_empty_range_deletion_is_noop() {
+    // An empty range deletion [k, k) covers no keys; it must not delete k.
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    db.put(b"k", b"v").unwrap();
+    db.delete_range(b"k", b"k").unwrap();
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+
+    // An inverted range [z, a) also covers nothing.
+    db.put(b"m", b"v2").unwrap();
+    db.delete_range(b"z", b"a").unwrap();
+    assert_eq!(db.get(b"m").unwrap(), Some(b"v2".to_vec()));
+
+    // A proper non-empty range still deletes.
+    db.put(b"p", b"v3").unwrap();
+    db.delete_range(b"p", b"q").unwrap();
+    assert_eq!(db.get(b"p").unwrap(), None);
+}
+
+#[test]
+fn test_num_levels_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in [0usize, 1] {
+        let res = DB::open(
+            DbOptions {
+                create_if_missing: true,
+                num_levels: bad,
+                ..Default::default()
+            },
+            dir.path(),
+        );
+        assert!(res.is_err(), "num_levels={} should be rejected", bad);
+    }
+}
+
+#[test]
+fn test_bidi_lazy_no_reyield_after_forward_exhausted() {
+    // Regression: after forward iteration consumes every key, the first
+    // next_back() must not re-yield the last forward key.
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    db.put(b"a", b"1").unwrap();
+    db.put(b"b", b"2").unwrap();
+
+    let mut it = mmdb::BidiIterator::lazy(db.iter().unwrap());
+    assert_eq!(it.next().unwrap().0, b"a");
+    assert_eq!(it.next().unwrap().0, b"b");
+    assert!(it.next_back().is_none(), "must not re-yield a consumed key");
+}
+
+#[test]
+fn test_prefix_seek_for_prev_beyond_range() {
+    // Regression: seek_for_prev with a target beyond the prefix range must land
+    // on the last key within the prefix, not stop on a larger non-prefix key.
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    db.put(b"a1", b"x").unwrap();
+    db.put(b"a2", b"y").unwrap();
+    db.put(b"z1", b"z").unwrap();
+
+    let mut it = db
+        .iter_with_prefix(b"a", &mmdb::ReadOptions::default())
+        .unwrap();
+    it.seek_for_prev(b"zz");
+    assert!(
+        it.valid(),
+        "iterator should be positioned within the prefix"
+    );
+    assert_eq!(it.key(), Some(b"a2".as_ref()));
+}

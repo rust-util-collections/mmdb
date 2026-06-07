@@ -286,6 +286,17 @@ impl VersionSet {
             }
         }
 
+        // Before any MANIFEST record referencing the new SST files can become
+        // durable — either via a later `sync_manifest()`/`manifest_sync_handle`
+        // sync, or via the `maybe_compact_manifest()` snapshot below — fsync the
+        // DB directory so the new files' directory entries survive a crash.
+        // (The file *contents* are already fsynced by `TableBuilder::finish`.)
+        // Otherwise a crash could leave the MANIFEST referencing an SST whose
+        // directory entry was lost.
+        if !edit.new_files.is_empty() {
+            Self::fsync_directory(&self.db_path).c(d!())?;
+        }
+
         // Version built successfully — now persist to MANIFEST (write only, no sync).
         // Callers on hot paths should release the main lock and call
         // `sync_manifest()` separately to avoid stalling other operations.
@@ -321,6 +332,10 @@ impl VersionSet {
 
     /// Sync the MANIFEST writer. Only acquires the internal manifest lock,
     /// so callers can invoke this without holding the main DB mutex.
+    ///
+    /// Directory entries for any newly created SST files are made durable in
+    /// `log_and_apply` (before the referencing MANIFEST record), so this only
+    /// needs to fsync the MANIFEST writer itself.
     pub fn sync_manifest(&self) -> Result<()> {
         let mut w = self.manifest_writer.lock();
         if let Some(ref mut writer) = *w {

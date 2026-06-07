@@ -586,6 +586,23 @@ impl DBIterator {
         self.seek_to_first();
     }
 
+    /// The shortest key strictly greater than every key sharing this iterator's
+    /// prefix (the exclusive upper bound of the prefix range). Returns `None`
+    /// when no prefix is set, or the prefix is all `0xFF` (no finite successor).
+    fn prefix_successor(&self) -> Option<Vec<u8>> {
+        let mut succ = self.prefix.clone()?;
+        let mut i = succ.len();
+        while i > 0 {
+            i -= 1;
+            if succ[i] < 0xFF {
+                succ[i] += 1;
+                succ.truncate(i + 1);
+                return Some(succ);
+            }
+        }
+        None
+    }
+
     /// Seek to the last visible user key <= target.
     ///
     /// Uses a single backward seek + inline resolution. No redundant forward seek.
@@ -596,7 +613,7 @@ impl DBIterator {
             .iterate_upper_bound
             .as_deref()
             .is_some_and(|ub| ub <= target);
-        let (seek_key, bound) = if upper_clamps_target {
+        let (mut seek_key, mut bound) = if upper_clamps_target {
             let ub = self.iterate_upper_bound.as_deref().unwrap();
             (
                 InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::Value),
@@ -607,6 +624,17 @@ impl DBIterator {
             bound.push(0x00);
             (InternalKey::new(target, 0, ValueType::Deletion), bound)
         };
+
+        // Clamp the backward seek to the prefix range. Without this, a target
+        // beyond the prefix (e.g. prefix "a", target "zz") would seek onto a
+        // larger non-prefix key ("z1"), where the prefix guard stops the backward
+        // walk and misses valid prefix keys below it ("a1").
+        if let Some(succ) = self.prefix_successor()
+            && succ.as_slice() < bound.as_slice()
+        {
+            seek_key = InternalKey::new(&succ, MAX_SEQUENCE_NUMBER, ValueType::Value);
+            bound = succ;
+        }
 
         // Use merger backward seek to find the last internal key below the effective bound.
         self.merger.seek_for_prev(seek_key.as_bytes());
@@ -805,26 +833,13 @@ impl DBIterator {
 
         // Determine the effective upper bound for backward seek.
         let mut resolve_bound = self.iterate_upper_bound.clone();
-        if let Some(ref pfx) = self.prefix {
-            // Prefix-bounded: seek backward from prefix upper bound.
-            let mut upper = pfx.clone();
-            if {
-                let mut carry = true;
-                for byte in upper.iter_mut().rev() {
-                    if carry {
-                        if *byte == 0xFF {
-                            *byte = 0x00;
-                        } else {
-                            *byte += 1;
-                            carry = false;
-                        }
-                    }
-                }
-                !carry
-            } && resolve_bound.as_ref().is_none_or(|bound| upper < *bound)
-            {
-                resolve_bound = Some(upper);
-            }
+        if let Some(succ) = self.prefix_successor()
+            && resolve_bound.as_ref().is_none_or(|bound| succ < *bound)
+        {
+            // Prefix-bounded: seek backward from the prefix successor (the exclusive
+            // upper bound of the prefix range), correctly truncated so a key just
+            // past the prefix cannot shadow valid prefix keys.
+            resolve_bound = Some(succ);
         }
 
         if let Some(ref ub) = resolve_bound {

@@ -10,6 +10,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::cache::block_cache::BlockCache;
 use crate::error::{Error, Result};
+use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::sst::block::{Block, decode_entry_reuse};
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::{
@@ -71,7 +72,7 @@ pub struct TableReader {
     /// Cached range tombstones for this SST file as a pre-fragmented index.
     /// Populated once on first max_covering_tombstone_seq call, then reused.
     /// O(log T) binary search instead of O(T) linear scan.
-    range_tombstone_cache: OnceLock<Arc<crate::iterator::range_del::FragmentedRangeTombstoneList>>,
+    range_tombstone_cache: OnceLock<Arc<FragmentedRangeTombstoneList>>,
     /// Handle to the range-deletion block (if present in metaindex).
     range_del_handle: Option<BlockHandle>,
 }
@@ -327,9 +328,7 @@ impl TableReader {
 
     /// Get cached range tombstones as a pre-fragmented index (O(log T) lookup).
     /// Populated once on first access.
-    fn cached_range_tombstones(
-        &self,
-    ) -> Result<Arc<crate::iterator::range_del::FragmentedRangeTombstoneList>> {
+    fn cached_range_tombstones(&self) -> Result<Arc<FragmentedRangeTombstoneList>> {
         if let Some(cached) = self.range_tombstone_cache.get() {
             return Ok(cached.clone());
         }
@@ -369,8 +368,7 @@ impl TableReader {
             }
         }
 
-        let cached =
-            Arc::new(crate::iterator::range_del::FragmentedRangeTombstoneList::new(triples));
+        let cached = Arc::new(FragmentedRangeTombstoneList::new(triples));
         // Race is benign — worst case we build twice
         let _ = self.range_tombstone_cache.set(cached.clone());
         Ok(cached)

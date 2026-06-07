@@ -826,6 +826,8 @@ mod tests {
         // seek_lt(30) should return 20
         let ptr = sl.seek_lt_raw(&30);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, v) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 20);
         assert_eq!(*v, 200);
@@ -837,12 +839,16 @@ mod tests {
         // seek_lt(11) should return 10
         let ptr = sl.seek_lt_raw(&11);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, _) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 10);
 
         // seek_lt(51) should return 50
         let ptr = sl.seek_lt_raw(&51);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, _) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 50);
 
@@ -861,12 +867,16 @@ mod tests {
         // seek_le(30) should return 30 (exact match)
         let ptr = sl.seek_le_raw(&30);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, _) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 30);
 
         // seek_le(25) should return 20 (no exact, falls back to lt)
         let ptr = sl.seek_le_raw(&25);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, _) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 20);
 
@@ -888,6 +898,8 @@ mod tests {
 
         let ptr = sl.tail_ptr();
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, v) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 20);
         assert_eq!(*v, 200);
@@ -903,18 +915,24 @@ mod tests {
         // seek_lt(500) should return 498
         let ptr = sl.seek_lt_raw(&500);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, _) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 498);
 
         // seek_lt(1) should return 0
         let ptr = sl.seek_lt_raw(&1);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, _) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 0);
 
         // seek_lt(1999) should return 1998
         let ptr = sl.seek_lt_raw(&1999);
         assert!(!ptr.is_null());
+        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
+        // non-null above, so it points to a live node owned by this skiplist.
         let (k, _) = unsafe { sl.node_kv(ptr) };
         assert_eq!(*k, 1998);
     }

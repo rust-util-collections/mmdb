@@ -45,6 +45,13 @@ impl MemTable {
 
     /// Insert an entry. `key` is the user key; it will be encoded as an InternalKey.
     pub fn put(&self, key: &[u8], value: &[u8], sequence: SequenceNumber, value_type: ValueType) {
+        // An empty or inverted range deletion `[begin, end)` with `begin >= end`
+        // covers no keys. Storing it would leave a RangeDeletion entry keyed at
+        // `begin` that a point lookup misreads as a deletion of `begin`, so treat
+        // it as a no-op. (`value` holds the range's end key for RangeDeletion.)
+        if value_type == ValueType::RangeDeletion && key >= value {
+            return;
+        }
         let ikey = InternalKey::new(key, sequence, value_type);
         let val = match value_type {
             ValueType::Value => value.to_vec(),

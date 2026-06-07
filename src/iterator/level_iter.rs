@@ -274,9 +274,15 @@ impl super::merge::SeekableIterator for LevelIterator {
                 table_iter.set_bounds(None, Some(ub));
             }
             table_iter.seek_to_last();
-            self.file_index = idx;
-            self.current_iter = Some(table_iter);
-            return;
+            // The file passed the file-level filters, but block-property filters or
+            // the upper bound may leave the table iterator unpositioned. Only accept
+            // it if it actually yielded an entry; otherwise an earlier file holding
+            // matching keys would be skipped (mirrors seek_for_prev above).
+            if table_iter.current().is_some() {
+                self.file_index = idx;
+                self.current_iter = Some(table_iter);
+                return;
+            }
         }
     }
 

@@ -247,6 +247,15 @@ impl DB {
         let mut options = options;
         let path = path.as_ref().to_path_buf();
 
+        // A leveled LSM needs at least L0 plus one lower level; `num_levels < 2`
+        // would panic during L0 counting / L0→L1 compaction.
+        if options.num_levels < 2 {
+            return Err(eg!(Error::InvalidArgument(format!(
+                "num_levels must be >= 2, got {}",
+                options.num_levels
+            ))));
+        }
+
         if options.create_if_missing {
             fs::create_dir_all(&path).c(d!())?;
         } else if !path.exists() {
@@ -313,10 +322,19 @@ impl DB {
         // Recover from any WAL files not yet flushed
         let mut active_memtable = Arc::new(MemTable::new());
         let mut wal_numbers: Vec<u64> = Vec::new();
+        let mut max_disk_file_number = 0u64;
         for entry in fs::read_dir(&path).c(d!())? {
             let entry = entry.c(d!())?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
+            // Track the highest file number present on disk across WAL/SST files.
+            if let Some(num) = name
+                .strip_suffix(".wal")
+                .or_else(|| name.strip_suffix(".sst"))
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                max_disk_file_number = max_disk_file_number.max(num);
+            }
             if let Some(num_str) = name.strip_suffix(".wal")
                 && let Ok(num) = num_str.parse::<u64>()
             {
@@ -328,6 +346,13 @@ impl DB {
         }
         wal_numbers.sort();
 
+        // Never hand out a file number that already exists on disk. A crash
+        // during flush can create a WAL whose number was not yet persisted in
+        // the MANIFEST; if recovery reused that number for the fresh WAL and
+        // then deleted the old WALs, it would unlink the live active WAL and
+        // lose subsequently-acknowledged writes.
+        versions.ensure_file_number_at_least(max_disk_file_number + 1);
+
         for wal_num in &wal_numbers {
             let wal_path = path.join(format!("{:06}.wal", wal_num));
             let mut reader = WalReader::new(&wal_path).c(d!())?;
@@ -338,14 +363,27 @@ impl DB {
                             .c(d!())?;
                     }
                     Ok(None) => break,
-                    Err(e) if reader.is_at_file_end().unwrap_or(false) => {
-                        tracing::warn!("WAL {} has corrupt tail: {}", wal_num, e);
+                    // Records are appended sequentially, so crash-induced corruption is
+                    // always at the tail of validly-written data: no valid record can
+                    // follow a torn one. Treat any corruption as end-of-log, recover the
+                    // prefix, and continue with the next (higher-numbered) WAL. This is
+                    // the standard tolerant-tail recovery for write-ahead logs; failing
+                    // the whole open would discard committed data unnecessarily.
+                    Err(e) => {
+                        tracing::warn!("WAL {} has corrupt tail, stopping replay: {}", wal_num, e);
                         break;
                     }
-                    Err(e) => return Err(e),
                 }
             }
         }
+
+        // Create the fresh WAL up front so its number can be recorded in the
+        // SAME MANIFEST edit that installs the recovered SST. Otherwise a crash
+        // between installing the SST and advancing `log_number` would replay the
+        // same WALs again and create a duplicate L0 file with identical keys.
+        let wal_number = versions.new_file_number();
+        let wal_path = path.join(format!("{:06}.wal", wal_number));
+        let wal_writer = WalWriter::new(&wal_path).c(d!())?;
 
         // If we recovered data from WALs, flush it to SST before deleting
         // the old WALs. This ensures the data persists even if we crash again
@@ -373,6 +411,7 @@ impl DB {
             let build_result = builder.finish().c(d!())?;
 
             let mut edit = VersionEdit::new();
+            edit.set_log_number(wal_number);
             edit.set_last_sequence(max_sequence);
             edit.set_next_file_number(versions.next_file_number());
             edit.add_file(
@@ -390,29 +429,24 @@ impl DB {
 
             // Reset the memtable — data is now safely in SST
             active_memtable = Arc::new(MemTable::new());
-        }
-
-        // Create a fresh WAL
-        let wal_number = versions.new_file_number();
-        let wal_path = path.join(format!("{:06}.wal", wal_number));
-        let wal_writer = WalWriter::new(&wal_path).c(d!())?;
-
-        // Safe to clean up old WAL files now — data is in SST
-        for wal_num in &wal_numbers {
-            let old_wal = path.join(format!("{:06}.wal", wal_num));
-            if let Err(e) = fs::remove_file(&old_wal) {
-                tracing::warn!("failed to remove old WAL {}: {}", old_wal.display(), e);
-            }
-        }
-
-        // Record the new log number in MANIFEST
-        {
+        } else {
+            // No recovered data: still record the new log number so the old
+            // WALs are skipped on the next open.
             let mut edit = VersionEdit::new();
             edit.set_log_number(wal_number);
             edit.set_next_file_number(versions.next_file_number());
             edit.set_last_sequence(max_sequence);
             versions.log_and_apply(edit).c(d!())?;
             versions.sync_manifest().c(d!())?;
+        }
+
+        // Safe to clean up old WAL files now — the new log_number is durable,
+        // so they will not be replayed even if we crash here.
+        for wal_num in &wal_numbers {
+            let old_wal = path.join(format!("{:06}.wal", wal_num));
+            if let Err(e) = fs::remove_file(&old_wal) {
+                tracing::warn!("failed to remove old WAL {}: {}", old_wal.display(), e);
+            }
         }
 
         let next_sequence = max_sequence.checked_add(1).ok_or_else(|| {
@@ -516,7 +550,6 @@ impl DB {
                                     let hints: Vec<CompactionHint> =
                                         mem::take(&mut *bg_hints.lock());
                                     if !hints.is_empty() {
-                                        let active_snaps = bg_snapshot_list.as_sorted_vec();
                                         for hint in &hints {
                                             // Phase 1: pick + pre-allocate (short lock)
                                             let pick = {
@@ -549,12 +582,27 @@ impl DB {
                                                             bg_options.num_levels,
                                                             &all_inputs,
                                                         );
-                                                    (task, file_start, file_limit, is_bottom)
+                                                    // Capture the snapshot list under the
+                                                    // DB lock, consistent with the inputs.
+                                                    let active_snaps =
+                                                        bg_snapshot_list.as_sorted_vec();
+                                                    (
+                                                        task,
+                                                        file_start,
+                                                        file_limit,
+                                                        is_bottom,
+                                                        active_snaps,
+                                                    )
                                                 })
                                             }; // lock released
 
-                                            if let Some((task, file_start, file_limit, is_bottom)) =
-                                                pick
+                                            if let Some((
+                                                task,
+                                                file_start,
+                                                file_limit,
+                                                is_bottom,
+                                                active_snaps,
+                                            )) = pick
                                             {
                                                 // Phase 2: I/O (no lock)
                                                 let ctx = CompactionContext {
@@ -622,8 +670,6 @@ impl DB {
 
                                 // Run pending compactions (lock released during I/O)
                                 loop {
-                                    let active_snaps = bg_snapshot_list.as_sorted_vec();
-
                                     // Phase 1: pick + pre-allocate (short lock)
                                     let pick = {
                                         let mut inner = bg_inner.lock();
@@ -661,17 +707,30 @@ impl DB {
                                                         bg_options.num_levels,
                                                         &all_inputs,
                                                     );
+                                                // Capture the snapshot list under the DB
+                                                // lock, consistent with the picked inputs.
+                                                let active_snaps = bg_snapshot_list.as_sorted_vec();
                                                 Some((
-                                                    task, file_start, file_limit, l0_inputs,
+                                                    task,
+                                                    file_start,
+                                                    file_limit,
+                                                    l0_inputs,
                                                     is_bottom,
+                                                    active_snaps,
                                                 ))
                                             }
                                             None => None,
                                         }
                                     }; // lock released
 
-                                    let Some((task, file_start, file_limit, l0_inputs, is_bottom)) =
-                                        pick
+                                    let Some((
+                                        task,
+                                        file_start,
+                                        file_limit,
+                                        l0_inputs,
+                                        is_bottom,
+                                        active_snaps,
+                                    )) = pick
                                     else {
                                         break;
                                     };
@@ -1315,7 +1374,12 @@ impl DB {
             if tf.meta.has_range_deletions {
                 any_range_deletions = true;
             }
-            let iter = TableIterator::new(tf.reader.clone());
+            let iter = if options.block_property_filters.is_empty() {
+                TableIterator::new(tf.reader.clone())
+            } else {
+                TableIterator::new(tf.reader.clone())
+                    .with_block_filters(options.block_property_filters.clone())
+            };
             sources.push(IterSource::from_table_iter(iter));
         }
         // L1+: one LevelIterator per level with lazy file opening.
@@ -1332,9 +1396,12 @@ impl DB {
                     }
                 }
             }
-            let level_iter = LevelIterator::new(files.to_vec())
+            let mut level_iter = LevelIterator::new(files.to_vec())
                 .with_prefix(prefix_owned.to_vec())
                 .with_range_hints(Some(prefix_owned.to_vec()), prefix_upper.clone());
+            if !options.block_property_filters.is_empty() {
+                level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
+            }
             sources.push(IterSource::from_level_iter(level_iter));
         }
 
@@ -1526,6 +1593,13 @@ impl DB {
     }
 
     pub fn snapshot_seq(&self) -> SequenceNumber {
+        // Register the snapshot under the DB lock so that its sequence number and
+        // its registration are atomic with respect to compaction, which captures
+        // the snapshot list *after* picking its input files under the same lock.
+        // This guarantees a compaction either observes this snapshot, or picks
+        // inputs whose maximum sequence is <= this snapshot's sequence (so the
+        // snapshot can never need a version the compaction might garbage-collect).
+        let _inner = self.inner.lock();
         let seq = self.current_sequence();
         self.snapshot_list.acquire(seq)
     }
@@ -1649,12 +1723,8 @@ impl DB {
         }
         let frozen = self.freeze_memtable_sync(&mut inner).c(d!())?;
         drop(inner); // release lock during SST write
-        let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
-        let mut inner = self.inner.lock(); // reacquire
-        self.install_flush(&mut inner, &frozen, build_result)
-            .c(d!())?;
+        self.flush_and_install_frozen(&frozen).c(d!())?;
         let old_wal = frozen.old_wal_number;
-        drop(inner);
         self.post_flush_cleanup(old_wal).c(d!())?;
         if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger {
             self.do_compaction().c(d!())?;
@@ -1681,12 +1751,8 @@ impl DB {
             if !inner.active_memtable.is_empty() {
                 let frozen = self.freeze_memtable_sync(&mut inner).c(d!())?;
                 drop(inner);
-                let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
-                let mut inner = self.inner.lock();
-                self.install_flush(&mut inner, &frozen, build_result)
-                    .c(d!())?;
+                self.flush_and_install_frozen(&frozen).c(d!())?;
                 let old_wal = frozen.old_wal_number;
-                drop(inner);
                 self.post_flush_cleanup(old_wal).c(d!())?;
             }
         }
@@ -1700,14 +1766,6 @@ impl DB {
         }
 
         // Range-filtered compaction: compact files overlapping [begin, end)
-        let active_snaps = self.snapshot_list.as_sorted_vec();
-        let ctx = CompactionContext {
-            db_path: &self.path,
-            options: &self.options,
-            rate_limiter: Some(&self.rate_limiter),
-            stats: Some(&self.stats),
-            active_snapshots: &active_snaps,
-        };
         loop {
             let pick = {
                 let mut inner = self.inner.lock();
@@ -1737,16 +1795,35 @@ impl DB {
                             self.options.num_levels,
                             &all_inputs,
                         );
-                        Some((task, file_start, file_limit, l0_inputs, is_bottom))
+                        // Capture the snapshot list under the DB lock, consistent
+                        // with the inputs just picked, so no concurrently-acquired
+                        // snapshot can be missed.
+                        let active_snaps = self.snapshot_list.as_sorted_vec();
+                        Some((
+                            task,
+                            file_start,
+                            file_limit,
+                            l0_inputs,
+                            is_bottom,
+                            active_snaps,
+                        ))
                     }
                     None => None,
                 }
             };
 
-            let Some((task, file_start, file_limit, l0_inputs, is_bottom)) = pick else {
+            let Some((task, file_start, file_limit, l0_inputs, is_bottom, active_snaps)) = pick
+            else {
                 break;
             };
 
+            let ctx = CompactionContext {
+                db_path: &self.path,
+                options: &self.options,
+                rate_limiter: Some(&self.rate_limiter),
+                stats: Some(&self.stats),
+                active_snapshots: &active_snaps,
+            };
             let output = LeveledCompaction::execute_compaction_io(
                 &ctx, &task, file_start, file_limit, is_bottom,
             )
@@ -2212,17 +2289,26 @@ impl DB {
                             let mut inner = self.inner.lock(); // reacquire
                             match self.install_flush(&mut inner, &frozen, build_result) {
                                 Ok(()) => flush_wal = Some(old_wal),
-                                Err(e) => tracing::error!("flush install failed: {}", e),
+                                Err(e) => {
+                                    // The frozen memtable is still live in
+                                    // `immutable_memtables` and its WAL is intact, but a
+                                    // later successful flush would advance `log_number`
+                                    // past this WAL (stale reads + lost recovery). Fail-stop.
+                                    self.set_bg_error(format!("flush install failed: {}", e));
+                                }
                             }
                             drop(inner);
                         }
                         Err(e) => {
-                            tracing::error!("auto-flush SST write failed (data safe in WAL): {}", e)
+                            // Same hazard as an install failure: the unflushed memtable
+                            // must not be skipped by a later flush. Fail-stop so its WAL
+                            // stays recoverable and no stale state is published.
+                            self.set_bg_error(format!("auto-flush SST write failed: {}", e));
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!("auto-flush freeze failed: {}", e);
+                    self.set_bg_error(format!("auto-flush freeze failed: {}", e));
                     drop(inner);
                 }
             }
@@ -2243,13 +2329,51 @@ impl DB {
     /// and releasing it would complicate the caller.
     fn freeze_and_flush(&self, inner: &mut DBInner) -> Result<()> {
         let frozen = self.freeze_memtable_sync(inner).c(d!())?;
-        let build_result = self.flush_frozen_memtable(&frozen).c(d!())?;
-        self.install_flush(inner, &frozen, build_result).c(d!())?;
+        // After a successful freeze the immutable memtable + its WAL are live; any
+        // failure before the install + manifest sync complete must fail-stop, or a
+        // later flush could advance log_number past this WAL (stale reads + lost
+        // recovery on restart).
+        let build_result = match self.flush_frozen_memtable(&frozen) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_bg_error(format!("flush SST write failed: {}", e));
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.install_flush(inner, &frozen, build_result) {
+            self.set_bg_error(format!("flush install failed: {}", e));
+            return Err(e);
+        }
         // Sync inline (close path, not performance-critical)
-        inner.versions.sync_manifest().c(d!())?;
+        if let Err(e) = inner.versions.sync_manifest() {
+            self.set_bg_error(format!("flush manifest sync failed: {}", e));
+            return Err(e);
+        }
         let old_wal_path = self.path.join(format!("{:06}.wal", frozen.old_wal_number));
         if let Err(e) = fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
+        }
+        Ok(())
+    }
+
+    /// Flush a frozen memtable to SST and install it, fail-stopping on any failure.
+    /// Used by the explicit `flush()` / `compact_range()` paths, which release the
+    /// DB lock during the SST write. A failure after the freeze leaves the frozen
+    /// memtable live in `immutable_memtables`; without fail-stop a later successful
+    /// flush would advance `log_number` past this memtable's WAL.
+    fn flush_and_install_frozen(&self, frozen: &FrozenMemtable) -> Result<()> {
+        let build_result = match self.flush_frozen_memtable(frozen) {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_bg_error(format!("flush SST write failed: {}", e));
+                return Err(e);
+            }
+        };
+        let mut inner = self.inner.lock();
+        if let Err(e) = self.install_flush(&mut inner, frozen, build_result) {
+            drop(inner);
+            self.set_bg_error(format!("flush install failed: {}", e));
+            return Err(e);
         }
         Ok(())
     }
@@ -2353,6 +2477,12 @@ impl DB {
             l0_compaction_trigger: 1,
             ..self.options.clone()
         };
+
+        let mut inner = self.inner.lock();
+        // Capture the snapshot list under the DB lock (consistent with the inputs
+        // picked below, which all have sequence <= the current sequence). Any
+        // snapshot registered after this point also registers under the DB lock,
+        // so its sequence is >= the inputs' max sequence and needs no GC'd version.
         let active_snaps = self.snapshot_list.as_sorted_vec();
         let ctx = CompactionContext {
             db_path: &self.path,
@@ -2361,8 +2491,6 @@ impl DB {
             stats: Some(&self.stats),
             active_snapshots: &active_snaps,
         };
-
-        let mut inner = self.inner.lock();
         loop {
             let version = inner.versions.current();
             match LeveledCompaction::pick_compaction(&version, &force_opts) {

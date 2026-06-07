@@ -33,6 +33,11 @@ pub fn decode_varint(data: &[u8]) -> Result<(u32, usize)> {
         if i >= 5 {
             return Err(eg!(Error::Corruption("varint too long".to_string())));
         }
+        // The 5th byte of a u32 varint may only carry the top 4 bits; any
+        // higher bits set means the value overflows u32 (corrupt length field).
+        if i == 4 && byte & 0xF0 != 0 {
+            return Err(eg!(Error::Corruption("varint overflows u32".to_string())));
+        }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
             return Ok((result, i + 1));

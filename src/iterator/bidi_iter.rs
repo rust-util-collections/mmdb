@@ -220,6 +220,20 @@ impl DoubleEndedIterator for BidiIterator {
                     return None;
                 }
                 let k = db_iter.key()?.to_vec();
+                // If forward iteration already consumed this key (or past it),
+                // there is nothing left to yield from the back; otherwise we would
+                // re-yield a key already returned by next(). Mirrors the frontier
+                // check in the LazyBackStarted branch.
+                if let Some(fk) = last_fwd_key.as_deref()
+                    && k.as_slice() <= fk
+                {
+                    self.inner = BidiInner::LazyBackStarted {
+                        db_iter,
+                        last_fwd_key,
+                        last_back_key: Some(k),
+                    };
+                    return None;
+                }
                 let v = db_iter.value()?.to_vec();
                 self.inner = BidiInner::LazyBackStarted {
                     db_iter,

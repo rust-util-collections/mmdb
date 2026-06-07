@@ -18,13 +18,9 @@ pub mod rate_limiter;
 pub mod stats;
 
 // Re-export primary API types
-pub use db::DB;
-pub use db::Snapshot;
-pub use db::pool_return;
+pub use db::{DB, Snapshot, pool_return};
 pub use error::{Error, Result};
-pub use iterator::BidiIterator;
-pub use iterator::DBIterator;
-pub use iterator::PooledIterator;
+pub use iterator::{BidiIterator, DBIterator, PooledIterator};
 pub use options::{
     CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
 };

@@ -23,11 +23,16 @@ impl BloomFilter {
     /// Build a filter for the given set of keys.
     /// Returns the filter data.
     pub fn create_filter(&self, keys: &[&[u8]]) -> Vec<u8> {
-        let bits = (keys.len() as u32)
-            .saturating_mul(self.bits_per_key)
-            .max(64); // minimum 64 bits
-        let bytes = bits.div_ceil(8) as usize;
-        let bits = (bytes * 8) as u32;
+        // Compute the bit count in u64 to avoid overflow, then cap the byte
+        // count so that `bytes * 8` always fits in a u32 (the modulus type used
+        // during probing). Without the cap, a pathological bits_per_key/key
+        // count could wrap the bit count to 0 and panic on `h % bits`.
+        const MAX_FILTER_BYTES: u64 = (u32::MAX / 8) as u64;
+        let bits = (keys.len() as u64)
+            .saturating_mul(self.bits_per_key as u64)
+            .max(64);
+        let bytes = bits.div_ceil(8).min(MAX_FILTER_BYTES) as usize;
+        let bits = (bytes as u32) * 8;
 
         let mut filter = vec![0u8; bytes + 1]; // +1 for k at the end
         *filter.last_mut().unwrap() = self.k as u8;

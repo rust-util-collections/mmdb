@@ -553,6 +553,8 @@ fn execute_sub_compaction_io(
     let mut current_file_number = 0u64;
     let mut next_file_idx = 0u64;
     let mut current_size = 0usize;
+    let mut current_file_user_key: Vec<u8> = Vec::new();
+    let mut pending_cut = false;
     let mut last_point_key: Option<Vec<u8>> = None;
     let mut last_range_del_key: Option<Vec<u8>> = None;
     let mut last_written_seq: SequenceNumber = 0;
@@ -579,6 +581,36 @@ fn execute_sub_compaction_io(
             break;
         }
 
+        // Only cut output files at a user-key boundary: all versions of one user
+        // key must stay in the same file, otherwise L1+ files would have
+        // overlapping key ranges and a point read could pick the wrong file and
+        // miss a visible version. A size-triggered cut is deferred until the user
+        // key changes here.
+        if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
+            let result = match builder.take().unwrap().finish().c(d!()) {
+                Ok(result) => result,
+                Err(e) => {
+                    cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
+                    return Err(e);
+                }
+            };
+            if let Some(s) = ctx.stats {
+                s.record_compaction_bytes(result.file_size);
+            }
+            new_files.push((
+                params.target_level as u32,
+                FileMetaData {
+                    number: current_file_number,
+                    file_size: result.file_size,
+                    smallest_key: result.smallest_key.unwrap_or_default(),
+                    largest_key: result.largest_key.unwrap_or_default(),
+                    has_range_deletions: result.has_range_deletions,
+                },
+            ));
+            current_size = 0;
+            pending_cut = false;
+        }
+
         if ikr.value_type() == ValueType::RangeDeletion {
             range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
             range_tombstones.reset();
@@ -599,6 +631,22 @@ fn execute_sub_compaction_io(
             }
             if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
                 last_written_seq = ikr.sequence();
+                // A retained older version that is shadowed by a range tombstone
+                // below the oldest snapshot must still be dropped. Otherwise, if
+                // that tombstone is itself dropped at the bottommost level, the
+                // value would resurrect for the snapshot that retained it. (The
+                // newest-version branch below already applies this check; retained
+                // versions need it too.)
+                if ikr.value_type() == ValueType::Value
+                    && !range_tombstones.is_empty()
+                    && range_tombstones.is_deleted(
+                        user_key,
+                        ikr.sequence(),
+                        params.oldest_snapshot_seq,
+                    )
+                {
+                    continue;
+                }
             } else {
                 continue;
             }
@@ -691,32 +739,19 @@ fn execute_sub_compaction_io(
             return Err(e);
         }
         current_size += entry_bytes;
+        if current_file_user_key != user_key {
+            current_file_user_key.clear();
+            current_file_user_key.extend_from_slice(user_key);
+        }
 
         if let Some(rl) = ctx.rate_limiter {
             rl.request(entry_bytes);
         }
 
         if current_size >= ctx.options.target_file_size_base as usize {
-            let result = match builder.take().unwrap().finish().c(d!()) {
-                Ok(result) => result,
-                Err(e) => {
-                    cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
-                    return Err(e);
-                }
-            };
-            if let Some(s) = ctx.stats {
-                s.record_compaction_bytes(result.file_size);
-            }
-            new_files.push((
-                params.target_level as u32,
-                FileMetaData {
-                    number: current_file_number,
-                    file_size: result.file_size,
-                    smallest_key: result.smallest_key.unwrap_or_default(),
-                    largest_key: result.largest_key.unwrap_or_default(),
-                    has_range_deletions: result.has_range_deletions,
-                },
-            ));
+            // Defer the actual file cut to the next user-key boundary (handled at
+            // the top of the loop) so a key's versions are never split across files.
+            pending_cut = true;
         }
     }
 
@@ -1219,7 +1254,18 @@ impl LeveledCompaction {
         output
             .edit
             .set_next_file_number(versions.next_file_number());
-        versions.log_and_apply(output.edit).c(d!())?;
+        // Capture the output file list so we can delete the freshly-written SSTs
+        // if installing the edit fails (otherwise they would be orphaned on disk).
+        let output_files = output.edit.new_files.clone();
+        if let Err(e) = versions.log_and_apply(output.edit) {
+            cleanup_output_files(db_path, &output_files, None);
+            if let Some(cache) = table_cache {
+                for (_, meta) in &output_files {
+                    cache.evict(meta.number);
+                }
+            }
+            return Err(e).c(d!());
+        }
 
         // Evict from caches (fast, safe before sync)
         for num in &output.input_file_numbers {
@@ -1311,6 +1357,8 @@ impl LeveledCompaction {
         let mut builder: Option<TableBuilder> = None;
         let mut current_file_number = 0u64;
         let mut current_size = 0usize;
+        let mut current_file_user_key: Vec<u8> = Vec::new();
+        let mut pending_cut = false;
         let mut last_point_key: Option<Vec<u8>> = None;
         let mut last_range_del_key: Option<Vec<u8>> = None;
         let mut last_written_seq: SequenceNumber = 0;
@@ -1323,6 +1371,38 @@ impl LeveledCompaction {
             }
             let ikr = InternalKeyRef::new(&ikey);
             let user_key = ikr.user_key();
+
+            // Defer size-triggered file cuts to user-key boundaries so a key's
+            // versions are never split across files (which would create overlapping
+            // same-level key ranges and possibly miss visible versions on reads).
+            if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
+                let result = match builder.take().unwrap().finish().c(d!()) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        cleanup_output_files(
+                            ctx.db_path,
+                            &edit.new_files,
+                            Some(current_file_number),
+                        );
+                        return Err(e);
+                    }
+                };
+                if let Some(s) = ctx.stats {
+                    s.record_compaction_bytes(result.file_size);
+                }
+                edit.add_file(
+                    level as u32,
+                    FileMetaData {
+                        number: current_file_number,
+                        file_size: result.file_size,
+                        smallest_key: result.smallest_key.unwrap_or_default(),
+                        largest_key: result.largest_key.unwrap_or_default(),
+                        has_range_deletions: result.has_range_deletions,
+                    },
+                );
+                current_size = 0;
+                pending_cut = false;
+            }
 
             if ikr.value_type() == ValueType::RangeDeletion {
                 range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
@@ -1346,6 +1426,19 @@ impl LeveledCompaction {
                 }
                 if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
                     last_written_seq = ikr.sequence();
+                    // A retained older version shadowed by a range tombstone below
+                    // the oldest snapshot must still be dropped, or it would
+                    // resurrect if that tombstone is dropped at the bottommost level.
+                    if ikr.value_type() == ValueType::Value
+                        && !range_tombstones.is_empty()
+                        && range_tombstones.is_deleted(
+                            user_key,
+                            ikr.sequence(),
+                            oldest_snapshot_seq,
+                        )
+                    {
+                        continue;
+                    }
                 } else {
                     continue;
                 }
@@ -1436,6 +1529,10 @@ impl LeveledCompaction {
             }
             let entry_bytes = ikey_ref.len() + final_value.len();
             current_size += entry_bytes;
+            if current_file_user_key != user_key {
+                current_file_user_key.clear();
+                current_file_user_key.extend_from_slice(user_key);
+            }
 
             // Rate-limit compaction writes
             if let Some(rl) = ctx.rate_limiter {
@@ -1443,30 +1540,8 @@ impl LeveledCompaction {
             }
 
             if current_size >= ctx.options.target_file_size_base as usize {
-                let result = match builder.take().unwrap().finish().c(d!()) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        cleanup_output_files(
-                            ctx.db_path,
-                            &edit.new_files,
-                            Some(current_file_number),
-                        );
-                        return Err(e);
-                    }
-                };
-                if let Some(s) = ctx.stats {
-                    s.record_compaction_bytes(result.file_size);
-                }
-                edit.add_file(
-                    level as u32,
-                    FileMetaData {
-                        number: current_file_number,
-                        file_size: result.file_size,
-                        smallest_key: result.smallest_key.unwrap_or_default(),
-                        largest_key: result.largest_key.unwrap_or_default(),
-                        has_range_deletions: result.has_range_deletions,
-                    },
-                );
+                // Defer the actual cut to the next user-key boundary.
+                pending_cut = true;
             }
         }
 
@@ -1509,7 +1584,13 @@ impl LeveledCompaction {
         }
 
         edit.set_next_file_number(versions.next_file_number());
-        versions.log_and_apply(edit).c(d!())?;
+        // Capture output files so they can be deleted if the install fails,
+        // otherwise the freshly-written SSTs would be orphaned on disk.
+        let output_files = edit.new_files.clone();
+        if let Err(e) = versions.log_and_apply(edit) {
+            cleanup_output_files(ctx.db_path, &output_files, None);
+            return Err(e).c(d!());
+        }
         // force_merge_level holds &mut VersionSet for the duration, sync here.
         versions.sync_manifest().c(d!())?;
 
