@@ -1,11 +1,13 @@
 # Unsafe Code Audit Patterns
 
 ## Overview
-MMDB contains ~76 unsafe blocks, concentrated in:
-- `src/memtable/skiplist_impl.rs` — lock-free skiplist nodes with raw pointers
-- `src/sst/block.rs` — block data parsing from raw bytes
-- `src/types.rs` — internal key encoding/decoding
-- `src/sst/format.rs` — footer/handle parsing
+MMDB contains 67 unsafe blocks/functions across 4 production files:
+- `src/memtable/skiplist_impl.rs` (43) — lock-free skiplist nodes with raw pointers; defines `pub unsafe fn node_kv`/`node_next0` (crate-internal: `mod memtable` is private in lib.rs)
+- `src/memtable/skiplist.rs` (12) — `unsafe impl Send for MemTableCursorIter` plus 11 blocks dereferencing the skiplist raw pointer and calling `node_kv`/`node_next0`
+- `src/db.rs` (11) — `unsafe impl Send/Sync for DB`, one `libc::flock` call, and 8 raw `WriteRequest` pointer derefs in the group-commit path
+- `src/sst/table_reader.rs` (1) — a single `libc::posix_fadvise` call (advisory readahead hint)
+
+> **Note**: `src/sst/block.rs`, `src/types.rs`, and `src/sst/format.rs` contain **zero** unsafe blocks (all parsing uses safe `from_le_bytes()`). The "block parsing" category previously associated with these files is safe code — no unsafe audit is needed there.
 
 ## Audit Protocol
 
@@ -31,7 +33,7 @@ Check for ALL categories of undefined behavior in Rust:
 | **Uninitialized memory** | Is the memory read without being initialized first? |
 
 ### Step 3: Skiplist-Specific Checks
-For changes in `skiplist_impl.rs`:
+For changes in `skiplist_impl.rs` or `skiplist.rs`:
 
 - **Node allocation**: Verify allocated memory is properly sized for the node + key + value
 - **Pointer stores**: Verify `Release` ordering on pointer stores to node links
@@ -40,17 +42,26 @@ For changes in `skiplist_impl.rs`:
 - **Deallocation**: Verify nodes are not freed while any reader may hold a pointer
   - Current pattern: nodes live as long as the skiplist (arena-based, no individual deallocation)
   - If individual deallocation is added: MUST use epoch-based reclamation or hazard pointers
+- **Public API**: `pub unsafe fn node_kv` and `pub unsafe fn node_next0` (defined in `skiplist_impl.rs`) are callable from anywhere in the crate (`mod memtable` is private, so external crates cannot reach them). Any change to their signatures or preconditions must update all call sites in `skiplist.rs` and `skiplist_impl.rs`.
+- **Cursor Send safety**: `unsafe impl Send for MemTableCursorIter` (skiplist.rs) relies on arena-backed nodes never being individually freed and the iterator holding an `Arc<MemTable>` that keeps the arena alive.
 
-### Step 4: Block Parsing Checks
-For changes in `block.rs`, `format.rs`:
+### Step 4: SST-Level Checks
+For changes in `table_reader.rs` (the only SST file with unsafe code):
 
-- **Slice bounds**: Verify all `slice::from_raw_parts` calls have correct length
-- **Alignment**: Use `read_unaligned` for integers parsed from byte slices
-- **Lifetime**: The resulting `&[u8]` must not outlive the source buffer
-- **Bounds**: Validate offset + size <= buffer.len() BEFORE creating the slice
+- The single unsafe block is a `libc::posix_fadvise` call — an advisory syscall with no memory-safety obligations beyond a valid fd. Verify the `File` is alive (owns the fd) for the duration of the call and that offset/len are derived from validated block handles.
+- Block data access in the SST layer is entirely safe code (`Arc<Vec<u8>>`-backed, bounds-checked) — do not assume cache-backed pointer casts exist.
 
-### Step 5: Transmute/Cast Checks
-For any `transmute`, `as *const`, or `as *mut`:
+> **Note**: `block.rs`, `format.rs`, and `types.rs` contain **zero** unsafe blocks. All integer parsing in these files uses safe `from_le_bytes()` / `from_be_bytes()`. Block iteration is safe code — no unsafe audit is required.
+
+### Step 5: DB-Level Unsafe Checks
+For changes in `db.rs`:
+
+- **Group-commit raw pointers**: `WriteRequest` pointers (`*mut WriteRequest`) are stack addresses of blocked writer threads, pushed into the queue under the `write_queue` lock. Verify every deref happens while the owning writer is still blocked (it must not return until the leader sets `done` under the same lock), and that no pointer is retained after `done` is signaled.
+- **`unsafe impl Send/Sync for DB`**: Verify the SAFETY comments' claims still hold — all shared mutable state behind locks/atomics, raw request pointers never stored in `DB` itself.
+- **`libc::flock`**: Advisory file lock on a held `File`; verify the fd is valid and the lock file outlives the DB handle.
+
+### Step 6: Transmute/Cast Checks
+For any `transmute`, `as *const`, or `as *mut` (note: the codebase currently contains **zero** `transmute` calls — any new one deserves extra scrutiny):
 
 - **Size**: Source and target types must have the same size
 - **Validity**: Every bit pattern of the source must be valid for the target type
@@ -61,10 +72,10 @@ For any `transmute`, `as *const`, or `as *mut`:
 
 | Location | Risk | Reason |
 |----------|------|--------|
-| skiplist_impl.rs | CRITICAL | Raw pointers, concurrent access, manual memory layout |
-| block.rs | HIGH | Raw byte parsing, slice construction from offsets |
-| types.rs | MEDIUM | Integer encode/decode, but bounded by key format |
-| format.rs | MEDIUM | Footer parsing, bounded by fixed-size format |
+| skiplist_impl.rs | CRITICAL | Raw pointers, concurrent access, manual memory layout (43 unsafe blocks) |
+| skiplist.rs | HIGH | Raw skiplist pointer derefs + `unsafe impl Send` for cursor iterator (12 unsafe) |
+| db.rs | HIGH | Group-commit `WriteRequest` raw pointer protocol, `unsafe impl Send/Sync for DB`, `libc::flock` (11 unsafe) |
+| table_reader.rs | LOW | Single advisory `posix_fadvise` syscall (1 unsafe) |
 
 ## Red Flags
 Report immediately if you see:

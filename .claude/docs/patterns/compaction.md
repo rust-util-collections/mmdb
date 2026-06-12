@@ -20,6 +20,11 @@ L1+ output files must have non-overlapping key ranges. If two output files overl
 Tombstones at non-bottommost levels MUST be written to output. At bottommost level, tombstones are dropped only if no live snapshot covers them.
 **Check**: Verify `is_bottommost_level` accounts for ALL levels below, not just `level + 1`.
 
+### INV-C2a: Range Tombstone Sub-Compaction Propagation
+When a range tombstone spans sub-compaction boundaries, it must be propagated to all sub-compactions whose key ranges intersect it. The `RangeTombstoneTracker` (pre-populated with all input range deletions) is shared across sub-compactions so that each sub-compaction's `CompactionIter` sees the complete set of covering tombstones.
+
+**Check**: Verify the `RangeTombstoneTracker` is fully constructed from all input files BEFORE sub-compactions are spawned. Sub-compaction boundaries must not truncate range tombstone coverage.
+
 ### INV-C3: Sequence Number Zeroing
 Sequence numbers may only be zeroed at the bottommost level, and only for keys with no live snapshot dependency.
 **Check**: Verify sequence zeroing logic checks both bottommost AND snapshot list.
@@ -31,6 +36,11 @@ When splitting work across threads, the boundary key must be assigned to exactly
 ### INV-C5: Input File Deletion Safety
 Compaction input files may only be deleted after the output files are fully written AND the MANIFEST records the new version.
 **Check**: Verify file deletion happens AFTER `VersionSet::log_and_apply()` succeeds.
+
+### INV-C5a: Stale-Output Detection in `install_compaction`
+After compaction I/O completes and the lock is re-acquired to install results, verify that the SuperVersion used to pick inputs has not been superseded by a concurrent flush or another compaction. If a newer version exists, the output files from this compaction may reference stale inputs and MUST be discarded rather than installed.
+
+**Check**: Verify `install_compaction()` checks that its input files are still present in the current Version before applying the VersionEdit. Output files built from stale inputs must be deleted without being added to the MANIFEST.
 
 ### INV-C6: Compaction Filter Contract
 User-provided `CompactionFilter` receives every key-value pair exactly once. Filter decisions (Keep/Remove/ChangeValue) must be applied atomically per entry.
@@ -51,9 +61,14 @@ Background compaction thread deadlocks, causing write stall (L0 file count grows
 Token bucket rate limiter starves compaction during heavy writes, causing L0 buildup.
 **Check**: Verify rate limiter allows burst capacity and doesn't block indefinitely.
 
+### Aggregate Key Range Overlap
+When computing whether a file overlaps with deeper levels (for `is_bottommost_level` and tombstone decisions), the overlap check must consider the aggregate key ranges of all input files, not individual file ranges. A single input file may have a narrow key range, but the compaction as a whole spans a wider range that overlaps files in deeper levels.
+
+**Check**: Verify `add_file_extents()` collects the union of all input file user-key extents before checking for overlaps in deeper levels. Individual-file checks will miss overlaps covered by other files in the same compaction.
+
 ## Review Checklist
 - [ ] Output files have monotonically increasing, non-overlapping key ranges
-- [ ] Tombstones retained at non-bottommost levels
+- [ ] Tombstones retained at non-bottommost levels; range tombstones propagated to all sub-compactions
 - [ ] Sequence zeroing only at bottommost with no snapshot dependency
 - [ ] Sub-compaction boundaries don't duplicate or skip keys
 - [ ] MANIFEST updated before input file deletion
@@ -61,3 +76,5 @@ Token bucket rate limiter starves compaction during heavy writes, causing L0 bui
 - [ ] Trivial move conditions are sufficient (1 input file, no overlap, no compaction filter)
 - [ ] Error handling: partial compaction failure leaves DB in consistent state
 - [ ] Rate limiter doesn't cause unbounded stalls
+- [ ] `install_compaction` checks for stale inputs before applying VersionEdit
+- [ ] `is_bottommost_level` uses aggregate key range extents from all input files, not per-file ranges

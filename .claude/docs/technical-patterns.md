@@ -43,7 +43,7 @@ Load this document FIRST before performing any review or debug analysis.
 
 ### 2.2 InternalKey Encoding/Decoding Mismatch
 **Pattern**: Encoding user_key as `[user_key][!pack(seq, type)]` but decoding with wrong byte order or wrong bit inversion.
-**Where**: `types.rs` — `InternalKey::encode()` / `InternalKey::decode()`.
+**Where**: `types.rs` — `InternalKey::new()` (encoding from components) / `InternalKey::from_encoded()` (wrapping, from bytes).
 **Impact**: Incorrect key ordering — breaks binary search, iterator merge, compaction.
 **Check**: Verify pack/unpack round-trips. Verify bit inversion (`!`) is applied symmetrically.
 
@@ -88,10 +88,13 @@ Load this document FIRST before performing any review or debug analysis.
 **Check**: Verify compaction completion triggers `unpin()` for all blocks of deleted L0 files.
 
 ### 3.4 MemTable Size Tracking Drift
-**Pattern**: `approximate_memory_usage()` drifts from actual allocation due to missed accounting of range tombstone entries or skiplist node overhead.
+**Pattern**: `approximate_size()` drifts from actual allocation due to missed accounting of range tombstone entries or skiplist node overhead.
+
+> **Status**: Resolved in current code. `MemTable::approximate_size()` (mod.rs:72-76) accounts for range tombstone entry overhead (`key.len() + value.len() + size_of::<MemRangeTombstone>()`) and skiplist Node overhead (~160 bytes per entry). The "Watch for" guidance below targets future changes that might add new entry types.
+
 **Where**: `memtable/mod.rs`, `memtable/skiplist.rs`.
 **Impact**: MemTable grows larger than `write_buffer_size` before triggering flush.
-**Check**: Verify all insert paths (put, delete, delete_range) update the size tracker.
+**Check**: Verify all insert paths (put, delete, delete_range) update the size tracker. New entry types must add their overhead to the atomic size counter.
 
 ---
 
@@ -146,6 +149,8 @@ Load this document FIRST before performing any review or debug analysis.
 ---
 
 ## Category 6: Unsafe Code Bugs
+
+> **Note**: The codebase has 67 unsafe blocks/functions across 4 files: `skiplist_impl.rs` (43), `skiplist.rs` (12), `db.rs` (11), `table_reader.rs` (1). All have `// SAFETY:` comments. Block parsing (`block.rs`), key encoding (`types.rs`), and format parsing (`format.rs`) contain zero unsafe blocks.
 
 ### 6.1 Skiplist Node Lifetime
 **Pattern**: Skiplist node contains raw pointers to other nodes. If a node is deallocated while another thread holds a pointer, it's use-after-free.

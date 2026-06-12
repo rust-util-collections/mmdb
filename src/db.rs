@@ -487,8 +487,6 @@ impl DB {
             options.compaction_filter = Some(Arc::new(lazy_filter));
         }
 
-        let l0_cv = Arc::new(Condvar::new());
-
         let (l0_file_count, super_version) = {
             let g = inner.lock();
             let l0 = Arc::new(AtomicUsize::new(g.versions.current().l0_file_count()));
@@ -520,8 +518,6 @@ impl DB {
             let bg_snapshot_list = snapshot_list.clone();
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
-
-            let bg_l0_cv = l0_cv.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -649,7 +645,6 @@ impl DB {
                                                         inner.versions.current().l0_file_count(),
                                                         Ordering::Relaxed,
                                                     );
-                                                    bg_l0_cv.notify_all();
                                                     refresh_super_version(&bg_sv, &inner);
                                                     cleanup
                                                 };
@@ -773,7 +768,6 @@ impl DB {
                                             inner.versions.current().l0_file_count(),
                                             Ordering::Relaxed,
                                         );
-                                        bg_l0_cv.notify_all();
                                         refresh_super_version(&bg_sv, &inner);
                                         cleanup
                                     };
@@ -2390,7 +2384,7 @@ impl DB {
     }
 
     /// Freeze+flush in one call (holds lock throughout).
-    /// Used by `close()` and `do_compaction` where lock is already held
+    /// Used by `close()` where the lock is already held
     /// and releasing it would complicate the caller.
     fn freeze_and_flush(&self, inner: &mut DBInner) -> Result<()> {
         let frozen = self.freeze_memtable_sync(inner).c(d!())?;

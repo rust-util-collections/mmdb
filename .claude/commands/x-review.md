@@ -78,7 +78,7 @@ Check every change for:
 Check changed files against project style rules:
 
 1. **No lint suppression** — `#[allow(clippy::...)]`, `#[allow(unused_...)]`, `#[allow(dead_code)]` etc. are forbidden. All warnings must be fixed at the source, not silenced. Report every `allow(...)` attribute in changed code as a finding.
-2. **No inline paths** — Types must be imported via `use` at the top of the file, not referenced inline as `std::collections::HashMap::new()`. The only exception is disambiguation in a single call site where two types share a name.
+2. **Prefer imports over inline paths** — Avoid `std::foo::Bar::new()` inline in function bodies when the same path appears 3+ times in a file; add `use std::foo;` at file top (or `use std::foo::Bar;`) instead. Function-body `use` statements (scoped imports) are fine and don't count as inline paths. 1-2 inline uses of common `std::` items are acceptable. Report only when the same full-qualified path appears 3+ times inline across a file.
 3. **Import grouping** — Imports with a common prefix must be merged using nested braces: `use std::sync::{Arc, Mutex};` not separate `use std::sync::Arc; use std::sync::Mutex;`.
 4. **Doc-code alignment** — If the change modifies a public function signature, struct field, module structure, or adds/removes/renames a public type or module, verify docs still match. Specifically check:
    - `CLAUDE.md` architecture table (subsystem paths, type names, dependency info)
@@ -214,7 +214,7 @@ After all agents complete:
 ```
 ## Full Audit Report
 
-**Scope**: All src/ files (~17K LOC)
+**Scope**: All src/ files (~19K LOC)
 **Subsystems Audited**: <list>
 **Total Findings**: N (X critical, Y high, Z medium, W low)
 

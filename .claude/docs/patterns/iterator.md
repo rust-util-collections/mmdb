@@ -12,7 +12,7 @@
 - MergingIterator: min-heap merge of K sources with single-source fast path
 - LevelIterator: deferred block reads, binary search on level
 - BidiIterator: direction switch with heap rebuild
-- RangeTombstoneTracker: fragmented tombstone list, sweep-line O(1) amortized
+- FragmentedRangeTombstoneList: tombstones pre-collected at iterator creation, fragmented into non-overlapping intervals; immutable, O(log T) binary search per key (range_del.rs also keeps the sweep-line `RangeTombstoneTracker` used by compaction)
 
 ## Critical Invariants
 
@@ -26,7 +26,7 @@ Every key in the valid range that is visible at the snapshot's sequence number m
 
 ### INV-I3: Range Tombstone Coverage
 If a range tombstone `[start, end)` with seq S covers a key K with seq S' < S, the key must be filtered out.
-**Check**: Verify RangeTombstoneTracker is consulted for every key yielded by MergingIterator, and the check uses the correct sequence comparison.
+**Check**: Verify `FragmentedRangeTombstoneList` is consulted for every key yielded by MergingIterator, and the check uses the correct sequence comparison. For the DBIterator path, every yielded key is checked against the pre-fragmented tombstone list via O(log T) binary search.
 
 ### INV-I4: Direction Switch Correctness
 Switching from forward to backward (or vice versa) must not skip or duplicate any keys.
@@ -51,20 +51,39 @@ Switching from `next()` to `prev()` yields the current key twice.
 **Check**: Verify the direction switch logic accounts for whether the current key has been consumed.
 
 ### Range Tombstone Not Checked on Seek
-`seek(target)` lands on a key covered by a range tombstone, but the tombstone tracker isn't updated for the new position.
-**Check**: Verify seek() resets/repositions the RangeTombstoneTracker.
+`seek(target)` lands on a key covered by a range tombstone, but the covering-tombstone check is skipped for the new position.
+**Check**: Verify every key yielded after seek() is still checked against the FragmentedRangeTombstoneList (the list is immutable and stateless — the risk is a code path that bypasses the per-key query, not stale tracker state).
 
 ### LevelIterator File Boundary Skip
 When crossing from one SST file to the next in a level, a key at the exact boundary is skipped.
 **Check**: Verify LevelIterator's file transition logic — the first key of the new file must be yielded.
 
+## Key Optimizations (not documented individually above)
+
+These patterns exist in the codebase and should be checked during review:
+
+- **`next_into()` buffer reuse**: Copies entries directly into caller-provided buffers — avoids per-entry heap allocation. Verify no aliasing with live MemTable/SST data.
+- **Prefetch-based init_heap I/O**: `MergingIterator` issues `posix_fadvise(WILLNEED)` prefetch hints for all seekable sources before draining them during heap initialization (overlaps I/O across sources).
+- **SetBounds propagation**: `ReadOptions` bounds are propagated to `LevelIterator` and `TableIterator` sub-iterators for early termination.
+- **SkipPoint callback**: `ReadOptions.skip_point` filter allows callers to skip entries without consulting the value.
+- **LevelIterator file skip by bound**: Files whose smallest user key is `>= upper_bound` are skipped entirely; the bound is also pushed into each opened `TableIterator`.
+- **Cross-level tombstone pruning**: A tombstone from level L may only delete keys from levels deeper than L (`level >= source_level` tombstones are ignored). `FragmentedRangeTombstoneList` tracks per-level tombstone origin to enforce this — deeper-or-same-level tombstones must never suppress shallower keys.
+- **`posix_fadvise` sequential readahead**: Detects sequential block access patterns and issues `WILLNEED` hints to the OS page cache.
+- **Deferred block read**: SST index stores `first_key` per block; seek positions the iterator without reading data blocks until `next()` is called.
+- **L0 metadata pinning**: Index and bloom filter blocks for L0 files are pinned in cache via `insert_pinned()` and unpinned when the file is compacted.
+- **Atomic L0 counter**: Write-throttle checks use an atomic counter for L0 file count, avoiding mutex contention on the hot write path.
+
 ## Review Checklist
 - [ ] MergingIterator heap invariant maintained after every next()/prev()/seek()
 - [ ] DBIterator skips same-user-key entries with higher sequence numbers correctly
 - [ ] All sources included: active MemTable + immutable MemTables + L0 files + L1+ levels
-- [ ] Range tombstone tracker consulted for every yielded key
+- [ ] FragmentedRangeTombstoneList consulted for every yielded key
 - [ ] Direction switch rebuilds heap and repositions all children
 - [ ] Prefix bound check is byte-exact, not lexicographic over-bound
 - [ ] Seek handles the case where target key is covered by a range tombstone
 - [ ] Iterator holds Arc references to prevent SuperVersion/MemTable/SST cleanup during iteration
 - [ ] `next_into()` buffer reuse doesn't alias with live data
+- [ ] SetBounds propagated correctly to LevelIterator and TableIterator sub-iterators
+- [ ] SkipPoint callback filter applied without advancing past matching entries
+- [ ] Prefetch hints (fadvise) issued at correct sequential-access detection points
+- [ ] L0 pinned blocks unpinned after compaction deletes the L0 file

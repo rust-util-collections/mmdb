@@ -7,7 +7,6 @@ fmt:
 
 lint:
 	cargo clippy --all-targets -- -D warnings
-	cargo clippy --all-targets --tests -- -D warnings
 
 check:
 	cargo check

@@ -21,7 +21,7 @@ A pure-Rust LSM-Tree key-value storage engine, purpose-built for
 
 ## Performance
 
-In typical configurations, MMDB's scan throughput and point-read latency are comparable to RocksDB. The engine uses the same core optimizations (bloom filters, block cache, prefix compression, leveled compaction) and is designed to perform well across both warm-cache and cold-cache workloads. Run `make bench` to evaluate performance under your specific hardware and data profile.
+In typical configurations, MMDB's scan throughput and point-read latency are comparable to RocksDB. The engine uses the same core optimizations (bloom filters, block cache, prefix compression, leveled compaction) and is designed to perform well across both warm-cache and cold-cache workloads. Run `make bench` to evaluate performance under your specific hardware and data profile (criterion benchmarks with warm-cache and cold-cache scenarios).
 
 ---
 
@@ -150,7 +150,8 @@ src/
 +-- stats.rs                # Database statistics
 +-- memtable/
 |   +-- mod.rs              # MemTable (put/get/iter with approximate_size tracking)
-|   +-- skiplist.rs         # OrdInternalKey + skiplist (O(1) iteration)
+|   +-- skiplist.rs         # OrdInternalKey + skiplist + MemTableCursorIter (O(1) iteration)
+|   +-- skiplist_impl.rs    # Lock-free skiplist implementation (raw pointers, arena allocation)
 +-- wal/
 |   +-- writer.rs           # WAL append with block-based fragmentation
 |   +-- reader.rs           # WAL replay for crash recovery
@@ -175,7 +176,7 @@ src/
     +-- merge.rs            # Min-heap MergingIterator with buffer reuse + prefetch
     +-- db_iter.rs          # DBIterator: dedup, snapshot, tombstone/range-del filtering
     +-- level_iter.rs       # LevelIterator: lazy two-level iterator for L1+
-    +-- range_del.rs        # RangeTombstoneTracker: sweep-line O(1) amortized
+    +-- range_del.rs        # FragmentedRangeTombstoneList (O(log T) lookup) + sweep-line RangeTombstoneTracker
     +-- bidi_iter.rs        # BidiIterator: bidirectional iteration
 ```
 
@@ -226,7 +227,7 @@ impl DB {
     /// | `iter()`             | ✗                 | ✗                    |
     /// | `iter_with_range()`  | ✓                 | ✗                    |
     /// | `iter_with_prefix()` | ✓                 | ✓                    |
-    pub fn iter_with_range(&self, options: &ReadOptions, lower: Option<&[u8]>, upper: Option<&[u8]>) -> Result<DBIterator>;
+    pub fn iter_with_range(&self, options: &ReadOptions, lower_bound: Option<&[u8]>, upper_bound: Option<&[u8]>) -> Result<DBIterator>;
 
     /// RAII snapshot — automatically released on drop.
     pub fn snapshot(&self) -> Snapshot<'_>;

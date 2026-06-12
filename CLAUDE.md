@@ -9,7 +9,7 @@ MMDB is a pure-Rust LSM-Tree key-value storage engine, optimized as the backend 
 ```bash
 make all          # fmt + lint + test
 make test         # cargo test && cargo test --release
-make lint         # cargo clippy --all-targets -- -D warnings
+make lint         # cargo clippy --all-targets -- -D warnings (matches CI)
 make bench        # cargo bench (criterion)
 cargo test --test integration   # integration tests only
 cargo test --test crash_recovery
@@ -58,4 +58,4 @@ Supporting documentation in `.claude/docs/`:
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
-- ~76 unsafe blocks, concentrated in skiplist and block parsing — all require `// SAFETY:` comments
+- 67 unsafe blocks/functions concentrated in: `skiplist_impl.rs` (43), `skiplist.rs` (12), `db.rs` (11), `table_reader.rs` (1) — all require `// SAFETY:` comments

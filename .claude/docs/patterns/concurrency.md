@@ -8,7 +8,7 @@ MMDB uses a single-writer / multi-reader concurrency model:
 Writers:  [User Thread] → group commit leader → WAL + MemTable (serialized)
 Readers:  [User Thread] → ArcSwap<SuperVersion> load (lock-free) → MemTable + SST
 Background: [Compaction Thread(s)] → read SSTs, write new SSTs, update VersionSet
-Flush:    [Background Thread] → freeze MemTable → write SST → update VersionSet
+Flush:    [Write-path auto-flush, explicit flush()/compact_range(), close()] → freeze MemTable → write SST → update VersionSet
 ```
 
 ## Key Synchronization Primitives
@@ -19,8 +19,12 @@ Flush:    [Background Thread] → freeze MemTable → write SST → update Versi
 | `ArcSwap<SuperVersion>` | db.rs | Lock-free read path |
 | `Arc<MemTable>` | db.rs | MemTable lifetime across readers |
 | `Atomic*` | db.rs, skiplist | Counters, flags, skiplist node pointers |
-| `Condvar` | db.rs | Write stall (L0 backpressure) |
+| `write_cv` (parking_lot Condvar) | db.rs | Group commit write queue — writers wait for leadership/notification |
+| `compaction_notify` (std Condvar) | db.rs | Background compaction thread wake-up — work available notification |
 | `std::thread::scope` | compaction | Sub-compaction parallelism |
+
+> **Note**: L0 backpressure does NOT use a condvar. There are exactly two condvar
+> wait sites in db.rs: `write_cv` and `compaction_notify`.
 
 ## Critical Invariants
 
@@ -53,20 +57,26 @@ Steps 2-5 must happen atomically (under the write lock). Step 6 may happen after
 **Check**: Verify the write lock is held from step 2 through step 5.
 
 ### INV-CC4: Background Thread Safety
-Compaction and flush threads must not hold `db_mutex` while performing I/O (reading/writing SST files). They should:
+Compaction threads must not hold `db_mutex` while performing I/O (reading/writing SST files). The 3-phase lock-release pattern:
 1. Acquire mutex → pick compaction inputs → release mutex
-2. Perform compaction I/O (no mutex)
+2. Perform compaction/flush I/O (no mutex)
 3. Acquire mutex → apply VersionEdit → release mutex
 
-**Check**: Verify I/O operations happen between mutex release and re-acquire.
+Flush never runs on the background compaction threads (`do_compaction` only compacts SSTs; it never freezes/flushes a memtable). The real flush paths are:
+- **Write-path auto-flush** (`write_batch_group`): freezes under `db_mutex`, drops the lock during the SST write, re-acquires to install
+- **Explicit `flush()` / `compact_range()`**: same pattern — lock released during the SST write
+- **`close()`** via `freeze_and_flush`: holds the lock throughout (shutdown path, not performance-critical)
 
-### INV-CC5: Write Stall Signaling
-When L0 file count exceeds the slowdown/stop threshold:
-- Slowdown: artificial delay on write path
-- Stop: block writers until compaction reduces L0 count
-The signal (condvar) must be sent AFTER compaction completes AND VersionEdit is applied.
+`do_compaction` holds `db_mutex` for its entire run; it is invoked by explicit `flush()`/`compact()`/`compact_range()` calls AND inline from the write path when L0 reaches `l0_stop_trigger` (`maybe_throttle_writes`).
 
-**Check**: Verify condvar::notify is called after the new version (with fewer L0 files) is installed.
+**Check**: Verify I/O operations happen between mutex release and re-acquire. For auto-flush in the write path, verify the lock is dropped before SST write and re-acquired after.
+
+### INV-CC5: Write Stall Behavior (L0 Backpressure)
+When L0 file count (cached in an atomic, no lock) exceeds a threshold, the write path applies backpressure — without any condvar:
+- Slowdown (`l0_slowdown_trigger`): progressive `thread::sleep` delay, longer as L0 count grows
+- Stop (`l0_stop_trigger`): the writer runs **inline** `do_compaction()` synchronously to reduce L0 count; if that compaction fails, the DB fail-stops (background error is set) rather than admitting the write
+
+**Check**: Verify the atomic L0 counter is refreshed after every install that changes L0 (flush install, compaction install, inline compaction). Verify the stop path fail-stops on compaction error instead of silently admitting writes.
 
 ### INV-CC6: Snapshot Lifetime
 A snapshot pins a sequence number. All data visible at that sequence must remain accessible until the snapshot is dropped. This means:
@@ -83,8 +93,13 @@ Thread B holds `version_lock`, then tries to acquire `db_mutex`.
 **Check**: Map all lock acquisition paths and verify no cycles.
 
 ### Lost Wakeup
-Writer blocks on condvar waiting for compaction. Compaction completes and calls notify, but the writer hasn't entered wait() yet — notification is lost.
-**Check**: Verify condvar wait is in a loop that re-checks the condition: `while l0_count >= stop_threshold { condvar.wait(&mut guard); }`
+A thread waits on a condvar under lock, but the notifier calls `notify_all()` before the waiter acquires the lock and enters `wait()`. The notification is lost, and the waiter blocks forever.
+
+**Two condvar wait patterns in db.rs** — verify each is in a loop re-checking its condition:
+
+1. **`write_cv`** (group commit queue): `while !req.done && wq.leader_active { write_cv.wait(&mut wq); }` — writers wait until their batch is processed or they should become leader
+2. **`compaction_notify`** (background compaction wake): `while !*has_work && !shutdown { has_work = cvar.wait(has_work).unwrap(); }` — compaction threads wait for work, use `std::sync::Condvar` paired with `std::sync::Mutex<bool>`
+**Check**: Each wait site uses `while condition { condvar.wait(...) }` loop (not `if`). Each notify happens after the condition is changed under the lock the waiter holds in the wait loop.
 
 ### ArcSwap Load + Modify Race
 Two threads both load the current SuperVersion, modify it, and try to store back. One modification is lost.
