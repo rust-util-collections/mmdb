@@ -27,7 +27,7 @@ use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
 use crate::options::{CompactionFilterDecision, DbOptions};
 use crate::rate_limiter::RateLimiter;
-use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+use crate::sst::table_builder::{META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator};
 use crate::stats::DbStats;
 use crate::types::{
@@ -256,6 +256,38 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
     for tf in inputs {
         if !add_file_extents(tf, &mut extents) {
             return files.to_vec();
+        }
+    }
+
+    // Seed with the aggregate [min smallest, max largest] range across ALL
+    // inputs, not just per-file extents. The merged compaction output may span
+    // key gaps between discontiguous inputs (output files are cut by size, not
+    // at input-file boundaries), so a target-level file sitting inside such a
+    // gap MUST be included as an input — otherwise the installed output would
+    // overlap it, breaking the L1+ disjointness invariant and making keys
+    // unreachable via binary search. This mirrors `total_key_range` used by
+    // the background pickers.
+    {
+        let mut agg_smallest: Option<&[u8]> = None;
+        let mut agg_largest: Option<&[u8]> = None;
+        for tf in inputs {
+            if tf.meta.smallest_key.is_empty() || tf.meta.largest_key.is_empty() {
+                continue;
+            }
+            let s = user_key(&tf.meta.smallest_key);
+            let l = user_key(&tf.meta.largest_key);
+            if agg_smallest.is_none_or(|cur| s < cur) {
+                agg_smallest = Some(s);
+            }
+            if agg_largest.is_none_or(|cur| l > cur) {
+                agg_largest = Some(l);
+            }
+        }
+        if let (Some(s), Some(l)) = (agg_smallest, agg_largest) {
+            extents.push(UserKeyRange::File {
+                smallest: s.to_vec(),
+                largest: l.to_vec(),
+            });
         }
     }
 
@@ -748,9 +780,13 @@ fn execute_sub_compaction_io(
             rl.request(entry_bytes);
         }
 
-        if current_size >= ctx.options.target_file_size_base as usize {
+        if current_size >= ctx.options.target_file_size_base as usize
+            || builder.as_ref().unwrap().projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD
+        {
             // Defer the actual file cut to the next user-key boundary (handled at
             // the top of the loop) so a key's versions are never split across files.
+            // The meta-size condition keeps the per-file index / range-del blocks
+            // well below the reader's hard cap for key-heavy data.
             pending_cut = true;
         }
     }
@@ -793,7 +829,13 @@ fn execute_sub_compaction_io(
 
 impl LeveledCompaction {
     pub(crate) fn max_output_files(task: &CompactionTask, options: &DbOptions) -> u64 {
-        let target_size = options.target_file_size_base.max(1);
+        // Output files are also cut when their projected index / range-del
+        // meta block reaches META_BLOCK_SPLIT_THRESHOLD (key-heavy data), so
+        // size the reservation for the smaller of the two cut conditions.
+        let target_size = options
+            .target_file_size_base
+            .max(1)
+            .min((META_BLOCK_SPLIT_THRESHOLD / 2) as u64);
         let estimated_input_size = task
             .input_files_level
             .iter()
@@ -967,9 +1009,9 @@ impl LeveledCompaction {
     /// Execute compaction with optional table cache for eviction and rate limiter.
     ///
     /// `active_snapshots` lists sequence numbers of all open snapshots.
-    /// Keys with sequence numbers below the smallest active snapshot get
-    /// their sequence zeroed (P5.1). At the bottommost level, tombstones
-    /// are dropped (P5.2).
+    /// At the bottommost level, keys with sequence numbers below the smallest
+    /// active snapshot get their sequence zeroed and tombstones below that
+    /// snapshot are dropped.
     /// Convenience wrapper: runs compaction I/O and installs the result.
     /// Requires `&mut VersionSet` for the entire duration — use
     /// `execute_compaction_io` + `install_compaction` separately when
@@ -1539,8 +1581,12 @@ impl LeveledCompaction {
                 rl.request(entry_bytes);
             }
 
-            if current_size >= ctx.options.target_file_size_base as usize {
-                // Defer the actual cut to the next user-key boundary.
+            if current_size >= ctx.options.target_file_size_base as usize
+                || builder.as_ref().unwrap().projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD
+            {
+                // Defer the actual cut to the next user-key boundary. The
+                // meta-size condition keeps the per-file index / range-del
+                // blocks well below the reader's hard cap for key-heavy data.
                 pending_cut = true;
             }
         }

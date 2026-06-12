@@ -34,6 +34,11 @@ pub struct LevelIterator {
     upper_bound: Option<Vec<u8>>,
     /// Block property filters to pass to each TableIterator.
     block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
+    /// First I/O error encountered while iterating or repositioning. Once
+    /// set, iteration stops instead of silently advancing to the next file
+    /// (which would truncate the errored file's contribution). Cleared on
+    /// explicit seeks, which start a fresh scan.
+    error: Option<String>,
 }
 
 impl LevelIterator {
@@ -48,6 +53,7 @@ impl LevelIterator {
             end_hint: None,
             upper_bound: None,
             block_property_filters: Vec::new(),
+            error: None,
         }
     }
 
@@ -97,6 +103,7 @@ impl LevelIterator {
 
     /// Seek to the first entry >= target.
     fn seek_impl(&mut self, target: &[u8]) {
+        self.error = None;
         // Binary search: find first file whose largest_key >= target.
         // partition_point returns first index where predicate is false.
         let idx = self.files.partition_point(|tf| {
@@ -133,6 +140,14 @@ impl LevelIterator {
             }
             if let Some(t) = target {
                 table_iter.seek(t);
+                if let Some(e) = table_iter.iter_error() {
+                    // Repositioning failed with I/O error — stop instead of
+                    // silently skipping this file's keys.
+                    self.error = Some(e);
+                    self.file_index = self.files.len();
+                    self.current_iter = None;
+                    return;
+                }
             }
             self.current_iter = Some(table_iter);
             return;
@@ -145,16 +160,27 @@ impl Iterator for LevelIterator {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.error.is_some() {
+            return None;
+        }
         loop {
             // If no iterator is open yet, try to open the current file.
             if self.current_iter.is_none() && self.file_index < self.files.len() {
                 self.open_file_and_seek(None);
                 self.current_iter.as_ref()?;
             }
-            if let Some(ref mut iter) = self.current_iter
-                && let Some(entry) = iter.next()
-            {
-                return Some(entry);
+            if let Some(ref mut iter) = self.current_iter {
+                if let Some(entry) = iter.next() {
+                    return Some(entry);
+                }
+                // Exhaustion may actually be a mid-file I/O error. Advancing
+                // to the next file would silently truncate this file's
+                // contribution — stop and surface the error instead.
+                if let Some(e) = iter.iter_error() {
+                    self.error = Some(e);
+                    self.current_iter = None;
+                    return None;
+                }
             }
             // Current file exhausted — move to next
             self.current_iter = None;
@@ -179,11 +205,19 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        if self.error.is_some() {
+            return None;
+        }
         // Try prev within current table iterator
-        if let Some(ref mut iter) = self.current_iter
-            && let Some(entry) = iter.prev()
-        {
-            return Some((entry.0, LazyValue::Inline(entry.1)));
+        if let Some(ref mut iter) = self.current_iter {
+            if let Some(entry) = iter.prev() {
+                return Some((entry.0, LazyValue::Inline(entry.1)));
+            }
+            if let Some(e) = iter.iter_error() {
+                self.error = Some(e);
+                self.current_iter = None;
+                return None;
+            }
         }
         // Current table exhausted backward — move to previous file
         loop {
@@ -204,6 +238,11 @@ impl super::merge::SeekableIterator for LevelIterator {
                 table_iter.set_bounds(None, Some(ub));
             }
             table_iter.seek_to_last();
+            if let Some(e) = table_iter.iter_error() {
+                self.error = Some(e);
+                self.current_iter = None;
+                return None;
+            }
             // Use current() to read without advancing the cursor, so
             // subsequent prev() calls work correctly.
             if let Some(entry) = table_iter.current() {
@@ -214,6 +253,7 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
+        self.error = None;
         // Binary search: find last file whose smallest_key <= target.
         let idx = self.files.partition_point(|tf| {
             compare_internal_key(&tf.meta.smallest_key, target) != Ordering::Greater
@@ -242,6 +282,15 @@ impl super::merge::SeekableIterator for LevelIterator {
                 table_iter.set_bounds(None, Some(ub));
             }
             table_iter.seek_for_prev(target);
+            if let Some(e) = table_iter.iter_error() {
+                // A repositioning I/O error is indistinguishable from "no
+                // entry" via current(); skipping the file would silently
+                // drop its keys from the scan. Stop and surface the error.
+                self.error = Some(e);
+                self.file_index = 0;
+                self.current_iter = None;
+                return;
+            }
             if table_iter.current().is_some() {
                 self.file_index = try_idx;
                 self.current_iter = Some(table_iter);
@@ -253,12 +302,14 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn seek_to_first(&mut self) {
+        self.error = None;
         self.file_index = 0;
         self.current_iter = None;
         self.open_file_and_seek(None);
     }
 
     fn seek_to_last(&mut self) {
+        self.error = None;
         self.current_iter = None;
         // Start from the last file and work backward
         for idx in (0..self.files.len()).rev() {
@@ -274,6 +325,11 @@ impl super::merge::SeekableIterator for LevelIterator {
                 table_iter.set_bounds(None, Some(ub));
             }
             table_iter.seek_to_last();
+            if let Some(e) = table_iter.iter_error() {
+                self.error = Some(e);
+                self.current_iter = None;
+                return;
+            }
             // The file passed the file-level filters, but block-property filters or
             // the upper bound may leave the table iterator unpositioned. Only accept
             // it if it actually yielded an entry; otherwise an earlier file holding
@@ -287,6 +343,9 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
+        if self.error.is_some() {
+            return false;
+        }
         loop {
             if self.current_iter.is_none() && self.file_index < self.files.len() {
                 self.open_file_and_seek(None);
@@ -294,10 +353,15 @@ impl super::merge::SeekableIterator for LevelIterator {
                     return false;
                 }
             }
-            if let Some(ref mut iter) = self.current_iter
-                && iter.next_into(key_buf, value_buf)
-            {
-                return true;
+            if let Some(ref mut iter) = self.current_iter {
+                if iter.next_into(key_buf, value_buf) {
+                    return true;
+                }
+                if let Some(e) = iter.iter_error() {
+                    self.error = Some(e);
+                    self.current_iter = None;
+                    return false;
+                }
             }
             self.current_iter = None;
             self.file_index += 1;
@@ -316,7 +380,9 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn iter_error(&self) -> Option<String> {
-        self.current_iter.as_ref().and_then(|it| it.iter_error())
+        self.error
+            .clone()
+            .or_else(|| self.current_iter.as_ref().and_then(|it| it.iter_error()))
     }
 }
 

@@ -10,6 +10,11 @@
 
 ## Won't Fix
 
+### [LOW] sst: pathological same-user-key version runs can still error flush instead of splitting
+- **Where**: src/db.rs (write_memtable_ssts), src/sst/table_builder.rs (META_BLOCK_HARD_LIMIT guard)
+- **What**: Flush/compaction outputs split at user-key boundaries when projected index/range-del meta blocks reach 32 MiB. A single user key rewritten enough times with multi-MiB keys in one memtable (e.g., 8 versions of an 8 MiB key) cannot be cut mid-run, so the builder's hard guard rejects the entry and flush fail-stops with an explicit `InvalidArgument` instead of silently producing an unreadable SST.
+- **Reason**: Cutting mid-user-key across L0 files breaks newest-file-first point lookups, and supporting it safely requires ordered file-number assignment invariants across recovery and in-process installs. The trigger (tens of MiB of same-key versions inside one write buffer) is far outside realistic workloads; write-path key/entry caps (`types::MAX_USER_KEY_SIZE`, `MAX_WRITE_ENTRY_SIZE`) bound the blast radius, and the failure is now loud and attributable rather than a silent read-back wedge.
+
 ### [HIGH] sst: corrupt block entry could read restart-array bytes / iteration degrades to EOF
 - **Where**: src/sst/block.rs:73-97, 411-528; src/sst/table_reader.rs:379-392
 - **What**: Entry decoders bound key/value lengths against `data.len()` rather than the data-region end (`restart_offset`), and a mid-block decode failure surfaces as iterator EOF rather than an error.

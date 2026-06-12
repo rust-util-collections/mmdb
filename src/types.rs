@@ -18,6 +18,21 @@ pub type SequenceNumber = u64;
 /// Maximum valid sequence number (56-bit).
 pub const MAX_SEQUENCE_NUMBER: SequenceNumber = (1 << 56) - 1;
 
+/// Maximum allowed user key length for writes (8 MiB).
+///
+/// Derived from the SST format: every data block contributes an index entry
+/// that stores the block's boundary keys *twice* (separator key + first key),
+/// and the whole index lives in a single block that the reader caps at 64 MiB.
+/// Bounding keys keeps any single index entry far below that cap; the table
+/// builder splits output files when the aggregate index grows large.
+pub const MAX_USER_KEY_SIZE: usize = 8 * 1024 * 1024;
+
+/// Maximum allowed user key + value payload for a single write entry.
+///
+/// Mirrors the table builder's per-entry limit (one entry plus framing must
+/// fit in a readable 64 MiB block), minus the 8-byte internal-key trailer.
+pub const MAX_WRITE_ENTRY_SIZE: usize = 64 * 1024 * 1024 - 64 - 8;
+
 /// Operation type stored in the low 8 bits of the packed trailer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

@@ -20,6 +20,12 @@ pub struct DBIterator {
     merger: MergingIterator<IKeyCompareFn>,
     /// Snapshot sequence number for visibility filtering.
     sequence: SequenceNumber,
+    /// Start of the reserved batch-overlay sequence region (see
+    /// `DB::iter_with_batch`). Entries with `seq >= floor` are uncommitted
+    /// batch entries that must be visible *in addition to* entries at or
+    /// below `sequence`. Real writers can never produce sequences in the
+    /// reserved region, so the two visibility ranges never alias.
+    batch_seq_floor: Option<SequenceNumber>,
     /// Reusable buffer for last user key (for deduplication).
     last_user_key: Vec<u8>,
     /// Whether last_user_key has been set at least once.
@@ -73,6 +79,7 @@ impl DBIterator {
         Self {
             merger,
             sequence,
+            batch_seq_floor: None,
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
@@ -96,6 +103,7 @@ impl DBIterator {
         Self {
             merger,
             sequence,
+            batch_seq_floor: None,
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
@@ -124,6 +132,7 @@ impl DBIterator {
         Self {
             merger,
             sequence,
+            batch_seq_floor: None,
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
@@ -145,6 +154,7 @@ impl DBIterator {
     pub fn reset(&mut self, sources: Vec<IterSource>, sequence: SequenceNumber) {
         self.merger.reset(sources);
         self.sequence = sequence;
+        self.batch_seq_floor = None;
         self.last_user_key.clear();
         self.has_last_key = false;
         self.current = None;
@@ -193,6 +203,37 @@ impl DBIterator {
         // Tombstones list is already empty by default.
     }
 
+    /// Mark the start of the reserved batch-overlay sequence region. Entries
+    /// (and range tombstones) with `seq >= floor` become visible in addition
+    /// to entries at or below the snapshot sequence. Used by
+    /// `DB::iter_with_batch` to overlay uncommitted batch writes on top of a
+    /// snapshot read without aliasing committed sequence numbers.
+    pub fn set_batch_seq_floor(&mut self, floor: SequenceNumber) {
+        self.batch_seq_floor = Some(floor);
+    }
+
+    /// Visibility predicate: an entry is visible if it is within the snapshot
+    /// (`seq <= sequence`) or part of the batch overlay (`seq >= floor`).
+    #[inline]
+    fn is_visible(&self, seq: SequenceNumber) -> bool {
+        seq <= self.sequence || self.batch_seq_floor.is_some_and(|floor| seq >= floor)
+    }
+
+    /// Snapshot bound to use for range-tombstone visibility. The tombstone
+    /// list is frozen at iterator creation: it contains only tombstones at or
+    /// below the snapshot sequence, plus (for batch iterators) overlay
+    /// tombstones in the reserved region — there is nothing in between. With
+    /// a batch overlay present, every collected tombstone must be visible, so
+    /// the bound is lifted to MAX.
+    #[inline]
+    fn tombstone_snapshot(&self) -> SequenceNumber {
+        if self.batch_seq_floor.is_some() {
+            MAX_SEQUENCE_NUMBER
+        } else {
+            self.sequence
+        }
+    }
+
     /// Set an exclusive upper bound on user keys.
     /// Iteration stops when user key >= this bound.
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
@@ -238,9 +279,11 @@ impl DBIterator {
         if self.range_tombstones.is_empty() {
             return false;
         }
-        self.range_tombstones
-            .max_covering_tombstone_seq_for_level(user_key, self.sequence, None)
-            > seq
+        self.range_tombstones.max_covering_tombstone_seq_for_level(
+            user_key,
+            self.tombstone_snapshot(),
+            None,
+        ) > seq
     }
 
     /// Set a skip-point callback. During iteration, any user key for which
@@ -321,6 +364,10 @@ impl DBIterator {
                 seq: SequenceNumber,
             },
         }
+        // Copy visibility parameters out of self: peek_entry() holds a
+        // mutable borrow of self.merger across the checks below.
+        let snapshot = self.sequence;
+        let batch_floor = self.batch_seq_floor;
         loop {
             let action = {
                 let (ikey_ref, _value_ref) = self.merger.peek_entry()?;
@@ -331,7 +378,7 @@ impl DBIterator {
                     let seq = ikr.sequence();
                     let vt = ikr.value_type();
 
-                    if seq > self.sequence {
+                    if !(seq <= snapshot || batch_floor.is_some_and(|floor| seq >= floor)) {
                         Action::Skip
                     } else {
                         let uk_len = ikey_ref.len() - 8;
@@ -401,7 +448,7 @@ impl DBIterator {
                     };
                     let covered = self.range_tombstones.max_covering_tombstone_seq_for_level(
                         &self.last_user_key,
-                        self.sequence,
+                        self.tombstone_snapshot(),
                         level_filter,
                     ) > seq;
                     if covered {
@@ -445,6 +492,10 @@ impl DBIterator {
                 self.merger.seek(seek_key.as_bytes());
             }
         }
+        // Copy visibility parameters out of self: peek_entry() holds a
+        // mutable borrow of self.merger across the checks below.
+        let snapshot = self.sequence;
+        let batch_floor = self.batch_seq_floor;
         loop {
             let (ikey_ref, _) = self.merger.peek_entry()?;
             if ikey_ref.len() < 8 {
@@ -456,7 +507,7 @@ impl DBIterator {
             let seq = ikr.sequence();
             let vt = ikr.value_type();
 
-            if seq > self.sequence {
+            if !(seq <= snapshot || batch_floor.is_some_and(|floor| seq >= floor)) {
                 self.merger.advance_entry();
                 continue;
             }
@@ -738,7 +789,7 @@ impl DBIterator {
                 // Backward order = seq ascending, so each new entry has higher seq.
                 // Use >= so that sequence-0 entries (produced by bottommost compaction)
                 // are correctly picked up when best_seq starts at 0.
-                if seq <= self.sequence && seq >= best_seq {
+                if self.is_visible(seq) && seq >= best_seq {
                     best_seq = seq;
                     best_is_deletion = vt == ValueType::Deletion;
                     if !best_is_deletion {

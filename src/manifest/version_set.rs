@@ -39,6 +39,14 @@ pub struct VersionSet {
     table_cache: Option<Arc<TableCache>>,
     /// Count of edits since last MANIFEST snapshot (for Phase I compaction).
     edits_since_snapshot: u64,
+    /// Set when the MANIFEST writer is in an unrecoverable state: either a
+    /// record append failed mid-write (leaving a torn record in the stream —
+    /// appending more records after it would make the file unrecoverable
+    /// mid-file), or a rotation published a new MANIFEST whose durability
+    /// could not be confirmed. While poisoned, `log_and_apply` fails fast
+    /// *before* applying anything, so callers can rely on the invariant
+    /// "Err ⇒ edit not applied". Recovery on reopen truncates any torn tail.
+    poisoned: bool,
 }
 
 impl VersionSet {
@@ -71,6 +79,7 @@ impl VersionSet {
             manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
             table_cache,
             edits_since_snapshot: 0,
+            poisoned: false,
         };
 
         // Write initial snapshot edit
@@ -120,6 +129,10 @@ impl VersionSet {
 
         // (level, meta) pairs for files that are still live after all edits.
         let mut live_files: HashMap<u64, (usize, FileMetaData)> = HashMap::new();
+        // Number of edits replayed — seeds `edits_since_snapshot` so that
+        // restart-heavy workloads still trigger MANIFEST compaction instead
+        // of growing the file without bound across process lifetimes.
+        let mut edits_replayed = 0u64;
 
         loop {
             let data = match reader.read_record() {
@@ -132,6 +145,7 @@ impl VersionSet {
                 Err(e) => return Err(e),
             };
             let edit = VersionEdit::decode(&data).c(d!())?;
+            edits_replayed += 1;
 
             if let Some(n) = edit.next_file_number {
                 next_file_number = n;
@@ -154,9 +168,20 @@ impl VersionSet {
             // Track additions
             for (level, meta) in &edit.new_files {
                 let level = *level as usize;
-                if level < num_levels {
-                    live_files.insert(meta.number, (level, meta.clone()));
+                if level >= num_levels {
+                    // Silently dropping the file would make its keys unreadable,
+                    // and the next MANIFEST snapshot would persist the loss
+                    // permanently. Fail loudly instead.
+                    return Err(eg!(Error::Corruption(format!(
+                        "MANIFEST references SST {} at level {} but the database \
+                         is configured with num_levels {}; reopen with num_levels >= {}",
+                        meta.number,
+                        level,
+                        num_levels,
+                        level + 1
+                    ))));
                 }
+                live_files.insert(meta.number, (level, meta.clone()));
             }
         }
 
@@ -208,7 +233,8 @@ impl VersionSet {
             manifest_number,
             manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
             table_cache,
-            edits_since_snapshot: 0,
+            edits_since_snapshot: edits_replayed,
+            poisoned: false,
         })
     }
 
@@ -232,7 +258,19 @@ impl VersionSet {
     }
 
     /// Apply a VersionEdit: write to MANIFEST and install a new Version.
+    ///
+    /// Error contract: `Err` means the edit was **not** applied — neither in
+    /// memory nor durably. Callers rely on this to safely delete output SSTs
+    /// referenced by a failed edit.
     pub fn log_and_apply(&mut self, edit: VersionEdit) -> Result<()> {
+        if self.poisoned {
+            return Err(eg!(Error::Corruption(
+                "MANIFEST writer poisoned by an earlier write failure; \
+                 reopen the database to recover"
+                    .to_string()
+            )));
+        }
+
         // Build new version from current + edit FIRST, before persisting.
         // This ensures that if an SST fails to open, the MANIFEST is not
         // polluted with an edit referencing a broken file.
@@ -303,8 +341,17 @@ impl VersionSet {
         let encoded = edit.encode();
         {
             let mut w = self.manifest_writer.lock();
-            if let Some(ref mut writer) = *w {
-                writer.add_record(&encoded).c(d!())?;
+            if let Some(ref mut writer) = *w
+                && let Err(e) = writer.add_record(&encoded)
+            {
+                // The failed append may have left a torn record in the
+                // MANIFEST stream. Appending further records after it would
+                // produce mid-file corruption that recovery rejects (only
+                // *tail* corruption is tolerated). Poison the writer so no
+                // more records can follow; recovery truncates the torn tail.
+                drop(w);
+                self.poisoned = true;
+                return Err(e).c(d!());
             }
         }
 
@@ -322,10 +369,12 @@ impl VersionSet {
         self.current = Arc::new(new_version);
         self.edits_since_snapshot += 1;
 
-        // Check if MANIFEST needs compaction. Safe pre-publish failures are
-        // deferred inside `maybe_compact_manifest`; post-CURRENT failures are
-        // propagated because durability is no longer guaranteed.
-        self.maybe_compact_manifest().c(d!())?;
+        // Check if MANIFEST needs compaction. The edit is already applied at
+        // this point, so `maybe_compact_manifest` must never surface an error
+        // (callers would interpret it as "edit not applied" and e.g. delete
+        // freshly-installed SSTs). All rotation failures are either deferred
+        // (retried on a later edit) or poison the writer (fail-stop).
+        self.maybe_compact_manifest();
 
         Ok(())
     }
@@ -397,11 +446,19 @@ impl VersionSet {
 
     /// Rewrite the MANIFEST with a full snapshot of the current version.
     /// This prevents unbounded MANIFEST growth.
-    pub fn maybe_compact_manifest(&mut self) -> Result<()> {
+    ///
+    /// Called from `log_and_apply` *after* the edit has been applied, so this
+    /// must never surface an error. Pre-publish failures are deferred (the
+    /// rotation is retried on a later edit). A post-publish directory-fsync
+    /// failure poisons the writer instead: at that point both the old and the
+    /// new MANIFEST durably contain every applied edit, but a crash could
+    /// recover either one — blocking further edits keeps the two from
+    /// diverging, and the old MANIFEST is retained as a fallback.
+    pub fn maybe_compact_manifest(&mut self) {
         const MANIFEST_COMPACTION_THRESHOLD: u64 = 1000;
 
         if self.edits_since_snapshot < MANIFEST_COMPACTION_THRESHOLD {
-            return Ok(());
+            return;
         }
 
         // Allocate new manifest number BEFORE taking the snapshot,
@@ -423,7 +480,7 @@ impl VersionSet {
             Ok(writer) => writer,
             Err(e) => {
                 tracing::warn!("MANIFEST compaction deferred creating snapshot: {}", e);
-                return Ok(());
+                return;
             }
         };
 
@@ -433,13 +490,31 @@ impl VersionSet {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             tracing::warn!("MANIFEST compaction deferred writing snapshot: {}", e);
-            return Ok(());
+            return;
         }
         if let Err(e) = new_writer.sync().c(d!()) {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             tracing::warn!("MANIFEST compaction deferred syncing snapshot: {}", e);
-            return Ok(());
+            return;
+        }
+
+        // Sync the OLD writer before publishing the new MANIFEST. The current
+        // edit may still sit in the old writer's buffer; if the CURRENT rename
+        // below turns out not to be durable (post-publish dir-fsync failure +
+        // crash), recovery falls back to the old MANIFEST — which must then
+        // contain everything `log_and_apply` reported as applied.
+        {
+            let mut w = self.manifest_writer.lock();
+            if let Some(ref mut writer) = *w
+                && let Err(e) = writer.sync()
+            {
+                drop(w);
+                drop(new_writer);
+                let _ = fs::remove_file(&new_manifest_path);
+                tracing::warn!("MANIFEST compaction deferred syncing old manifest: {}", e);
+                return;
+            }
         }
 
         // Publish CURRENT in two phases so a post-rename fsync failure cannot
@@ -448,14 +523,14 @@ impl VersionSet {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             tracing::warn!("MANIFEST compaction deferred writing CURRENT: {}", e);
-            return Ok(());
+            return;
         }
         if let Err(e) = Self::rename_current_file(&self.db_path).c(d!()) {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             let _ = fs::remove_file(self.db_path.join("CURRENT.tmp"));
             tracing::warn!("MANIFEST compaction deferred publishing CURRENT: {}", e);
-            return Ok(());
+            return;
         }
 
         let old_manifest_number = self.manifest_number;
@@ -463,7 +538,21 @@ impl VersionSet {
         *self.manifest_writer.lock() = Some(new_writer);
         self.edits_since_snapshot = 0;
 
-        Self::fsync_directory(&self.db_path).c(d!())?;
+        if let Err(e) = Self::fsync_directory(&self.db_path) {
+            // The CURRENT rename is visible in the live filesystem (the new
+            // writer stays installed for in-process consistency) but its
+            // durability is unknown: a crash could recover from either
+            // MANIFEST. Both contain every applied edit thanks to the old-
+            // writer sync above. Poison further edits so the two files cannot
+            // diverge, and keep the old MANIFEST as the fallback.
+            self.poisoned = true;
+            tracing::error!(
+                "MANIFEST rotation could not fsync the DB directory; \
+                 poisoning manifest writer (reopen the database to recover): {}",
+                e
+            );
+            return;
+        }
 
         // Delete old manifest
         let old_manifest_path = self
@@ -476,8 +565,6 @@ impl VersionSet {
                 e
             );
         }
-
-        Ok(())
     }
 
     fn set_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {

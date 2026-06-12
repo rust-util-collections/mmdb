@@ -22,6 +22,34 @@ use crate::sst::table_reader::MAX_DECOMPRESSED_BLOCK_SIZE;
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
 use ruc::*;
 
+/// Hard ceiling for the single-block meta structures (index block and
+/// range-del block). The reader rejects any block above
+/// `MAX_DECOMPRESSED_BLOCK_SIZE`; the margin leaves room for the restart
+/// array and block framing. The builder must never finish a table whose
+/// meta blocks exceed this — such an SST could never be opened again.
+pub(crate) const META_BLOCK_HARD_LIMIT: usize = MAX_DECOMPRESSED_BLOCK_SIZE - 4096;
+
+/// Soft threshold at which callers that can split their output across
+/// multiple SST files (flush, compaction) should cut the current file, so
+/// the hard limit above is never approached in normal operation.
+pub(crate) const META_BLOCK_SPLIT_THRESHOLD: usize = 32 * 1024 * 1024;
+
+/// Conservative per-entry overhead estimate for meta block accounting:
+/// covers the 16-byte block handle, varint length headers, and the restart
+/// array slot.
+const META_ENTRY_OVERHEAD: usize = 64;
+
+// Compile-time ties between the write-path limits in `types` and the SST
+// format limits enforced here: any entry the write path accepts must be
+// flushable into a readable SST.
+const _: () = {
+    assert!(crate::types::MAX_WRITE_ENTRY_SIZE + 8 <= MAX_DECOMPRESSED_BLOCK_SIZE - 64);
+    assert!(
+        2 * (crate::types::MAX_USER_KEY_SIZE + 8) + META_ENTRY_OVERHEAD
+            <= META_BLOCK_SPLIT_THRESHOLD
+    );
+};
+
 /// Options for building an SST table.
 pub struct TableBuildOptions {
     pub block_size: usize,
@@ -108,6 +136,13 @@ pub struct TableBuilder {
     /// Buffered range deletion entries (key, value) to write as a separate block.
     range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
 
+    /// Projected encoded size of the index block from already-flushed data
+    /// blocks (each entry stores the block's last key, first key, handle and
+    /// properties). Used to keep the index block under the reader's cap.
+    index_block_projected: usize,
+    /// Projected encoded size of the range-del block.
+    range_del_projected: usize,
+
     /// Block property collectors for per-block metadata.
     block_property_collectors: Vec<Box<dyn crate::options::BlockPropertyCollector>>,
 
@@ -134,9 +169,30 @@ impl TableBuilder {
             prefix_set: HashSet::new(),
             has_range_deletions: false,
             range_del_entries: Vec::new(),
+            index_block_projected: 0,
+            range_del_projected: 0,
             block_property_collectors: collectors,
             finished: false,
         })
+    }
+
+    /// Projected encoded size of the index block, including the entry the
+    /// currently open data block will contribute when flushed.
+    fn projected_index_size(&self) -> usize {
+        let mut size = self.index_block_projected;
+        if !self.data_block.is_empty() {
+            size += self.pending_first_key.as_ref().map_or(0, |k| k.len())
+                + self.last_key.len()
+                + META_ENTRY_OVERHEAD;
+        }
+        size
+    }
+
+    /// Largest projected single-block meta structure (index or range-del
+    /// block). Callers that can split output across multiple SSTs should cut
+    /// the current file once this reaches `META_BLOCK_SPLIT_THRESHOLD`.
+    pub(crate) fn projected_meta_size(&self) -> usize {
+        self.projected_index_size().max(self.range_del_projected)
     }
 
     /// Add a key-value pair. Must be called in sorted key order.
@@ -179,12 +235,41 @@ impl TableBuilder {
         if self.options.internal_keys && key.len() >= 8 {
             let ikr = InternalKeyRef::new(key);
             if ikr.value_type() == ValueType::RangeDeletion {
+                // All range tombstones share one block; it must stay readable.
+                let projected = self
+                    .range_del_projected
+                    .saturating_add(entry_size)
+                    .saturating_add(META_ENTRY_OVERHEAD);
+                if projected > META_BLOCK_HARD_LIMIT {
+                    return Err(eg!(Error::InvalidArgument(format!(
+                        "range-del block size {} would exceed maximum readable block size {}",
+                        projected, META_BLOCK_HARD_LIMIT
+                    ))));
+                }
+                self.range_del_projected = projected;
                 self.has_range_deletions = true;
                 self.range_del_entries.push((key.to_vec(), value.to_vec()));
                 self.last_key = key.to_vec();
                 self.num_entries += 1;
                 return Ok(());
             }
+        }
+
+        // The index block stores each data block's last key AND first key, in
+        // a single block the reader caps at MAX_DECOMPRESSED_BLOCK_SIZE.
+        // Reject an entry that could push the index past the readable limit —
+        // pessimistically count this key as both extending the open block and
+        // starting a new one.
+        let projected_index = self
+            .projected_index_size()
+            .saturating_add(2 * key.len())
+            .saturating_add(META_ENTRY_OVERHEAD);
+        if projected_index > META_BLOCK_HARD_LIMIT {
+            return Err(eg!(Error::InvalidArgument(format!(
+                "index block size {} would exceed maximum readable block size {} \
+                 (consider a larger block_size for very large keys)",
+                projected_index, META_BLOCK_HARD_LIMIT
+            ))));
         }
 
         // Collect key for bloom filter (use user key if internal_keys mode)
@@ -288,6 +373,12 @@ impl TableBuilder {
             .collect();
 
         let handle = self.write_raw_block(&block_data).c(d!())?;
+        let props_size: usize = props.iter().map(|(n, d)| n.len() + d.len() + 8).sum();
+        self.index_block_projected += last_key
+            .len()
+            .saturating_add(first_key.len())
+            .saturating_add(props_size)
+            .saturating_add(META_ENTRY_OVERHEAD);
         self.index_entries.push(PendingIndexEntry {
             last_key,
             handle,

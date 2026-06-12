@@ -1755,9 +1755,7 @@ mod tests {
         // for that user key (since lower seq sorts later in internal key order).
         let seek_key =
             |uk: &[u8]| -> Vec<u8> { InternalKey::new(uk, 0, ValueType::Deletion).into_bytes() };
-        let extract_uk = |ikey: &[u8]| -> Vec<u8> {
-            crate::types::InternalKeyRef::new(ikey).user_key().to_vec()
-        };
+        let extract_uk = |ikey: &[u8]| -> Vec<u8> { InternalKeyRef::new(ikey).user_key().to_vec() };
 
         // seek_for_prev to exact user key
         let mut iter = TableIterator::new(reader.clone());
@@ -1809,9 +1807,7 @@ mod tests {
 
         let seek_key =
             |uk: &[u8]| -> Vec<u8> { InternalKey::new(uk, 0, ValueType::Deletion).into_bytes() };
-        let extract_uk = |ikey: &[u8]| -> Vec<u8> {
-            crate::types::InternalKeyRef::new(ikey).user_key().to_vec()
-        };
+        let extract_uk = |ikey: &[u8]| -> Vec<u8> { InternalKeyRef::new(ikey).user_key().to_vec() };
 
         // Seek to middle, then prev
         let mut iter = TableIterator::new(reader.clone());
@@ -1861,9 +1857,7 @@ mod tests {
                 return;
             }
             self.seen = true;
-            self.skip_block = crate::types::InternalKeyRef::new(key)
-                .user_key()
-                .starts_with(b"a_skip_");
+            self.skip_block = InternalKeyRef::new(key).user_key().starts_with(b"a_skip_");
         }
 
         fn finish_block(&mut self) -> Vec<u8> {
@@ -1930,7 +1924,7 @@ mod tests {
 
         let mut seen = 0;
         while let Some((key, _)) = iter.current() {
-            let user_key = crate::types::InternalKeyRef::new(&key).user_key().to_vec();
+            let user_key = InternalKeyRef::new(&key).user_key().to_vec();
             assert!(
                 user_key.starts_with(b"z_keep_"),
                 "filtered reverse scan yielded skipped key {:?}",

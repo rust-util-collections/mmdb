@@ -1,4 +1,5 @@
-//! MMDB — Modern Memory-Mapped Database
+//! MMDB — the pure-Rust LSM-Tree storage engine behind
+//! [vsdb](https://github.com/rust-util-collections/vsdb).
 //!
 //! A high-performance LSM-Tree storage engine in pure Rust.
 
