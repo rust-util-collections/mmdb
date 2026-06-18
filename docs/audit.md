@@ -54,3 +54,48 @@
 - **Where**: src/types.rs:54-62
 - **What**: Comment uses "Safety:" but no unsafe block is involved.
 - **Reason**: Comment is a design note, not a safety justification. Cosmetic only.
+
+### [LOW] db: point-lookup `get` path scans all L1+ files with range deletions
+- **Where**: src/db.rs (get path), src/iterator/
+- **What**: The point-lookup `get` path iterates ALL L1+ files that have range deletions to check for covering tombstones — O(files_with_range_dels). The iterator path bounds this by checking `smallest_key > upper_bound` to skip files entirely past the range, but the point-lookup path cannot apply the same optimization since range tombstones can extend past a file's largest key.
+- **Reason**: This is an inherent limitation of range tombstones combined with point lookups. The cost is bounded by the number of tombstone-bearing files (typically small in practice), and the alternative (maintaining a separate tombstone index) would add write-path complexity disproportionate to the benefit.
+
+### [LOW] types: `InternalKey` panics on malformed encoded data
+- **Where**: src/types.rs (`InternalKey::from_encoded`, `from_encoded_slice`, `InternalKeyRef::new`)
+- **What**: Uses `assert!` guards that panic (in both debug and release builds) on encoded keys < 8 bytes, rather than returning a `Result`.
+- **Reason**: Design assumption that all encoded keys come from CRC-protected storage (WAL and SST blocks are checksummed before decode), making this condition unreachable in practice. `InternalKey::new()` builds from components and always appends the 8-byte trailer — no guard needed. Converting to fallible returns would touch every callsite on the hot read path.
+
+### [LOW] options: `DbOptions` Debug impl omits ~14 fields
+- **Where**: src/options.rs
+- **What**: The manual `Debug` implementation omits `l0_slowdown_trigger`, `l0_stop_trigger`, `rate_limiter_bytes_per_sec`, `compression_per_level`, and others.
+- **Reason**: Intentional conciseness — use `{:#?}` via derived Debug on inner types for full display.
+
+---
+
+## Known Issues & Limitations
+
+This section provides user-facing context for the audit entries above. See individual entries in the [Won't Fix](#wont-fix) section for technical details.
+
+### Mutex-Held I/O Trade-offs
+
+`compact()` / `flush()` (explicit API) and manifest compaction hold the DB mutex during blocking I/O. Point reads stay lock-free via `ArcSwap<SuperVersion>`. The background flush path correctly releases the mutex during I/O. Manifest compaction fires every 1000th edit — imperceptible for most workloads (~1ms spike).
+
+### Range Tombstone O(N) in Point Lookups
+
+`get()` scans all L1+ files with range deletions to check for covering tombstones. The iterator path bounds this with key-range checks, but point lookups cannot apply the same optimization. Cost is bounded by the count of tombstone-bearing files, which is typically small.
+
+### InternalKey Panics on Malformed Data
+
+Encoded internal keys < 8 bytes cause a panic (debug and release). All stored data is CRC-protected, making corruption unreachable in practice. The design chooses a loud failure (panic with clear message) over silent data loss.
+
+### DbOptions Debug Omits Fields
+
+`DbOptions::fmt` is intentionally concise; use `{:#?}` for full display.
+
+### Invalid ValueType → Deletion (Design Decision)
+
+Unknown value type tags map to `Deletion` rather than erroring. All persisted data is CRC32-protected; when reachable (memory corruption), treating unknown as deletion is safer than returning phantom data.
+
+### Corrupt Block Entry → Restart Array Read (Design Decision)
+
+CRC32 verification (per-block, checked before any decoder runs) blocks corrupt blocks. The window exists only under CRC32 collision (~2^-32 probability).
