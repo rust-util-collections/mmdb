@@ -55,9 +55,9 @@
 - **What**: Comment uses "Safety:" but no unsafe block is involved.
 - **Reason**: Comment is a design note, not a safety justification. Cosmetic only.
 
-### [LOW] db: point-lookup `get` path scans all L1+ files with range deletions
+### [LOW] db: point-lookup `get` path scans all L0 + L1+ files with range deletions
 - **Where**: src/db.rs (get path), src/iterator/
-- **What**: The point-lookup `get` path iterates ALL L1+ files that have range deletions to check for covering tombstones — O(files_with_range_dels). The iterator path bounds this by checking `smallest_key > upper_bound` to skip files entirely past the range, but the point-lookup path cannot apply the same optimization since range tombstones can extend past a file's largest key.
+- **What**: The point-lookup `get` path iterates ALL L0 and L1+ files that have range deletions to check for covering tombstones — O(files_with_range_dels). The iterator path bounds the L1+ portion by checking `smallest_key > upper_bound` to skip files entirely past the range, but the point-lookup path cannot apply the same optimization since range tombstones can extend past a file's largest key. The L0 branch must pre-scan every tombstone-bearing L0 file before any point lookup because a single split flush numbers its files by key, not sequence, so a tombstone can live in a different L0 file than the keys it covers.
 - **Reason**: This is an inherent limitation of range tombstones combined with point lookups. The cost is bounded by the number of tombstone-bearing files (typically small in practice), and the alternative (maintaining a separate tombstone index) would add write-path complexity disproportionate to the benefit.
 
 ### [LOW] types: `InternalKey` panics on malformed encoded data

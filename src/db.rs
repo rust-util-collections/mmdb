@@ -245,6 +245,14 @@ impl CompactionFilter for LazyDeleteFilter {
         }
         CompactionFilterDecision::Keep
     }
+
+    fn is_noop(&self) -> bool {
+        // No-op only when there is no user filter to consult AND no key is
+        // currently registered for lazy deletion. A dead key registered after a
+        // trivial move is still removed by a later compaction that re-examines
+        // the relocated file, so allowing the move here is safe.
+        self.user_filter.as_ref().is_none_or(|f| f.is_noop()) && self.dead_keys.read().is_empty()
+    }
 }
 
 impl DB {
@@ -959,13 +967,27 @@ impl DB {
             return Ok(None);
         }
 
-        // 4. L0 SST files (newest first, may overlap)
-        // Check range tombstones in each file and accumulate max_tomb_seq.
-        for tf in version.level_files(0) {
+        // 4. L0 SST files (newest first, may overlap).
+        // A single memtable flush can be split into several L0 files cut at
+        // user-key boundaries; those files are numbered in ascending key order,
+        // and a range tombstone is written only to the file holding its start
+        // key (it is not fragmented into later split files). A tombstone in a
+        // lower-numbered file can therefore cover point keys living in a
+        // higher-numbered file from the same flush. Because L0 is scanned
+        // newest-first (descending file number), that point key would be found
+        // and returned before the tombstone-bearing file is ever visited. So
+        // accumulate covering tombstone sequences across ALL L0 files before
+        // doing any point lookup, mirroring the L1+ branch and the iterator
+        // path. (File number does not track sequence order within one split
+        // flush, so the per-file early-out is unsound here.)
+        let l0_files = version.level_files(0);
+        for tf in l0_files {
             if tf.meta.has_range_deletions {
                 let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq).c(d!())?;
                 max_tomb_seq = max_tomb_seq.max(file_tomb_seq);
             }
+        }
+        for tf in l0_files {
             if let Some((result, entry_seq)) = tf.reader.get_internal_with_seq(key, seq).c(d!())? {
                 if max_tomb_seq > entry_seq {
                     return Ok(None);

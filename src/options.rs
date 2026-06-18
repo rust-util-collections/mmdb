@@ -359,6 +359,17 @@ pub enum CompactionFilterDecision {
 /// During compaction, each key-value pair is passed to the filter for a decision.
 pub trait CompactionFilter: Send + Sync {
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionFilterDecision;
+
+    /// Returns `true` if this filter never removes or changes any entry, i.e.
+    /// [`filter`](Self::filter) always returns [`CompactionFilterDecision::Keep`].
+    ///
+    /// When `true`, the engine may apply the trivial-move optimization
+    /// (relocating a single SST to the next level without rewriting it) instead
+    /// of streaming every entry through the filter. The default is `false`
+    /// (conservative — the filter is assumed to be active).
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 impl fmt::Debug for dyn CompactionFilter {

@@ -1027,11 +1027,17 @@ impl LeveledCompaction {
 
         // Trivial move optimization: if there's exactly one input file and no
         // overlap with the next level, just move the metadata without rewriting.
-        // Skip the optimisation when a compaction filter is installed, because
-        // the filter needs to see every key-value pair to decide on removals.
+        // Skip the optimisation when the compaction filter could remove or
+        // change entries — it needs to see every key-value pair. A filter that
+        // reports itself a no-op (e.g. lazy-delete with no user filter and no
+        // registered dead keys) still permits the move.
         if task.input_files_level.len() == 1
             && task.input_files_next.is_empty()
-            && ctx.options.compaction_filter.is_none()
+            && ctx
+                .options
+                .compaction_filter
+                .as_ref()
+                .is_none_or(|f| f.is_noop())
         {
             let tf = &task.input_files_level[0];
             let mut edit = VersionEdit::new();
