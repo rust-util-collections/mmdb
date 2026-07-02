@@ -2,7 +2,21 @@
   "permissions": {
     "allow": [
       "Edit(docs/audit.md)",
-      "Write(docs/audit.md)"
+      "Write(docs/audit.md)",
+      "Edit(Cargo.toml)",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(make fmt)",
+      "Bash(make lint)",
+      "Bash(make test)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(git show:*)",
+      "Bash(git blame:*)"
     ]
   }
 }

@@ -1,3 +1,7 @@
+---
+description: Fix audit backlog — resolve every open finding in docs/audit.md, self-review, commit
+---
+
 # Fix Audit Backlog
 
 You are resolving every open finding in `docs/audit.md`, then self-reviewing and committing the result.
@@ -9,9 +13,10 @@ You are resolving every open finding in `docs/audit.md`, then self-reviewing and
 ## Setup
 
 1. **MANDATORY**: Read `.claude/docs/technical-patterns.md` — bug pattern reference.
-2. Read `.claude/docs/review-core.md` — review methodology.
+2. Read `.claude/docs/review-core.md` — review methodology and the canonical **Subsystem Map**.
 3. Read `.claude/docs/false-positive-guide.md` — consult before reporting any finding.
-4. Read `docs/audit.md` — this is your **primary work list**.
+4. Read `.claude/docs/commit-protocol.md` — validate/bump/commit procedure.
+5. Read `docs/audit.md` — this is your **primary work list**.
 
 ## Phase 1: Fix
 
@@ -20,61 +25,41 @@ You are resolving every open finding in `docs/audit.md`, then self-reviewing and
 1. Read `docs/audit.md`. If no `## Open` entries exist, report "nothing to fix" and stop.
 2. Sort open findings by severity: CRITICAL → HIGH → MEDIUM → LOW.
 3. For each finding, read the code at the reported location with full context (100+ lines).
-4. For each affected subsystem, read the corresponding pattern file from `.claude/docs/patterns/`.
+4. For each affected subsystem, read its pattern guide(s) per the Subsystem Map.
 
 ### Task 2: Fix
 
 For each open finding, in severity order:
 
-1. **Understand** the root cause — read the code, trace call sites, understand the invariant being violated.
-2. **Implement** a complete fix. The fix must:
-   - Fully resolve the finding — not a band-aid, not a workaround
-   - Not introduce new issues (check boundary conditions, error paths, concurrency)
-   - Respect crash safety (WAL durability, fsync ordering), lock ordering, and MVCC invariants
-   - Follow the project's existing code style and conventions
+1. **Understand** the root cause — read the code, trace call sites, identify the violated invariant.
+2. **Implement** a complete fix that:
+   - Fully resolves the finding — not a band-aid, not a workaround
+   - Introduces no new issues (check boundary conditions, error paths, concurrency)
+   - Respects crash safety (WAL durability, fsync ordering), lock ordering, and MVCC invariants
+   - Follows existing code style and conventions
 3. **Verify** the fix by reading the modified code and tracing its effects.
-4. If the finding **cannot be fixed** (technical limitation, disproportionate risk, or would require architectural redesign), move it to `## Won't Fix` with a clear `**Reason**` explaining why.
+4. If the finding **cannot be fixed** (technical limitation, disproportionate risk, architectural redesign required), move it to `## Won't Fix` with a clear `**Reason**`.
 
-### Task 3: Validate
-
-1. After all fixes are applied, re-read every modified file to check for regressions.
-2. Run `make fmt` to ensure formatting is consistent.
-3. Run `make lint` to catch any new warnings.
-
-### Task 4: Update Audit Registry
+### Task 3: Update Audit Registry
 
 1. Remove all fixed entries from `## Open`.
-2. For entries moved to `## Won't Fix`, add the `**Reason**` field.
+2. Add `**Reason**` to entries moved to `## Won't Fix`.
 3. Write the updated `docs/audit.md`.
 
 ## Phase 2: Self-Review
 
 1. Run `git diff HEAD` to see all changes from audit fixes.
 2. If the diff is empty, report "nothing to commit" and stop.
-3. Execute the `/x-review` Execution Protocol on the diff — including invariant checks, concurrency analysis, crash safety, and unsafe block audit.
+3. Execute the `/x-review` Execution Protocol on the diff — invariant checks, concurrency analysis, crash safety, unsafe audit.
 4. Cross-reference every finding with `false-positive-guide.md`.
-5. If the review produces **new findings**:
-   - Fix them immediately.
-   - Update `docs/audit.md`.
-   - Repeat until `## Open` has zero entries (or only Won't Fix).
+5. If the review produces **new findings**: fix them immediately, update `docs/audit.md`, and repeat until `## Open` is empty (or only Won't Fix remains).
 
-## Phase 3: Commit
+## Phase 3: Validate, Bump, Commit
 
-1. Run `make fmt`.
-2. Run `git diff HEAD --stat` and `git log -5 --oneline` to understand scope and style.
-3. Stage all changed files with `git add` (specific files, not `-A`).
-4. Bump patch version in `Cargo.toml` if any `.rs` files changed (see `/x-commit` Task 4).
-5. Draft a commit message summarizing the audit fixes.
-6. Commit using a HEREDOC — **do NOT include any co-author line**:
-
-```
-git commit -m "$(cat <<'EOF'
-<commit message here>
-EOF
-)"
-```
-
-7. Run `git status` to verify success.
+Execute `.claude/docs/commit-protocol.md` in full:
+1. **Validate** (fmt → lint → scoped tests) — audit fixes span subsystems, so default to the full `cargo test` suite.
+2. **Bump patch version** if any `.rs` file changed.
+3. **Commit** with a message summarizing the audit fixes (specific files, HEREDOC, no co-author line).
 
 ## Output Format
 
@@ -87,6 +72,9 @@ EOF
 
 ### Self-Review
 **New findings**: N (all resolved)
+
+### Validation
+fmt ✓ | lint ✓ | tests <which suites> ✓
 
 ### Commit
 **Commit**: <short hash> <subject line>

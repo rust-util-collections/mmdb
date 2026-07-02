@@ -1,70 +1,56 @@
+---
+description: Deep regression review of recent changes (or full codebase with `all`); updates docs/audit.md
+argument-hint: "[N | all | <hash> | <hash1>..<hash2>]"
+---
+
 # Deep Regression Analysis for MMDB
 
 You are performing a deep code review of changes to MMDB, a Rust LSM-Tree storage engine.
 
 ## Setup
 
-1. **MANDATORY**: Read `.claude/docs/technical-patterns.md` first — this is your bug pattern reference.
-2. Read `.claude/docs/review-core.md` — this is your review methodology.
+1. **MANDATORY**: Read `.claude/docs/technical-patterns.md` — your bug pattern reference.
+2. Read `.claude/docs/review-core.md` — review methodology, including the canonical **Subsystem Map** (file → subsystem → pattern guide).
 3. Read `.claude/docs/false-positive-guide.md` — consult before reporting any finding.
 
 ## Input
 
 Arguments: `$ARGUMENTS`
 
-Parse the arguments to determine review scope:
-
 | Input | Scope | How |
 |-------|-------|-----|
 | *(empty)* | Latest commit | `git diff HEAD~1`, `git log -1` |
 | `N` (integer) | Last N commits | `git diff HEAD~N`, `git log -N --oneline` |
-| `all` | Full codebase audit | Read all `src/` files by subsystem (see Full Audit Protocol below) |
+| `all` | Full codebase audit | See **Full Audit Protocol** below |
 | `<commit hash>` | Specific commit | `git diff <hash>~1 <hash>` |
 | `<hash1>..<hash2>` | Commit range | `git diff <hash1> <hash2>` |
 
-For diff-based reviews (everything except `all`), proceed to the Execution Protocol below.
-For `all`, skip to the **Full Audit Protocol** section at the end of this document.
+For diff-based reviews, run the Execution Protocol. For `all`, skip to the Full Audit Protocol.
 
 ## Execution Protocol
 
 ### Task 1: Context & Classification
 
-1. Read the full diff carefully
-2. Identify ALL affected subsystems by mapping changed files:
-   - `src/db.rs` → write-path, read-path
-   - `src/memtable/` → memtable
-   - `src/wal/` → WAL
-   - `src/sst/` → SST
-   - `src/iterator/` → iterator
-   - `src/compaction/` → compaction
-   - `src/manifest/` → manifest
-   - `src/cache/` → cache
-   - `src/types.rs` → data-encoding
-   - `src/options.rs` → configuration
-3. For EACH affected subsystem, read the corresponding pattern file:
-   - `.claude/docs/patterns/compaction.md`
-   - `.claude/docs/patterns/iterator.md`
-   - `.claude/docs/patterns/wal.md`
-   - `.claude/docs/patterns/sst.md`
-   - `.claude/docs/patterns/memtable.md`
-   - `.claude/docs/patterns/concurrency.md`
-4. Classify each change per the review-core methodology (control flow, resource lifecycle, concurrency, unsafe, etc.)
+1. Read the full diff carefully.
+2. Map every changed file to its subsystem via the **Subsystem Map** in review-core.md.
+3. Read the pattern guide(s) for EACH affected subsystem.
+4. Classify each change per review-core.md Phase 2 (control flow, resource lifecycle, concurrency, unsafe, etc.).
 
 ### Task 2: Deep Regression Analysis
 
 For each HIGH or CRITICAL classified change:
 
 1. **Read the surrounding code** — at least 50 lines of context around each change
-2. **Trace call sites** — use grep/LSP to find all callers of changed functions
-3. **Check invariants** — verify each invariant from review-core.md Phase 3.1
-4. **Boundary conditions** — check edge cases from review-core.md Phase 3.2
-5. **Failure paths** — analyze error handling per review-core.md Phase 3.3
-6. **Concurrency** — if shared state is touched, perform full concurrency analysis per review-core.md Phase 3.4
+2. **Trace call sites** — grep/LSP for all callers of changed functions
+3. **Check invariants** — review-core.md Phase 3.1
+4. **Boundary conditions** — review-core.md Phase 3.2
+5. **Failure paths** — review-core.md Phase 3.3
+6. **Concurrency** — if shared state is touched, full analysis per review-core.md Phase 3.4
 
-For each finding:
-- Cross-reference with `technical-patterns.md` — which pattern does it match?
-- Cross-reference with `false-positive-guide.md` — is this a known false positive?
-- Only report if you have **concrete evidence**
+For each candidate finding:
+- Which pattern in `technical-patterns.md` does it match?
+- Does `false-positive-guide.md` rule it out?
+- Only report with **concrete evidence** — a specific triggering scenario.
 
 ### Task 3: Cross-Cutting Analysis
 
@@ -75,37 +61,27 @@ Check every change for:
 
 ### Task 4: Code Style Enforcement
 
-Check changed files against project style rules:
-
-1. **No lint suppression** — `#[allow(clippy::...)]`, `#[allow(unused_...)]`, `#[allow(dead_code)]` etc. are forbidden. All warnings must be fixed at the source, not silenced. Report every `allow(...)` attribute in changed code as a finding.
-2. **Prefer imports over inline paths** — Avoid `std::foo::Bar::new()` inline in function bodies when the same path appears 3+ times in a file; add `use std::foo;` at file top (or `use std::foo::Bar;`) instead. Function-body `use` statements (scoped imports) are fine and don't count as inline paths. 1-2 inline uses of common `std::` items are acceptable. Report only when the same full-qualified path appears 3+ times inline across a file.
-3. **Import grouping** — Imports with a common prefix must be merged using nested braces: `use std::sync::{Arc, Mutex};` not separate `use std::sync::Arc; use std::sync::Mutex;`.
-4. **Doc-code alignment** — If the change modifies a public function signature, struct field, module structure, or adds/removes/renames a public type or module, verify docs still match. Specifically check:
-   - `CLAUDE.md` architecture table (subsystem paths, type names, dependency info)
-   - `.claude/docs/review-core.md` subsystem path mappings
-   - `.claude/commands/x-review.md` full-audit subsystem partitioning table
-   - `.claude/docs/patterns/` guides — referenced file lists and invariants
-   - Doc comments and README
+Apply the style rules from review-core.md Phase 4.4 to all changed files:
+no `#[allow(...)]`, no repeated inline paths (3+ per file), grouped imports, doc-code alignment.
 
 ### Task 5: Unsafe Code Audit
 
 If ANY `unsafe` block is added or modified:
 1. Read `.claude/docs/patterns/unsafe-audit.md`
-2. Verify SAFETY comment exists and is accurate
-3. Check all prerequisites mentioned in the SAFETY comment
-4. Verify no undefined behavior (aliasing, alignment, validity)
+2. Verify the SAFETY comment exists, is specific, and its prerequisites actually hold
+3. Check for undefined behavior (aliasing, alignment, validity, data races)
 
 ### Task 6: Audit Registry (docs/audit.md)
 
 After completing the analysis:
 
 1. Read `docs/audit.md` from the project root (create if absent).
-2. **Prune**: For each entry under `## Open`, verify against the current codebase. Remove entries that are 100% fixed.
-3. **Merge**: Add new findings from this review under `## Open`, deduplicating against existing entries. Sort by severity (CRITICAL → HIGH → MEDIUM → LOW).
-4. **Preserve**: Leave all `## Won't Fix` entries untouched.
+2. **Prune**: verify each `## Open` entry against the current code; remove entries that are 100% fixed.
+3. **Merge**: add new findings under `## Open`, deduplicated, sorted CRITICAL → HIGH → MEDIUM → LOW.
+4. **Preserve**: leave `## Won't Fix` entries untouched.
 5. Write the updated `docs/audit.md`.
 
-The file format:
+File format:
 
 ```markdown
 # Audit Findings
@@ -132,8 +108,6 @@ The file format:
 
 ## Output Format
 
-Report findings as:
-
 ```
 ## Review Summary
 
@@ -152,14 +126,12 @@ Report findings as:
 
 ---
 
-(repeat for each finding)
-
 ## No Issues Found
 
 (list areas checked where no issues were found, to demonstrate coverage)
 ```
 
-If zero findings after full analysis, report:
+If zero findings after full analysis:
 ```
 ## Review Summary
 **Result**: LGTM — no regressions found
@@ -170,51 +142,27 @@ If zero findings after full analysis, report:
 
 ## Full Audit Protocol (for `all` mode)
 
-When `$ARGUMENTS` is `all`, perform a full codebase audit instead of a diff-based review.
-
 ### Strategy: Parallel Subsystem Audit
 
-Launch **one Agent per subsystem** in parallel. Each agent receives:
-1. The subsystem file list to read
-2. The corresponding pattern file from `.claude/docs/patterns/`
-3. `technical-patterns.md` and `false-positive-guide.md`
-4. The code style rules from Task 4
-
-### Subsystem Partitioning
-
-| Subsystem | Files | Pattern Guide |
-|-----------|-------|---------------|
-| write-path & read-path | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `concurrency.md` |
-| memtable | `src/memtable/mod.rs`, `src/memtable/skiplist.rs`, `src/memtable/skiplist_impl.rs` | `memtable.md`, `unsafe-audit.md` |
-| WAL | `src/wal/writer.rs`, `src/wal/reader.rs`, `src/wal/record.rs` | `wal.md` |
-| SST | `src/sst/table_builder.rs`, `src/sst/table_reader.rs`, `src/sst/block.rs`, `src/sst/block_builder.rs`, `src/sst/filter.rs`, `src/sst/format.rs` | `sst.md`, `unsafe-audit.md` |
-| iterator | `src/iterator/db_iter.rs`, `src/iterator/merge.rs`, `src/iterator/level_iter.rs`, `src/iterator/bidi_iter.rs`, `src/iterator/range_del.rs` | `iterator.md` |
-| compaction | `src/compaction/leveled.rs` | `compaction.md` |
-| manifest & cache | `src/manifest/version_set.rs`, `src/manifest/version_edit.rs`, `src/manifest/version.rs`, `src/cache/block_cache.rs`, `src/cache/table_cache.rs` | `concurrency.md` |
-| types & encoding | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | (cross-cutting) |
-
-### Per-Subsystem Agent Instructions
-
-Each agent must:
-1. Read ALL files in its subsystem
-2. Read `technical-patterns.md` and the assigned pattern guide(s)
-3. Read `false-positive-guide.md`
-4. Perform the **full review-core methodology** (invariants, boundary conditions, failure paths, concurrency)
-5. Apply **code style rules** (no `#[allow(...)]`, no inline paths, grouped imports, doc-code alignment)
-6. Report findings in the standard format, prefixed with subsystem name
+Launch **one agent per subsystem row** of the Subsystem Map in review-core.md (9 subsystems; manifest and cache may share one agent). Each agent's prompt must include:
+1. The subsystem's file list (from the Subsystem Map)
+2. Instructions to read its pattern guide(s), `technical-patterns.md`, and `false-positive-guide.md`
+3. The full review-core methodology (invariants, boundary conditions, failure paths, concurrency)
+4. The code style rules (review-core.md Phase 4.4)
+5. The finding report format above, prefixed with the subsystem name
 
 ### Aggregation
 
 After all agents complete:
-1. Collect all findings
-2. Deduplicate cross-subsystem findings (e.g., a concurrency issue reported by both write-path and compaction agents)
-3. Sort by severity: CRITICAL → HIGH → MEDIUM → LOW
-4. Output a unified audit report:
+1. Deduplicate cross-subsystem findings (e.g., a concurrency issue reported by both write-path and compaction agents)
+2. Sort by severity: CRITICAL → HIGH → MEDIUM → LOW
+3. Update `docs/audit.md` per Task 6
+4. Output:
 
 ```
 ## Full Audit Report
 
-**Scope**: All src/ files (~19K LOC)
+**Scope**: All src/ files
 **Subsystems Audited**: <list>
 **Total Findings**: N (X critical, Y high, Z medium, W low)
 

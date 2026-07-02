@@ -42,9 +42,12 @@ MSRV: Rust 1.89 (edition 2024)
 
 Supporting documentation in `.claude/docs/`:
 - `technical-patterns.md` — cataloged bug patterns for LSM-Tree/Rust
-- `review-core.md` — systematic review methodology
+- `review-core.md` — systematic review methodology + canonical Subsystem Map (file → subsystem → pattern guide)
 - `false-positive-guide.md` — rules for filtering spurious findings
+- `commit-protocol.md` — canonical validate → version-bump → commit procedure
 - `patterns/` — per-subsystem review guides (compaction, iterator, WAL, SST, memtable, concurrency, unsafe-audit)
+
+Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` and `/x-fix`; open findings sorted by severity plus a Won't Fix section.
 
 ## Conventions
 

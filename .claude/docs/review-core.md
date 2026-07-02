@@ -9,10 +9,26 @@ This document defines the systematic review protocol for MMDB code changes.
 Before analyzing any change, gather context:
 
 1. **Read the diff** — understand every changed line
-2. **Identify affected subsystems** — map changes to: write-path, read-path, memtable, WAL, SST, iterator, compaction, manifest, cache
-3. **Load subsystem patterns** — read the relevant `.claude/docs/patterns/<subsystem>.md`
+2. **Identify affected subsystems** — map changed files using the Subsystem Map below
+3. **Load subsystem patterns** — read every pattern guide mapped to an affected subsystem
 4. **Check call sites** — use grep/LSP to find all callers of changed functions
 5. **Check related tests** — identify which test files cover the changed code
+
+### Subsystem Map (canonical — all commands reference this table)
+
+| Subsystem | Files | Pattern guide(s) |
+|-----------|-------|------------------|
+| write-path & read-path | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `concurrency.md`, `unsafe-audit.md` (db.rs unsafe) |
+| memtable | `src/memtable/` (mod.rs, skiplist.rs, skiplist_impl.rs) | `memtable.md`, `unsafe-audit.md` |
+| WAL | `src/wal/` (writer.rs, reader.rs, record.rs) | `wal.md` |
+| SST | `src/sst/` (table_builder.rs, table_reader.rs, block.rs, block_builder.rs, filter.rs, format.rs) | `sst.md`, `unsafe-audit.md` (table_reader only) |
+| iterator | `src/iterator/` (db_iter.rs, merge.rs, level_iter.rs, bidi_iter.rs, range_del.rs) | `iterator.md` |
+| compaction | `src/compaction/leveled.rs` | `compaction.md` |
+| manifest | `src/manifest/` (version_set.rs, version_edit.rs, version.rs) | `concurrency.md` |
+| cache | `src/cache/` (block_cache.rs, table_cache.rs) | `concurrency.md` |
+| types & encoding | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` §2 (cross-cutting) |
+
+Pattern guides live in `.claude/docs/patterns/`.
 
 ## Phase 2: Change Classification
 
@@ -95,8 +111,7 @@ These are enforced project conventions — violations are findings (severity LOW
 - **Grouped imports**: Common prefixes must be merged — `use std::sync::{Arc, Mutex};` not two separate `use` lines.
 - **Doc-code alignment**: Public API changes must have matching doc comment / README / CLAUDE.md updates. Stale docs are a finding. When a change adds, removes, or renames a public type, module, or subsystem path, also verify:
   - `CLAUDE.md` architecture table (paths, type names, dependency info)
-  - `.claude/docs/review-core.md` subsystem path mappings
-  - `.claude/commands/x-review.md` full-audit subsystem partitioning table
+  - The Subsystem Map above (canonical file → subsystem → guide mapping)
   - `.claude/docs/patterns/` guides — referenced file lists and invariants
 
 ## Phase 5: Reporting
