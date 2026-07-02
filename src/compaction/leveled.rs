@@ -792,6 +792,7 @@ fn execute_sub_compaction_io(
     }
 
     // Flush remaining builder
+    let active_file_number = builder.as_ref().map(|_| current_file_number);
     if let Some(b) = builder {
         let result = match b.finish().c(d!()) {
             Ok(result) => result,
@@ -817,7 +818,7 @@ fn execute_sub_compaction_io(
 
     if let Some(e) = merger.error() {
         // Clean up orphan SST files written during the failed merge
-        cleanup_output_files(ctx.db_path, &new_files, None);
+        cleanup_output_files(ctx.db_path, &new_files, active_file_number);
         return Err(eg!("sub-compaction merge error: {}", e));
     }
 
@@ -1200,10 +1201,26 @@ impl LeveledCompaction {
                 }
             }
             if let Some(e) = first_err {
-                // Clean up SST files from successful sub-compactions
+                // Collect known file numbers from successful sub-compactions.
+                let known: std::collections::HashSet<u64> = outputs
+                    .iter()
+                    .flat_map(|o| o.new_files.iter().map(|(_, m)| m.number))
+                    .collect();
+                // Clean up SST files from successful sub-compactions.
                 for sub_out in &outputs {
                     for (_, meta) in &sub_out.new_files {
                         let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
+                        let _ = remove_file(&orphan);
+                    }
+                }
+                // Clean up any orphaned SSTs from the panicked thread(s):
+                // file numbers were consumed from the shared counter but never
+                // reported, so delete any .sst file in the allocated range that
+                // is not accounted for in the successful outputs.
+                let end = file_counter.load(Ordering::Acquire);
+                for num in file_number_start..end {
+                    if !known.contains(&num) {
+                        let orphan = ctx.db_path.join(format!("{:06}.sst", num));
                         let _ = remove_file(&orphan);
                     }
                 }
@@ -1597,6 +1614,7 @@ impl LeveledCompaction {
             }
         }
 
+        let active_file_number = builder.as_ref().map(|_| current_file_number);
         if let Some(b) = builder {
             let result = match b.finish().c(d!()) {
                 Ok(result) => result,
@@ -1625,6 +1643,10 @@ impl LeveledCompaction {
             // Clean up orphan SST files written during the failed merge
             for (_, meta) in &edit.new_files {
                 let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
+                let _ = remove_file(&orphan);
+            }
+            if let Some(num) = active_file_number {
+                let orphan = ctx.db_path.join(format!("{:06}.sst", num));
                 let _ = remove_file(&orphan);
             }
             return Err(eg!("force_merge iterator error: {}", e));

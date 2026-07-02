@@ -80,7 +80,7 @@ proptest! {
     }
 
     #[test]
-    fn test_write_batch_atomicity(batches in vec(
+    fn test_write_batch_correctness(batches in vec(
         vec((arb_key(), arb_value()), 1..10),
         1..10
     )) {

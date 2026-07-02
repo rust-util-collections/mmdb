@@ -313,7 +313,6 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     pub fn lower_bound(&self, target: &K) -> Option<(K, V)> {
         let max_h = self.max_height.load(Ordering::Acquire);
         let mut current: *const Node<K, V> = ptr::null();
-        let mut candidate: *const Node<K, V> = ptr::null();
 
         for level in (0..max_h).rev() {
             let mut next = if current.is_null() {
@@ -330,15 +329,14 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                     current = next;
                     next = n.next[level].load(Ordering::Acquire);
                 } else {
-                    // n.key >= target — this is a candidate
-                    candidate = next;
                     break;
                 }
             }
         }
 
-        // After the level traversal, we need to check level 0 from `current`
-        // to find the exact first node >= target.
+        // After the level traversal, walk level 0 from `current` to find
+        // the exact first node >= target. The level-0 linked list is complete
+        // (every node is reachable via level-0 links), so no fallback is needed.
         let start = if current.is_null() {
             self.head[0].load(Ordering::Acquire)
         } else {
@@ -354,13 +352,6 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
                 return Some((n.key.clone(), n.value.clone()));
             }
             ptr = n.next[0].load(Ordering::Acquire);
-        }
-
-        // Fall back to candidate if the level-0 walk didn't find anything
-        if !candidate.is_null() {
-            // SAFETY: candidate is a node pointer observed from an acquired link.
-            let n = unsafe { &*candidate };
-            return Some((n.key.clone(), n.value.clone()));
         }
 
         None

@@ -1477,50 +1477,50 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 return None;
             }
         }
-        // Forward cursor path (hot path)
-        if let Some(ref block) = self.current_block
-            && self.block_cursor_offset < self.block_data_end
-        {
-            let data = block.data();
-            let result =
-                decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key);
-            if let Some((value_start, value_len, next_offset)) = result {
-                // Check upper bound
+        loop {
+            // Forward cursor path (hot path)
+            if let Some(ref block) = self.current_block
+                && self.block_cursor_offset < self.block_data_end
+            {
+                let data = block.data();
+                let result =
+                    decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key);
+                if let Some((value_start, value_len, next_offset)) = result {
+                    // Check upper bound
+                    if let Some(ref ub) = self.upper_bound
+                        && user_key(&self.block_cursor_key) >= ub.as_slice()
+                    {
+                        return None;
+                    }
+                    self.block_cursor_offset = next_offset;
+                    key_buf.clear();
+                    key_buf.extend_from_slice(&self.block_cursor_key);
+                    return Some(LazyValue::BlockRef {
+                        data: block.data_arc().clone(),
+                        offset: value_start as u32,
+                        len: value_len as u32,
+                    });
+                }
+            }
+            // Materialized entries path (backward iteration)
+            if self.block_pos < self.current_block_entries.len() {
+                let (ref k, ref v) = self.current_block_entries[self.block_pos];
                 if let Some(ref ub) = self.upper_bound
-                    && user_key(&self.block_cursor_key) >= ub.as_slice()
+                    && user_key(k) >= ub.as_slice()
                 {
                     return None;
                 }
-                self.block_cursor_offset = next_offset;
                 key_buf.clear();
-                key_buf.extend_from_slice(&self.block_cursor_key);
-                return Some(LazyValue::BlockRef {
-                    data: block.data_arc().clone(),
-                    offset: value_start as u32,
-                    len: value_len as u32,
-                });
+                key_buf.extend_from_slice(k);
+                let lv = LazyValue::Inline(v.clone());
+                self.block_pos += 1;
+                return Some(lv);
             }
-        }
-        // Materialized entries path (backward iteration)
-        if self.block_pos < self.current_block_entries.len() {
-            let (ref k, ref v) = self.current_block_entries[self.block_pos];
-            if let Some(ref ub) = self.upper_bound
-                && user_key(k) >= ub.as_slice()
-            {
+            // Try loading next block
+            if !self.load_next_block() {
                 return None;
             }
-            key_buf.clear();
-            key_buf.extend_from_slice(k);
-            let lv = LazyValue::Inline(v.clone());
-            self.block_pos += 1;
-            return Some(lv);
         }
-        // Try loading next block
-        if !self.load_next_block() {
-            return None;
-        }
-        // Recurse once after loading a new block
-        self.next_lazy(key_buf)
     }
 }
 

@@ -1,10 +1,12 @@
 //! VersionSet: manages the MANIFEST file and the chain of Versions.
 
-use std::collections::HashMap;
-use std::fs;
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    fs,
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::cache::table_cache::TableCache;
 use crate::error::{Error, Result};

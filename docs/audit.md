@@ -1,6 +1,7 @@
 # Audit Findings
 
 > Auto-managed by /x-review and /x-fix.
+> Last full audit: 2026-07-02 (9 subsystems, 25 findings — 21 fixed, 4 deferred)
 
 ## Open
 
@@ -95,6 +96,26 @@ Encoded internal keys < 8 bytes cause a panic (debug and release). All stored da
 ### Invalid ValueType → Deletion (Design Decision)
 
 Unknown value type tags map to `Deletion` rather than erroring. All persisted data is CRC32-protected; when reachable (memory corruption), treating unknown as deletion is safer than returning phantom data.
+
+### [LOW] merge: IterSource::seek_to uses next() instead of next_lazy() (missed zero-copy)
+- **Where**: src/iterator/merge.rs:397-427
+- **What**: After seek_to(), source branches call `iter.next()` which allocates Vec for value. `next_lazy()` returns LazyValue without allocation.
+- **Reason**: Performance optimization on hot path, not a correctness bug. Restructuring to use next_lazy requires borrowing self.peeked_key across the match arms, which needs broader refactoring of the IterSource state machine. The current code is correct; the allocation overhead is marginal.
+
+### [LOW] db_iter: forward iteration level filter may be too strict for same-level entries
+- **Where**: src/iterator/db_iter.rs:443-453, src/iterator/range_del.rs:275-280
+- **What**: Level filter uses `level >= src_lvl`. A tombstone at level L can never delete entries also at level L.
+- **Reason**: Tentative finding — the backward path uses `None` (no level filter, conservative). The forward path's behavior is the RocksDB-derived pattern. No concrete reproduction case was identified. Requires deeper analysis with specific memtable-level tombstone scenarios.
+
+### [LOW] test: test_write_options_no_slowdown discards its behavioral signal
+- **Where**: tests/integration.rs:807-849
+- **What**: Tracks `hit_error` but discards it. Accepts any outcome as valid.
+- **Reason**: Test verifies the no_slowdown API doesn't crash (smoke test). Full behavioral verification (asserting write rejection under L0 pressure) requires careful setup of write buffer sizes and compaction thresholds that would be fragile. The existing test provides basic API safety coverage.
+
+### [LOW] manifest: recovery and log_and_apply handle out-of-range levels inconsistently
+- **Where**: src/manifest/version_set.rs:171-183 (recovery) vs. 281 (log_and_apply)
+- **What**: Recovery errors on out-of-range levels; log_and_apply silently skips.
+- **Reason**: Requires an internal logic bug to trigger (normal compaction/flush never produces out-of-range levels). Making log_and_apply fallible at this point changes its return type and touches all call sites. The recovery path already catches any such MANIFEST corruption on next open.
 
 ### Corrupt Block Entry → Restart Array Read (Design Decision)
 

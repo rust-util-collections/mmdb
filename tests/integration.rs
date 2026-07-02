@@ -56,15 +56,15 @@ fn test_sequential_write_read_1000() {
     let dir = tempfile::tempdir().unwrap();
     let db = make_db(dir.path());
 
-    // Write 100 entries
-    for i in 0..100 {
+    // Write 1000 entries
+    for i in 0..1000 {
         let key = format!("{:08}", i);
         let val = format!("value_{}", i);
         db.put(key.as_bytes(), val.as_bytes()).unwrap();
     }
 
     // Read all back
-    for i in 0..100 {
+    for i in 0..1000 {
         let key = format!("{:08}", i);
         let val = format!("value_{}", i);
         assert_eq!(db.get(key.as_bytes()).unwrap(), Some(val.into_bytes()));
@@ -509,10 +509,11 @@ fn test_multi_snapshot_coexistence() {
 }
 
 #[test]
-fn test_compaction_preserves_snapshots() {
+fn test_snapshot_before_compaction_and_current_after() {
     // Verifies that:
     // 1. Snapshots work correctly before compaction
     // 2. Current view shows latest values after compaction
+    // Note: does not verify snapshots survive compaction (known gap).
     // Note: snapshot reads after compaction may not see old versions because
     // the current compaction implementation deduplicates without tracking
     // active snapshots.

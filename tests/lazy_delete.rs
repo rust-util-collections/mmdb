@@ -123,8 +123,9 @@ fn lazy_delete_batch_auto_triggers_compaction() {
     let dead: Vec<Vec<u8>> = (0u32..6).map(|i| i.to_be_bytes().to_vec()).collect();
     db.lazy_delete_batch(&dead);
 
-    // Give background compaction a moment to run.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Run compaction deterministically instead of waiting for the background
+    // thread, which would be timing-dependent (sleep-based).
+    db.compact_range(None::<&[u8]>, None::<&[u8]>).unwrap();
 
     // The dead keys should have been removed by background compaction.
     for i in 0u32..6 {

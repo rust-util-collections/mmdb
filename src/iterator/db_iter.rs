@@ -244,6 +244,7 @@ impl DBIterator {
         // Invalidate any buffered entry — it may now be beyond the new bound.
         self.current = None;
         self.needs_advance = true;
+        self.prev_overshoot = None;
     }
 
     /// Set an inclusive lower bound on user keys.
@@ -253,6 +254,7 @@ impl DBIterator {
         self.iterate_lower_bound = Some(bound);
         self.current = None;
         self.needs_advance = true;
+        self.prev_overshoot = None;
     }
 
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
@@ -262,6 +264,7 @@ impl DBIterator {
         self.iterate_upper_bound = upper;
         self.current = None;
         self.needs_advance = true;
+        self.prev_overshoot = None;
     }
 
     /// Return the first error from any underlying source iterator.
@@ -621,6 +624,8 @@ impl DBIterator {
         self.has_last_key = false;
         self.needs_advance = true;
         self.current = None;
+        self.prev_overshoot = None;
+        self.last_seek_key = None;
         self.backward_positioned = false;
     }
 

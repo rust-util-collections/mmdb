@@ -7,7 +7,7 @@ use crate::cache::block_cache::BlockCache;
 use crate::error::Result;
 use crate::sst::table_reader::TableReader;
 use crate::stats::DbStats;
-use ruc::*;
+use ruc::eg;
 
 /// Cache for open TableReader instances.
 pub struct TableCache {

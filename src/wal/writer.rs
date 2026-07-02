@@ -125,7 +125,10 @@ impl WalWriter {
     }
 
     fn sync_parent_dir(path: &Path) -> Result<()> {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
         File::open(parent).and_then(|dir| dir.sync_all()).c(d!())
     }
 }

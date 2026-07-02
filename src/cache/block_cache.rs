@@ -134,8 +134,17 @@ impl BlockCache {
         let key = (file_number, block_offset);
         self.pinned.lock().remove(&key);
         self.inner.invalidate(&key);
-        if let Some(offsets) = self.file_offsets.lock().get_mut(&file_number) {
-            offsets.remove(&block_offset);
+        let is_empty = {
+            let mut offsets = self.file_offsets.lock();
+            if let Some(set) = offsets.get_mut(&file_number) {
+                set.remove(&block_offset);
+                set.is_empty()
+            } else {
+                false
+            }
+        };
+        if is_empty {
+            self.file_offsets.lock().remove(&file_number);
         }
     }
 

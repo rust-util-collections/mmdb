@@ -223,12 +223,6 @@ mod tests {
         let entries: Vec<_> = mt.iter().collect();
         // Should be sorted by internal key ordering: a, b, c
         assert_eq!(entries.len(), 3);
-        let keys: Vec<&[u8]> = entries
-            .iter()
-            .map(|(k, _)| InternalKey::from_encoded(k.clone()).user_key().to_vec())
-            .map(|_| &[] as &[u8])
-            .collect();
-        // Better test: check user key ordering
         let user_keys: Vec<Vec<u8>> = entries
             .iter()
             .map(|(k, _)| {
@@ -236,7 +230,6 @@ mod tests {
                 ik.user_key().to_vec()
             })
             .collect();
-        let _ = keys;
         assert_eq!(user_keys[0], b"a");
         assert_eq!(user_keys[1], b"b");
         assert_eq!(user_keys[2], b"c");

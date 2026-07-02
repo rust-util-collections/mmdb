@@ -2367,10 +2367,18 @@ impl DB {
                     drop(inner); // release lock for slow SST write
                     match self.flush_frozen_memtable(&frozen) {
                         Ok(build_results) => {
+                            let output_numbers: Vec<u64> =
+                                build_results.iter().map(|(n, _)| *n).collect();
                             let mut inner = self.inner.lock(); // reacquire
                             match self.install_flush(&mut inner, &frozen, build_results) {
                                 Ok(()) => flush_wal = Some(old_wal),
                                 Err(e) => {
+                                    // Clean up orphan SST files: log_and_apply did not
+                                    // persist the edit, so these files must be deleted.
+                                    for num in &output_numbers {
+                                        let path = self.path.join(format!("{:06}.sst", num));
+                                        let _ = std::fs::remove_file(&path);
+                                    }
                                     // The frozen memtable is still live in
                                     // `immutable_memtables` and its WAL is intact, but a
                                     // later successful flush would advance `log_number`
@@ -2398,7 +2406,13 @@ impl DB {
         }
 
         if let Some(old_wal) = flush_wal {
-            self.post_flush_cleanup(old_wal).ok(); // best-effort sync
+            if let Err(e) = self.post_flush_cleanup(old_wal) {
+                tracing::warn!(
+                    "post-flush cleanup failed for WAL {}: {} — manifest sync may have failed",
+                    old_wal,
+                    e
+                );
+            }
             self.signal_compaction();
         }
 
@@ -2421,7 +2435,13 @@ impl DB {
                 return Err(e);
             }
         };
+        let output_numbers: Vec<u64> = build_results.iter().map(|(n, _)| *n).collect();
         if let Err(e) = self.install_flush(inner, &frozen, build_results) {
+            // Clean up orphan SST files produced by the failed flush install.
+            for num in &output_numbers {
+                let path = self.path.join(format!("{:06}.sst", num));
+                let _ = std::fs::remove_file(&path);
+            }
             self.set_bg_error(format!("flush install failed: {}", e));
             return Err(e);
         }
@@ -2450,9 +2470,15 @@ impl DB {
                 return Err(e);
             }
         };
+        let output_numbers: Vec<u64> = build_results.iter().map(|(n, _)| *n).collect();
         let mut inner = self.inner.lock();
         if let Err(e) = self.install_flush(&mut inner, frozen, build_results) {
             drop(inner);
+            // Clean up orphan SST files: log_and_apply did not persist the edit.
+            for num in &output_numbers {
+                let path = self.path.join(format!("{:06}.sst", num));
+                let _ = std::fs::remove_file(&path);
+            }
             self.set_bg_error(format!("flush install failed: {}", e));
             return Err(e);
         }

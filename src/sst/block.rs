@@ -370,15 +370,10 @@ impl Block {
 
             // Decode the key at restart point (shared_len is always 0 at restart)
             match decode_entry_at(&self.data, rp, &[]) {
-                Some((key, _, next_off)) => {
-                    let _ = next_off;
-                    if key.as_slice() < target {
-                        left = mid + 1;
-                    } else {
-                        right = mid;
-                    }
+                Some((key, _, _)) if key.as_slice() < target => {
+                    left = mid + 1;
                 }
-                None => {
+                Some(_) | None => {
                     right = mid;
                 }
             }

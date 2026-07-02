@@ -1030,11 +1030,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                         break;
                     }
                 }
-                if !reached && self.sources[i].has_peeked {
-                    // Still behind; fallback to full seek
-                    self.sources[i].seek_to(target, &self.compare);
-                } else if !reached {
-                    // exhausted — seek_to for final positioning
+                if !reached {
+                    // Not yet at target — fallback to full seek
                     self.sources[i].seek_to(target, &self.compare);
                 }
             }
