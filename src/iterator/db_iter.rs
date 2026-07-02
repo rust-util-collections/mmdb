@@ -234,8 +234,8 @@ impl DBIterator {
 
     /// Check if a user key is covered by any range tombstone visible at our snapshot,
     /// without cross-level pruning. Used for backward iteration where the source level
-    /// of the best entry may not match `last_source_level` (backward collection
-    /// aggregates entries from multiple sources).
+    /// of the winning entry is not reliably tracked (backward collection aggregates
+    /// entries from multiple sources).
     fn is_range_deleted_no_level_filter(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
         if self.range_tombstones.is_empty() {
             return false;
@@ -766,8 +766,8 @@ impl DBIterator {
                         Some((uk, val)) => {
                             // Check range tombstone coverage (O(log T) binary search).
                             // Use no-level-filter variant: backward collection aggregates
-                            // entries from multiple sources, so last_source_level may not
-                            // correspond to the winning entry's source.
+                            // entries from multiple sources, so the winning entry's source
+                            // level is not reliably tracked.
                             if self.is_range_deleted_no_level_filter(&uk, best_seq) {
                                 // Covered by range tombstone — skip
                                 current_bound = Some(cuk);

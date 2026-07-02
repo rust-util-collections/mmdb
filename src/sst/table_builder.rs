@@ -117,8 +117,6 @@ pub struct TableBuilder {
 
     // Current file offset
     offset: u64,
-    // Number of entries written
-    num_entries: u64,
     // Last key added (for ordering check)
     last_key: Vec<u8>,
 
@@ -161,7 +159,6 @@ impl TableBuilder {
             pending_first_key: None,
             filter_keys: Vec::new(),
             offset: 0,
-            num_entries: 0,
             last_key: Vec::new(),
             smallest_key: None,
             largest_key: None,
@@ -249,7 +246,6 @@ impl TableBuilder {
                 self.has_range_deletions = true;
                 self.range_del_entries.push((key.to_vec(), value.to_vec()));
                 self.last_key = key.to_vec();
-                self.num_entries += 1;
                 return Ok(());
             }
         }
@@ -302,7 +298,6 @@ impl TableBuilder {
 
         self.data_block.add(key, value);
         self.last_key = key.to_vec();
-        self.num_entries += 1;
 
         for collector in &mut self.block_property_collectors {
             collector.add(key, value);

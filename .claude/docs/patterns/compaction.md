@@ -1,7 +1,7 @@
 # Compaction Subsystem Review Patterns
 
 ## Files
-- `src/compaction/leveled.rs` (~61KB, most complex module)
+- `src/compaction/leveled.rs` (~83KB, most complex module)
 
 ## Architecture
 - Leveled compaction: L0 (overlapping) → L1+ (sorted, disjoint)

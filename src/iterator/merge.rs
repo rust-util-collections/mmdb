@@ -44,8 +44,6 @@ pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
     lower_bound: Option<Vec<u8>>,
     /// Exclusive upper bound on user keys (for bounds propagation).
     upper_bound: Option<Vec<u8>>,
-    /// LSM level of the source that produced the last peeked/emitted entry.
-    last_source_level: usize,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
@@ -64,7 +62,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             in_heap: vec![false; n],
             lower_bound: None,
             upper_bound: None,
-            last_source_level: usize::MAX,
         }
     }
 
@@ -173,7 +170,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 // Track current key for direction switching (same as multi-source path).
                 self.current_key.clear();
                 self.current_key.extend_from_slice(&entry.0);
-                self.last_source_level = self.sources[0].level;
                 let _ = self.sources[0].peek();
             });
         }
@@ -190,7 +186,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
         self.current_key.clear();
         self.current_key.extend_from_slice(&entry.0);
-        self.last_source_level = self.sources[min_idx].level;
 
         // Advance the source and peek its next entry
         let _ = self.sources[min_idx].peek();
@@ -231,7 +226,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             return self.sources[0].take_peeked().inspect(|entry| {
                 self.current_key.clear();
                 self.current_key.extend_from_slice(&entry.0);
-                self.last_source_level = self.sources[0].level;
                 self.sources[0].prev_advance();
             });
         }
@@ -248,7 +242,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
         self.current_key.clear();
         self.current_key.extend_from_slice(&entry.0);
-        self.last_source_level = self.sources[max_idx].level;
 
         // Move this source backward
         if self.sources[max_idx].prev_advance() {
@@ -463,7 +456,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     #[inline]
     pub fn advance_entry(&mut self) {
         if self.single_source {
-            self.last_source_level = self.sources[0].level;
             self.sources[0].skip_peeked();
             let _ = self.sources[0].peek();
             return;
@@ -474,7 +466,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
 
         let min_idx = self.heap[0];
-        self.last_source_level = self.sources[min_idx].level;
         self.sources[min_idx].skip_peeked();
         let _ = self.sources[min_idx].peek();
 
@@ -495,7 +486,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Only call this for entries that will actually be returned to the caller.
     pub fn take_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if self.single_source {
-            self.last_source_level = self.sources[0].level;
             let entry = self.sources[0].take_peeked()?;
             self.current_key.clear();
             self.current_key.extend_from_slice(&entry.0);
@@ -508,7 +498,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
 
         let min_idx = self.heap[0];
-        self.last_source_level = self.sources[min_idx].level;
         let entry = self.sources[min_idx].take_peeked()?;
 
         self.current_key.clear();

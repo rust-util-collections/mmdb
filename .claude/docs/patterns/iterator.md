@@ -2,9 +2,9 @@
 
 ## Files
 - `src/iterator/db_iter.rs` (~49KB) — user-facing DBIterator
-- `src/iterator/merge.rs` (~27KB) — MergingIterator (heap-based)
-- `src/iterator/source.rs` (~23KB) — IterSource wrapper + SeekableIterator trait (extracted from merge.rs)
-- `src/iterator/level_iter.rs` (~21KB) — lazy two-level iterator for L1+
+- `src/iterator/merge.rs` (~25KB) — MergingIterator (heap-based)
+- `src/iterator/source.rs` (~20KB) — IterSource wrapper + SeekableIterator trait (extracted from merge.rs)
+- `src/iterator/level_iter.rs` (~25KB) — lazy two-level iterator for L1+
 - `src/iterator/bidi_iter.rs` (~16KB) — bidirectional support
 - `src/iterator/range_del.rs` (~19KB) — range tombstone tracking
 

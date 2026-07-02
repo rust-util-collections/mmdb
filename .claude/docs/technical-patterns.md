@@ -43,7 +43,7 @@ Load this document FIRST before performing any review or debug analysis.
 
 ### 2.2 InternalKey Encoding/Decoding Mismatch
 **Pattern**: Encoding user_key as `[user_key][!pack(seq, type)]` but decoding with wrong byte order or wrong bit inversion.
-**Where**: `types.rs` — `InternalKey::new()` (encoding from components) / `InternalKey::from_encoded()` (wrapping, from bytes).
+**Where**: `types.rs` — `InternalKey::new()` (encoding from components) / `InternalKeyRef` (decoding from bytes: `user_key()`/`sequence()`/`value_type()`).
 **Impact**: Incorrect key ordering — breaks binary search, iterator merge, compaction.
 **Check**: Verify pack/unpack round-trips. Verify bit inversion (`!`) is applied symmetrically.
 

@@ -1,7 +1,7 @@
 # SST Subsystem Review Patterns
 
 ## Files
-- `src/sst/table_builder.rs` (~22KB) — SST file writer
+- `src/sst/table_builder.rs` (~27KB) — SST file writer
 - `src/sst/table_reader/mod.rs` (~25KB) — SST file reader (open, block read/cache, point lookup)
 - `src/sst/table_reader/iterator.rs` (~48KB) — TableIterator, complex seek logic
 - `src/sst/block.rs` (~25KB) — data block codec, prefix compression
