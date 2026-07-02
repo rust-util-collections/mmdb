@@ -1,12 +1,10 @@
 //! WAL reader: reads and reassembles records from a WAL file.
 
 use std::fs::File;
-use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom};
+use std::io::{BufReader, ErrorKind, Read, Seek};
 use std::path::Path;
 
-use ruc::*;
-
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultExt};
 use crate::wal::record::*;
 
 /// WAL reader. Reads records from a WAL file, handling fragmentation.
@@ -20,41 +18,24 @@ pub struct WalReader {
     /// After iterating all records, this is the safe truncation point for
     /// append-after-crash (any bytes beyond this are corrupt/partial).
     last_valid_offset: u64,
-    file_size: u64,
 }
 
 impl WalReader {
     /// Open a WAL file for reading.
     pub fn new(path: &Path) -> Result<Self> {
-        let file = File::open(path).c(d!())?;
-        let file_size = file.metadata().c(d!())?.len();
+        let file = File::open(path).ctx()?;
         Ok(Self {
             reader: BufReader::new(file),
             block_offset: 0,
             eof: false,
             last_valid_offset: 0,
-            file_size,
         })
-    }
-
-    /// Reset to the beginning of the file.
-    pub fn reset(&mut self) -> Result<()> {
-        self.reader.seek(SeekFrom::Start(0)).c(d!())?;
-        self.block_offset = 0;
-        self.eof = false;
-        self.last_valid_offset = 0;
-        Ok(())
     }
 
     /// Byte position of the end of the last successfully read complete record.
     /// Use this as the truncation point when reopening for append after a crash.
     pub fn last_valid_offset(&self) -> u64 {
         self.last_valid_offset
-    }
-
-    /// Whether the underlying reader is positioned at the physical end of file.
-    pub fn is_at_file_end(&mut self) -> Result<bool> {
-        Ok(self.reader.stream_position().c(d!())? >= self.file_size)
     }
 
     /// True if every byte from the current read position to EOF is zero.
@@ -79,12 +60,13 @@ impl WalReader {
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(e) => return Err(eg!(e)),
+                Err(e) => return Err(e).ctx(),
             }
         }
     }
 
     /// Return an iterator over all records in the WAL.
+    #[cfg(test)]
     pub fn iter(&mut self) -> WalIterator<'_> {
         WalIterator { reader: self }
     }
@@ -113,38 +95,36 @@ impl WalReader {
                 Some((record_type, data)) => match record_type {
                     RecordType::Full => {
                         if in_fragmented_record {
-                            return Err(eg!(Error::Corruption(
+                            return Err(Error::corruption(
                                 "full record inside fragment".to_string(),
-                            )));
+                            ));
                         }
-                        self.last_valid_offset = self.reader.stream_position().c(d!())?;
+                        self.last_valid_offset = self.reader.stream_position().ctx()?;
                         return Ok(Some(data));
                     }
                     RecordType::First => {
                         if in_fragmented_record {
-                            return Err(eg!(Error::Corruption(
+                            return Err(Error::corruption(
                                 "first record inside fragment".to_string(),
-                            )));
+                            ));
                         }
                         in_fragmented_record = true;
                         result = data;
                     }
                     RecordType::Middle => {
                         if !in_fragmented_record {
-                            return Err(eg!(Error::Corruption(
+                            return Err(Error::corruption(
                                 "middle record without first".to_string(),
-                            )));
+                            ));
                         }
                         result.extend_from_slice(&data);
                     }
                     RecordType::Last => {
                         if !in_fragmented_record {
-                            return Err(eg!(Error::Corruption(
-                                "last record without first".to_string()
-                            )));
+                            return Err(Error::corruption("last record without first".to_string()));
                         }
                         result.extend_from_slice(&data);
-                        self.last_valid_offset = self.reader.stream_position().c(d!())?;
+                        self.last_valid_offset = self.reader.stream_position().ctx()?;
                         return Ok(Some(result));
                     }
                     RecordType::Zero => unreachable!("zero records are handled as padding"),
@@ -166,7 +146,7 @@ impl WalReader {
                     match self.reader.read_exact(&mut skip) {
                         Ok(()) => {}
                         Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-                        Err(e) => return Err(eg!(e)),
+                        Err(e) => return Err(e).ctx(),
                     }
                 }
                 self.block_offset = 0;
@@ -178,17 +158,17 @@ impl WalReader {
             match self.reader.read_exact(&mut header_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(eg!(e)),
+                Err(e) => return Err(e).ctx(),
             }
 
             let (checksum, length, record_type) = decode_header(&header_buf);
             let record_type = match record_type {
                 Some(rt) => rt,
                 None => {
-                    return Err(eg!(Error::Corruption(format!(
+                    return Err(Error::corruption(format!(
                         "unknown WAL record type: {}",
                         header_buf[6]
-                    ))));
+                    )));
                 }
             };
             let length = length as usize;
@@ -196,10 +176,10 @@ impl WalReader {
             // Validate that the record payload fits within the current block.
             let remaining = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
             if length > remaining {
-                return Err(eg!(Error::Corruption(format!(
+                return Err(Error::corruption(format!(
                     "WAL record length {} exceeds remaining block space {}",
                     length, remaining
-                ))));
+                )));
             }
 
             // Read the data
@@ -210,7 +190,7 @@ impl WalReader {
                     // Crash-truncated tail record: treat as clean end-of-data
                     return Ok(None);
                 }
-                Err(e) => return Err(eg!(e)),
+                Err(e) => return Err(e).ctx(),
             }
 
             self.block_offset += HEADER_SIZE + length;
@@ -221,9 +201,7 @@ impl WalReader {
                 continue;
             }
             if matches!(record_type, RecordType::Zero) {
-                return Err(eg!(Error::Corruption(
-                    "non-padding WAL zero record".to_string()
-                )));
+                return Err(Error::corruption("non-padding WAL zero record".to_string()));
             }
 
             // Verify checksum
@@ -233,10 +211,10 @@ impl WalReader {
             let expected_checksum = hasher.finalize();
 
             if checksum != expected_checksum {
-                return Err(eg!(Error::Corruption(format!(
+                return Err(Error::corruption(format!(
                     "WAL checksum mismatch: expected {:#x}, got {:#x}",
                     expected_checksum, checksum
-                ))));
+                )));
             }
 
             return Ok(Some((record_type, data)));
@@ -244,11 +222,13 @@ impl WalReader {
     }
 }
 
-/// Iterator adapter over WAL records.
+/// Iterator adapter over WAL records (test helper).
+#[cfg(test)]
 pub struct WalIterator<'a> {
     reader: &'a mut WalReader,
 }
 
+#[cfg(test)]
 impl<'a> Iterator for WalIterator<'a> {
     type Item = Result<Vec<u8>>;
 
@@ -265,6 +245,7 @@ impl<'a> Iterator for WalIterator<'a> {
 mod tests {
     use super::*;
     use crate::wal::writer::WalWriter;
+    use std::io::SeekFrom;
 
     #[test]
     fn test_empty_wal() {

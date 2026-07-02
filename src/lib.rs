@@ -2,28 +2,34 @@
 //! [vsdb](https://github.com/rust-util-collections/vsdb).
 //!
 //! A high-performance LSM-Tree storage engine in pure Rust.
+//!
+//! The public API is the set of items re-exported from this crate root;
+//! internal modules (WAL, SST, manifest, compaction, cache, ...) are
+//! implementation details and deliberately private.
 
-pub mod cache;
-pub mod compaction;
-pub mod db;
-pub mod error;
-pub mod iterator;
-pub mod manifest;
+mod cache;
+mod compaction;
+mod db;
+mod error;
+mod iterator;
+mod manifest;
 mod memtable;
-pub mod options;
-pub mod sst;
-pub mod types;
-pub mod wal;
+mod options;
+mod rate_limiter;
+mod sst;
+mod stats;
+mod types;
+mod wal;
 
-pub mod rate_limiter;
-pub mod stats;
-
-// Re-export primary API types
-pub use db::{DB, Snapshot, pool_return};
-pub use error::{Error, Result};
-pub use iterator::{BidiIterator, DBIterator, PooledIterator};
+// ---- Primary API ----
+pub use db::{DB, Snapshot};
+pub use error::{Error, ErrorKind, Result, ResultExt};
+pub use iterator::{BidiIterator, DBIterator};
 pub use options::{
-    CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
+    BlockPropertyCollector, BlockPropertyFilter, CompactionFilter, CompactionFilterDecision,
+    DbOptions, ReadOptions, SkipPointFn, WriteOptions,
 };
 pub use sst::format::CompressionType;
-pub use types::{SequenceNumber, WriteBatch, WriteBatchWithIndex};
+pub use types::{
+    MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, WriteBatch, WriteBatchWithIndex,
+};

@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 
-use crate::iterator::LevelIterator;
+use crate::iterator::level_iter::LevelIterator;
 use crate::memtable::skiplist::MemTableCursorIter;
 use crate::sst::table_reader::TableIterator;
 use crate::types::LazyValue;
@@ -29,10 +29,6 @@ enum IterSourceInner {
         pos: usize,
     },
     Boxed(Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>),
-    /// A seekable boxed source (e.g., backed by a TableIterator that supports seek).
-    SeekableBoxed {
-        iter: Box<dyn SeekableIterator + Send>,
-    },
     /// Direct (non-boxed) memtable cursor — zero vtable dispatch.
     Memtable {
         iter: crate::memtable::skiplist::MemTableCursorIter,
@@ -148,16 +144,6 @@ impl IterSource {
         }
     }
 
-    pub fn from_seekable(iter: Box<dyn SeekableIterator + Send>) -> Self {
-        Self {
-            inner: IterSourceInner::SeekableBoxed { iter },
-            peeked_key: Vec::new(),
-            peeked_value: LazyValue::empty(),
-            has_peeked: false,
-            level: usize::MAX,
-        }
-    }
-
     pub(crate) fn from_memtable(iter: MemTableCursorIter) -> Self {
         Self {
             inner: IterSourceInner::Memtable { iter },
@@ -186,17 +172,6 @@ impl IterSource {
             has_peeked: false,
             level: usize::MAX,
         }
-    }
-
-    /// Tag this source with its LSM level.
-    pub fn with_level(mut self, level: usize) -> Self {
-        self.level = level;
-        self
-    }
-
-    /// Return the LSM level of this source.
-    pub fn level(&self) -> usize {
-        self.level
     }
 
     pub fn peek(&mut self) -> Option<(&[u8], &[u8])> {
@@ -250,13 +225,6 @@ impl IterSource {
                 }
                 None => false,
             },
-            IterSourceInner::SeekableBoxed { iter } => match iter.next_lazy(&mut self.peeked_key) {
-                Some(lv) => {
-                    self.peeked_value = lv;
-                    true
-                }
-                None => false,
-            },
             IterSourceInner::Memtable { iter } => match iter.next_lazy(&mut self.peeked_key) {
                 Some(lv) => {
                     self.peeked_value = lv;
@@ -299,15 +267,6 @@ impl IterSource {
                 }
             }
             IterSourceInner::Boxed(_) => false,
-            IterSourceInner::SeekableBoxed { iter } => {
-                let mut tmp_val = Vec::new();
-                if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = LazyValue::Inline(tmp_val);
-                    true
-                } else {
-                    false
-                }
-            }
             IterSourceInner::Memtable { iter } => {
                 let mut tmp_val = Vec::new();
                 if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
@@ -338,14 +297,9 @@ impl IterSource {
         }
     }
 
-    pub fn is_exhausted(&mut self) -> bool {
-        self.peek().is_none()
-    }
-
     /// Propagate iteration bounds to the underlying seekable iterator (if any).
     pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
         match &mut self.inner {
-            IterSourceInner::SeekableBoxed { iter } => iter.set_bounds(lower, upper),
             IterSourceInner::Memtable { iter } => iter.set_bounds(lower, upper),
             IterSourceInner::Sst { iter } => iter.set_bounds(lower, upper),
             IterSourceInner::Level { iter } => iter.set_bounds(lower, upper),
@@ -356,7 +310,6 @@ impl IterSource {
     /// Return the first error from the underlying iterator, if any.
     pub fn iter_error(&self) -> Option<String> {
         match &self.inner {
-            IterSourceInner::SeekableBoxed { iter } => iter.iter_error(),
             IterSourceInner::Sst { iter } => iter.iter_error(),
             IterSourceInner::Level { iter } => iter.iter_error(),
             _ => None,
@@ -366,7 +319,6 @@ impl IterSource {
     /// Issue a prefetch hint for the first data block (if backed by a seekable iterator).
     pub fn prefetch_hint(&mut self) {
         match &mut self.inner {
-            IterSourceInner::SeekableBoxed { iter } => iter.prefetch_first_block(),
             IterSourceInner::Sst { iter } => iter.prefetch_first_block(),
             IterSourceInner::Level { iter } => iter.prefetch_first_block(),
             _ => {}
@@ -375,7 +327,6 @@ impl IterSource {
 
     /// Seek to the first key >= target, supporting backward movement.
     /// For Vec sources, resets position and re-scans from the appropriate point.
-    /// For SeekableBoxed sources, delegates to the underlying iterator's seek.
     /// For plain Boxed sources, can only seek forward (same as `seek`).
     pub fn seek_to<F: Fn(&[u8], &[u8]) -> Ordering>(&mut self, target: &[u8], compare: &F) {
         self.has_peeked = false;
@@ -397,13 +348,6 @@ impl IterSource {
             }
             // Seekable variants: seek + peek next entry (lazily — key lands in
             // the reused peeked_key buffer, value stays zero-copy for SST sources)
-            IterSourceInner::SeekableBoxed { iter } => {
-                iter.seek_to(target);
-                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
-                    self.peeked_value = lv;
-                    self.has_peeked = true;
-                }
-            }
             IterSourceInner::Memtable { iter } => {
                 iter.seek_to(target);
                 if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
@@ -466,14 +410,6 @@ impl IterSource {
                     *pos += 1;
                 }
             }
-            IterSourceInner::SeekableBoxed { iter } => {
-                iter.seek_for_prev(target);
-                if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
-                    self.has_peeked = true;
-                }
-            }
             IterSourceInner::Memtable { iter } => {
                 iter.seek_for_prev(target);
                 if let Some((k, v)) = iter.current() {
@@ -517,14 +453,6 @@ impl IterSource {
                     *pos = 1;
                 }
             }
-            IterSourceInner::SeekableBoxed { iter } => {
-                iter.seek_to_first();
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
-                    self.has_peeked = true;
-                }
-            }
             IterSourceInner::Memtable { iter } => {
                 iter.seek_to_first();
                 if let Some((k, v)) = iter.next() {
@@ -566,14 +494,6 @@ impl IterSource {
                     self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
                     *pos += 1;
-                }
-            }
-            IterSourceInner::SeekableBoxed { iter } => {
-                iter.seek_to_last();
-                if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
-                    self.has_peeked = true;
                 }
             }
             IterSourceInner::Memtable { iter } => {

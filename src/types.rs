@@ -11,7 +11,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use ruc::*;
 
 /// Global monotonically increasing sequence number.
 pub type SequenceNumber = u64;
@@ -67,13 +66,11 @@ pub fn pack_sequence_and_type(seq: SequenceNumber, vt: ValueType) -> u64 {
     (seq << 8) | (vt as u64)
 }
 
-/// Unpack a packed u64 into (sequence, value_type).
-#[inline]
-pub fn unpack_sequence_and_type(packed: u64) -> (SequenceNumber, ValueType) {
+/// Unpack a packed u64 into (sequence, value_type). Inverse of
+/// [`pack_sequence_and_type`]; used by tests to validate the encoding.
+#[cfg(test)]
+pub(crate) fn unpack_sequence_and_type(packed: u64) -> (SequenceNumber, ValueType) {
     let seq = packed >> 8;
-    // Robustness: unknown type bytes default to Deletion (invisible) rather than
-    // Value (phantom data).  CRC-protected storage makes this path unreachable
-    // in practice; it guards against memory corruption or future format drift.
     let vt = ValueType::from_u8((packed & 0xFF) as u8).unwrap_or(ValueType::Deletion);
     (seq, vt)
 }
@@ -99,8 +96,15 @@ impl InternalKey {
         Self { encoded }
     }
 
-    /// Wrap already-encoded bytes (must include the 8-byte trailer).
-    pub fn from_encoded(encoded: Vec<u8>) -> Self {
+    /// Raw encoded bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    /// Wrap already-encoded bytes (test helper).
+    #[cfg(test)]
+    pub(crate) fn from_encoded(encoded: Vec<u8>) -> Self {
         assert!(
             encoded.len() >= 8,
             "InternalKey requires at least 8 bytes, got {}",
@@ -109,43 +113,25 @@ impl InternalKey {
         Self { encoded }
     }
 
-    /// Wrap a reference to already-encoded bytes.
-    pub fn from_encoded_slice(encoded: &[u8]) -> InternalKeyRef<'_> {
-        assert!(
-            encoded.len() >= 8,
-            "InternalKey requires at least 8 bytes, got {}",
-            encoded.len()
-        );
-        InternalKeyRef { encoded }
-    }
-
-    /// Raw encoded bytes.
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.encoded
-    }
-
-    /// Extract user key portion.
-    #[inline]
-    pub fn user_key(&self) -> &[u8] {
+    /// Extract user key portion (test helper).
+    #[cfg(test)]
+    pub(crate) fn user_key(&self) -> &[u8] {
         &self.encoded[..self.encoded.len() - 8]
     }
 
-    /// Extract sequence number.
-    #[inline]
-    pub fn sequence(&self) -> SequenceNumber {
-        let trailer = self.trailer();
-        trailer >> 8
+    /// Extract sequence number (test helper).
+    #[cfg(test)]
+    pub(crate) fn sequence(&self) -> SequenceNumber {
+        self.trailer() >> 8
     }
 
-    /// Extract value type.
-    #[inline]
-    pub fn value_type(&self) -> ValueType {
-        let trailer = self.trailer();
-        ValueType::from_u8((trailer & 0xFF) as u8).unwrap_or(ValueType::Deletion)
+    /// Extract value type (test helper).
+    #[cfg(test)]
+    pub(crate) fn value_type(&self) -> ValueType {
+        ValueType::from_u8((self.trailer() & 0xFF) as u8).unwrap_or(ValueType::Deletion)
     }
 
-    #[inline]
+    #[cfg(test)]
     fn trailer(&self) -> u64 {
         let offset = self.encoded.len() - 8;
         !u64::from_be_bytes(self.encoded[offset..].try_into().unwrap())
@@ -200,11 +186,6 @@ impl<'a> InternalKeyRef<'a> {
     fn trailer(&self) -> u64 {
         let offset = self.encoded.len() - 8;
         !u64::from_be_bytes(self.encoded[offset..].try_into().unwrap())
-    }
-
-    #[inline]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.encoded
     }
 }
 
@@ -397,14 +378,12 @@ impl WriteBatchWithIndex {
         for (user_key, &(entry_idx, pos)) in &self.index {
             let entry = &self.batch.entries[entry_idx];
             let seq = base_seq.checked_add(pos).ok_or_else(|| {
-                eg!(Error::InvalidArgument(
-                    "sequence number space exhausted".to_string()
-                ))
+                Error::invalid_argument("sequence number space exhausted".to_string())
             })?;
             if seq > MAX_SEQUENCE_NUMBER {
-                return Err(eg!(Error::InvalidArgument(
-                    "sequence number space exhausted".to_string()
-                )));
+                return Err(Error::invalid_argument(
+                    "sequence number space exhausted".to_string(),
+                ));
             }
             let ikey = InternalKey::new(user_key, seq, entry.value_type);
             let value = entry.value.clone().unwrap_or_default();
@@ -472,11 +451,6 @@ impl LazyValue {
             LazyValue::Inline(v) => v.len(),
             LazyValue::BlockRef { len, .. } => *len as usize,
         }
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// Create an empty inline value.
@@ -619,8 +593,8 @@ mod tests {
         assert_eq!(ik.value_type(), ValueType::Value);
         assert_eq!(ik.encoded_len(), 8); // just the 8-byte trailer
 
-        // from_encoded_slice round-trip
-        let ikr = InternalKey::from_encoded_slice(ik.as_bytes());
+        // encoded-slice round-trip via InternalKeyRef
+        let ikr = InternalKeyRef::new(ik.as_bytes());
         assert_eq!(ikr.user_key(), b"");
         assert_eq!(ikr.sequence(), 42);
         assert_eq!(ikr.value_type(), ValueType::Value);

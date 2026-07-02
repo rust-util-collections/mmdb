@@ -39,6 +39,8 @@ pub struct LevelIterator {
     /// (which would truncate the errored file's contribution). Cleared on
     /// explicit seeks, which start a fresh scan.
     error: Option<String>,
+    /// Whether cache misses populate the block cache (default: true).
+    fill_cache: bool,
 }
 
 impl LevelIterator {
@@ -54,7 +56,15 @@ impl LevelIterator {
             upper_bound: None,
             block_property_filters: Vec::new(),
             error: None,
+            fill_cache: true,
         }
+    }
+
+    /// Set whether cache misses populate the block cache (default: true).
+    /// Forwarded to every `TableIterator` this level iterator opens.
+    pub fn with_fill_cache(mut self, fill_cache: bool) -> Self {
+        self.fill_cache = fill_cache;
+        self
     }
 
     /// Enable prefix bloom filter pruning.
@@ -131,7 +141,8 @@ impl LevelIterator {
                     return;
                 }
             }
-            let mut table_iter = TableIterator::new(tf.reader.clone());
+            let mut table_iter =
+                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
             if !self.block_property_filters.is_empty() {
                 table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
             }
@@ -230,7 +241,8 @@ impl super::merge::SeekableIterator for LevelIterator {
             if !self.file_passes_filters(tf) {
                 continue;
             }
-            let mut table_iter = TableIterator::new(tf.reader.clone());
+            let mut table_iter =
+                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
             if !self.block_property_filters.is_empty() {
                 table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
             }
@@ -274,7 +286,8 @@ impl super::merge::SeekableIterator for LevelIterator {
             if !self.file_passes_filters(tf) {
                 continue;
             }
-            let mut table_iter = TableIterator::new(tf.reader.clone());
+            let mut table_iter =
+                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
             if !self.block_property_filters.is_empty() {
                 table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
             }
@@ -317,7 +330,8 @@ impl super::merge::SeekableIterator for LevelIterator {
             if !self.file_passes_filters(tf) {
                 continue;
             }
-            let mut table_iter = TableIterator::new(tf.reader.clone());
+            let mut table_iter =
+                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
             if !self.block_property_filters.is_empty() {
                 table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
             }
@@ -423,11 +437,12 @@ mod tests {
         }
         builder.finish().unwrap();
 
+        let file_size = std::fs::metadata(&path).unwrap().len();
         let reader = Arc::new(TableReader::open(&path).unwrap());
         TableFile {
             meta: FileMetaData {
                 number: file_num,
-                file_size: reader.file_size(),
+                file_size,
                 smallest_key: smallest,
                 largest_key: largest,
                 has_range_deletions: false,
@@ -471,11 +486,12 @@ mod tests {
         }
         builder.finish().unwrap();
 
+        let file_size = std::fs::metadata(&path).unwrap().len();
         let reader = Arc::new(TableReader::open(&path).unwrap());
         TableFile {
             meta: FileMetaData {
                 number: file_num,
-                file_size: reader.file_size(),
+                file_size,
                 smallest_key: smallest,
                 largest_key: largest,
                 has_range_deletions: false,

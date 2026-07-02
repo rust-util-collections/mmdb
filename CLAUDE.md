@@ -57,8 +57,9 @@ Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` a
 - **Grouped imports** — merge common prefixes: `use std::sync::{Arc, Mutex};`
 - **Doc-code alignment** — public API changes must update corresponding docs
 - `parking_lot` for Mutex/RwLock (non-reentrant, no poisoning)
-- `thiserror` for error types
+- Typed errors: `Error`/`ErrorKind` in `src/error.rs` (hand-rolled, no thiserror/ruc); propagate with `.ctx()` / `.with_ctx(|| ..)` — each hop records `file:line:column` via `#[track_caller]`
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
 - 66 unsafe blocks/functions concentrated in: `skiplist_impl.rs` (42), `skiplist.rs` (12), `db.rs` (11), `table_reader/mod.rs` (1) — all require `// SAFETY:` comments
+- Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes

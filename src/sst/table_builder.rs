@@ -14,13 +14,12 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultExt};
 use crate::sst::block_builder::BlockBuilder;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::*;
 use crate::sst::table_reader::MAX_DECOMPRESSED_BLOCK_SIZE;
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
-use ruc::*;
 
 /// Hard ceiling for the single-block meta structures (index block and
 /// range-del block). The reader rejects any block above
@@ -152,7 +151,7 @@ pub struct TableBuilder {
 impl TableBuilder {
     /// Create a new table builder writing to the given path.
     pub fn new(path: &Path, mut options: TableBuildOptions) -> Result<Self> {
-        let file = File::create(path).c(d!())?;
+        let file = File::create(path).ctx()?;
         let collectors = std::mem::take(&mut options.block_property_collectors);
         Ok(Self {
             writer: BufWriter::new(file),
@@ -224,11 +223,11 @@ impl TableBuilder {
         const BLOCK_FRAMING_MARGIN: usize = 64;
         let entry_size = key.len().saturating_add(value.len());
         if entry_size > MAX_DECOMPRESSED_BLOCK_SIZE - BLOCK_FRAMING_MARGIN {
-            return Err(eg!(Error::InvalidArgument(format!(
+            return Err(Error::invalid_argument(format!(
                 "entry size {} exceeds maximum block size {}",
                 entry_size,
                 MAX_DECOMPRESSED_BLOCK_SIZE - BLOCK_FRAMING_MARGIN
-            ))));
+            )));
         }
 
         // Buffer range deletions into a separate block
@@ -241,10 +240,10 @@ impl TableBuilder {
                     .saturating_add(entry_size)
                     .saturating_add(META_ENTRY_OVERHEAD);
                 if projected > META_BLOCK_HARD_LIMIT {
-                    return Err(eg!(Error::InvalidArgument(format!(
+                    return Err(Error::invalid_argument(format!(
                         "range-del block size {} would exceed maximum readable block size {}",
                         projected, META_BLOCK_HARD_LIMIT
-                    ))));
+                    )));
                 }
                 self.range_del_projected = projected;
                 self.has_range_deletions = true;
@@ -265,11 +264,11 @@ impl TableBuilder {
             .saturating_add(2 * key.len())
             .saturating_add(META_ENTRY_OVERHEAD);
         if projected_index > META_BLOCK_HARD_LIMIT {
-            return Err(eg!(Error::InvalidArgument(format!(
+            return Err(Error::invalid_argument(format!(
                 "index block size {} would exceed maximum readable block size {} \
                  (consider a larger block_size for very large keys)",
                 projected_index, META_BLOCK_HARD_LIMIT
-            ))));
+            )));
         }
 
         // Collect key for bloom filter (use user key if internal_keys mode)
@@ -293,7 +292,7 @@ impl TableBuilder {
             && (self.data_block.estimated_size() >= self.options.block_size
                 || projected > MAX_DECOMPRESSED_BLOCK_SIZE - BLOCK_FRAMING_MARGIN)
         {
-            self.flush_data_block().c(d!())?;
+            self.flush_data_block().ctx()?;
         }
 
         // Record first key of a new data block
@@ -316,38 +315,37 @@ impl TableBuilder {
     pub fn finish(mut self) -> Result<TableBuildResult> {
         // Flush remaining data block
         if !self.data_block.is_empty() {
-            self.flush_data_block().c(d!())?;
+            self.flush_data_block().ctx()?;
         }
 
         // Write meta block (bloom filter)
-        let filter_handle = self.write_filter_block().c(d!())?;
+        let filter_handle = self.write_filter_block().ctx()?;
 
         // Write prefix filter block
-        let prefix_filter_handle = self.write_prefix_filter_block().c(d!())?;
+        let prefix_filter_handle = self.write_prefix_filter_block().ctx()?;
 
         // Write range-del block if any
-        let range_del_handle = self.write_range_del_block().c(d!())?;
+        let range_del_handle = self.write_range_del_block().ctx()?;
 
         // Write meta index block
         let metaindex_handle = self
             .write_metaindex_block(&filter_handle, &prefix_filter_handle, &range_del_handle)
-            .c(d!())?;
+            .ctx()?;
 
         // Write index block
-        let index_handle = self.write_index_block().c(d!())?;
+        let index_handle = self.write_index_block().ctx()?;
 
         // Write footer
         let footer = encode_footer(&metaindex_handle, &index_handle);
-        self.writer.write_all(&footer).c(d!())?;
+        self.writer.write_all(&footer).ctx()?;
         self.offset += FOOTER_SIZE as u64;
 
-        self.writer.flush().c(d!())?;
-        self.writer.get_ref().sync_all().c(d!())?;
+        self.writer.flush().ctx()?;
+        self.writer.get_ref().sync_all().ctx()?;
         self.finished = true;
 
         Ok(TableBuildResult {
             file_size: self.offset,
-            num_entries: self.num_entries,
             smallest_key: self.smallest_key,
             largest_key: self.largest_key,
             has_range_deletions: self.has_range_deletions,
@@ -372,7 +370,7 @@ impl TableBuilder {
             .map(|c| (c.name().to_string(), c.finish_block()))
             .collect();
 
-        let handle = self.write_raw_block(&block_data).c(d!())?;
+        let handle = self.write_raw_block(&block_data).ctx()?;
         let props_size: usize = props.iter().map(|(n, d)| n.len() + d.len() + 8).sum();
         self.index_block_projected += last_key
             .len()
@@ -413,7 +411,7 @@ impl TableBuilder {
 
         let handle = BlockHandle::new(self.offset, block_data.len() as u64);
 
-        self.writer.write_all(&block_data).c(d!())?;
+        self.writer.write_all(&block_data).ctx()?;
 
         // Write block trailer: compression_type(1) + crc32(4)
         let mut hasher = crc32fast::Hasher::new();
@@ -421,8 +419,8 @@ impl TableBuilder {
         hasher.update(&[compression_type as u8]);
         let crc = hasher.finalize();
 
-        self.writer.write_all(&[compression_type as u8]).c(d!())?;
-        self.writer.write_all(&crc.to_le_bytes()).c(d!())?;
+        self.writer.write_all(&[compression_type as u8]).ctx()?;
+        self.writer.write_all(&crc.to_le_bytes()).ctx()?;
 
         self.offset += block_data.len() as u64 + BLOCK_TRAILER_SIZE as u64;
 
@@ -439,7 +437,7 @@ impl TableBuilder {
         let key_refs: Vec<&[u8]> = self.filter_keys.iter().map(|k| k.as_slice()).collect();
         let filter_data = bf.create_filter(&key_refs);
 
-        self.write_raw_block(&filter_data).c(d!())
+        self.write_raw_block(&filter_data).ctx()
     }
 
     fn write_prefix_filter_block(&mut self) -> Result<BlockHandle> {
@@ -456,7 +454,7 @@ impl TableBuilder {
         let bf = BloomFilter::new(self.options.bloom_bits_per_key);
         let filter_data = bf.create_filter(&prefixes);
 
-        self.write_raw_block(&filter_data).c(d!())
+        self.write_raw_block(&filter_data).ctx()
     }
 
     fn write_range_del_block(&mut self) -> Result<BlockHandle> {
@@ -469,7 +467,7 @@ impl TableBuilder {
             builder.add(key, value);
         }
         let data = builder.finish();
-        self.write_raw_block(&data).c(d!())
+        self.write_raw_block(&data).ctx()
     }
 
     fn write_metaindex_block(
@@ -500,7 +498,7 @@ impl TableBuilder {
         }
 
         let data = builder.finish();
-        self.write_raw_block(&data).c(d!())
+        self.write_raw_block(&data).ctx()
     }
 
     fn write_index_block(&mut self) -> Result<BlockHandle> {
@@ -515,14 +513,13 @@ impl TableBuilder {
                     .iter()
                     .map(|(n, d)| (n.as_str(), d.as_slice()))
                     .collect();
-                encode_index_value_with_props(&entry.handle, &entry.first_key, &prop_refs)
-                    .c(d!())?
+                encode_index_value_with_props(&entry.handle, &entry.first_key, &prop_refs).ctx()?
             };
             builder.add(&entry.last_key, &value);
         }
 
         let data = builder.finish();
-        self.write_raw_block(&data).c(d!())
+        self.write_raw_block(&data).ctx()
     }
 }
 
@@ -530,7 +527,6 @@ impl TableBuilder {
 #[derive(Debug)]
 pub struct TableBuildResult {
     pub file_size: u64,
-    pub num_entries: u64,
     pub smallest_key: Option<Vec<u8>>,
     pub largest_key: Option<Vec<u8>>,
     /// Whether any range deletion entry was written to this table.
@@ -540,6 +536,7 @@ pub struct TableBuildResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sst::table_reader::TableReader;
 
     #[test]
     fn test_build_table() {
@@ -554,7 +551,7 @@ mod tests {
         }
         let result = builder.finish().unwrap();
 
-        assert_eq!(result.num_entries, 100);
+        assert_eq!(TableReader::open(&path).unwrap().iter().unwrap().len(), 100);
         assert!(result.file_size > 0);
         assert_eq!(
             result.smallest_key.as_deref(),
@@ -576,7 +573,6 @@ mod tests {
         let builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
         let result = builder.finish().unwrap();
 
-        assert_eq!(result.num_entries, 0);
         assert!(result.file_size > 0); // footer + index + metaindex still present
         assert!(result.smallest_key.is_none());
         assert!(result.largest_key.is_none());
@@ -601,7 +597,7 @@ mod tests {
         builder.add(b"only_key", b"only_value").unwrap();
         let result = builder.finish().unwrap();
 
-        assert_eq!(result.num_entries, 1);
+        assert_eq!(TableReader::open(&path).unwrap().iter().unwrap().len(), 1);
         assert_eq!(result.smallest_key.as_deref(), Some(b"only_key".as_slice()));
         assert_eq!(result.largest_key.as_deref(), Some(b"only_key".as_slice()));
 
@@ -642,8 +638,8 @@ mod tests {
             );
             builder.add(key.as_bytes(), val.as_bytes()).unwrap();
         }
-        let result = builder.finish().unwrap();
-        assert_eq!(result.num_entries, 500);
+        builder.finish().unwrap();
+        assert_eq!(TableReader::open(&path).unwrap().iter().unwrap().len(), 500);
 
         // Read back and verify all entries
         let reader = TableReader::open(&path).unwrap();
@@ -723,7 +719,8 @@ mod tests {
             .unwrap();
 
         let result = builder.finish().unwrap();
-        assert_eq!(result.num_entries, 5);
+        // Point-entry iteration excludes the 2 range-deletion entries (5 added total).
+        assert_eq!(TableReader::open(&path).unwrap().iter().unwrap().len(), 3);
         assert!(result.has_range_deletions);
 
         // Read back and verify

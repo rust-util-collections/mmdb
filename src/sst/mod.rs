@@ -13,6 +13,3 @@ pub mod filter;
 pub mod format;
 pub mod table_builder;
 pub mod table_reader;
-
-pub use table_builder::TableBuilder;
-pub use table_reader::TableReader;

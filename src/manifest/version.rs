@@ -41,8 +41,9 @@ impl Version {
         &self.files[level]
     }
 
-    /// Total number of files across all levels.
-    pub fn total_files(&self) -> usize {
+    /// Total number of files across all levels (test helper).
+    #[cfg(test)]
+    pub(crate) fn total_files(&self) -> usize {
         self.files.iter().map(|f| f.len()).sum()
     }
 

@@ -78,16 +78,6 @@ impl BlockBuilder {
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
-
-    /// Reset the builder for reuse.
-    pub fn reset(&mut self) {
-        self.buffer.clear();
-        self.restarts.clear();
-        self.restarts.push(0);
-        self.last_key.clear();
-        self.counter = 0;
-        self.finished = false;
-    }
 }
 
 #[cfg(test)]

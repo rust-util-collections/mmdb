@@ -4,9 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use ruc::*;
-
-use crate::error::Result;
+use crate::error::{Result, ResultExt};
 use crate::wal::record::*;
 
 /// WAL writer. Appends records to a file, splitting across block boundaries.
@@ -24,8 +22,8 @@ impl WalWriter {
             .truncate(true)
             .write(true)
             .open(path)
-            .c(d!())?;
-        Self::sync_parent_dir(path).c(d!())?;
+            .ctx()?;
+        Self::sync_parent_dir(path).ctx()?;
         Ok(Self {
             writer: BufWriter::new(file),
             block_offset: 0,
@@ -38,9 +36,9 @@ impl WalWriter {
     /// Use `WalReader::last_valid_offset()` to determine the safe truncation
     /// point, then call this to discard the corrupt tail before appending.
     pub fn open_append_truncated(path: &Path, valid_len: u64) -> Result<Self> {
-        let mut file = OpenOptions::new().write(true).open(path).c(d!())?;
-        file.set_len(valid_len).c(d!())?;
-        file.seek(SeekFrom::End(0)).c(d!())?;
+        let mut file = OpenOptions::new().write(true).open(path).ctx()?;
+        file.set_len(valid_len).ctx()?;
+        file.seek(SeekFrom::End(0)).ctx()?;
         let block_offset = valid_len as usize % BLOCK_SIZE;
         Ok(Self {
             writer: BufWriter::new(file),
@@ -62,7 +60,7 @@ impl WalWriter {
                 // Not enough space for a header, fill remainder with zeros
                 if leftover > 0 {
                     let zeros = vec![0u8; leftover];
-                    self.writer.write_all(&zeros).c(d!())?;
+                    self.writer.write_all(&zeros).ctx()?;
                 }
                 self.block_offset = 0;
                 continue;
@@ -95,14 +93,14 @@ impl WalWriter {
 
     /// Flush and fsync the WAL file.
     pub fn sync(&mut self) -> Result<()> {
-        self.writer.flush().c(d!())?;
-        self.writer.get_ref().sync_all().c(d!())?;
+        self.writer.flush().ctx()?;
+        self.writer.get_ref().sync_all().ctx()?;
         Ok(())
     }
 
     /// Flush the WAL buffer (without fsync).
     pub fn flush(&mut self) -> Result<()> {
-        self.writer.flush().c(d!())?;
+        self.writer.flush().ctx()?;
         Ok(())
     }
 
@@ -117,8 +115,8 @@ impl WalWriter {
         let mut header = [0u8; HEADER_SIZE];
         encode_header(&mut header, checksum, length, record_type);
 
-        self.writer.write_all(&header).c(d!())?;
-        self.writer.write_all(data).c(d!())?;
+        self.writer.write_all(&header).ctx()?;
+        self.writer.write_all(data).ctx()?;
         self.block_offset += HEADER_SIZE + data.len();
 
         Ok(())
@@ -129,7 +127,7 @@ impl WalWriter {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        File::open(parent).and_then(|dir| dir.sync_all()).c(d!())
+        File::open(parent).and_then(|dir| dir.sync_all()).ctx()
     }
 }
 

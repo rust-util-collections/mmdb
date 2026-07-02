@@ -9,6 +9,7 @@ use crate::sst::format::CompressionType;
 pub type SkipPointFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 /// Database-level options.
+#[derive(Clone)]
 pub struct DbOptions {
     /// Create the database directory if it does not exist.
     pub create_if_missing: bool,
@@ -72,35 +73,7 @@ pub struct DbOptions {
     /// Pin L0 index and filter blocks in block cache (never evict). Default: true.
     /// RocksDB equivalent: `pin_l0_filter_and_index_blocks_in_cache`.
     pub pin_l0_filter_and_index_blocks_in_cache: bool,
-    /// Cache index and filter blocks in block cache. Default: true.
-    /// RocksDB equivalent: `cache_index_and_filter_blocks`.
-    /// **Not yet implemented** — index and filter blocks are always cached when
-    /// a block cache is configured. Accepted for API compatibility.
-    pub cache_index_and_filter_blocks: bool,
 
-    // ---- Write buffer ----
-    /// Maximum total number of write buffers (active + immutable). Default: 6.
-    /// RocksDB equivalent: `max_write_buffer_number`.
-    /// **Not yet implemented** — the actual limit is controlled by
-    /// `max_immutable_memtables`. Accepted for API compatibility.
-    pub max_write_buffer_number: usize,
-
-    // ---- Advanced tuning (reserved, documented) ----
-    /// Use dynamic level sizes for compaction. Default: false.
-    /// RocksDB equivalent: `level_compaction_dynamic_level_bytes`.
-    /// **Not yet implemented** — fixed level-size multiplier is always used.
-    /// Accepted for API compatibility.
-    pub level_compaction_dynamic_level_bytes: bool,
-    /// Allow concurrent memtable writes from multiple threads. Default: false.
-    /// RocksDB equivalent: `allow_concurrent_memtable_write`.
-    /// **Not yet implemented** — writes are serialized via group commit.
-    /// Accepted for API compatibility.
-    pub allow_concurrent_memtable_write: bool,
-    /// Memtable prefix bloom ratio (fraction of memtable for bloom). Default: 0.0 (disabled).
-    /// RocksDB equivalent: `memtable_prefix_bloom_ratio`.
-    /// **Not yet implemented** — memtable prefix bloom is not supported.
-    /// Accepted for API compatibility.
-    pub memtable_prefix_bloom_ratio: f64,
     /// Factories for block property collectors. Each factory is called once per SST
     /// file build to produce a fresh collector instance.
     pub block_property_collectors:
@@ -138,51 +111,8 @@ impl Default for DbOptions {
             max_background_compactions: 1,
             max_subcompactions: 1,
             pin_l0_filter_and_index_blocks_in_cache: true,
-            cache_index_and_filter_blocks: true,
-            max_write_buffer_number: 6,
-            level_compaction_dynamic_level_bytes: false,
-            allow_concurrent_memtable_write: false,
-            memtable_prefix_bloom_ratio: 0.0,
             block_property_collectors: Vec::new(),
             lazy_delete_compaction_threshold: 10_000,
-        }
-    }
-}
-
-impl Clone for DbOptions {
-    fn clone(&self) -> Self {
-        Self {
-            create_if_missing: self.create_if_missing,
-            error_if_exists: self.error_if_exists,
-            write_buffer_size: self.write_buffer_size,
-            max_immutable_memtables: self.max_immutable_memtables,
-            l0_compaction_trigger: self.l0_compaction_trigger,
-            target_file_size_base: self.target_file_size_base,
-            max_bytes_for_level_base: self.max_bytes_for_level_base,
-            max_bytes_for_level_multiplier: self.max_bytes_for_level_multiplier,
-            num_levels: self.num_levels,
-            block_size: self.block_size,
-            block_restart_interval: self.block_restart_interval,
-            bloom_bits_per_key: self.bloom_bits_per_key,
-            compression: self.compression,
-            block_cache_capacity: self.block_cache_capacity,
-            max_open_files: self.max_open_files,
-            l0_slowdown_trigger: self.l0_slowdown_trigger,
-            l0_stop_trigger: self.l0_stop_trigger,
-            rate_limiter_bytes_per_sec: self.rate_limiter_bytes_per_sec,
-            prefix_len: self.prefix_len,
-            compression_per_level: self.compression_per_level.clone(),
-            compaction_filter: self.compaction_filter.clone(),
-            max_background_compactions: self.max_background_compactions,
-            max_subcompactions: self.max_subcompactions,
-            pin_l0_filter_and_index_blocks_in_cache: self.pin_l0_filter_and_index_blocks_in_cache,
-            cache_index_and_filter_blocks: self.cache_index_and_filter_blocks,
-            max_write_buffer_number: self.max_write_buffer_number,
-            level_compaction_dynamic_level_bytes: self.level_compaction_dynamic_level_bytes,
-            allow_concurrent_memtable_write: self.allow_concurrent_memtable_write,
-            memtable_prefix_bloom_ratio: self.memtable_prefix_bloom_ratio,
-            block_property_collectors: self.block_property_collectors.clone(),
-            lazy_delete_compaction_threshold: self.lazy_delete_compaction_threshold,
         }
     }
 }
@@ -208,10 +138,34 @@ impl fmt::Debug for DbOptions {
             .field("compression", &self.compression)
             .field("block_cache_capacity", &self.block_cache_capacity)
             .field("max_open_files", &self.max_open_files)
+            .field("l0_slowdown_trigger", &self.l0_slowdown_trigger)
+            .field("l0_stop_trigger", &self.l0_stop_trigger)
+            .field(
+                "rate_limiter_bytes_per_sec",
+                &self.rate_limiter_bytes_per_sec,
+            )
             .field("prefix_len", &self.prefix_len)
+            .field("compression_per_level", &self.compression_per_level)
+            .field(
+                "compaction_filter",
+                &self.compaction_filter.as_ref().map(|_| ".."),
+            )
+            .field(
+                "max_background_compactions",
+                &self.max_background_compactions,
+            )
+            .field("max_subcompactions", &self.max_subcompactions)
+            .field(
+                "pin_l0_filter_and_index_blocks_in_cache",
+                &self.pin_l0_filter_and_index_blocks_in_cache,
+            )
             .field(
                 "block_property_collectors",
                 &self.block_property_collectors.len(),
+            )
+            .field(
+                "lazy_delete_compaction_threshold",
+                &self.lazy_delete_compaction_threshold,
             )
             .finish()
     }
@@ -233,7 +187,6 @@ impl DbOptions {
             l0_stop_trigger: 36,
             compression: CompressionType::Lz4,
             max_background_compactions: 4,
-            max_write_buffer_number: 8,
             ..Default::default()
         }
     }
@@ -257,30 +210,18 @@ pub struct ReadOptions {
     /// If set, reads will use this snapshot sequence number. Values above the
     /// current committed sequence are clamped to it, so a snapshot can never
     /// observe uncommitted or partially-applied writes.
+    ///
+    /// Obtain a registered sequence via [`crate::DB::snapshot`] (see
+    /// [`crate::Snapshot::read_options`]); a raw sequence number that is not
+    /// registered as a snapshot may see its data garbage-collected by
+    /// compaction.
     pub snapshot: Option<u64>,
-    /// Whether to fill the block cache for this read. Default: true.
-    /// **Not yet implemented** — reads always populate the cache when present.
-    /// Accepted for API compatibility.
+    /// Whether a block-cache miss inserts the block into the cache. Default: true.
+    ///
+    /// Set to `false` for large scans (analytics, backups, bulk exports) so
+    /// one-shot blocks don't evict hot point-read blocks. Cache *hits* are
+    /// still served from the cache either way. RocksDB equivalent: `fill_cache`.
     pub fill_cache: bool,
-    /// Whether to verify checksums on reads. Default: false.
-    /// **Not yet implemented** — block checksums are always verified on read.
-    /// Accepted for API compatibility.
-    pub verify_checksums: bool,
-    /// Readahead size hint in bytes for sequential iteration. 0 = auto. Default: 0.
-    /// RocksDB equivalent: `readahead_size`.
-    /// **Not yet implemented** — OS readahead is used.
-    /// Accepted for API compatibility.
-    pub readahead_size: usize,
-    /// If true, ignore prefix bloom filters and do a total order seek. Default: false.
-    /// RocksDB equivalent: `total_order_seek`.
-    /// **Not yet implemented** — iterators always use the total-order path unless
-    /// created via `iter_with_prefix()`. Accepted for API compatibility.
-    pub total_order_seek: bool,
-    /// If true, pin data blocks in memory during iteration. Default: false.
-    /// RocksDB equivalent: `pin_data`.
-    /// **Not yet implemented** — data blocks are managed by the block cache.
-    /// Accepted for API compatibility.
-    pub pin_data: bool,
     /// Optional callback checked during iteration. If it returns `true` for a
     /// user key, that key is skipped without being yielded.
     pub skip_point: Option<SkipPointFn>,
@@ -296,37 +237,29 @@ pub struct ReadOptions {
     pub iterate_upper_bound: Option<Vec<u8>>,
 }
 
-impl fmt::Debug for ReadOptions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReadOptions")
-            .field("snapshot", &self.snapshot)
-            .field("fill_cache", &self.fill_cache)
-            .field("verify_checksums", &self.verify_checksums)
-            .field("readahead_size", &self.readahead_size)
-            .field("total_order_seek", &self.total_order_seek)
-            .field("pin_data", &self.pin_data)
-            .field("skip_point", &self.skip_point.as_ref().map(|_| ".."))
-            .field("block_property_filters", &self.block_property_filters.len())
-            .field("iterate_lower_bound", &self.iterate_lower_bound)
-            .field("iterate_upper_bound", &self.iterate_upper_bound)
-            .finish()
-    }
-}
-
 impl Default for ReadOptions {
     fn default() -> Self {
         Self {
             snapshot: None,
             fill_cache: true,
-            verify_checksums: false,
-            readahead_size: 0,
-            total_order_seek: false,
-            pin_data: false,
             skip_point: None,
             block_property_filters: Vec::new(),
             iterate_lower_bound: None,
             iterate_upper_bound: None,
         }
+    }
+}
+
+impl fmt::Debug for ReadOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadOptions")
+            .field("snapshot", &self.snapshot)
+            .field("fill_cache", &self.fill_cache)
+            .field("skip_point", &self.skip_point.as_ref().map(|_| ".."))
+            .field("block_property_filters", &self.block_property_filters.len())
+            .field("iterate_lower_bound", &self.iterate_lower_bound)
+            .field("iterate_upper_bound", &self.iterate_upper_bound)
+            .finish()
     }
 }
 
@@ -339,10 +272,6 @@ pub struct WriteOptions {
     pub disable_wal: bool,
     /// If true, return an error instead of sleeping when writes are throttled.
     pub no_slowdown: bool,
-    /// If true, gives this write lower priority during contention.
-    /// **Not yet implemented** — all writes use the same priority.
-    /// Accepted for API compatibility.
-    pub low_pri: bool,
 }
 
 /// Decision returned by a compaction filter.

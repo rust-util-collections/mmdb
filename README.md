@@ -49,7 +49,10 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | Compaction filter | Implemented |
 | Rate limiter (token bucket, wired to compaction) | Implemented |
 | DB properties/statistics (wired to all paths) | Implemented |
-| Configurable options (RocksDB parity) | Implemented |
+| Typed errors with full propagation traces | Implemented |
+
+Every configuration option is real: knobs that are accepted but not
+implemented do not exist in this API.
 
 ---
 
@@ -199,7 +202,7 @@ impl DB {
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()>;
     pub fn delete_range_with_options(&self, options: &WriteOptions, begin: &[u8], end: &[u8]) -> Result<()>;
     pub fn write(&self, batch: WriteBatch) -> Result<()>;
-    pub fn write_with_options(&self, batch: WriteBatch, options: &WriteOptions) -> Result<()>;
+    pub fn write_with_options(&self, options: &WriteOptions, batch: WriteBatch) -> Result<()>;
     pub fn iter(&self) -> Result<DBIterator>;
 
     /// Prefix-bounded iteration — the fastest option for prefix-scoped queries.
@@ -243,6 +246,7 @@ impl DB {
 }
 
 impl DBIterator {
+    // Also implements Iterator<Item = (Vec<u8>, Vec<u8>)>.
     pub fn valid(&mut self) -> bool;
     pub fn key(&mut self) -> Option<&[u8]>;     // None if invalid (no panic)
     pub fn value(&mut self) -> Option<&[u8]>;   // None if invalid (no panic)
@@ -252,20 +256,60 @@ impl DBIterator {
     pub fn seek_to_first(&mut self);
     pub fn seek_to_last(&mut self);
     pub fn prev(&mut self);
+    pub fn error(&self) -> Option<String>;       // I/O errors swallowed by Iterator::next
 }
 
 impl Snapshot<'_> {
+    // RAII guard: released automatically on drop.
     pub fn sequence(&self) -> SequenceNumber;
     pub fn read_options(&self) -> ReadOptions;  // pre-configured for this snapshot
 }
 
 struct ReadOptions {
-    pub snapshot: Option<u64>,
+    pub snapshot: Option<u64>,                 // from Snapshot::sequence()
+    pub fill_cache: bool,                      // false = scans don't evict hot blocks
+    pub skip_point: Option<SkipPointFn>,
+    pub block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
     pub iterate_lower_bound: Option<Vec<u8>>,  // inclusive
     pub iterate_upper_bound: Option<Vec<u8>>,  // exclusive
-    // ... other options
+}
+
+struct WriteOptions {
+    pub sync: bool,        // fsync WAL before acknowledging
+    pub disable_wal: bool, // skip WAL (data may be lost on crash)
+    pub no_slowdown: bool, // error instead of sleeping when throttled
 }
 ```
+
+---
+
+## Error Handling
+
+All fallible APIs return `mmdb::Result<T> = Result<T, mmdb::Error>`.
+
+`Error` carries a typed [`ErrorKind`] (`Io`, `Corruption`, `InvalidArgument`,
+`DbClosed`, `Background`) for programmatic matching, plus a full propagation
+trace — the origin `file:line:column` and one frame per `.ctx()` /
+`.with_ctx(..)` hop — and preserves the underlying source error (e.g.
+`std::io::Error`) for `std::error::Error::source()` downcasting.
+`Display`/`Debug` render the complete chain:
+
+```text
+Corruption: WAL 000012 CRC mismatch
+    at src/wal/reader.rs:116:38
+    at src/db.rs:410:36 -- refusing prefix recovery
+caused by: unexpected end of file
+```
+
+```rust
+match db.get(b"key") {
+    Err(e) if e.kind() == mmdb::ErrorKind::Corruption => { /* quarantine */ }
+    other => { /* ... */ }
+}
+```
+
+`Error` is `Clone + Send + Sync`, so one failure can be shared across
+group-commit waiters without stringification.
 
 ---
 
@@ -294,6 +338,37 @@ let opts = DbOptions::read_heavy();   // large cache, 14 bits/key bloom
 ## Feature Comparison
 
 See [COMPARISON.md](COMPARISON.md) for a detailed feature-by-feature comparison with RocksDB and Pebble, including gap analysis and recommendations.
+
+---
+
+## Migrating 3.x → 4.0
+
+v4.0 is a design-level cleanup release. Breaking changes:
+
+1. **Typed errors replace `ruc` chains.** `Result<T>` is now
+   `Result<T, mmdb::Error>`; match on `err.kind()` (`ErrorKind`). Errors still
+   carry a full per-hop `file:line:column` propagation trace (rendered by
+   `Display`/`Debug`), plus `std::error::Error::source()`, `Clone`, and `Sync`
+   — a strict superset of the old `Box<dyn RucError>` payload. Code that only
+   propagates/prints errors (incl. `ruc`'s `.c(d!())` on the caller side)
+   keeps working since `Error: Display + Debug + Send + Sync`.
+2. **Internal modules are private.** Import everything from the crate root
+   (e.g. `mmdb::CompressionType`, not `mmdb::sst::format::CompressionType`).
+3. **No-op "compatibility" options removed** from `DbOptions`
+   (`cache_index_and_filter_blocks`, `max_write_buffer_number`,
+   `level_compaction_dynamic_level_bytes`, `allow_concurrent_memtable_write`,
+   `memtable_prefix_bloom_ratio`), `ReadOptions` (`verify_checksums`,
+   `readahead_size`, `total_order_seek`, `pin_data`) and `WriteOptions`
+   (`low_pri`). Delete them from struct literals. `ReadOptions::fill_cache`
+   remains and is now **actually implemented** (checksums are always
+   verified).
+4. **Iterator pool removed.** `pool_return()` and `PooledIterator` are gone —
+   just drop iterators.
+5. **RAII-only snapshots.** `snapshot_seq()`/`release_snapshot()` are private;
+   use `let snap = db.snapshot();` and `snap.read_options()` /
+   `snap.sequence()`.
+6. **`write_with_options(&WriteOptions, WriteBatch)`** — options now come
+   first, consistent with every other `*_with_options` method.
 
 ---
 

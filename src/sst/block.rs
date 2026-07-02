@@ -21,8 +21,6 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use ruc::*;
-
 use crate::error::{Error, Result};
 
 /// Decode a varint from the given buffer. Returns (value, bytes_consumed).
@@ -31,12 +29,12 @@ pub fn decode_varint(data: &[u8]) -> Result<(u32, usize)> {
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
         if i >= 5 {
-            return Err(eg!(Error::Corruption("varint too long".to_string())));
+            return Err(Error::corruption("varint too long"));
         }
         // The 5th byte of a u32 varint may only carry the top 4 bits; any
         // higher bits set means the value overflows u32 (corrupt length field).
         if i == 4 && byte & 0xF0 != 0 {
-            return Err(eg!(Error::Corruption("varint overflows u32".to_string())));
+            return Err(Error::corruption("varint overflows u32"));
         }
         result |= ((byte & 0x7F) as u32) << shift;
         if byte & 0x80 == 0 {
@@ -44,7 +42,7 @@ pub fn decode_varint(data: &[u8]) -> Result<(u32, usize)> {
         }
         shift += 7;
     }
-    Err(eg!(Error::Corruption("unterminated varint".to_string())))
+    Err(Error::corruption("unterminated varint"))
 }
 
 /// Encode a u32 as a varint, return bytes written.
@@ -77,15 +75,15 @@ impl Block {
     /// Parse a data block from shared (Arc) raw bytes — zero-copy from block cache.
     pub fn new(data: Arc<Vec<u8>>) -> Result<Self> {
         if data.len() < 4 {
-            return Err(eg!(Error::Corruption("block too short".to_string())));
+            return Err(Error::corruption("block too short"));
         }
         let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
         let restarts_size = (num_restarts as usize) * 4 + 4; // restart array + count
         if num_restarts == 0 {
-            return Err(eg!(Error::Corruption("bad restart count".to_string())));
+            return Err(Error::corruption("bad restart count"));
         }
         if restarts_size > data.len() {
-            return Err(eg!(Error::Corruption("bad restart count".to_string())));
+            return Err(Error::corruption("bad restart count"));
         }
         let restart_offset = data.len() - restarts_size;
         let mut prev_restart = 0usize;
@@ -96,7 +94,7 @@ impl Block {
                 || restart > restart_offset
                 || (i > 0 && restart < prev_restart)
             {
-                return Err(eg!(Error::Corruption("bad restart offset".to_string())));
+                return Err(Error::corruption("bad restart offset"));
             }
             prev_restart = restart;
         }
@@ -304,23 +302,6 @@ impl Block {
         entries
     }
 
-    /// Find which restart segment contains a given byte offset in the block data.
-    /// Returns the restart index whose restart point is <= offset.
-    pub fn restart_index_for_offset(&self, offset: usize) -> u32 {
-        let offset = offset as u32;
-        let mut left = 0u32;
-        let mut right = self.num_restarts;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            if self.restart_point(mid) <= offset {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        left.saturating_sub(1)
-    }
-
     /// Decode only the first key at the given restart point (zero shared prefix).
     /// O(1) — decodes a single entry, no segment walk needed.
     pub fn first_key_at_restart(&self, restart_index: u32) -> Option<Vec<u8>> {
@@ -356,6 +337,7 @@ impl Block {
     /// Binary search for a key using restart points, then linear scan.
     /// Returns Some((key, value)) for exact user key match at the latest sequence,
     /// or None if not found.
+    #[cfg(test)]
     pub fn seek(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         if self.restart_offset == 0 {
             return None;

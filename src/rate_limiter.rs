@@ -72,9 +72,12 @@ impl RateLimiter {
 
         std::thread::sleep(Duration::from_secs_f64(wait_secs.min(MAX_SLEEP_SECS)));
     }
+}
 
-    /// Check if the rate limiter is enabled.
-    pub fn is_enabled(&self) -> bool {
+impl RateLimiter {
+    /// Whether a rate limit is configured (test helper).
+    #[cfg(test)]
+    pub(crate) fn is_enabled(&self) -> bool {
         self.inner.lock().rate_bytes_per_sec > 0
     }
 }

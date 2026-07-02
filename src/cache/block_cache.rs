@@ -129,25 +129,6 @@ impl BlockCache {
         }
     }
 
-    /// Invalidate a specific cached block.
-    pub fn invalidate(&self, file_number: u64, block_offset: u64) {
-        let key = (file_number, block_offset);
-        self.pinned.lock().remove(&key);
-        self.inner.invalidate(&key);
-        let is_empty = {
-            let mut offsets = self.file_offsets.lock();
-            if let Some(set) = offsets.get_mut(&file_number) {
-                set.remove(&block_offset);
-                set.is_empty()
-            } else {
-                false
-            }
-        };
-        if is_empty {
-            self.file_offsets.lock().remove(&file_number);
-        }
-    }
-
     /// Current approximate entry count (includes pinned entries).
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count() + self.pinned.lock().len() as u64
@@ -174,20 +155,5 @@ mod tests {
 
         // Miss
         assert!(cache.get(3, 0).is_none());
-    }
-
-    #[test]
-    fn test_block_cache_invalidate() {
-        let cache = BlockCache::new(1024 * 1024);
-        cache.insert(1, 0, vec![1]);
-        cache.insert(1, 100, vec![2]);
-        cache.insert(2, 0, vec![3]);
-
-        cache.invalidate(1, 0);
-        cache.inner.run_pending_tasks();
-
-        assert!(cache.get(1, 0).is_none());
-        assert!(cache.get(1, 100).is_some()); // only specific block invalidated
-        assert!(cache.get(2, 0).is_some());
     }
 }

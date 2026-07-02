@@ -10,7 +10,7 @@
 | NextPrefix skip | No | Yes | Yes | O(log N) inter-prefix jump |
 | SeekGEWithLimit / IterAtLimit | No | Yes | No | Soft limit for distributed shard scanning |
 | LazyValue / deferred value loading | Partial (BlobDB) | Yes | Yes | Zero-copy within SST blocks, no value alloc on skip path |
-| Iterator object pool | Yes | Yes | Yes | Global pool (`parking_lot::Mutex<Vec<DBIterator>>`) + PooledIterator RAII wrapper |
+| Iterator object pool | Yes | Yes | Yes | Removed in v4.0 — always-empty global pool added a lock hop per iterator for zero benefit; iterators are flat structs, sources dominate construction cost |
 | SetBounds propagation to sub-iterators | Yes | Yes | Yes | upper_bound propagated to TableIterator/LevelIterator |
 | SkipPoint callback | No | Yes | Yes | ReadOptions.skip_point callback filtering |
 | Iterator error propagation | Yes | Yes | Yes | DBIterator::error() exposes I/O errors |
@@ -97,9 +97,10 @@ Split points derived from target-level file boundaries. Uses `std::thread::scope
 parallel execution with shared `AtomicU64` file number counter and pre-populated
 `RangeTombstoneTracker` for cross-boundary tombstone correctness.
 
-**Global iterator object pool** — Replaced thread-local pool with global
-`parking_lot::Mutex<Vec<DBIterator>>`. Added `PooledIterator` RAII wrapper for
-automatic return on drop. Pool capacity adapts to `num_cpus * 4`.
+**Compaction reads bypass the block cache** — compaction `TableIterator`s run
+with `fill_cache=false` (RocksDB behavior): every input block is read exactly
+once, so inserting it would only evict hot point-read blocks. Public scans can
+opt in via `ReadOptions::fill_cache = false`.
 
 ### High Value
 

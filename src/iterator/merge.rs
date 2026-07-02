@@ -68,24 +68,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
     }
 
-    /// Replace sources and reset state, reusing allocated memory.
-    pub fn reset(&mut self, sources: Vec<IterSource>) {
-        let n = sources.len();
-        self.sources = sources;
-        self.heap.clear();
-        self.heap.extend(0..n);
-        self.heap_size = 0;
-        self.initialized = false;
-        self.direction = Direction::Forward;
-        self.single_source = n == 1;
-        self.current_key.clear();
-        self.in_heap.clear();
-        self.in_heap.resize(n, false);
-        self.lower_bound = None;
-        self.upper_bound = None;
-        self.last_source_level = usize::MAX;
-    }
-
     /// Build the initial heap from all non-exhausted sources.
     fn init_heap(&mut self) {
         if self.initialized {
@@ -327,6 +309,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     }
 
     /// Collect all entries.
+    #[cfg(test)]
     pub fn collect_all(&mut self) -> Vec<(Vec<u8>, LazyValue)> {
         let mut result = Vec::new();
         while let Some(entry) = self.next_entry() {
@@ -581,12 +564,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         for source in self.sources.iter_mut() {
             source.set_bounds(lower, upper);
         }
-    }
-
-    /// Level of the source that produced the last emitted entry.
-    /// Returns `usize::MAX` if no entry has been emitted yet.
-    pub fn last_source_level(&self) -> usize {
-        self.last_source_level
     }
 
     /// Return the LSM level of the source currently at the top of the heap

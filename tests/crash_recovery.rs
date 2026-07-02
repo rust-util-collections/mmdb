@@ -3,7 +3,7 @@
 //! Simulates crash scenarios by abruptly closing the DB
 //! and verifying data integrity on reopen.
 
-use mmdb::sst::format::CompressionType;
+use mmdb::CompressionType;
 use mmdb::{DB, DbOptions, WriteBatch, WriteOptions};
 
 fn make_opts() -> DbOptions {

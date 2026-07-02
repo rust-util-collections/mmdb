@@ -4,13 +4,13 @@ pub use iterator::TableIterator;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, MutexGuard};
 
 use crate::cache::block_cache::BlockCache;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultExt};
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::sst::block::Block;
 use crate::sst::filter::BloomFilter;
@@ -20,7 +20,6 @@ use crate::sst::format::{
 };
 use crate::stats::DbStats;
 use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
-use ruc::*;
 
 /// A range tombstone: (begin_key, end_key, sequence_number).
 type RangeTombstoneEntry = (Vec<u8>, Vec<u8>, SequenceNumber);
@@ -55,8 +54,6 @@ struct MetaIndexData {
 
 /// Reader for an SST file.
 pub struct TableReader {
-    path: PathBuf,
-    file_size: u64,
     file_number: u64,
     index_block: Block,
     filter_data: Option<Vec<u8>>,
@@ -82,20 +79,6 @@ impl TableReader {
         Self::open_with_all(path, 0, None, None)
     }
 
-    /// Open an SST file for reading with a known file number (for cache keying).
-    pub fn open_with_number(path: &Path, file_number: u64) -> Result<Self> {
-        Self::open_with_all(path, file_number, None, None)
-    }
-
-    /// Open with file number and optional block cache.
-    pub fn open_full(
-        path: &Path,
-        file_number: u64,
-        block_cache: Option<Arc<BlockCache>>,
-    ) -> Result<Self> {
-        Self::open_with_all(path, file_number, block_cache, None)
-    }
-
     /// Open with file number, optional block cache, and optional stats.
     pub fn open_with_all(
         path: &Path,
@@ -103,33 +86,31 @@ impl TableReader {
         block_cache: Option<Arc<BlockCache>>,
         stats: Option<Arc<DbStats>>,
     ) -> Result<Self> {
-        let mut file = File::open(path).c(d!())?;
-        let file_size = file.metadata().c(d!())?.len();
+        let mut file = File::open(path).ctx()?;
+        let file_size = file.metadata().ctx()?.len();
 
         if file_size < FOOTER_SIZE as u64 {
-            return Err(eg!(Error::Corruption(format!(
+            return Err(Error::corruption(format!(
                 "SST file too small: {} bytes",
                 file_size
-            ))));
+            )));
         }
 
         // Read footer
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).c(d!())?;
+        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).ctx()?;
         let mut footer_buf = [0u8; FOOTER_SIZE];
-        file.read_exact(&mut footer_buf).c(d!())?;
-        let (metaindex_handle, index_handle) = decode_footer(&footer_buf).c(d!())?;
+        file.read_exact(&mut footer_buf).ctx()?;
+        let (metaindex_handle, index_handle) = decode_footer(&footer_buf).ctx()?;
 
         // Read index block
         let index_data =
-            Self::read_block_data_with_size(&mut file, &index_handle, file_size).c(d!())?;
-        let index_block = Block::from_vec(index_data).c(d!())?;
+            Self::read_block_data_with_size(&mut file, &index_handle, file_size).ctx()?;
+        let index_block = Block::from_vec(index_data).ctx()?;
 
         // Read filters and range-del handle from metaindex
-        let meta = Self::read_metaindex(&mut file, &metaindex_handle, file_size).c(d!())?;
+        let meta = Self::read_metaindex(&mut file, &metaindex_handle, file_size).ctx()?;
 
         Ok(Self {
-            path: path.to_path_buf(),
-            file_size,
             file_number,
             index_block,
             filter_data: meta.bloom,
@@ -162,7 +143,7 @@ impl TableReader {
         index_block
             .iter()
             .map(|(k, v)| {
-                let d = decode_index_value_with_props(&v).c(d!())?;
+                let d = decode_index_value_with_props(&v).ctx()?;
                 Ok(IndexEntry {
                     separator_key: k,
                     handle: d.handle,
@@ -178,6 +159,7 @@ impl TableReader {
     }
 
     /// Look up a key in the SST (exact byte match). Returns the value if found.
+    #[cfg(test)]
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // Check bloom filter first
         if let Some(ref filter) = self.filter_data
@@ -187,14 +169,14 @@ impl TableReader {
         }
 
         // Search index block for the data block that might contain the key
-        let block_handle = match self.find_data_block(key).c(d!())? {
+        let block_handle = match self.find_data_block(key).ctx()? {
             Some(h) => h,
             None => return Ok(None),
         };
 
         // Read and search the data block
-        let block_data = self.read_block_cached(&block_handle).c(d!())?;
-        let block = Block::new(block_data).c(d!())?;
+        let block_data = self.read_block_cached(&block_handle).ctx()?;
+        let block = Block::new(block_data).ctx()?;
 
         match block.seek(key) {
             Some((found_key, value)) if found_key.as_slice() == key => Ok(Some(value)),
@@ -208,6 +190,7 @@ impl TableReader {
     /// - `Some(Some(value))` if a Value entry is found
     /// - `Some(None)` if a Deletion tombstone is found
     /// - `None` if the key doesn't exist in this table
+    #[cfg(test)]
     pub fn get_internal(
         &self,
         user_key: &[u8],
@@ -232,12 +215,12 @@ impl TableReader {
             .index_block
             .seek_by(seek_key.as_bytes(), compare_internal_key)
         {
-            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).c(d!())?,
+            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).ctx()?,
             None => return Ok(None),
         };
 
-        let block_data = self.read_block_cached(&handle).c(d!())?;
-        let block = Block::new(block_data).c(d!())?;
+        let block_data = self.read_block_cached(&handle).ctx()?;
+        let block = Block::new(block_data).ctx()?;
 
         // Seek within the data block. The first entry >= seek_key with matching user_key
         // is our answer (because entries are sorted user_key ASC, seq DESC).
@@ -258,10 +241,12 @@ impl TableReader {
 
     /// Like `get_internal` but also returns the sequence number of the found entry.
     /// Returns `Some((result, entry_seq))` if found, `None` if key not in this table.
+    /// When `fill_cache` is false, a cache miss does not populate the block cache.
     pub fn get_internal_with_seq(
         &self,
         user_key: &[u8],
         sequence: SequenceNumber,
+        fill_cache: bool,
     ) -> Result<Option<(Option<Vec<u8>>, SequenceNumber)>> {
         use crate::types::InternalKey;
 
@@ -278,12 +263,12 @@ impl TableReader {
             .index_block
             .seek_by(seek_key.as_bytes(), compare_internal_key)
         {
-            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).c(d!())?,
+            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).ctx()?,
             None => return Ok(None),
         };
 
-        let block_data = self.read_block_cached(&handle).c(d!())?;
-        let block = Block::new(block_data).c(d!())?;
+        let block_data = self.read_block_cached_opt(&handle, fill_cache).ctx()?;
+        let block = Block::new(block_data).ctx()?;
 
         match block.seek_by(seek_key.as_bytes(), compare_internal_key) {
             Some((encoded_ikey, value)) if encoded_ikey.len() >= 8 => {
@@ -314,14 +299,14 @@ impl TableReader {
         user_key: &[u8],
         read_seq: SequenceNumber,
     ) -> Result<SequenceNumber> {
-        let tombstones = self.cached_range_tombstones().c(d!())?;
+        let tombstones = self.cached_range_tombstones().ctx()?;
         Ok(tombstones.max_covering_tombstone_seq(user_key, read_seq))
     }
 
     /// Return all range tombstones as (begin, end, seq) triples.
     /// Delegates to `cached_range_tombstones()` — no extra I/O after first call.
     pub fn get_range_tombstones(&self) -> Result<Vec<RangeTombstoneEntry>> {
-        let cached = self.cached_range_tombstones().c(d!())?;
+        let cached = self.cached_range_tombstones().ctx()?;
         Ok(cached.tombstones())
     }
 
@@ -336,8 +321,8 @@ impl TableReader {
 
         if let Some(ref handle) = self.range_del_handle {
             // New path: read from dedicated range-del block
-            let block_data = self.read_block_cached(handle).c(d!())?;
-            let block = Block::new(block_data).c(d!())?;
+            let block_data = self.read_block_cached(handle).ctx()?;
+            let block = Block::new(block_data).ctx()?;
             for (k, v) in block.iter() {
                 if k.len() < 8 {
                     continue;
@@ -350,9 +335,9 @@ impl TableReader {
         } else {
             // Backward compatibility: old SST format without range-del block
             for (_, handle_bytes) in self.index_block.iter() {
-                let handle = BlockHandle::decode(&handle_bytes).c(d!())?;
-                let block_data = self.read_block_cached(&handle).c(d!())?;
-                let block = Block::new(block_data).c(d!())?;
+                let handle = BlockHandle::decode(&handle_bytes).ctx()?;
+                let block_data = self.read_block_cached(&handle).ctx()?;
+                let block = Block::new(block_data).ctx()?;
 
                 for (k, v) in block.iter() {
                     if k.len() < 8 {
@@ -374,13 +359,14 @@ impl TableReader {
     }
 
     /// Iterate over all key-value pairs in the table.
+    #[cfg(test)]
     pub fn iter(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut result = Vec::new();
 
         for (_, handle_bytes) in self.index_block.iter() {
-            let handle = BlockHandle::decode(&handle_bytes).c(d!())?;
-            let block_data = self.read_block_cached(&handle).c(d!())?;
-            let block = Block::new(block_data).c(d!())?;
+            let handle = BlockHandle::decode(&handle_bytes).ctx()?;
+            let block_data = self.read_block_cached(&handle).ctx()?;
+            let block = Block::new(block_data).ctx()?;
             for entry in block.iter() {
                 result.push(entry);
             }
@@ -390,10 +376,11 @@ impl TableReader {
     }
 
     /// Find the data block handle that might contain the given key.
+    #[cfg(test)]
     fn find_data_block(&self, key: &[u8]) -> Result<Option<BlockHandle>> {
         match self.index_block.seek(key) {
             Some((_idx_key, handle_bytes)) => {
-                let handle = BlockHandle::decode(&handle_bytes).c(d!())?;
+                let handle = BlockHandle::decode(&handle_bytes).ctx()?;
                 Ok(Some(handle))
             }
             None => Ok(None),
@@ -401,7 +388,7 @@ impl TableReader {
     }
 
     fn read_block_data(file: &mut File, handle: &BlockHandle) -> Result<Vec<u8>> {
-        let file_size = file.metadata().c(d!())?.len();
+        let file_size = file.metadata().ctx()?.len();
         Self::read_block_data_with_size(file, handle, file_size)
     }
 
@@ -415,31 +402,31 @@ impl TableReader {
             .offset
             .checked_add(handle.size)
             .and_then(|n| n.checked_add(BLOCK_TRAILER_SIZE as u64))
-            .ok_or_else(|| Error::Corruption("block handle range overflow".to_string()))
-            .c(d!())?;
+            .ok_or_else(|| Error::corruption("block handle range overflow"))
+            .ctx()?;
         if end > file_size {
-            return Err(eg!(Error::Corruption(format!(
+            return Err(Error::corruption(format!(
                 "block handle out of bounds: offset={}, size={}, file_size={}",
                 handle.offset, handle.size, file_size
-            ))));
+            )));
         }
         if handle.size > MAX_COMPRESSED_BLOCK_SIZE {
-            return Err(eg!(Error::Corruption(format!(
+            return Err(Error::corruption(format!(
                 "compressed block size {} exceeds limit {}",
                 handle.size, MAX_COMPRESSED_BLOCK_SIZE
-            ))));
+            )));
         }
-        file.seek(SeekFrom::Start(handle.offset)).c(d!())?;
+        file.seek(SeekFrom::Start(handle.offset)).ctx()?;
         let mut data = vec![0u8; handle.size as usize];
-        file.read_exact(&mut data).c(d!())?;
+        file.read_exact(&mut data).ctx()?;
 
         // Read and verify trailer
         let mut trailer = [0u8; BLOCK_TRAILER_SIZE];
-        file.read_exact(&mut trailer).c(d!())?;
+        file.read_exact(&mut trailer).ctx()?;
 
         let compression_type = CompressionType::from_u8(trailer[0])
-            .ok_or_else(|| Error::Corruption("unknown compression type".to_string()))
-            .c(d!())?;
+            .ok_or_else(|| Error::corruption("unknown compression type"))
+            .ctx()?;
 
         let stored_crc = u32::from_le_bytes(trailer[1..5].try_into().unwrap());
         let mut hasher = crc32fast::Hasher::new();
@@ -448,36 +435,36 @@ impl TableReader {
         let computed_crc = hasher.finalize();
 
         if stored_crc != computed_crc {
-            return Err(eg!(Error::Corruption(format!(
+            return Err(Error::corruption(format!(
                 "block CRC mismatch: stored {:#x}, computed {:#x}",
                 stored_crc, computed_crc
-            ))));
+            )));
         }
 
         // Decompress if needed (with size bound to prevent allocation bombs)
         let data = match compression_type {
             CompressionType::Lz4 => {
                 if data.len() < 4 {
-                    return Err(eg!(Error::Corruption(
-                        "LZ4 block too small for size header".to_string()
-                    )));
+                    return Err(Error::corruption(
+                        "LZ4 block too small for size header".to_string(),
+                    ));
                 }
                 let uncompressed_size =
                     u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
                 if uncompressed_size > MAX_DECOMPRESSED_BLOCK_SIZE {
-                    return Err(eg!(Error::Corruption(format!(
+                    return Err(Error::corruption(format!(
                         "LZ4 decompressed size {} exceeds limit {}",
                         uncompressed_size, MAX_DECOMPRESSED_BLOCK_SIZE
-                    ))));
+                    )));
                 }
                 lz4_flex::decompress_size_prepended(&data)
-                    .map_err(|e| Error::Corruption(format!("LZ4 decompression error: {}", e)))
-                    .c(d!())?
+                    .map_err(|e| Error::corruption(format!("LZ4 decompression error: {}", e)))
+                    .ctx()?
             }
             CompressionType::Zstd => {
                 zstd::bulk::decompress(data.as_slice(), MAX_DECOMPRESSED_BLOCK_SIZE)
-                    .map_err(|e| Error::Corruption(format!("Zstd decompression error: {}", e)))
-                    .c(d!())?
+                    .map_err(|e| Error::corruption(format!("Zstd decompression error: {}", e)))
+                    .ctx()?
             }
             CompressionType::None => data,
         };
@@ -500,8 +487,8 @@ impl TableReader {
         }
 
         let metaindex_data =
-            Self::read_block_data_with_size(file, metaindex_handle, file_size).c(d!())?;
-        let metaindex = Block::from_vec(metaindex_data).c(d!())?;
+            Self::read_block_data_with_size(file, metaindex_handle, file_size).ctx()?;
+        let metaindex = Block::from_vec(metaindex_data).ctx()?;
 
         let mut bloom = None;
         let mut prefix = None;
@@ -510,25 +497,23 @@ impl TableReader {
 
         for (key, value) in metaindex.iter() {
             if key == b"filter.bloom" {
-                let handle = BlockHandle::decode(&value).c(d!())?;
-                bloom = Some(Self::read_block_data_with_size(file, &handle, file_size).c(d!())?);
+                let handle = BlockHandle::decode(&value).ctx()?;
+                bloom = Some(Self::read_block_data_with_size(file, &handle, file_size).ctx()?);
             } else if key == b"filter.prefix" {
-                let handle = BlockHandle::decode(&value).c(d!())?;
-                prefix = Some(Self::read_block_data_with_size(file, &handle, file_size).c(d!())?);
+                let handle = BlockHandle::decode(&value).ctx()?;
+                prefix = Some(Self::read_block_data_with_size(file, &handle, file_size).ctx()?);
             } else if key == PREFIX_FILTER_LEN_NAME.as_bytes() {
                 if value.len() != 8 {
-                    return Err(eg!(Error::Corruption(
-                        "bad prefix filter length metadata".to_string()
-                    )));
+                    return Err(Error::corruption(
+                        "bad prefix filter length metadata".to_string(),
+                    ));
                 }
                 let len = u64::from_le_bytes(value.as_slice().try_into().unwrap());
                 prefix_len = Some(usize::try_from(len).map_err(|_| {
-                    eg!(Error::Corruption(
-                        "prefix filter length overflows usize".to_string()
-                    ))
+                    Error::corruption("prefix filter length overflows usize".to_string())
                 })?);
             } else if key == RANGE_DEL_BLOCK_NAME.as_bytes() {
-                range_del_handle = Some(BlockHandle::decode(&value).c(d!())?);
+                range_del_handle = Some(BlockHandle::decode(&value).ctx()?);
             }
         }
 
@@ -551,21 +536,22 @@ impl TableReader {
         }
     }
 
-    pub fn file_size(&self) -> u64 {
-        self.file_size
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn file_number(&self) -> u64 {
-        self.file_number
-    }
-
     /// Read a block, consulting the cache first if available.
     /// Returns Arc<Vec<u8>> — zero-copy on cache hit.
     fn read_block_cached(&self, handle: &BlockHandle) -> Result<Arc<Vec<u8>>> {
+        self.read_block_cached_opt(handle, true)
+    }
+
+    /// Like [`read_block_cached`](Self::read_block_cached), but when
+    /// `fill_cache` is false a cache miss does **not** insert the block into
+    /// the block cache. Used by scans (user iterators with
+    /// `ReadOptions::fill_cache == false`, and compaction reads) to avoid
+    /// evicting hot point-read blocks.
+    fn read_block_cached_opt(
+        &self,
+        handle: &BlockHandle,
+        fill_cache: bool,
+    ) -> Result<Arc<Vec<u8>>> {
         if let Some(ref cache) = self.block_cache
             && let Some(cached) = cache.get(self.file_number, handle.offset)
         {
@@ -581,10 +567,10 @@ impl TableReader {
             s.record_cache_miss();
         }
 
-        let mut file = self.open_file().c(d!())?;
-        let data = Self::read_block_data(&mut file, handle).c(d!())?;
+        let mut file = self.open_file().ctx()?;
+        let data = Self::read_block_data(&mut file, handle).ctx()?;
 
-        if let Some(ref cache) = self.block_cache {
+        if fill_cache && let Some(ref cache) = self.block_cache {
             return Ok(cache.insert(self.file_number, handle.offset, data));
         }
 

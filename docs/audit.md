@@ -70,15 +70,15 @@
 - **What**: Uses `assert!` guards that panic (in both debug and release builds) on encoded keys < 8 bytes, rather than returning a `Result`.
 - **Reason**: Design assumption that all encoded keys come from CRC-protected storage (WAL and SST blocks are checksummed before decode), making this condition unreachable in practice. `InternalKey::new()` builds from components and always appends the 8-byte trailer — no guard needed. Converting to fallible returns would touch every callsite on the hot read path. Re-checked 2026-07-02: still applies.
 
-### [LOW] options: `DbOptions` Debug impl omits ~14 fields
-- **Where**: src/options.rs:190-217
-- **What**: The manual `Debug` implementation omits `l0_slowdown_trigger`, `l0_stop_trigger`, `rate_limiter_bytes_per_sec`, `compression_per_level`, and others.
-- **Reason**: Intentional conciseness — use `{:#?}` via derived Debug on inner types for full display. Re-checked 2026-07-02: still applies.
+### [LOW] options: `DbOptions` Debug impl is manual
+- **Where**: src/options.rs (Debug impl)
+- **What**: `DbOptions` needs a manual `Debug` because of non-Debug callback fields (`compaction_filter`, `block_property_collectors`); when adding a field, remember to extend the Debug impl. As of v4.0 the impl lists every field.
+- **Reason**: Structural constraint of `dyn` callback members. Re-checked 2026-07-02 (v4.0): impl now covers all fields.
 
 ### [LOW] db_iter: forward iteration level filter may be too strict for same-level entries
 - **Where**: src/iterator/db_iter.rs (forward path level filter), src/iterator/range_del.rs (level-filtered lookup)
 - **What**: Level filter uses `level >= src_lvl`, which assumes a tombstone at level L never needs to delete entries also tagged level L.
-- **Reason**: Currently dormant: DB-constructed sources are untagged (`with_level()` is unused in production), so the filter never actually excludes a tombstone. Naïvely tagging every source level 0 would be incorrect — a same-level delete is real (an active-memtable tombstone `[a,c)@10` must hide an immutable-memtable/L0 entry `b@5`, and distinct L0 files are the same "level"). Any future use of `with_level()` must assign distinct source indices per memtable/L0 file, not per LSM level. Re-checked 2026-07-02: still applies (dormant).
+- **Reason**: Currently dormant: DB-constructed sources are untagged (`IterSource.level` is always `usize::MAX` in production; the `with_level()` setter was removed in v4.0 as dead code), so the filter never actually excludes a tombstone. Naïvely tagging every source level 0 would be incorrect — a same-level delete is real (an active-memtable tombstone `[a,c)@10` must hide an immutable-memtable/L0 entry `b@5`, and distinct L0 files are the same "level"). Any future source-level tagging must assign distinct source indices per memtable/L0 file, not per LSM level. Re-checked 2026-07-02 (v4.0): still applies (dormant).
 
 ### [LOW] test: test_write_options_no_slowdown discards its behavioral signal
 - **Where**: tests/integration.rs:807-849

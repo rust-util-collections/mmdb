@@ -8,6 +8,4 @@ pub(crate) mod range_del;
 pub mod source;
 
 pub use bidi_iter::BidiIterator;
-pub use db_iter::{DBIterator, PooledIterator};
-pub use level_iter::LevelIterator;
-pub use merge::MergingIterator;
+pub use db_iter::DBIterator;

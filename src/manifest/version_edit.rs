@@ -2,7 +2,6 @@
 
 use crate::error::{Error, Result};
 use crate::types::SequenceNumber;
-use ruc::*;
 
 /// Metadata for a file in a particular level.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,7 +113,7 @@ impl VersionEdit {
             match tag {
                 1 => {
                     if pos + 8 > data.len() {
-                        return Err(eg!(Error::Corruption("truncated log_number".into())));
+                        return Err(Error::corruption("truncated log_number"));
                     }
                     edit.log_number =
                         Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
@@ -122,7 +121,7 @@ impl VersionEdit {
                 }
                 2 => {
                     if pos + 8 > data.len() {
-                        return Err(eg!(Error::Corruption("truncated next_file_number".into())));
+                        return Err(Error::corruption("truncated next_file_number"));
                     }
                     edit.next_file_number =
                         Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
@@ -130,7 +129,7 @@ impl VersionEdit {
                 }
                 3 => {
                     if pos + 8 > data.len() {
-                        return Err(eg!(Error::Corruption("truncated last_sequence".into())));
+                        return Err(Error::corruption("truncated last_sequence"));
                     }
                     edit.last_sequence =
                         Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
@@ -139,7 +138,7 @@ impl VersionEdit {
                 4 | 6 => {
                     // new_file (tag 4 = legacy, tag 6 = v2 with has_range_deletions)
                     if pos + 4 + 8 + 8 > data.len() {
-                        return Err(eg!(Error::Corruption("truncated new_file header".into())));
+                        return Err(Error::corruption("truncated new_file header"));
                     }
                     let level = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
                     pos += 4;
@@ -149,34 +148,32 @@ impl VersionEdit {
                     pos += 8;
 
                     if pos + 4 > data.len() {
-                        return Err(eg!(Error::Corruption("truncated smallest_key_len".into())));
+                        return Err(Error::corruption("truncated smallest_key_len"));
                     }
                     let sk_len =
                         u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     if pos + sk_len > data.len() {
-                        return Err(eg!(Error::Corruption("truncated smallest_key".into())));
+                        return Err(Error::corruption("truncated smallest_key"));
                     }
                     let smallest_key = data[pos..pos + sk_len].to_vec();
                     pos += sk_len;
 
                     if pos + 4 > data.len() {
-                        return Err(eg!(Error::Corruption("truncated largest_key_len".into())));
+                        return Err(Error::corruption("truncated largest_key_len"));
                     }
                     let lk_len =
                         u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                     pos += 4;
                     if pos + lk_len > data.len() {
-                        return Err(eg!(Error::Corruption("truncated largest_key".into())));
+                        return Err(Error::corruption("truncated largest_key"));
                     }
                     let largest_key = data[pos..pos + lk_len].to_vec();
                     pos += lk_len;
 
                     let has_range_deletions = if tag == 6 {
                         if pos >= data.len() {
-                            return Err(eg!(Error::Corruption(
-                                "truncated has_range_deletions".into()
-                            )));
+                            return Err(Error::corruption("truncated has_range_deletions"));
                         }
                         let v = data[pos] != 0;
                         pos += 1;
@@ -199,7 +196,7 @@ impl VersionEdit {
                 5 => {
                     // deleted_file
                     if pos + 4 + 8 > data.len() {
-                        return Err(eg!(Error::Corruption("truncated deleted_file".into())));
+                        return Err(Error::corruption("truncated deleted_file"));
                     }
                     let level = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
                     pos += 4;
@@ -208,7 +205,7 @@ impl VersionEdit {
                     edit.deleted_files.push((level, number));
                 }
                 _ => {
-                    return Err(eg!(Error::Corruption(format!("unknown tag: {}", tag))));
+                    return Err(Error::corruption(format!("unknown tag: {}", tag)));
                 }
             }
         }

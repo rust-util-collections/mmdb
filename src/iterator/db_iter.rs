@@ -70,7 +70,8 @@ fn ikey_compare(a: &[u8], b: &[u8]) -> Ordering {
 
 impl DBIterator {
     /// Build a DB iterator from multiple sorted Vec sources of internal key-value pairs.
-    pub fn new(sources: Vec<Vec<(Vec<u8>, Vec<u8>)>>, sequence: SequenceNumber) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(sources: Vec<Vec<(Vec<u8>, Vec<u8>)>>, sequence: SequenceNumber) -> Self {
         let iter_sources: Vec<IterSource> = sources.into_iter().map(IterSource::new).collect();
 
         let merger =
@@ -97,7 +98,7 @@ impl DBIterator {
     }
 
     /// Build a DB iterator from pre-built IterSource objects (supports streaming).
-    pub fn from_sources(sources: Vec<IterSource>, sequence: SequenceNumber) -> Self {
+    pub(crate) fn from_sources(sources: Vec<IterSource>, sequence: SequenceNumber) -> Self {
         let merger = MergingIterator::new(sources, ikey_compare as fn(&[u8], &[u8]) -> Ordering);
 
         Self {
@@ -122,7 +123,7 @@ impl DBIterator {
 
     /// Build a DB iterator with prefix-bounded iteration.
     /// Iteration stops when user key no longer starts with `prefix`.
-    pub fn from_sources_with_prefix(
+    pub(crate) fn from_sources_with_prefix(
         sources: Vec<IterSource>,
         sequence: SequenceNumber,
         prefix: Vec<u8>,
@@ -149,48 +150,20 @@ impl DBIterator {
         }
     }
 
-    /// Reset the iterator with new sources and sequence, reusing allocated memory.
-    /// Used by the iterator pool to avoid per-iteration allocation overhead.
-    pub fn reset(&mut self, sources: Vec<IterSource>, sequence: SequenceNumber) {
-        self.merger.reset(sources);
-        self.sequence = sequence;
-        self.batch_seq_floor = None;
-        self.last_user_key.clear();
-        self.has_last_key = false;
-        self.current = None;
-        self.needs_advance = true;
-        self.range_tombstones = FragmentedRangeTombstoneList::empty();
-        self.prefix = None;
-        self.iterate_upper_bound = None;
-        self.iterate_lower_bound = None;
-        self.prev_overshoot = None;
-        self.backward_positioned = false;
-        self.skip_point = None;
-        self.last_seek_key = None;
-        self.clean_read = true;
-    }
-
-    /// Reset with prefix-bounded iteration, reusing allocated memory.
-    pub fn reset_with_prefix(
-        &mut self,
-        sources: Vec<IterSource>,
-        sequence: SequenceNumber,
-        prefix: Vec<u8>,
-    ) {
-        self.reset(sources, sequence);
-        self.prefix = Some(prefix);
-    }
-
     /// Set pre-collected range tombstones. Called by the DB layer after
     /// collecting tombstones from all memtables and SST files.
-    pub fn set_range_tombstones(&mut self, tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) {
+    #[cfg(test)]
+    pub(crate) fn set_range_tombstones(
+        &mut self,
+        tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>,
+    ) {
         self.range_tombstones = FragmentedRangeTombstoneList::new(tombstones);
         self.clean_read = false;
     }
 
     /// Set range tombstones with level info for cross-level pruning.
     /// A tombstone from level L can only delete keys from levels > L.
-    pub fn set_range_tombstones_with_levels(
+    pub(crate) fn set_range_tombstones_with_levels(
         &mut self,
         tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
     ) {
@@ -198,17 +171,12 @@ impl DBIterator {
         self.clean_read = false;
     }
 
-    /// No-op: tombstones are loaded upfront; emptiness is checked via is_empty().
-    pub fn set_no_range_deletions(&mut self) {
-        // Tombstones list is already empty by default.
-    }
-
     /// Mark the start of the reserved batch-overlay sequence region. Entries
     /// (and range tombstones) with `seq >= floor` become visible in addition
     /// to entries at or below the snapshot sequence. Used by
     /// `DB::iter_with_batch` to overlay uncommitted batch writes on top of a
     /// snapshot read without aliasing committed sequence numbers.
-    pub fn set_batch_seq_floor(&mut self, floor: SequenceNumber) {
+    pub(crate) fn set_batch_seq_floor(&mut self, floor: SequenceNumber) {
         self.batch_seq_floor = Some(floor);
     }
 
@@ -237,7 +205,7 @@ impl DBIterator {
     /// Set an exclusive upper bound on user keys.
     /// Iteration stops when user key >= this bound.
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
-    pub fn set_upper_bound(&mut self, bound: Vec<u8>) {
+    pub(crate) fn set_upper_bound(&mut self, bound: Vec<u8>) {
         self.merger
             .set_bounds(self.iterate_lower_bound.as_deref(), Some(&bound));
         self.iterate_upper_bound = Some(bound);
@@ -247,18 +215,8 @@ impl DBIterator {
         self.prev_overshoot = None;
     }
 
-    /// Set an inclusive lower bound on user keys.
-    pub fn set_lower_bound(&mut self, bound: Vec<u8>) {
-        self.merger
-            .set_bounds(Some(&bound), self.iterate_upper_bound.as_deref());
-        self.iterate_lower_bound = Some(bound);
-        self.current = None;
-        self.needs_advance = true;
-        self.prev_overshoot = None;
-    }
-
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
-    pub fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
+    pub(crate) fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
         self.merger.set_bounds(lower.as_deref(), upper.as_deref());
         self.iterate_lower_bound = lower;
         self.iterate_upper_bound = upper;
@@ -291,7 +249,7 @@ impl DBIterator {
 
     /// Set a skip-point callback. During iteration, any user key for which
     /// the callback returns `true` is silently skipped.
-    pub fn set_skip_point(&mut self, f: crate::options::SkipPointFn) {
+    pub(crate) fn set_skip_point(&mut self, f: crate::options::SkipPointFn) {
         self.skip_point = Some(f);
         self.clean_read = false;
     }
@@ -629,19 +587,6 @@ impl DBIterator {
         self.backward_positioned = false;
     }
 
-    /// Fully reset internal deduplication/tombstone state, then seek to first.
-    /// Used by BidiIterator when materializing after a seek_to_last().
-    pub fn reset_and_seek_to_first(&mut self) {
-        self.has_last_key = false;
-        self.last_user_key.clear();
-        // range_tombstones is immutable — no reset needed.
-        self.prev_overshoot = None;
-        self.backward_positioned = false;
-        self.current = None;
-        self.needs_advance = true;
-        self.seek_to_first();
-    }
-
     /// The shortest key strictly greater than every key sharing this iterator's
     /// prefix (the exclusive upper bound of the prefix range). Returns `None`
     /// when no prefix is set, or the prefix is all `0xFF` (no finite successor).
@@ -922,22 +867,6 @@ impl DBIterator {
             None
         }
     }
-
-    pub fn collect_remaining(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut result = Vec::new();
-        for entry in self.by_ref() {
-            result.push(entry);
-        }
-        result
-    }
-
-    pub fn count(&mut self) -> usize {
-        let mut n = 0;
-        while self.next().is_some() {
-            n += 1;
-        }
-        n
-    }
 }
 
 impl DBIterator {
@@ -945,7 +874,7 @@ impl DBIterator {
     /// materializing it. Avoids the into_vec() copy that Iterator::next()
     /// must perform.
     #[inline(always)]
-    pub fn next_lazy(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+    pub(crate) fn next_lazy(&mut self) -> Option<(Vec<u8>, LazyValue)> {
         if self.ensure_current() {
             let entry = self.current.take().unwrap();
             self.needs_advance = true;
@@ -954,15 +883,6 @@ impl DBIterator {
             None
         }
     }
-
-    /// Take ownership of the current buffered entry without advancing.
-    /// After this call, valid() returns false until the next seek/advance.
-    #[inline(always)]
-    pub fn take_current(&mut self) -> Option<(Vec<u8>, LazyValue)> {
-        let entry = self.current.take();
-        self.needs_advance = false;
-        entry
-    }
 }
 
 impl Iterator for DBIterator {
@@ -970,48 +890,6 @@ impl Iterator for DBIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_lazy().map(|(k, lv)| (k, lv.into_vec()))
-    }
-}
-
-/// A pooled iterator that automatically returns to the global pool on drop.
-///
-/// Wraps a [`DBIterator`] and implements `Deref`/`DerefMut` so it can be used
-/// identically. When dropped, the iterator is reset (releasing `Arc<TableReader>`
-/// references) and returned to the global pool for reuse by any thread.
-pub struct PooledIterator {
-    inner: Option<DBIterator>,
-}
-
-impl PooledIterator {
-    /// Wrap a `DBIterator` for automatic pool return on drop.
-    pub fn new(iter: DBIterator) -> Self {
-        Self { inner: Some(iter) }
-    }
-
-    /// Take ownership of the inner iterator, disabling automatic pool return.
-    pub fn into_inner(mut self) -> DBIterator {
-        self.inner.take().unwrap()
-    }
-}
-
-impl Drop for PooledIterator {
-    fn drop(&mut self) {
-        if let Some(iter) = self.inner.take() {
-            crate::db::pool_return(iter);
-        }
-    }
-}
-
-impl std::ops::Deref for PooledIterator {
-    type Target = DBIterator;
-    fn deref(&self) -> &DBIterator {
-        self.inner.as_ref().unwrap()
-    }
-}
-
-impl std::ops::DerefMut for PooledIterator {
-    fn deref_mut(&mut self) -> &mut DBIterator {
-        self.inner.as_mut().unwrap()
     }
 }
 

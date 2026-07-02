@@ -10,8 +10,7 @@
 //! └───────────────────────────────┘
 //! ```
 
-use crate::error::{Error, Result};
-use ruc::*;
+use crate::error::{Error, Result, ResultExt};
 
 /// Magic number identifying MMDB SST files.
 pub const TABLE_MAGIC: u64 = 0x4D4D_4442_5353_5400; // "MMDBSST\0"
@@ -49,7 +48,10 @@ impl BlockHandle {
     /// Decode from bytes. Returns an error if `buf` is shorter than 16 bytes.
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < 16 {
-            return Err(eg!("BlockHandle::decode: need 16 bytes, got {}", buf.len()));
+            return Err(Error::corruption(format!(
+                "BlockHandle::decode: need 16 bytes, got {}",
+                buf.len()
+            )));
         }
         let offset = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let size = u64::from_le_bytes(buf[8..16].try_into().unwrap());
@@ -104,13 +106,13 @@ pub fn encode_footer(
 pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> Result<(BlockHandle, BlockHandle)> {
     let magic = u64::from_le_bytes(data[40..48].try_into().unwrap());
     if magic != TABLE_MAGIC {
-        return Err(eg!(Error::Corruption(format!(
+        return Err(Error::corruption(format!(
             "invalid SST magic: {:#x}",
             magic
-        ))));
+        )));
     }
-    let metaindex_handle = BlockHandle::decode(&data[0..16]).c(d!())?;
-    let index_handle = BlockHandle::decode(&data[16..32]).c(d!())?;
+    let metaindex_handle = BlockHandle::decode(&data[0..16]).ctx()?;
+    let index_handle = BlockHandle::decode(&data[16..32]).ctx()?;
     Ok((metaindex_handle, index_handle))
 }
 
@@ -134,20 +136,14 @@ pub fn encode_index_value_with_props(
 ) -> Result<Vec<u8>> {
     let mut buf = encode_index_value(handle, first_key);
     let num_props = u16::try_from(properties.len())
-        .map_err(|_| Error::InvalidArgument("too many block properties".into()))
-        .c(d!())?;
+        .map_err(|_| Error::invalid_argument("too many block properties"))
+        .ctx()?;
     buf.extend_from_slice(&num_props.to_le_bytes());
     for (name, data) in properties {
-        let name_len = u16::try_from(name.len()).map_err(|_| {
-            eg!(Error::InvalidArgument(
-                "block property name too large".into()
-            ))
-        })?;
-        let data_len = u16::try_from(data.len()).map_err(|_| {
-            eg!(Error::InvalidArgument(
-                "block property data too large".into()
-            ))
-        })?;
+        let name_len = u16::try_from(name.len())
+            .map_err(|_| Error::invalid_argument("block property name too large"))?;
+        let data_len = u16::try_from(data.len())
+            .map_err(|_| Error::invalid_argument("block property data too large"))?;
         buf.extend_from_slice(&name_len.to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(&data_len.to_le_bytes());
@@ -166,7 +162,7 @@ pub struct DecodedIndexValue<'a> {
 /// Decode an extended index value that may contain block properties.
 /// Compatible with old format (no properties appended).
 pub fn decode_index_value_with_props(data: &[u8]) -> Result<DecodedIndexValue<'_>> {
-    let handle = BlockHandle::decode(data).c(d!())?;
+    let handle = BlockHandle::decode(data).ctx()?;
     let mut first_key: Option<&[u8]> = None;
     let mut props = Vec::new();
 
@@ -184,16 +180,14 @@ pub fn decode_index_value_with_props(data: &[u8]) -> Result<DecodedIndexValue<'_
         let fk_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if data.len() < offset + fk_len {
-            return Err(eg!(Error::Corruption("truncated index first_key".into())));
+            return Err(Error::corruption("truncated index first_key"));
         }
         if fk_len > 0 {
             first_key = Some(&data[offset..offset + fk_len]);
         }
         offset += fk_len;
     } else if data.len() > 16 {
-        return Err(eg!(Error::Corruption(
-            "truncated index first_key length".into()
-        )));
+        return Err(Error::corruption("truncated index first_key length"));
     }
 
     // Parse properties (if present)
@@ -202,46 +196,34 @@ pub fn decode_index_value_with_props(data: &[u8]) -> Result<DecodedIndexValue<'_
         offset += 2;
         for _ in 0..num_props {
             if data.len() < offset + 2 {
-                return Err(eg!(Error::Corruption(
-                    "truncated block property name length".into()
-                )));
+                return Err(Error::corruption("truncated block property name length"));
             }
             let name_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
             if data.len() < offset + name_len {
-                return Err(eg!(Error::Corruption(
-                    "truncated block property name".into()
-                )));
+                return Err(Error::corruption("truncated block property name"));
             }
             let name = &data[offset..offset + name_len];
             offset += name_len;
             if data.len() < offset + 2 {
-                return Err(eg!(Error::Corruption(
-                    "truncated block property data length".into()
-                )));
+                return Err(Error::corruption("truncated block property data length"));
             }
             let data_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
             if data.len() < offset + data_len {
-                return Err(eg!(Error::Corruption(
-                    "truncated block property data".into()
-                )));
+                return Err(Error::corruption("truncated block property data"));
             }
             let prop_data = &data[offset..offset + data_len];
             offset += data_len;
             props.push((name, prop_data));
         }
         if offset != data.len() {
-            return Err(eg!(Error::Corruption(
-                "trailing bytes after block properties".into()
-            )));
+            return Err(Error::corruption("trailing bytes after block properties"));
         }
     } else if data.len() > offset {
-        return Err(eg!(Error::Corruption(
-            "truncated block property count".into()
-        )));
+        return Err(Error::corruption("truncated block property count"));
     }
 
     Ok(DecodedIndexValue {

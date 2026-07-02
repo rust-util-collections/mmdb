@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::block_cache::BlockCache;
-use crate::error::Result;
+use crate::error::{Result, ResultExt};
 use crate::sst::table_reader::TableReader;
 use crate::stats::DbStats;
-use ruc::eg;
 
 /// Cache for open TableReader instances.
 pub struct TableCache {
@@ -20,6 +19,7 @@ pub struct TableCache {
 impl TableCache {
     /// Create a new table cache.
     /// `max_open_files` is the maximum number of SST files to keep open.
+    #[cfg(test)]
     pub fn new(db_path: &Path, max_open_files: u64, block_cache: Option<Arc<BlockCache>>) -> Self {
         Self::new_with_stats(db_path, max_open_files, block_cache, None)
     }
@@ -43,30 +43,24 @@ impl TableCache {
 
     /// Get or open a table reader for the given file number.
     /// Uses moka's `try_get_with` to coalesce concurrent loads for the same file.
+    /// `Error: Clone` lets every coalesced waiter receive the full typed error
+    /// chain instead of a stringified copy.
     pub fn get_reader(&self, file_number: u64) -> Result<Arc<TableReader>> {
         let db_path = self.db_path.clone();
         let block_cache = self.block_cache.clone();
         let stats = self.stats.clone();
         self.inner
-            .try_get_with::<_, String>(file_number, || {
+            .try_get_with(file_number, || {
                 let path = db_path.join(format!("{:06}.sst", file_number));
-                let reader = Arc::new(
-                    TableReader::open_with_all(&path, file_number, block_cache, stats)
-                        .map_err(|e| format!("{}", e))?,
-                );
-                Ok(reader)
+                TableReader::open_with_all(&path, file_number, block_cache, stats).map(Arc::new)
             })
-            .map_err(|e| eg!(format!("table cache load failed: {}", e)))
+            .map_err(|e: Arc<crate::error::Error>| (*e).clone())
+            .with_ctx(|| format!("table cache load failed for file {:06}", file_number))
     }
 
     /// Evict a file from the cache.
     pub fn evict(&self, file_number: u64) {
         self.inner.invalidate(&file_number);
-    }
-
-    /// Number of cached readers.
-    pub fn entry_count(&self) -> u64 {
-        self.inner.entry_count()
     }
 }
 

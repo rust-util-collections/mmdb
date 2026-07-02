@@ -9,14 +9,13 @@ use std::{
 };
 
 use crate::cache::table_cache::TableCache;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ResultExt};
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::sst::table_reader::TableReader;
 use crate::types::{SequenceNumber, compare_internal_key};
 use crate::wal::{WalReader, WalWriter};
 use parking_lot::Mutex;
-use ruc::*;
 
 /// Manages the MANIFEST file and the current Version.
 pub struct VersionSet {
@@ -52,8 +51,9 @@ pub struct VersionSet {
 }
 
 impl VersionSet {
-    /// Create a new VersionSet (for a fresh database).
-    pub fn create(db_path: &Path, num_levels: usize) -> Result<Self> {
+    /// Create a new VersionSet (for a fresh database). Test-only wrapper.
+    #[cfg(test)]
+    pub(crate) fn create(db_path: &Path, num_levels: usize) -> Result<Self> {
         Self::create_with_cache(db_path, num_levels, None)
     }
 
@@ -65,10 +65,10 @@ impl VersionSet {
     ) -> Result<Self> {
         let manifest_number = 1;
         let manifest_path = db_path.join(format!("MANIFEST-{:06}", manifest_number));
-        let manifest_writer = WalWriter::new(&manifest_path).c(d!())?;
+        let manifest_writer = WalWriter::new(&manifest_path).ctx()?;
 
         // Write CURRENT file
-        Self::set_current_file(db_path, manifest_number).c(d!())?;
+        Self::set_current_file(db_path, manifest_number).ctx()?;
 
         let mut vs = Self {
             db_path: db_path.to_path_buf(),
@@ -88,14 +88,15 @@ impl VersionSet {
         let mut edit = VersionEdit::new();
         edit.set_next_file_number(vs.next_file_number);
         edit.set_last_sequence(vs.last_sequence);
-        vs.log_and_apply(edit).c(d!())?;
-        vs.sync_manifest().c(d!())?;
+        vs.log_and_apply(edit).ctx()?;
+        vs.sync_manifest().ctx()?;
 
         Ok(vs)
     }
 
-    /// Recover an existing VersionSet from MANIFEST.
-    pub fn recover(db_path: &Path, num_levels: usize) -> Result<Self> {
+    /// Test-only wrapper for [`Self::recover_with_cache`].
+    #[cfg(test)]
+    pub(crate) fn recover(db_path: &Path, num_levels: usize) -> Result<Self> {
         Self::recover_with_cache(db_path, num_levels, None)
     }
 
@@ -108,8 +109,8 @@ impl VersionSet {
         // Read CURRENT to find manifest file
         let current_path = db_path.join("CURRENT");
         let manifest_name = fs::read_to_string(&current_path)
-            .map_err(|e| eg!(Error::Corruption(format!("cannot read CURRENT: {}", e))))
-            .c(d!())?;
+            .map_err(|e| Error::corruption(format!("cannot read CURRENT: {}", e)))
+            .ctx()?;
         let manifest_name = manifest_name.trim();
         let manifest_path = db_path.join(manifest_name);
 
@@ -124,7 +125,7 @@ impl VersionSet {
         // Pass 2: Open only the files that survive all deletions.
         // This handles the case where compaction adds + deletes files in
         // separate edits, and the deleted SST no longer exists on disk.
-        let mut reader = WalReader::new(&manifest_path).c(d!())?;
+        let mut reader = WalReader::new(&manifest_path).ctx()?;
         let mut next_file_number = 2u64;
         let mut log_number = 0u64;
         let mut last_sequence = 0u64;
@@ -150,7 +151,7 @@ impl VersionSet {
                 }
                 Err(e) => return Err(e),
             };
-            let edit = VersionEdit::decode(&data).c(d!())?;
+            let edit = VersionEdit::decode(&data).ctx()?;
             edits_replayed += 1;
 
             if let Some(n) = edit.next_file_number {
@@ -180,16 +181,16 @@ impl VersionSet {
                         live_files.remove(file_number);
                     }
                     Some((live_level, _)) => {
-                        return Err(eg!(Error::Corruption(format!(
+                        return Err(Error::corruption(format!(
                             "MANIFEST deletes SST {} at level {} but it is live at level {}",
                             file_number, level, live_level
-                        ))));
+                        )));
                     }
                     None => {
-                        return Err(eg!(Error::Corruption(format!(
+                        return Err(Error::corruption(format!(
                             "MANIFEST deletes SST {} at level {} but it is not live",
                             file_number, level
-                        ))));
+                        )));
                     }
                 }
             }
@@ -201,21 +202,21 @@ impl VersionSet {
                     // Silently dropping the file would make its keys unreadable,
                     // and the next MANIFEST snapshot would persist the loss
                     // permanently. Fail loudly instead.
-                    return Err(eg!(Error::Corruption(format!(
+                    return Err(Error::corruption(format!(
                         "MANIFEST references SST {} at level {} but the database \
                          is configured with num_levels {}; reopen with num_levels >= {}",
                         meta.number,
                         level,
                         num_levels,
                         level + 1
-                    ))));
+                    )));
                 }
                 if let Some((prev_level, _)) = live_files.insert(meta.number, (level, meta.clone()))
                 {
-                    return Err(eg!(Error::Corruption(format!(
+                    return Err(Error::corruption(format!(
                         "MANIFEST adds SST {} at level {} but it is already live at level {}",
                         meta.number, level, prev_level
-                    ))));
+                    )));
                 }
             }
         }
@@ -237,10 +238,10 @@ impl VersionSet {
                     });
                 }
                 Err(e) => {
-                    return Err(eg!(Error::Corruption(format!(
+                    return Err(Error::corruption(format!(
                         "cannot open SST {} during recovery: {}",
                         meta.number, e
-                    ))));
+                    )));
                 }
             }
         }
@@ -256,7 +257,7 @@ impl VersionSet {
         // Reopen manifest for appending, truncating any corrupt tail
         let valid_offset = reader.last_valid_offset();
         let manifest_writer =
-            WalWriter::open_append_truncated(&manifest_path, valid_offset).c(d!())?;
+            WalWriter::open_append_truncated(&manifest_path, valid_offset).ctx()?;
 
         Ok(Self {
             db_path: db_path.to_path_buf(),
@@ -271,11 +272,6 @@ impl VersionSet {
             edits_since_snapshot: edits_replayed,
             poisoned: false,
         })
-    }
-
-    /// Open or create a VersionSet.
-    pub fn open(db_path: &Path, num_levels: usize) -> Result<Self> {
-        Self::open_with_cache(db_path, num_levels, None)
     }
 
     /// Open or create a VersionSet with an optional table cache.
@@ -299,11 +295,11 @@ impl VersionSet {
     /// referenced by a failed edit.
     pub fn log_and_apply(&mut self, edit: VersionEdit) -> Result<()> {
         if self.poisoned {
-            return Err(eg!(Error::Corruption(
+            return Err(Error::corruption(
                 "MANIFEST writer poisoned by an earlier write failure; \
                  reopen the database to recover"
-                    .to_string()
-            )));
+                    .to_string(),
+            ));
         }
 
         // Build new version from current + edit FIRST, before persisting.
@@ -318,10 +314,10 @@ impl VersionSet {
             // replay is rejected by `recover_with_cache` on the next open —
             // fail loudly before anything is written.
             if level >= self.num_levels {
-                return Err(eg!(Error::Corruption(format!(
+                return Err(Error::corruption(format!(
                     "VersionEdit adds SST {} at out-of-range level {} (num_levels {})",
                     meta.number, level, self.num_levels
-                ))));
+                )));
             }
             let reader = if let Some(ref tc) = self.table_cache {
                 tc.get_reader(meta.number)
@@ -352,10 +348,10 @@ impl VersionSet {
                     }
                 }
                 Err(e) => {
-                    return Err(eg!(Error::Corruption(format!(
+                    return Err(Error::corruption(format!(
                         "failed to open new SST {}: {}",
                         meta.number, e
-                    ))));
+                    )));
                 }
             }
         }
@@ -367,18 +363,18 @@ impl VersionSet {
         for (level, file_number) in &edit.deleted_files {
             let level = *level as usize;
             if level >= self.num_levels {
-                return Err(eg!(Error::Corruption(format!(
+                return Err(Error::corruption(format!(
                     "VersionEdit deletes SST {} at out-of-range level {} (num_levels {})",
                     file_number, level, self.num_levels
-                ))));
+                )));
             }
             let before = new_version.files[level].len();
             new_version.files[level].retain(|f| f.meta.number != *file_number);
             if new_version.files[level].len() == before {
-                return Err(eg!(Error::Corruption(format!(
+                return Err(Error::corruption(format!(
                     "VersionEdit deletes SST {} at level {} but no such live file exists there",
                     file_number, level
-                ))));
+                )));
             }
         }
 
@@ -390,7 +386,7 @@ impl VersionSet {
         // Otherwise a crash could leave the MANIFEST referencing an SST whose
         // directory entry was lost.
         if !edit.new_files.is_empty() {
-            Self::fsync_directory(&self.db_path).c(d!())?;
+            Self::fsync_directory(&self.db_path).ctx()?;
         }
 
         // Version built successfully — now persist to MANIFEST (write only, no sync).
@@ -409,7 +405,7 @@ impl VersionSet {
                 // more records can follow; recovery truncates the torn tail.
                 drop(w);
                 self.poisoned = true;
-                return Err(e).c(d!());
+                return Err(e).ctx();
             }
         }
 
@@ -446,7 +442,7 @@ impl VersionSet {
     pub fn sync_manifest(&self) -> Result<()> {
         let mut w = self.manifest_writer.lock();
         if let Some(ref mut writer) = *w {
-            writer.sync().c(d!())?;
+            writer.sync().ctx()?;
         }
         Ok(())
     }
@@ -503,10 +499,6 @@ impl VersionSet {
         self.last_sequence
     }
 
-    pub fn set_last_sequence(&mut self, seq: SequenceNumber) {
-        self.last_sequence = seq;
-    }
-
     /// Rewrite the MANIFEST with a full snapshot of the current version.
     /// This prevents unbounded MANIFEST growth.
     ///
@@ -539,7 +531,7 @@ impl VersionSet {
         let new_manifest_path = self
             .db_path
             .join(format!("MANIFEST-{:06}", new_manifest_number));
-        let mut new_writer = match WalWriter::new(&new_manifest_path).c(d!()) {
+        let mut new_writer = match WalWriter::new(&new_manifest_path).ctx() {
             Ok(writer) => writer,
             Err(e) => {
                 tracing::warn!("MANIFEST compaction deferred creating snapshot: {}", e);
@@ -549,13 +541,13 @@ impl VersionSet {
 
         // Write the snapshot edit
         let encoded = snapshot_edit.encode();
-        if let Err(e) = new_writer.add_record(&encoded).c(d!()) {
+        if let Err(e) = new_writer.add_record(&encoded).ctx() {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             tracing::warn!("MANIFEST compaction deferred writing snapshot: {}", e);
             return;
         }
-        if let Err(e) = new_writer.sync().c(d!()) {
+        if let Err(e) = new_writer.sync().ctx() {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             tracing::warn!("MANIFEST compaction deferred syncing snapshot: {}", e);
@@ -582,13 +574,13 @@ impl VersionSet {
 
         // Publish CURRENT in two phases so a post-rename fsync failure cannot
         // leave the live process appending to a different MANIFEST than CURRENT.
-        if let Err(e) = Self::write_current_file_tmp(&self.db_path, new_manifest_number).c(d!()) {
+        if let Err(e) = Self::write_current_file_tmp(&self.db_path, new_manifest_number).ctx() {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             tracing::warn!("MANIFEST compaction deferred writing CURRENT: {}", e);
             return;
         }
-        if let Err(e) = Self::rename_current_file(&self.db_path).c(d!()) {
+        if let Err(e) = Self::rename_current_file(&self.db_path).ctx() {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             let _ = fs::remove_file(self.db_path.join("CURRENT.tmp"));
@@ -631,9 +623,9 @@ impl VersionSet {
     }
 
     fn set_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {
-        Self::write_current_file_tmp(db_path, manifest_number).c(d!())?;
-        Self::rename_current_file(db_path).c(d!())?;
-        Self::fsync_directory(db_path).c(d!())?;
+        Self::write_current_file_tmp(db_path, manifest_number).ctx()?;
+        Self::rename_current_file(db_path).ctx()?;
+        Self::fsync_directory(db_path).ctx()?;
         Ok(())
     }
 
@@ -642,11 +634,11 @@ impl VersionSet {
         let tmp_path = db_path.join("CURRENT.tmp");
 
         // Write and fsync the temp file before rename to ensure durability
-        let file = fs::File::create(&tmp_path).c(d!())?;
+        let file = fs::File::create(&tmp_path).ctx()?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(contents.as_bytes()).c(d!())?;
-        writer.flush().c(d!())?;
-        writer.get_ref().sync_all().c(d!())?;
+        writer.write_all(contents.as_bytes()).ctx()?;
+        writer.flush().ctx()?;
+        writer.get_ref().sync_all().ctx()?;
 
         Ok(())
     }
@@ -654,14 +646,14 @@ impl VersionSet {
     fn rename_current_file(db_path: &Path) -> Result<()> {
         let tmp_path = db_path.join("CURRENT.tmp");
         // Atomic rename
-        fs::rename(&tmp_path, db_path.join("CURRENT")).c(d!())?;
+        fs::rename(&tmp_path, db_path.join("CURRENT")).ctx()?;
         Ok(())
     }
 
     /// Fsync a directory to persist metadata changes (renames, creates).
     fn fsync_directory(dir: &Path) -> Result<()> {
-        let f = fs::File::open(dir).c(d!())?;
-        f.sync_all().c(d!())?;
+        let f = fs::File::open(dir).ctx()?;
+        f.sync_all().ctx()?;
         Ok(())
     }
 }

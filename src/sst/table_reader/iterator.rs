@@ -62,6 +62,11 @@ pub struct TableIterator {
     // --- Block property filters ---
     /// Filters that can skip entire data blocks based on collected properties.
     block_property_filters: Vec<Arc<dyn crate::options::BlockPropertyFilter>>,
+
+    // --- Cache policy ---
+    /// Whether cache misses populate the block cache. False for scans that
+    /// must not evict hot blocks (compaction, `ReadOptions::fill_cache=false`).
+    fill_cache: bool,
 }
 
 impl TableIterator {
@@ -86,7 +91,14 @@ impl TableIterator {
             err: None,
             upper_bound: None,
             block_property_filters: Vec::new(),
+            fill_cache: true,
         }
+    }
+
+    /// Set whether cache misses populate the block cache (default: true).
+    pub fn with_fill_cache(mut self, fill_cache: bool) -> Self {
+        self.fill_cache = fill_cache;
+        self
     }
 
     /// Attach block property filters to this iterator.
@@ -164,10 +176,10 @@ impl TableIterator {
     /// Materialize the deferred block: load the data block for deferred_index_pos.
     fn materialize_deferred_block(&mut self) {
         if let Some(ref index_entries) = self.index_entries {
-            match self
-                .reader
-                .read_block_cached(&index_entries[self.deferred_index_pos].handle)
-            {
+            match self.reader.read_block_cached_opt(
+                &index_entries[self.deferred_index_pos].handle,
+                self.fill_cache,
+            ) {
                 Ok(data) => match Block::new(data) {
                     Ok(block) => {
                         self.set_block_for_cursor(block);
@@ -260,7 +272,10 @@ impl TableIterator {
                 return;
             }
 
-            match self.reader.read_block_cached(&entry.handle) {
+            match self
+                .reader
+                .read_block_cached_opt(&entry.handle, self.fill_cache)
+            {
                 Ok(data) => match Block::new(data) {
                     Ok(block) => {
                         self.seek_within_block(block, target, compare_internal_key);
@@ -392,7 +407,10 @@ impl TableIterator {
             }
             let handle = entry.handle;
 
-            let block_result = self.reader.read_block_cached(&handle).and_then(Block::new);
+            let block_result = self
+                .reader
+                .read_block_cached_opt(&handle, self.fill_cache)
+                .and_then(Block::new);
             match block_result {
                 Err(e) => {
                     self.err = Some(format!("block read error in seek_for_prev: {e}"));
@@ -526,7 +544,10 @@ impl TableIterator {
                 continue;
             }
 
-            match self.reader.read_block_cached(&entry.handle) {
+            match self
+                .reader
+                .read_block_cached_opt(&entry.handle, self.fill_cache)
+            {
                 Ok(data) => match Block::new(data) {
                     Ok(block) => {
                         let last_restart = block.num_restarts().saturating_sub(1);
@@ -601,7 +622,7 @@ impl TableIterator {
             }
             self.prev_block_index = block_idx;
 
-            match self.reader.read_block_cached(&handle) {
+            match self.reader.read_block_cached_opt(&handle, self.fill_cache) {
                 Ok(data) => match Block::new(data) {
                     Ok(block) => {
                         if block.data_end_offset() > 0 {
@@ -719,7 +740,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             last_idx -= 1;
         }
         let handle = index_entries[last_idx].handle;
-        match self.reader.read_block_cached(&handle) {
+        match self.reader.read_block_cached_opt(&handle, self.fill_cache) {
             Ok(data) => match Block::new(data) {
                 Ok(block) => {
                     let last_restart = block.num_restarts().saturating_sub(1);

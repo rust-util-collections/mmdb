@@ -98,19 +98,19 @@ fn test_snapshot_isolation() {
     db.put(b"a", b"1").unwrap();
     db.put(b"b", b"2").unwrap();
 
-    let snap1 = db.snapshot_seq();
+    let snap1 = db.snapshot();
 
     db.put(b"a", b"10").unwrap();
     db.delete(b"b").unwrap();
     db.put(b"c", b"3").unwrap();
 
-    let snap2 = db.snapshot_seq();
+    let snap2 = db.snapshot();
 
     db.put(b"a", b"100").unwrap();
 
     // snap1: a=1, b=2
     let r1 = ReadOptions {
-        snapshot: Some(snap1),
+        snapshot: Some(snap1.sequence()),
         ..Default::default()
     };
     assert_eq!(db.get_with_options(&r1, b"a").unwrap(), Some(b"1".to_vec()));
@@ -119,7 +119,7 @@ fn test_snapshot_isolation() {
 
     // snap2: a=10, b=deleted, c=3
     let r2 = ReadOptions {
-        snapshot: Some(snap2),
+        snapshot: Some(snap2.sequence()),
         ..Default::default()
     };
     assert_eq!(
@@ -409,7 +409,7 @@ fn test_snapshot_across_flush() {
     db.put(b"beta", b"2").unwrap();
 
     // Take snapshot before flush
-    let snap = db.snapshot_seq();
+    let snap = db.snapshot();
 
     // Flush to SST
     db.flush().unwrap();
@@ -420,7 +420,7 @@ fn test_snapshot_across_flush() {
 
     // Snapshot should still see pre-flush values
     let r = ReadOptions {
-        snapshot: Some(snap),
+        snapshot: Some(snap.sequence()),
         ..Default::default()
     };
     assert_eq!(
@@ -445,32 +445,32 @@ fn test_multi_snapshot_coexistence() {
 
     // Phase 1
     db.put(b"x", b"v1").unwrap();
-    let snap1 = db.snapshot_seq();
+    let snap1 = db.snapshot();
 
     // Phase 2
     db.put(b"x", b"v2").unwrap();
     db.put(b"y", b"v2").unwrap();
-    let snap2 = db.snapshot_seq();
+    let snap2 = db.snapshot();
 
     // Phase 3
     db.put(b"x", b"v3").unwrap();
     db.delete(b"y").unwrap();
     db.put(b"z", b"v3").unwrap();
-    let snap3 = db.snapshot_seq();
+    let snap3 = db.snapshot();
 
     // Phase 4 — final mutation
     db.put(b"x", b"v4").unwrap();
 
     let r1 = ReadOptions {
-        snapshot: Some(snap1),
+        snapshot: Some(snap1.sequence()),
         ..Default::default()
     };
     let r2 = ReadOptions {
-        snapshot: Some(snap2),
+        snapshot: Some(snap2.sequence()),
         ..Default::default()
     };
     let r3 = ReadOptions {
-        snapshot: Some(snap3),
+        snapshot: Some(snap3.sequence()),
         ..Default::default()
     };
 
@@ -533,11 +533,11 @@ fn test_snapshot_before_compaction_and_current_after() {
         db.put(key.as_bytes(), b"original").unwrap();
     }
     db.flush().unwrap();
-    let snap = db.snapshot_seq();
+    let snap = db.snapshot();
 
     // Verify snapshot works before compaction
     let r = ReadOptions {
-        snapshot: Some(snap),
+        snapshot: Some(snap.sequence()),
         ..Default::default()
     };
     for i in 0..50 {
@@ -1163,7 +1163,6 @@ fn test_range_iterator_bounds() {
             )
             .unwrap();
         iter.seek(b"key_0005");
-        iter.set_upper_bound(b"key_0010".to_vec());
         let entries: Vec<_> = iter.collect();
         assert_eq!(entries.len(), 5, "range [5,10) should have 5 entries");
         assert_eq!(entries[0].0, b"key_0005");
@@ -1180,17 +1179,15 @@ fn test_range_iterator_bounds() {
             )
             .unwrap();
         iter.seek(b"key_0005");
-        iter.set_upper_bound(b"key_0011".to_vec());
         let entries: Vec<_> = iter.collect();
         assert_eq!(entries.len(), 6, "range [5,10] should have 6 entries");
     }
 
     // [.., key_0003)
     {
-        let mut iter = db
+        let iter = db
             .iter_with_range(&mmdb::ReadOptions::default(), None, Some(b"key_0003"))
             .unwrap();
-        iter.set_upper_bound(b"key_0003".to_vec());
         let entries: Vec<_> = iter.collect();
         assert_eq!(entries.len(), 3, "range [..,3) should have 3 entries");
     }
@@ -1282,7 +1279,6 @@ fn test_bidi_range_reverse() {
         )
         .unwrap();
     iter.seek(b"r_0005");
-    iter.set_upper_bound(b"r_0015".to_vec());
     let entries: Vec<_> = iter.collect();
     assert_eq!(entries.len(), 10);
 
@@ -1489,11 +1485,6 @@ fn test_new_options_accepted() {
             max_background_compactions: 4,
             max_subcompactions: 2,
             pin_l0_filter_and_index_blocks_in_cache: true,
-            cache_index_and_filter_blocks: true,
-            max_write_buffer_number: 8,
-            level_compaction_dynamic_level_bytes: false,
-            allow_concurrent_memtable_write: false,
-            memtable_prefix_bloom_ratio: 0.0,
             ..Default::default()
         },
         dir.path(),

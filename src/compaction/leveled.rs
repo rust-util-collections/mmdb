@@ -15,11 +15,9 @@ use std::sync::{
 };
 use std::thread::scope;
 
-use ruc::*;
-
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
-use crate::error::Result;
+use crate::error::{Error, Result, ResultExt};
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::RangeTombstoneTracker;
 use crate::manifest::version::{TableFile, Version};
@@ -41,8 +39,6 @@ use crate::types::{
 pub struct CompactionHint {
     /// The level that was read-hot.
     pub level: usize,
-    /// Number of sampled reads at this level.
-    pub read_count: u64,
 }
 
 /// Shared context for compaction operations, reducing argument count.
@@ -72,8 +68,6 @@ pub struct CompactionOutput {
     pub input_files: Vec<(u32, FileMetaData)>,
     /// File numbers of all input files (for cache eviction and deletion).
     pub input_file_numbers: HashSet<u64>,
-    /// Number of output files produced.
-    pub files_produced: u64,
     /// One past the highest file number consumed during I/O.
     /// Used to ensure VersionSet::next_file_number doesn't fall behind
     /// the actual numbers used by sub-compaction threads.
@@ -87,16 +81,7 @@ pub struct PostCompactionCleanup {
     pub files_to_delete: HashSet<u64>,
 }
 
-impl CompactionTask {
-    /// Total size of all input files (both levels).
-    pub fn total_input_size(&self) -> u64 {
-        self.input_files_level
-            .iter()
-            .chain(self.input_files_next.iter())
-            .map(|f| f.meta.file_size)
-            .sum()
-    }
-}
+impl CompactionTask {}
 
 pub struct LeveledCompaction;
 
@@ -108,7 +93,7 @@ fn collect_range_del_entries(files: &[TableFile]) -> Result<Vec<(Vec<u8>, Vec<u8
     let mut entries = Vec::new();
     for tf in files {
         if tf.meta.has_range_deletions {
-            let tombstones = tf.reader.get_range_tombstones().c(d!())?;
+            let tombstones = tf.reader.get_range_tombstones().ctx()?;
             for (begin, end, seq) in tombstones {
                 let ikey = InternalKey::new(&begin, seq, ValueType::RangeDeletion);
                 entries.push((ikey.as_bytes().to_vec(), end));
@@ -370,7 +355,6 @@ struct SubCompactionParams<'a> {
 /// Output of a single sub-compaction (new files only; deletions handled by orchestrator).
 struct SubCompactionOutput {
     new_files: Vec<(u32, FileMetaData)>,
-    files_produced: u64,
 }
 
 /// Compute split points from target-level file boundaries.
@@ -511,15 +495,14 @@ fn allocate_output_file_number(params: &SubCompactionParams<'_>) -> Result<u64> 
     let mut current = params.file_number_counter.load(Ordering::Relaxed);
     loop {
         if current >= params.file_number_limit {
-            return Err(eg!(
+            return Err(Error::background(format!(
                 "reserved compaction output file numbers exhausted: next={}, limit={}",
-                current,
-                params.file_number_limit
-            ));
+                current, params.file_number_limit
+            )));
         }
         let next = current
             .checked_add(1)
-            .ok_or_else(|| eg!("compaction output file number overflow"))?;
+            .ok_or_else(|| Error::background("compaction output file number overflow"))?;
         match params.file_number_counter.compare_exchange_weak(
             current,
             next,
@@ -536,7 +519,7 @@ fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<RawTombstone>> {
     let mut tombstones = Vec::new();
     for tf in files {
         if tf.meta.has_range_deletions {
-            let ts = tf.reader.get_range_tombstones().c(d!())?;
+            let ts = tf.reader.get_range_tombstones().ctx()?;
             tombstones.extend(ts);
         }
     }
@@ -557,11 +540,15 @@ fn execute_sub_compaction_io(
     // Build streaming merge sources
     let mut sources: Vec<IterSource> = Vec::new();
     for tf in &sub.input_files_level {
-        let iter = TableIterator::new(tf.reader.clone());
+        // Compaction scans every input block exactly once; filling the
+        // block cache would evict hot point-read blocks for no benefit.
+        let iter = TableIterator::new(tf.reader.clone()).with_fill_cache(false);
         sources.push(IterSource::from_boxed(Box::new(iter)));
     }
     for tf in &sub.input_files_next {
-        let iter = TableIterator::new(tf.reader.clone());
+        // Compaction scans every input block exactly once; filling the
+        // block cache would evict hot point-read blocks for no benefit.
+        let iter = TableIterator::new(tf.reader.clone()).with_fill_cache(false);
         sources.push(IterSource::from_boxed(Box::new(iter)));
     }
 
@@ -583,7 +570,6 @@ fn execute_sub_compaction_io(
     let mut new_files: Vec<(u32, FileMetaData)> = Vec::new();
     let mut builder: Option<TableBuilder> = None;
     let mut current_file_number = 0u64;
-    let mut next_file_idx = 0u64;
     let mut current_size = 0usize;
     let mut current_file_user_key: Vec<u8> = Vec::new();
     let mut pending_cut = false;
@@ -619,7 +605,7 @@ fn execute_sub_compaction_io(
         // miss a visible version. A size-triggered cut is deferred until the user
         // key changes here.
         if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
-            let result = match builder.take().unwrap().finish().c(d!()) {
+            let result = match builder.take().unwrap().finish().ctx() {
                 Ok(result) => result,
                 Err(e) => {
                     cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
@@ -720,14 +706,13 @@ fn execute_sub_compaction_io(
 
         // Create new output file if needed
         if builder.is_none() {
-            current_file_number = match allocate_output_file_number(params).c(d!()) {
+            current_file_number = match allocate_output_file_number(params).ctx() {
                 Ok(number) => number,
                 Err(e) => {
                     cleanup_output_files(ctx.db_path, &new_files, None);
                     return Err(e);
                 }
             };
-            next_file_idx += 1;
             let sst_path = ctx.db_path.join(format!("{:06}.sst", current_file_number));
             let mut opts = params.build_opts.clone();
             opts.block_property_collectors = ctx
@@ -736,7 +721,7 @@ fn execute_sub_compaction_io(
                 .iter()
                 .map(|f| f())
                 .collect();
-            builder = match TableBuilder::new(&sst_path, opts).c(d!()) {
+            builder = match TableBuilder::new(&sst_path, opts).ctx() {
                 Ok(builder) => Some(builder),
                 Err(e) => {
                     cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
@@ -765,7 +750,7 @@ fn execute_sub_compaction_io(
             .as_mut()
             .unwrap()
             .add(ikey_ref, final_value.as_slice())
-            .c(d!())
+            .ctx()
         {
             cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
             return Err(e);
@@ -794,7 +779,7 @@ fn execute_sub_compaction_io(
     // Flush remaining builder
     let active_file_number = builder.as_ref().map(|_| current_file_number);
     if let Some(b) = builder {
-        let result = match b.finish().c(d!()) {
+        let result = match b.finish().ctx() {
             Ok(result) => result,
             Err(e) => {
                 cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
@@ -819,13 +804,13 @@ fn execute_sub_compaction_io(
     if let Some(e) = merger.error() {
         // Clean up orphan SST files written during the failed merge
         cleanup_output_files(ctx.db_path, &new_files, active_file_number);
-        return Err(eg!("sub-compaction merge error: {}", e));
+        return Err(Error::background(format!(
+            "sub-compaction merge error: {}",
+            e
+        )));
     }
 
-    Ok(SubCompactionOutput {
-        new_files,
-        files_produced: next_file_idx,
-    })
+    Ok(SubCompactionOutput { new_files })
 }
 
 impl LeveledCompaction {
@@ -989,24 +974,6 @@ impl LeveledCompaction {
         None
     }
 
-    /// Execute a compaction: stream-merge input files and produce new SST files.
-    /// Memory usage: O(input_files × block_size) instead of O(total_data).
-    pub fn execute_compaction(
-        task: &CompactionTask,
-        versions: &mut VersionSet,
-        db_path: &Path,
-        options: &DbOptions,
-    ) -> Result<()> {
-        let ctx = CompactionContext {
-            db_path,
-            options,
-            rate_limiter: None,
-            stats: None,
-            active_snapshots: &[],
-        };
-        Self::execute_compaction_with_cache(&ctx, task, versions, None, None)
-    }
-
     /// Execute compaction with optional table cache for eviction and rate limiter.
     ///
     /// `active_snapshots` lists sequence numbers of all open snapshots.
@@ -1045,7 +1012,7 @@ impl LeveledCompaction {
             edit.delete_file(task.level as u32, tf.meta.number);
             edit.add_file(target_level as u32, tf.meta.clone());
             edit.set_next_file_number(versions.next_file_number());
-            versions.log_and_apply(edit).c(d!())?;
+            versions.log_and_apply(edit).ctx()?;
             if let Some(s) = ctx.stats {
                 s.record_compaction_completed();
             }
@@ -1072,7 +1039,7 @@ impl LeveledCompaction {
             file_number_start.saturating_add(max_outputs),
             is_bottom,
         )
-        .c(d!())?;
+        .ctx()?;
 
         let cleanup = Self::install_compaction(
             output,
@@ -1082,9 +1049,9 @@ impl LeveledCompaction {
             ctx.db_path,
             ctx.stats,
         )
-        .c(d!())?;
+        .ctx()?;
         // This path holds &mut VersionSet for the duration, so sync here.
-        versions.sync_manifest().c(d!())?;
+        versions.sync_manifest().ctx()?;
         Self::run_post_compaction_cleanup(&cleanup, ctx.db_path);
         Ok(())
     }
@@ -1153,8 +1120,8 @@ impl LeveledCompaction {
             .chain(task.input_files_next.iter())
             .cloned()
             .collect();
-        let all_range_del_entries = collect_range_del_entries(&all_input_files).c(d!())?;
-        let all_raw_tombstones = collect_raw_tombstones(&all_input_files).c(d!())?;
+        let all_range_del_entries = collect_range_del_entries(&all_input_files).ctx()?;
+        let all_raw_tombstones = collect_raw_tombstones(&all_input_files).ctx()?;
 
         // Shared atomic counter for thread-safe file number allocation
         let file_counter = AtomicU64::new(file_number_start);
@@ -1172,7 +1139,7 @@ impl LeveledCompaction {
 
         let sub_outputs = if actual_subs <= 1 {
             // Fast path: single sub-compaction (zero overhead)
-            vec![execute_sub_compaction_io(ctx, &sub_tasks[0], &sub_params).c(d!())?]
+            vec![execute_sub_compaction_io(ctx, &sub_tasks[0], &sub_params).ctx()?]
         } else {
             // Parallel sub-compactions
             let thread_results: Vec<Result<SubCompactionOutput>> = scope(|s| {
@@ -1184,12 +1151,12 @@ impl LeveledCompaction {
                     .into_iter()
                     .map(|h| match h.join() {
                         Ok(r) => r,
-                        Err(_) => Err(eg!("sub-compaction thread panicked")),
+                        Err(_) => Err(Error::background("sub-compaction thread panicked")),
                     })
                     .collect()
             });
             let mut outputs = Vec::with_capacity(thread_results.len());
-            let mut first_err: Option<Box<dyn ruc::RucError>> = None;
+            let mut first_err: Option<Error> = None;
             for r in thread_results {
                 match r {
                     Ok(sub_out) => outputs.push(sub_out),
@@ -1231,12 +1198,10 @@ impl LeveledCompaction {
 
         // Merge sub-compaction outputs
         let mut edit = VersionEdit::new();
-        let mut total_files_produced = 0u64;
         for sub_out in sub_outputs {
             for file_entry in sub_out.new_files {
                 edit.new_files.push(file_entry);
             }
-            total_files_produced += sub_out.files_produced;
         }
 
         // Record deletions (orchestrator responsibility)
@@ -1264,7 +1229,6 @@ impl LeveledCompaction {
             edit,
             input_files,
             input_file_numbers,
-            files_produced: total_files_produced,
             next_file_number_hint: file_counter.load(Ordering::Relaxed),
         })
     }
@@ -1329,7 +1293,7 @@ impl LeveledCompaction {
                     cache.evict(meta.number);
                 }
             }
-            return Err(e).c(d!());
+            return Err(e).ctx();
         }
 
         // Evict from caches (fast, safe before sync)
@@ -1387,12 +1351,14 @@ impl LeveledCompaction {
 
         let mut sources: Vec<IterSource> = Vec::new();
         for tf in files {
-            let iter = TableIterator::new(tf.reader.clone());
+            // Compaction scans every input block exactly once; filling the
+            // block cache would evict hot point-read blocks for no benefit.
+            let iter = TableIterator::new(tf.reader.clone()).with_fill_cache(false);
             sources.push(IterSource::from_boxed(Box::new(iter)));
         }
 
         // Inject range tombstones from new-format SSTs into the merge stream
-        let range_del_entries = collect_range_del_entries(files).c(d!())?;
+        let range_del_entries = collect_range_del_entries(files).ctx()?;
         if !range_del_entries.is_empty() {
             sources.push(IterSource::new(range_del_entries));
         }
@@ -1441,7 +1407,7 @@ impl LeveledCompaction {
             // versions are never split across files (which would create overlapping
             // same-level key ranges and possibly miss visible versions on reads).
             if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
-                let result = match builder.take().unwrap().finish().c(d!()) {
+                let result = match builder.take().unwrap().finish().ctx() {
                     Ok(result) => result,
                     Err(e) => {
                         cleanup_output_files(
@@ -1553,7 +1519,7 @@ impl LeveledCompaction {
                     .iter()
                     .map(|f| f())
                     .collect();
-                builder = match TableBuilder::new(&sst_path, opts).c(d!()) {
+                builder = match TableBuilder::new(&sst_path, opts).ctx() {
                     Ok(builder) => Some(builder),
                     Err(e) => {
                         cleanup_output_files(
@@ -1587,7 +1553,7 @@ impl LeveledCompaction {
                 .as_mut()
                 .unwrap()
                 .add(ikey_ref, final_value.as_slice())
-                .c(d!())
+                .ctx()
             {
                 cleanup_output_files(ctx.db_path, &edit.new_files, Some(current_file_number));
                 return Err(e);
@@ -1616,7 +1582,7 @@ impl LeveledCompaction {
 
         let active_file_number = builder.as_ref().map(|_| current_file_number);
         if let Some(b) = builder {
-            let result = match b.finish().c(d!()) {
+            let result = match b.finish().ctx() {
                 Ok(result) => result,
                 Err(e) => {
                     cleanup_output_files(ctx.db_path, &edit.new_files, Some(current_file_number));
@@ -1649,7 +1615,10 @@ impl LeveledCompaction {
                 let orphan = ctx.db_path.join(format!("{:06}.sst", num));
                 let _ = remove_file(&orphan);
             }
-            return Err(eg!("force_merge iterator error: {}", e));
+            return Err(Error::background(format!(
+                "force_merge iterator error: {}",
+                e
+            )));
         }
 
         let input_file_numbers: HashSet<u64> = files.iter().map(|f| f.meta.number).collect();
@@ -1663,10 +1632,10 @@ impl LeveledCompaction {
         let output_files = edit.new_files.clone();
         if let Err(e) = versions.log_and_apply(edit) {
             cleanup_output_files(ctx.db_path, &output_files, None);
-            return Err(e).c(d!());
+            return Err(e).ctx();
         }
         // force_merge_level holds &mut VersionSet for the duration, sync here.
-        versions.sync_manifest().c(d!())?;
+        versions.sync_manifest().ctx()?;
 
         if let Some(cache) = table_cache {
             for num in &input_file_numbers {
