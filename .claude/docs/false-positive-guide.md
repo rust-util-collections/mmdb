@@ -99,3 +99,18 @@ Only report tombstone issues if tombstones are dropped when they SHOULD be retai
 2. Check the comparison operator: `<` is correct for end, `<=` is wrong
 3. Check the iterator: `seek(start)` + `while key < end` is correct
 **When to report**: Only when you can demonstrate a concrete key that is incorrectly included or excluded.
+
+## FP-13: Won't Fix → Skip Without Re-evaluation
+
+**Pattern**: Seeing an item in `docs/audit.md## Won't Fix` and skipping it without
+re-assessing it against the current code.
+**Rule**: Won't Fix is NOT a permanent exemption. Every audit MUST re-evaluate each
+Won't Fix entry against the latest code. The original deferral decision was based on
+a code snapshot that may have changed. Re-assessment checklist:
+- Has the surrounding code been refactored or removed?
+- Is the fix now straightforward (e.g., new helper functions, changed APIs)?
+- Was the severity underestimated?
+**When to skip**: Only after explicitly re-verifying that the original reasoning still
+holds against the current code, and noting that re-verification in the audit output.
+**When to report**: If an audit skips Won't Fix entries without re-assessment, that
+omission itself is a finding (severity: LOW, category: process).

@@ -78,7 +78,11 @@ After completing the analysis:
 1. Read `docs/audit.md` from the project root (create if absent).
 2. **Prune**: verify each `## Open` entry against the current code; remove entries that are 100% fixed.
 3. **Merge**: add new findings under `## Open`, deduplicated, sorted CRITICAL → HIGH → MEDIUM → LOW.
-4. **Preserve**: leave `## Won't Fix` entries untouched.
+4. **Re-evaluate Won't Fix**: read every `## Won't Fix` entry and verify it against the CURRENT code:
+   - Has surrounding code changed enough to invalidate the original reasoning?
+   - Is the severity still accurate?
+   - Promote fixable entries back to `## Open`; delete entries that no longer apply with an audit timestamp note.
+   Do NOT silently carry forward Won't Fix entries — each must earn its place again against the latest code.
 5. Write the updated `docs/audit.md`.
 
 File format:

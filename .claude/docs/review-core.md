@@ -114,7 +114,24 @@ These are enforced project conventions — violations are findings (severity LOW
   - The Subsystem Map above (canonical file → subsystem → guide mapping)
   - `.claude/docs/patterns/` guides — referenced file lists and invariants
 
-## Phase 5: Reporting
+## Phase 5: Audit Registry & Won't Fix Re-evaluation
+
+Before reporting, consult `docs/audit.md`:
+
+1. **Won't Fix re-evaluation** (MANDATORY on every review):
+   - Read every `## Won't Fix` entry.
+   - Re-assess each against the **current** code state — the original deferral decision was
+     based on a snapshot that may no longer be accurate.
+   - **Promote** to `## Open` if: the surrounding code has changed, the fix is now
+     straightforward, or the severity was underestimated.
+   - **Delete** if: the referenced code no longer exists, the pattern guide has been
+     updated to cover it, or the entry is objectively no longer applicable.
+   - **Keep** only if: the original reasoning still holds against the latest code,
+     with a brief note confirming re-verification (e.g. "Re-checked 2026-07-02: still applies").
+   - Do NOT treat Won't Fix as a permanent exemption — every entry must earn its
+     place again on each audit.
+
+2. **Open entries**: Verify each still exists in the current code; prune fixed ones.
 
 ### Finding Format
 For each finding, report:

@@ -11,6 +11,15 @@
 
 ## Won't Fix
 
+> **⚠️ Re-evaluation required on every audit.** Each entry here was deferred based on
+> the code state at a specific point in time. Every `/x-review` (including `all` mode)
+> MUST re-assess each Won't Fix entry against the **current** code:
+> - Has the surrounding code changed enough to invalidate the original reasoning?
+> - Is the severity assessment still accurate?
+> - If the entry is now fixable with reasonable effort, promote it back to `## Open`.
+> - If the entry is no longer relevant (code removed / refactored away), delete it.
+> Do NOT treat this section as a permanent exemption list.
+
 ### [LOW] sst: pathological same-user-key version runs can still error flush instead of splitting
 - **Where**: src/db.rs (write_memtable_ssts), src/sst/table_builder.rs (META_BLOCK_HARD_LIMIT guard)
 - **What**: Flush/compaction outputs split at user-key boundaries when projected index/range-del meta blocks reach 32 MiB. A single user key rewritten enough times with multi-MiB keys in one memtable (e.g., 8 versions of an 8 MiB key) cannot be cut mid-run, so the builder's hard guard rejects the entry and flush fail-stops with an explicit `InvalidArgument` instead of silently producing an unreadable SST.
