@@ -254,7 +254,9 @@ impl DbOptions {
 /// Options for read operations.
 #[derive(Clone)]
 pub struct ReadOptions {
-    /// If set, reads will use this snapshot sequence number.
+    /// If set, reads will use this snapshot sequence number. Values above the
+    /// current committed sequence are clamped to it, so a snapshot can never
+    /// observe uncommitted or partially-applied writes.
     pub snapshot: Option<u64>,
     /// Whether to fill the block cache for this read. Default: true.
     /// **Not yet implemented** — reads always populate the cache when present.

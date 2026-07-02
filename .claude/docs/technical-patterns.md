@@ -71,7 +71,7 @@ Load this document FIRST before performing any review or debug analysis.
 
 ### 3.1 File Descriptor Leak on Error Path
 **Pattern**: SST file opened for reading but not closed when an error occurs during table_reader construction.
-**Where**: `sst/table_reader.rs` — `TableReader::open()` error paths.
+**Where**: `sst/table_reader/mod.rs` — `TableReader::open()` error paths.
 **Impact**: FD exhaustion under sustained errors (e.g., corrupted files).
 **Check**: Verify all error paths either close the file or rely on RAII (`Drop`).
 
@@ -150,7 +150,7 @@ Load this document FIRST before performing any review or debug analysis.
 
 ## Category 6: Unsafe Code Bugs
 
-> **Note**: The codebase has 67 unsafe blocks/functions across 4 files: `skiplist_impl.rs` (43), `skiplist.rs` (12), `db.rs` (11), `table_reader.rs` (1). All have `// SAFETY:` comments. Block parsing (`block.rs`), key encoding (`types.rs`), and format parsing (`format.rs`) contain zero unsafe blocks.
+> **Note**: The codebase has 66 unsafe blocks/functions across 4 files: `skiplist_impl.rs` (42), `skiplist.rs` (12), `db.rs` (11), `table_reader/mod.rs` (1). All have `// SAFETY:` comments. Block parsing (`block.rs`), key encoding (`types.rs`), and format parsing (`format.rs`) contain zero unsafe blocks.
 
 ### 6.1 Skiplist Node Lifetime
 **Pattern**: Skiplist node contains raw pointers to other nodes. If a node is deallocated while another thread holds a pointer, it's use-after-free.
@@ -160,7 +160,7 @@ Load this document FIRST before performing any review or debug analysis.
 
 ### 6.2 Block Slice Aliasing
 **Pattern**: `&[u8]` slice into block data is used after the block is evicted from cache or the underlying buffer is reallocated.
-**Where**: `sst/block.rs`, `sst/table_reader.rs`.
+**Where**: `sst/block.rs`, `sst/table_reader/`.
 **Impact**: Read garbage data or crash.
 **Check**: Verify block data lifetime is tied to cache handle or `Arc<Vec<u8>>`.
 

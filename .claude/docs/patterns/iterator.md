@@ -2,7 +2,8 @@
 
 ## Files
 - `src/iterator/db_iter.rs` (~49KB) — user-facing DBIterator
-- `src/iterator/merge.rs` (~50KB) — MergingIterator (heap-based)
+- `src/iterator/merge.rs` (~27KB) — MergingIterator (heap-based)
+- `src/iterator/source.rs` (~23KB) — IterSource wrapper + SeekableIterator trait (extracted from merge.rs)
 - `src/iterator/level_iter.rs` (~21KB) — lazy two-level iterator for L1+
 - `src/iterator/bidi_iter.rs` (~16KB) — bidirectional support
 - `src/iterator/range_del.rs` (~19KB) — range tombstone tracking
@@ -10,6 +11,7 @@
 ## Architecture
 - DBIterator: deduplication, snapshot filtering, tombstone filtering, prefix bounds
 - MergingIterator: min-heap merge of K sources with single-source fast path
+- IterSource: uniform peeked-entry adapter over memtable/SST/level/boxed sources (lazy values)
 - LevelIterator: deferred block reads, binary search on level
 - BidiIterator: direction switch with heap rebuild
 - FragmentedRangeTombstoneList: tombstones pre-collected at iterator creation, fragmented into non-overlapping intervals; immutable, O(log T) binary search per key (range_del.rs also keeps the sweep-line `RangeTombstoneTracker` used by compaction)

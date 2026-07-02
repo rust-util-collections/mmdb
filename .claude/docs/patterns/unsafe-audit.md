@@ -1,11 +1,11 @@
 # Unsafe Code Audit Patterns
 
 ## Overview
-MMDB contains 67 unsafe blocks/functions across 4 production files:
-- `src/memtable/skiplist_impl.rs` (43) — lock-free skiplist nodes with raw pointers; defines `pub unsafe fn node_kv`/`node_next0` (crate-internal: `mod memtable` is private in lib.rs)
+MMDB contains 66 unsafe blocks/functions across 4 production files:
+- `src/memtable/skiplist_impl.rs` (42) — lock-free skiplist nodes with raw pointers; defines `pub unsafe fn node_kv`/`node_next0` (crate-internal: `mod memtable` is private in lib.rs)
 - `src/memtable/skiplist.rs` (12) — `unsafe impl Send for MemTableCursorIter` plus 11 blocks dereferencing the skiplist raw pointer and calling `node_kv`/`node_next0`
 - `src/db.rs` (11) — `unsafe impl Send/Sync for DB`, one `libc::flock` call, and 8 raw `WriteRequest` pointer derefs in the group-commit path
-- `src/sst/table_reader.rs` (1) — a single `libc::posix_fadvise` call (advisory readahead hint)
+- `src/sst/table_reader/mod.rs` (1) — a single `libc::posix_fadvise` call (advisory readahead hint)
 
 > **Note**: `src/sst/block.rs`, `src/types.rs`, and `src/sst/format.rs` contain **zero** unsafe blocks (all parsing uses safe `from_le_bytes()`). The "block parsing" category previously associated with these files is safe code — no unsafe audit is needed there.
 
@@ -46,7 +46,7 @@ For changes in `skiplist_impl.rs` or `skiplist.rs`:
 - **Cursor Send safety**: `unsafe impl Send for MemTableCursorIter` (skiplist.rs) relies on arena-backed nodes never being individually freed and the iterator holding an `Arc<MemTable>` that keeps the arena alive.
 
 ### Step 4: SST-Level Checks
-For changes in `table_reader.rs` (the only SST file with unsafe code):
+For changes in `table_reader/mod.rs` (the only SST file with unsafe code):
 
 - The single unsafe block is a `libc::posix_fadvise` call — an advisory syscall with no memory-safety obligations beyond a valid fd. Verify the `File` is alive (owns the fd) for the duration of the call and that offset/len are derived from validated block handles.
 - Block data access in the SST layer is entirely safe code (`Arc<Vec<u8>>`-backed, bounds-checked) — do not assume cache-backed pointer casts exist.
@@ -72,10 +72,10 @@ For any `transmute`, `as *const`, or `as *mut` (note: the codebase currently con
 
 | Location | Risk | Reason |
 |----------|------|--------|
-| skiplist_impl.rs | CRITICAL | Raw pointers, concurrent access, manual memory layout (43 unsafe blocks) |
+| skiplist_impl.rs | CRITICAL | Raw pointers, concurrent access, manual memory layout (42 unsafe blocks) |
 | skiplist.rs | HIGH | Raw skiplist pointer derefs + `unsafe impl Send` for cursor iterator (12 unsafe) |
 | db.rs | HIGH | Group-commit `WriteRequest` raw pointer protocol, `unsafe impl Send/Sync for DB`, `libc::flock` (11 unsafe) |
-| table_reader.rs | LOW | Single advisory `posix_fadvise` syscall (1 unsafe) |
+| table_reader/mod.rs | LOW | Single advisory `posix_fadvise` syscall (1 unsafe) |
 
 ## Red Flags
 Report immediately if you see:

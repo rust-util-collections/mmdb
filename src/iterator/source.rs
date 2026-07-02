@@ -395,36 +395,33 @@ impl IterSource {
             IterSourceInner::Boxed(_) => {
                 self.seek(target, compare);
             }
-            // Seekable variants: seek + peek next entry
+            // Seekable variants: seek + peek next entry (lazily — key lands in
+            // the reused peeked_key buffer, value stays zero-copy for SST sources)
             IterSourceInner::SeekableBoxed { iter } => {
                 iter.seek_to(target);
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
+                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
+                    self.peeked_value = lv;
                     self.has_peeked = true;
                 }
             }
             IterSourceInner::Memtable { iter } => {
                 iter.seek_to(target);
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
+                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
+                    self.peeked_value = lv;
                     self.has_peeked = true;
                 }
             }
             IterSourceInner::Sst { iter } => {
                 iter.seek_to(target);
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
+                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
+                    self.peeked_value = lv;
                     self.has_peeked = true;
                 }
             }
             IterSourceInner::Level { iter } => {
                 iter.seek_to(target);
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
+                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
+                    self.peeked_value = lv;
                     self.has_peeked = true;
                 }
             }

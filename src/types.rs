@@ -71,7 +71,7 @@ pub fn pack_sequence_and_type(seq: SequenceNumber, vt: ValueType) -> u64 {
 #[inline]
 pub fn unpack_sequence_and_type(packed: u64) -> (SequenceNumber, ValueType) {
     let seq = packed >> 8;
-    // Safety: unknown type bytes default to Deletion (invisible) rather than
+    // Robustness: unknown type bytes default to Deletion (invisible) rather than
     // Value (phantom data).  CRC-protected storage makes this path unreachable
     // in practice; it guards against memory corruption or future format drift.
     let vt = ValueType::from_u8((packed & 0xFF) as u8).unwrap_or(ValueType::Deletion);

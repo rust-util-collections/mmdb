@@ -1,8 +1,8 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::sst::block::{decode_entry_reuse, Block};
-use crate::types::{compare_internal_key, user_key, LazyValue};
+use crate::sst::block::{Block, decode_entry_reuse};
+use crate::types::{LazyValue, compare_internal_key, user_key};
 
 pub use crate::sst::format::BLOCK_TRAILER_SIZE;
 

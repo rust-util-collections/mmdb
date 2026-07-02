@@ -19,9 +19,7 @@ use crate::sst::format::{
     RANGE_DEL_BLOCK_NAME, decode_footer, decode_index_value_with_props,
 };
 use crate::stats::DbStats;
-use crate::types::{
-    InternalKeyRef, SequenceNumber, ValueType, compare_internal_key,
-};
+use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
 use ruc::*;
 
 /// A range tombstone: (begin_key, end_key, sequence_number).
@@ -649,4 +647,3 @@ impl TableReader {
         Ok(self.file.lock())
     }
 }
-

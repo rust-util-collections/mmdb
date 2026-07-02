@@ -140,7 +140,11 @@ impl VersionSet {
             let data = match reader.read_record() {
                 Ok(Some(data)) => data,
                 Ok(None) => break,
-                Err(e) if reader.is_at_file_end().unwrap_or(false) => {
+                // Tolerate a corrupt record only when nothing but zero padding
+                // follows it (torn tail); `open_append_truncated` below then
+                // discards the tail. Corruption followed by real data would
+                // silently drop later edits — fail the open instead.
+                Err(e) if reader.rest_is_zero_padding().unwrap_or(false) => {
                     tracing::warn!("MANIFEST {} has corrupt tail: {}", manifest_name, e);
                     break;
                 }
@@ -163,8 +167,31 @@ impl VersionSet {
             // old level and adds to the new level with the same file number.
             // Processing additions first would insert then immediately remove
             // the file, losing it entirely.
-            for (_level, file_number) in &edit.deleted_files {
-                live_files.remove(file_number);
+            //
+            // Deletions must match the recorded level: `log_and_apply` only
+            // removes a file from the exact level named in the edit, so a
+            // level-mismatched (or non-live) deletion record means the
+            // MANIFEST no longer reflects a consistent file set. Silently
+            // dropping by number here would diverge from the in-process
+            // behavior and could unlink a live file after restart.
+            for (level, file_number) in &edit.deleted_files {
+                match live_files.get(file_number) {
+                    Some((live_level, _)) if *live_level == *level as usize => {
+                        live_files.remove(file_number);
+                    }
+                    Some((live_level, _)) => {
+                        return Err(eg!(Error::Corruption(format!(
+                            "MANIFEST deletes SST {} at level {} but it is live at level {}",
+                            file_number, level, live_level
+                        ))));
+                    }
+                    None => {
+                        return Err(eg!(Error::Corruption(format!(
+                            "MANIFEST deletes SST {} at level {} but it is not live",
+                            file_number, level
+                        ))));
+                    }
+                }
             }
 
             // Track additions
@@ -183,7 +210,13 @@ impl VersionSet {
                         level + 1
                     ))));
                 }
-                live_files.insert(meta.number, (level, meta.clone()));
+                if let Some((prev_level, _)) = live_files.insert(meta.number, (level, meta.clone()))
+                {
+                    return Err(eg!(Error::Corruption(format!(
+                        "MANIFEST adds SST {} at level {} but it is already live at level {}",
+                        meta.number, level, prev_level
+                    ))));
+                }
             }
         }
 
@@ -280,49 +313,72 @@ impl VersionSet {
 
         for (level, meta) in &edit.new_files {
             let level = *level as usize;
-            if level < self.num_levels {
-                let reader = if let Some(ref tc) = self.table_cache {
-                    tc.get_reader(meta.number)
-                } else {
-                    let sst_path = self.db_path.join(format!("{:06}.sst", meta.number));
-                    TableReader::open(&sst_path).map(Arc::new)
-                };
-                match reader {
-                    Ok(reader) => {
-                        if level == 0 {
-                            // L0: insert at front (newest first)
-                            new_version.files[level].insert(
-                                0,
-                                TableFile {
-                                    meta: meta.clone(),
-                                    reader,
-                                },
-                            );
-                        } else {
-                            new_version.files[level].push(TableFile {
+            // An out-of-range level is an internal logic bug. Silently skipping
+            // would persist an edit whose keys become unreadable and whose
+            // replay is rejected by `recover_with_cache` on the next open —
+            // fail loudly before anything is written.
+            if level >= self.num_levels {
+                return Err(eg!(Error::Corruption(format!(
+                    "VersionEdit adds SST {} at out-of-range level {} (num_levels {})",
+                    meta.number, level, self.num_levels
+                ))));
+            }
+            let reader = if let Some(ref tc) = self.table_cache {
+                tc.get_reader(meta.number)
+            } else {
+                let sst_path = self.db_path.join(format!("{:06}.sst", meta.number));
+                TableReader::open(&sst_path).map(Arc::new)
+            };
+            match reader {
+                Ok(reader) => {
+                    if level == 0 {
+                        // L0: insert at front (newest first)
+                        new_version.files[level].insert(
+                            0,
+                            TableFile {
                                 meta: meta.clone(),
                                 reader,
-                            });
-                            // Keep levels 1+ sorted by smallest key (using logical ordering)
-                            new_version.files[level].sort_by(|a, b| {
-                                compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key)
-                            });
-                        }
+                            },
+                        );
+                    } else {
+                        new_version.files[level].push(TableFile {
+                            meta: meta.clone(),
+                            reader,
+                        });
+                        // Keep levels 1+ sorted by smallest key (using logical ordering)
+                        new_version.files[level].sort_by(|a, b| {
+                            compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key)
+                        });
                     }
-                    Err(e) => {
-                        return Err(eg!(Error::Corruption(format!(
-                            "failed to open new SST {}: {}",
-                            meta.number, e
-                        ))));
-                    }
+                }
+                Err(e) => {
+                    return Err(eg!(Error::Corruption(format!(
+                        "failed to open new SST {}: {}",
+                        meta.number, e
+                    ))));
                 }
             }
         }
 
+        // Deletions must name a live file at the exact level. A miss means the
+        // edit was built against a stale version (internal logic bug); recovery
+        // replay enforces the same invariant, so persisting the edit would make
+        // the next open fail. Fail loudly before anything is written.
         for (level, file_number) in &edit.deleted_files {
             let level = *level as usize;
-            if level < self.num_levels {
-                new_version.files[level].retain(|f| f.meta.number != *file_number);
+            if level >= self.num_levels {
+                return Err(eg!(Error::Corruption(format!(
+                    "VersionEdit deletes SST {} at out-of-range level {} (num_levels {})",
+                    file_number, level, self.num_levels
+                ))));
+            }
+            let before = new_version.files[level].len();
+            new_version.files[level].retain(|f| f.meta.number != *file_number);
+            if new_version.files[level].len() == before {
+                return Err(eg!(Error::Corruption(format!(
+                    "VersionEdit deletes SST {} at level {} but no such live file exists there",
+                    file_number, level
+                ))));
             }
         }
 
@@ -436,6 +492,11 @@ impl VersionSet {
 
     pub fn log_number(&self) -> u64 {
         self.log_number
+    }
+
+    /// Number of the MANIFEST file currently being appended to.
+    pub fn manifest_number(&self) -> u64 {
+        self.manifest_number
     }
 
     pub fn last_sequence(&self) -> SequenceNumber {

@@ -289,6 +289,109 @@ fn test_crash_partial_wal_record() {
 }
 
 #[test]
+fn test_crash_midlog_wal_corruption_fails_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Phase 1: write three synced records, then crash
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        for i in 0..3 {
+            db.put_with_options(
+                &WriteOptions {
+                    sync: true,
+                    ..Default::default()
+                },
+                format!("mid_key{}", i).as_bytes(),
+                format!("mid_value{}", i).as_bytes(),
+            )
+            .unwrap();
+        }
+        db.simulate_crash();
+    }
+
+    // Corrupt the FIRST record's payload in place (header/length intact, so
+    // the records for mid_key1/mid_key2 still follow it — this is mid-log
+    // corruption, not a torn tail).
+    let wal_path = {
+        let mut wal_files: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        wal_files.sort();
+        wal_files.into_iter().next().unwrap()
+    };
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        // 7-byte WAL header, then payload: seq(8) + count(4) + entry...
+        file.seek(SeekFrom::Start(7 + 12)).unwrap();
+        file.write_all(b"XXXX").unwrap();
+    }
+
+    // Phase 2: open MUST fail loudly — silently recovering the prefix would
+    // drop the two later committed records and then delete the WAL.
+    let result = DB::open(make_opts(), &path);
+    assert!(
+        result.is_err(),
+        "open should fail on mid-log WAL corruption instead of dropping later records"
+    );
+    // The corrupt WAL must be preserved for inspection, not deleted.
+    assert!(
+        wal_path.exists(),
+        "corrupt WAL should not be deleted by a failed open"
+    );
+}
+
+#[test]
+fn test_recovery_removes_orphan_sst() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Phase 1: create a DB with one flushed SST, then close cleanly.
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        for i in 0..20 {
+            let key = format!("orph_key_{:04}", i);
+            let val = format!("orph_val_{:040}", i);
+            db.put(key.as_bytes(), val.as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    // Simulate a crash that left an output SST behind without a MANIFEST
+    // reference (e.g. kill -9 between SST write and MANIFEST install).
+    let orphan = path.join("999999.sst");
+    std::fs::write(&orphan, b"not a real sst, never referenced").unwrap();
+
+    // Phase 2: reopen — recovery must delete the orphan and keep live data.
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        assert!(
+            !orphan.exists(),
+            "unreferenced SST should be removed during recovery"
+        );
+        for i in 0..20 {
+            let key = format!("orph_key_{:04}", i);
+            let val = format!("orph_val_{:040}", i);
+            assert_eq!(
+                db.get(key.as_bytes()).unwrap(),
+                Some(val.into_bytes()),
+                "live key {} must survive orphan cleanup",
+                i
+            );
+        }
+        db.close().unwrap();
+    }
+}
+
+#[test]
 fn test_crash_during_flush() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();

@@ -61,4 +61,4 @@ Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` a
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
-- 67 unsafe blocks/functions concentrated in: `skiplist_impl.rs` (43), `skiplist.rs` (12), `db.rs` (11), `table_reader.rs` (1) — all require `// SAFETY:` comments
+- 66 unsafe blocks/functions concentrated in: `skiplist_impl.rs` (42), `skiplist.rs` (12), `db.rs` (11), `table_reader/mod.rs` (1) — all require `// SAFETY:` comments

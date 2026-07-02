@@ -21,8 +21,8 @@ Before analyzing any change, gather context:
 | write-path & read-path | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `concurrency.md`, `unsafe-audit.md` (db.rs unsafe) |
 | memtable | `src/memtable/` (mod.rs, skiplist.rs, skiplist_impl.rs) | `memtable.md`, `unsafe-audit.md` |
 | WAL | `src/wal/` (writer.rs, reader.rs, record.rs) | `wal.md` |
-| SST | `src/sst/` (table_builder.rs, table_reader.rs, block.rs, block_builder.rs, filter.rs, format.rs) | `sst.md`, `unsafe-audit.md` (table_reader only) |
-| iterator | `src/iterator/` (db_iter.rs, merge.rs, level_iter.rs, bidi_iter.rs, range_del.rs) | `iterator.md` |
+| SST | `src/sst/` (table_builder.rs, table_reader/mod.rs, table_reader/iterator.rs, block.rs, block_builder.rs, filter.rs, format.rs) | `sst.md`, `unsafe-audit.md` (table_reader/mod.rs only) |
+| iterator | `src/iterator/` (db_iter.rs, merge.rs, source.rs, level_iter.rs, bidi_iter.rs, range_del.rs) | `iterator.md` |
 | compaction | `src/compaction/leveled.rs` | `compaction.md` |
 | manifest | `src/manifest/` (version_set.rs, version_edit.rs, version.rs) | `concurrency.md` |
 | cache | `src/cache/` (block_cache.rs, table_cache.rs) | `concurrency.md` |

@@ -160,8 +160,10 @@ src/
 |   +-- block.rs            # Data block: prefix compression + restart points + seek
 |   +-- block_builder.rs    # Block construction
 |   +-- table_builder.rs    # SST writer (data + filter + index with first_key + footer)
-|   +-- table_reader.rs     # SST reader + TableIterator (cursor-based, deferred block read)
-|   +-- filter.rs           # Bloom filter (double hashing)
+|   +-- table_reader/
+|   |   +-- mod.rs           # SST reader: open, block read/cache, point lookup
+|   |   +-- iterator.rs      # TableIterator (cursor-based, deferred block read)
+|   +-- filter.rs            # Bloom filter (double hashing)
 |   +-- format.rs           # Footer, BlockHandle, CompressionType, IndexEntry encoding
 +-- compaction/
 |   +-- leveled.rs          # Leveled compaction: streaming merge, trivial move, filter
@@ -174,6 +176,7 @@ src/
 |   +-- table_cache.rs      # SST reader cache
 +-- iterator/
     +-- merge.rs            # Min-heap MergingIterator with buffer reuse + prefetch
+    +-- source.rs           # IterSource (peeked-entry adapter) + SeekableIterator trait
     +-- db_iter.rs          # DBIterator: dedup, snapshot, tombstone/range-del filtering
     +-- level_iter.rs       # LevelIterator: lazy two-level iterator for L1+
     +-- range_del.rs        # FragmentedRangeTombstoneList (O(log T) lookup) + sweep-line RangeTombstoneTracker

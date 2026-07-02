@@ -3,6 +3,13 @@
 use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
+/// Upper bound on a single `request()` sleep. A pathologically large request
+/// (e.g. `bytes` near `usize::MAX` with a tiny rate) would otherwise overflow
+/// `Duration::from_secs_f64` and panic. The un-slept remainder stays recorded
+/// as debt in `available`, so subsequent callers still respect the aggregate
+/// rate.
+const MAX_SLEEP_SECS: f64 = 60.0;
+
 /// A token-bucket rate limiter.
 ///
 /// Controls the rate at which bytes can be written during compaction
@@ -33,7 +40,9 @@ impl RateLimiter {
         }
     }
 
-    /// Request `bytes` tokens. Blocks until enough tokens are available.
+    /// Request `bytes` tokens. Blocks until enough tokens are available
+    /// (sleeping at most `MAX_SLEEP_SECS` per call; any remaining deficit is
+    /// carried as debt and throttles subsequent callers).
     /// Returns immediately if the rate limiter is disabled (rate = 0).
     pub fn request(&self, bytes: usize) {
         let mut inner = self.inner.lock();
@@ -61,7 +70,7 @@ impl RateLimiter {
         let wait_secs = deficit / inner.rate_bytes_per_sec as f64;
         drop(inner);
 
-        std::thread::sleep(Duration::from_secs_f64(wait_secs));
+        std::thread::sleep(Duration::from_secs_f64(wait_secs.min(MAX_SLEEP_SECS)));
     }
 
     /// Check if the rate limiter is enabled.

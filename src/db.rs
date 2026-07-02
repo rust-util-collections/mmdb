@@ -198,7 +198,13 @@ pub struct DB {
     dead_keys: Arc<RwLock<HashSet<Vec<u8>>>>,
 }
 
-// SAFETY: WriteRequest pointers are only accessed under write_queue lock.
+// SAFETY: the raw `*mut WriteRequest` pointers held in `write_queue` reference
+// stack frames of writer threads that remain blocked on `write_cv` (waiting for
+// `done`) for the pointers' entire lifetime. Pointers are published and drained
+// under the write_queue lock; after draining a group, the single active leader
+// holds exclusive ownership of the drained pointers — it may dereference them
+// without the lock in `write_batch_group` — until it re-acquires the lock, sets
+// `done`, and wakes the owners. No two threads ever access a request concurrently.
 // SAFETY: DB's shared mutable state is behind Arc + parking_lot locks or atomics;
 // raw request pointers are stack-local to write_queue waiters and never stored in DB.
 unsafe impl Send for DB {}
@@ -377,15 +383,35 @@ impl DB {
                             .c(d!())?;
                     }
                     Ok(None) => break,
-                    // Records are appended sequentially, so crash-induced corruption is
-                    // always at the tail of validly-written data: no valid record can
-                    // follow a torn one. Treat any corruption as end-of-log, recover the
-                    // prefix, and continue with the next (higher-numbered) WAL. This is
-                    // the standard tolerant-tail recovery for write-ahead logs; failing
-                    // the whole open would discard committed data unnecessarily.
+                    // A torn tail (crash mid-append) surfaces either as a
+                    // truncated record — already handled as Ok(None) by the
+                    // reader — or as a corrupt record followed only by zero
+                    // padding / a zero-extended file tail. Tolerate exactly
+                    // that case: recover the prefix and continue with the next
+                    // (higher-numbered) WAL.
+                    //
+                    // Corruption in the MIDDLE of a WAL (non-zero data follows
+                    // the bad record) is NOT a torn tail: no valid record can
+                    // follow a torn one, so committed writes would follow the
+                    // corrupt record. Silently recovering the prefix would drop
+                    // them while still replaying newer WALs (a causal hole),
+                    // and the post-recovery cleanup would then delete the WAL,
+                    // destroying the data permanently. Fail the open loudly
+                    // instead and preserve the file for inspection.
                     Err(e) => {
-                        tracing::warn!("WAL {} has corrupt tail, stopping replay: {}", wal_num, e);
-                        break;
+                        if reader.rest_is_zero_padding().unwrap_or(false) {
+                            tracing::warn!(
+                                "WAL {} has corrupt tail, stopping replay: {}",
+                                wal_num,
+                                e
+                            );
+                            break;
+                        }
+                        return Err(e).c(d!(format!(
+                            "WAL {:06} is corrupt mid-log (data follows the corrupt record); \
+                             refusing prefix recovery to avoid silent data loss",
+                            wal_num
+                        )));
                     }
                 }
             }
@@ -454,14 +480,10 @@ impl DB {
             versions.sync_manifest().c(d!())?;
         }
 
-        // Safe to clean up old WAL files now — the new log_number is durable,
-        // so they will not be replayed even if we crash here.
-        for wal_num in &wal_numbers {
-            let old_wal = path.join(format!("{:06}.wal", wal_num));
-            if let Err(e) = fs::remove_file(&old_wal) {
-                tracing::warn!("failed to remove old WAL {}: {}", old_wal.display(), e);
-            }
-        }
+        // Safe to clean up obsolete files now — the new log_number is durable
+        // (so old WALs will never be replayed even if we crash here) and the
+        // recovered version set defines the complete live SST set.
+        Self::remove_orphan_files(&path, &versions);
 
         let next_sequence = max_sequence.checked_add(1).ok_or_else(|| {
             eg!(Error::InvalidArgument(
@@ -922,10 +944,7 @@ impl DB {
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_usable().c(d!())?;
 
-        let seq = match options.snapshot {
-            Some(s) => s,
-            None => self.current_sequence(),
-        };
+        let seq = self.resolve_read_sequence(options.snapshot);
 
         // Lock-free read via SuperVersion.
         let sv = self.get_super_version();
@@ -1128,10 +1147,7 @@ impl DB {
     ) -> Result<DBIterator> {
         self.check_usable().c(d!())?;
 
-        let seq = match options.snapshot {
-            Some(s) => s,
-            None => self.current_sequence(),
-        };
+        let seq = self.resolve_read_sequence(options.snapshot);
 
         // Lock-free read: use SuperVersion instead of locking inner.
         let sv = self.get_super_version();
@@ -1324,7 +1340,7 @@ impl DB {
     /// Set `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to further
     /// restrict iteration to a sub-range inside the prefix.
     pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator> {
-        let seq = options.snapshot.unwrap_or_else(|| self.current_sequence());
+        let seq = self.resolve_read_sequence(options.snapshot);
         self.iter_with_prefix_inner(prefix, seq, options)
     }
 
@@ -2103,6 +2119,19 @@ impl DB {
         self.committed_sequence.load(Ordering::Acquire)
     }
 
+    /// Resolve a caller-supplied read snapshot, clamping it to the committed
+    /// sequence. A future sequence (e.g. `u64::MAX`) must not observe entries
+    /// from batches that are still being applied to the memtable — the group
+    /// commit leader publishes `committed_sequence` only after a batch is
+    /// fully inserted, and readers are lock-free, so an unclamped future
+    /// snapshot could see a batch half-applied. Snapshots obtained from
+    /// `snapshot_seq()` are always <= the committed sequence, so the clamp
+    /// never weakens a legitimate snapshot.
+    fn resolve_read_sequence(&self, snapshot: Option<SequenceNumber>) -> SequenceNumber {
+        let committed = self.current_sequence();
+        snapshot.map_or(committed, |s| s.min(committed))
+    }
+
     /// Apply write backpressure based on L0 file count.
     fn maybe_throttle_writes(&self) -> Result<()> {
         // Fast path: check cached L0 count without locking inner.
@@ -2686,6 +2715,70 @@ impl DB {
             }
         }
         buf
+    }
+
+    /// Remove files in the DB directory that recovery has proven dead:
+    /// - `.wal` files numbered below the recovered `log_number` — already
+    ///   replayed (or superseded) and never read again,
+    /// - `.sst` files absent from the recovered version — crash orphans from
+    ///   an interrupted flush/compaction, or compaction inputs whose deletion
+    ///   edit was durable but whose unlink never ran,
+    /// - `MANIFEST-*` files other than the current one, plus `CURRENT.tmp` —
+    ///   leftovers from an interrupted MANIFEST compaction.
+    ///
+    /// Called from `open()` after the recovered state (including the fresh
+    /// `log_number`) is durable in the MANIFEST, while the directory LOCK is
+    /// held and before any background thread starts. Deletion failures are
+    /// logged and ignored — cleanup re-runs on the next open.
+    fn remove_orphan_files(path: &Path, versions: &VersionSet) {
+        let version = versions.current();
+        let live_ssts: HashSet<u64> = (0..version.num_levels)
+            .flat_map(|level| version.level_files(level))
+            .map(|tf| tf.meta.number)
+            .collect();
+
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!("orphan cleanup: cannot read DB dir: {}", e);
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let obsolete = if let Some(num) = name
+                .strip_suffix(".wal")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                num < versions.log_number()
+            } else if let Some(num) = name
+                .strip_suffix(".sst")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                !live_ssts.contains(&num)
+            } else if let Some(num) = name
+                .strip_prefix("MANIFEST-")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                num != versions.manifest_number()
+            } else {
+                name == "CURRENT.tmp"
+            };
+            if obsolete {
+                let file_path = entry.path();
+                match fs::remove_file(&file_path) {
+                    Ok(()) => tracing::info!("removed orphan file {}", file_path.display()),
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to remove orphan file {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn replay_wal_record(data: &[u8], mem: &MemTable, max_sequence: &mut u64) -> Result<()> {

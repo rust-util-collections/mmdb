@@ -57,6 +57,33 @@ impl WalReader {
         Ok(self.reader.stream_position().c(d!())? >= self.file_size)
     }
 
+    /// True if every byte from the current read position to EOF is zero.
+    ///
+    /// After `read_record()` fails, this distinguishes a torn tail from
+    /// mid-log corruption: a record torn by a crash is the last thing in the
+    /// file, followed at most by block padding or a filesystem zero-extended
+    /// tail. Non-zero bytes after the failed record mean data was written
+    /// after it, so the failure is real corruption and the log suffix would
+    /// be silently lost by prefix recovery.
+    ///
+    /// Consumes the remaining bytes; the reader is not usable for further
+    /// record reads afterwards (`last_valid_offset` is unaffected).
+    pub fn rest_is_zero_padding(&mut self) -> Result<bool> {
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.reader.read(&mut buf) {
+                Ok(0) => return Ok(true),
+                Ok(n) => {
+                    if buf[..n].iter().any(|&b| b != 0) {
+                        return Ok(false);
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(eg!(e)),
+            }
+        }
+    }
+
     /// Return an iterator over all records in the WAL.
     pub fn iter(&mut self) -> WalIterator<'_> {
         WalIterator { reader: self }
