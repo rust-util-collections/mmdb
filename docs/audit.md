@@ -1,11 +1,17 @@
 # Audit Findings
 
 > Auto-managed by /x-review and /x-fix.
-> Last review: 2026-07-03 (regression review of commit 7087027 / v4.0.2: 3 findings — all 3 fixed same session; all 13 Won't Fix entries re-verified against post-commit code, line refs refreshed)
+> Last review: 2026-07-03 (vsdb-side field report: inherited-L0 write-stall livelock — root-caused and fixed in v4.0.4; previously: regression review of commit 7087027 / v4.0.2: 3 findings — all 3 fixed same session; all 13 Won't Fix entries re-verified against post-commit code, line refs refreshed)
 
 ## Open
 
 (none)
+
+---
+
+## Fixed in v4.0.4 (2026-07-03)
+
+- **[HIGH] db: inherited L0 backlog caused a permanent write-slowdown livelock.** A DB opened with a pre-existing L0 backlog (e.g. WAL-recovery SSTs accumulated across short-lived processes — vsdb's test workflow) never scheduled compaction: the only routine `signal_compaction()` call sites were post-flush, post-lazy-delete-threshold, and read-hint paths, none of which fire on a freshly opened, lightly-written DB. With L0 in the slowdown band (`[l0_slowdown_trigger, l0_stop_trigger)`), `maybe_throttle_writes` slept 1–5 ms per write against a **cached** `l0_file_count` that nothing refreshed, and small workloads never filled a memtable to trigger the flush that would have signalled compaction — a stable degraded state (measured 5000 µs/put; ~2 µs/put healthy). Fixed by (1) signalling compaction once at the end of `DB::open`, and (2) making the slowdown branch signal compaction (idempotent) and refresh the cached L0 count after sleeping. Regression test: `test_startup_drains_inherited_l0_backlog` (fails in 30 s without the fix; passes in <1 s with it).
 
 ---
 

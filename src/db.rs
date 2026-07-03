@@ -856,6 +856,17 @@ impl DB {
             dead_keys,
         };
 
+        // Kick the background compaction threads once at startup. A DB
+        // opened with a pre-existing L0 backlog (e.g. WAL-recovery SSTs
+        // accumulated across short-lived processes) would otherwise not
+        // compact until the first memtable flush of THIS process signals
+        // the background thread — while every write pays the L0-slowdown
+        // penalty (and small workloads may never fill a memtable at all,
+        // making the stall permanent). The thread re-checks
+        // `pick_compaction` and goes back to sleep if there is nothing
+        // to do, so an unconditional signal is free.
+        db.signal_compaction();
+
         Ok(db)
     }
 
@@ -2129,9 +2140,22 @@ impl DB {
                 Ordering::Relaxed,
             );
         } else if l0_count >= self.options.l0_slowdown_trigger {
+            // Ensure the backlog is actually being worked on. The slowdown
+            // state can be entered without any prior signal (e.g. an L0
+            // backlog inherited from a previous process at open, before the
+            // startup kick has drained it), and signalling is idempotent.
+            self.signal_compaction();
             // Progressive delay: more L0 files → longer sleep
             let delay_us = (l0_count - self.options.l0_slowdown_trigger + 1) as u64 * 1000;
             thread::sleep(Duration::from_micros(delay_us));
+            // Refresh the cached count so a compaction finishing while we
+            // slept lifts the slowdown for the next writes immediately —
+            // without this, small workloads that never flush would keep
+            // paying the full penalty long after L0 has been drained.
+            self.l0_file_count.store(
+                self.inner.lock().versions.current().l0_file_count(),
+                Ordering::Relaxed,
+            );
         }
         Ok(())
     }

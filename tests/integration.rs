@@ -2180,3 +2180,76 @@ fn test_prefix_seek_for_prev_beyond_range() {
     );
     assert_eq!(it.key(), Some(b"a2".as_ref()));
 }
+
+#[test]
+fn test_startup_drains_inherited_l0_backlog() {
+    // Regression: a DB opened with a pre-existing L0 backlog (e.g. flushed
+    // SSTs accumulated across short-lived processes) must start draining it
+    // via background compaction WITHOUT requiring any write/flush activity
+    // in the new process. Previously the only routine compaction signal was
+    // post-flush, so such a DB sat in the L0 write-slowdown band forever —
+    // every write paid a multi-ms sleep and small workloads never recovered.
+    let dir = tempfile::tempdir().unwrap();
+
+    // Phase 1: manufacture an L0 backlog above the default slowdown
+    // trigger (8) with compaction effectively disabled.
+    {
+        let db = DB::open(
+            DbOptions {
+                create_if_missing: true,
+                l0_compaction_trigger: 1000, // never compacts
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        for i in 0..10u32 {
+            db.put(format!("key{i:03}").as_bytes(), b"v").unwrap();
+            db.flush().unwrap(); // one L0 SST per iteration
+        }
+        let l0: usize = db
+            .get_property("num-files-at-level0")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(l0 >= 10, "expected a manufactured L0 backlog, got {l0}");
+    }
+
+    // Phase 2: reopen with normal triggers and perform NO writes. The
+    // startup signal must let background compaction drain L0 below the
+    // slowdown trigger on its own.
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: false,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let l0: usize = db
+            .get_property("num-files-at-level0")
+            .unwrap()
+            .parse()
+            .unwrap();
+        if l0 < 8 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "L0 backlog was not drained by startup compaction (still {l0} files)"
+        );
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Data integrity: every key survives the compaction.
+    for i in 0..10u32 {
+        assert_eq!(
+            db.get(format!("key{i:03}").as_bytes()).unwrap().as_deref(),
+            Some(b"v".as_ref()),
+            "key{i:03} missing after startup compaction"
+        );
+    }
+}
