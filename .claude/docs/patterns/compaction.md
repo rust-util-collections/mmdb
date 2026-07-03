@@ -40,7 +40,7 @@ Compaction input files may only be deleted after the output files are fully writ
 ### INV-C5a: Stale-Output Detection in `install_compaction`
 After compaction I/O completes and the lock is re-acquired to install results, verify that the SuperVersion used to pick inputs has not been superseded by a concurrent flush or another compaction. If a newer version exists, the output files from this compaction may reference stale inputs and MUST be discarded rather than installed.
 
-**Check**: Verify `install_compaction()` checks that its input files are still present in the current Version before applying the VersionEdit. Output files built from stale inputs must be deleted without being added to the MANIFEST.
+**Check**: Verify `install_compaction()` checks that its input files are still present in the current Version before applying the VersionEdit, and that no output overlaps a target-level file the edit neither deletes nor produced (concurrent-install race). Output files built from stale inputs must be deleted without being added to the MANIFEST. The precheck runs under the DB lock, so it must not read SST files: output tombstone extents come from `CompactionOutput::output_tombstones`, captured from `TableBuildResult` during the unlocked I/O phase.
 
 ### INV-C6: Compaction Filter Contract
 User-provided `CompactionFilter` receives every key-value pair exactly once. Filter decisions (Keep/Remove/ChangeValue) must be applied atomically per entry.

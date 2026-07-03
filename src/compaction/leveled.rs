@@ -6,7 +6,7 @@
 //! After compaction, the old files are deleted and new files are installed.
 
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::remove_file;
 use std::path::Path;
 use std::sync::{
@@ -26,7 +26,7 @@ use crate::manifest::version_set::VersionSet;
 use crate::options::{CompactionFilterDecision, DbOptions};
 use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuilder};
-use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator, TableReader};
+use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator};
 use crate::stats::DbStats;
 use crate::types::{
     InternalKey, InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType,
@@ -60,6 +60,12 @@ pub struct CompactionTask {
     pub input_files_next: Vec<TableFile>,
 }
 
+/// Range tombstone user-key extents `[begin, end)` written to each output
+/// SST, keyed by file number. Captured from `TableBuildResult` during the
+/// unlocked I/O phase so the install-phase overlap precheck never has to
+/// open or read an SST while the caller holds the DB lock.
+type OutputTombstones = HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>>;
+
 /// Result of the I/O phase of compaction (no lock needed to produce this).
 pub struct CompactionOutput {
     /// The version edit with new files added and old files deleted.
@@ -72,6 +78,8 @@ pub struct CompactionOutput {
     /// Used to ensure VersionSet::next_file_number doesn't fall behind
     /// the actual numbers used by sub-compaction threads.
     pub next_file_number_hint: u64,
+    /// Range tombstone extents per output file, for the install precheck.
+    output_tombstones: OutputTombstones,
 }
 
 /// Deferred cleanup actions that must be performed AFTER the manifest is
@@ -355,6 +363,8 @@ struct SubCompactionParams<'a> {
 /// Output of a single sub-compaction (new files only; deletions handled by orchestrator).
 struct SubCompactionOutput {
     new_files: Vec<(u32, FileMetaData)>,
+    /// Range tombstone extents per output file (see `OutputTombstones`).
+    output_tombstones: OutputTombstones,
 }
 
 /// Compute split points from target-level file boundaries.
@@ -576,6 +586,7 @@ fn execute_sub_compaction_io(
     }
 
     let mut new_files: Vec<(u32, FileMetaData)> = Vec::new();
+    let mut output_tombstones = OutputTombstones::new();
     let mut builder: Option<TableBuilder> = None;
     let mut current_file_number = 0u64;
     let mut current_size = 0usize;
@@ -622,6 +633,9 @@ fn execute_sub_compaction_io(
             };
             if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
+            }
+            if result.has_range_deletions {
+                output_tombstones.insert(current_file_number, result.range_tombstones);
             }
             new_files.push((
                 params.target_level as u32,
@@ -797,6 +811,9 @@ fn execute_sub_compaction_io(
         if let Some(s) = ctx.stats {
             s.record_compaction_bytes(result.file_size);
         }
+        if result.has_range_deletions {
+            output_tombstones.insert(current_file_number, result.range_tombstones);
+        }
         new_files.push((
             params.target_level as u32,
             FileMetaData {
@@ -818,7 +835,10 @@ fn execute_sub_compaction_io(
         )));
     }
 
-    Ok(SubCompactionOutput { new_files })
+    Ok(SubCompactionOutput {
+        new_files,
+        output_tombstones,
+    })
 }
 
 impl LeveledCompaction {
@@ -1206,10 +1226,14 @@ impl LeveledCompaction {
 
         // Merge sub-compaction outputs
         let mut edit = VersionEdit::new();
+        let mut output_tombstones = OutputTombstones::new();
         for sub_out in sub_outputs {
             for file_entry in sub_out.new_files {
                 edit.new_files.push(file_entry);
             }
+            // File numbers come from a shared atomic counter, so per-sub maps
+            // are disjoint and extend cannot collide.
+            output_tombstones.extend(sub_out.output_tombstones);
         }
 
         // Record deletions (orchestrator responsibility)
@@ -1238,6 +1262,7 @@ impl LeveledCompaction {
             input_files,
             input_file_numbers,
             next_file_number_hint: file_counter.load(Ordering::Relaxed),
+            output_tombstones,
         })
     }
 
@@ -1256,7 +1281,7 @@ impl LeveledCompaction {
         // been removed, or if a concurrent install added an unexpected target-level
         // overlap while this compaction was doing I/O, this output is based on an
         // outdated version and must be discarded.
-        let precheck = {
+        let discard = {
             let version = versions.current();
             let stale = output.input_files.iter().any(|(level, expected)| {
                 let level = *level as usize;
@@ -1266,33 +1291,14 @@ impl LeveledCompaction {
                         .iter()
                         .any(|tf| tf.meta == *expected)
             });
-            if stale {
-                Ok(true)
-            } else {
-                Self::outputs_overlap_unexpected_current_files(
-                    &output,
-                    &version,
-                    table_cache,
-                    block_cache,
-                    db_path,
-                    stats,
-                )
-            }
+            stale || Self::outputs_overlap_unexpected_current_files(&output, &version)
         };
-        match precheck {
-            Ok(true) => {
-                cleanup_output_files(db_path, &output.edit.new_files, None);
-                evict_table_cache_files(table_cache, &output.edit.new_files);
-                return Ok(PostCompactionCleanup {
-                    files_to_delete: HashSet::new(),
-                });
-            }
-            Ok(false) => {}
-            Err(e) => {
-                cleanup_output_files(db_path, &output.edit.new_files, None);
-                evict_table_cache_files(table_cache, &output.edit.new_files);
-                return Err(e).ctx();
-            }
+        if discard {
+            cleanup_output_files(db_path, &output.edit.new_files, None);
+            evict_table_cache_files(table_cache, &output.edit.new_files);
+            return Ok(PostCompactionCleanup {
+                files_to_delete: HashSet::new(),
+            });
         }
 
         // Ensure next_file_number accounts for all numbers consumed by
@@ -1331,14 +1337,20 @@ impl LeveledCompaction {
         })
     }
 
+    /// Check whether any compaction output overlaps a target-level file that
+    /// this edit neither deletes nor produced — evidence that a concurrent
+    /// install raced the I/O phase. Installing such an output would break the
+    /// L1+ disjointness invariant, so it must be discarded.
+    ///
+    /// Runs under the DB lock: output extents come from the tombstone ranges
+    /// captured at build time (`output.output_tombstones`) — no output SST is
+    /// opened or read here. Current-version files are checked through their
+    /// long-lived readers, whose range tombstones are cached after first
+    /// access (same pattern the pick phase uses).
     fn outputs_overlap_unexpected_current_files(
         output: &CompactionOutput,
         version: &Version,
-        table_cache: Option<&Arc<TableCache>>,
-        block_cache: Option<&Arc<BlockCache>>,
-        db_path: &Path,
-        stats: Option<&Arc<DbStats>>,
-    ) -> Result<bool> {
+    ) -> bool {
         let deleted: HashSet<(u32, u64)> = output.edit.deleted_files.iter().copied().collect();
         for (level, meta) in &output.edit.new_files {
             let level_idx = *level as usize;
@@ -1353,28 +1365,15 @@ impl LeveledCompaction {
                     largest: user_key(&meta.largest_key).to_vec(),
                 });
             }
-            if meta.has_range_deletions {
-                let reader = if let Some(cache) = table_cache {
-                    cache.get_reader(meta.number)
-                } else {
-                    let path = db_path.join(format!("{:06}.sst", meta.number));
-                    TableReader::open_with_all(
-                        &path,
-                        meta.number,
-                        block_cache.cloned(),
-                        stats.cloned(),
-                    )
-                    .map(Arc::new)
-                }
-                .with_ctx(|| {
-                    format!(
-                        "failed to open compaction output {:06} for stale-overlap validation",
-                        meta.number
-                    )
-                })?;
-                for (begin, end, _) in reader.get_range_tombstones().ctx()? {
-                    extents.push(UserKeyRange::Tombstone { begin, end });
-                }
+            if let Some(tombstones) = output.output_tombstones.get(&meta.number) {
+                extents.extend(
+                    tombstones
+                        .iter()
+                        .map(|(begin, end)| UserKeyRange::Tombstone {
+                            begin: begin.clone(),
+                            end: end.clone(),
+                        }),
+                );
             }
             if extents.is_empty() {
                 continue;
@@ -1394,11 +1393,11 @@ impl LeveledCompaction {
                         level_idx,
                         current.meta.number
                     );
-                    return Ok(true);
+                    return true;
                 }
             }
         }
-        Ok(false)
+        false
     }
 
     /// Delete old SST files after manifest has been synced.

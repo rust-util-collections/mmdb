@@ -21,7 +21,7 @@ use crate::sst::block_builder::BlockBuilder;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::*;
 use crate::sst::table_reader::MAX_DECOMPRESSED_BLOCK_SIZE;
-use crate::types::{InternalKeyRef, ValueType, compare_internal_key};
+use crate::types::{InternalKeyRef, ValueType, compare_internal_key, user_key};
 
 /// Hard ceiling for the single-block meta structures (index block and
 /// range-del block). The reader rejects any block above
@@ -341,11 +341,20 @@ impl TableBuilder {
         self.writer.get_ref().sync_all().ctx()?;
         self.finished = true;
 
+        // Surface the written range tombstones as user-key extents so callers
+        // (e.g. compaction install prechecks) never need to re-open the file.
+        let range_tombstones = self
+            .range_del_entries
+            .iter()
+            .map(|(key, end)| (user_key(key).to_vec(), end.clone()))
+            .collect();
+
         Ok(TableBuildResult {
             file_size: self.offset,
             smallest_key: self.smallest_key,
             largest_key: self.largest_key,
             has_range_deletions: self.has_range_deletions,
+            range_tombstones,
         })
     }
 
@@ -528,6 +537,9 @@ pub struct TableBuildResult {
     pub largest_key: Option<Vec<u8>>,
     /// Whether any range deletion entry was written to this table.
     pub has_range_deletions: bool,
+    /// Range tombstone user-key extents `[begin, end)` written to this table.
+    /// Non-empty exactly when `has_range_deletions` is true.
+    pub range_tombstones: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 # Audit Findings
 
 > Auto-managed by /x-review and /x-fix.
-> Last review: 2026-07-03 (full codebase audit: 9 findings — 8 fixed, 1 Won't Fix; relevant Won't Fix entries re-verified)
+> Last review: 2026-07-03 (regression review of commit 7087027 / v4.0.2: 3 findings — all 3 fixed same session; all 13 Won't Fix entries re-verified against post-commit code, line refs refreshed)
 
 ## Open
 
@@ -36,12 +36,12 @@
 - **Reason**: Documented, intentional defensive choice: all persisted internal keys come from CRC32-protected storage (WAL records and SST blocks are checksummed before decode), so an invalid tag is unreachable in practice; when reached (memory corruption / future format drift) defaulting to the *invisible* Deletion is strictly safer than *phantom* Value. `value_type()` is on the hot read path; making it fallible across every SST/iterator/compaction call site is disproportionate to a CRC-collision-only scenario. Re-checked 2026-07-03: v4.0 moved `unpack_sequence_and_type` (the old test-facing decoder, types.rs:72) to `#[cfg(test)]`; the production invalid-tag→Deletion behavior now lives solely in `InternalKeyRef::value_type` (line 182). Reasoning unchanged; still applies.
 
 ### [MEDIUM] db: `do_compaction` holds db_mutex during blocking I/O
-- **Where**: src/db.rs:2592 (do_compaction)
+- **Where**: src/db.rs:2607 (do_compaction)
 - **What**: `do_compaction()` holds the inner mutex across `execute_compaction_with_cache` and `force_merge_level`, blocking all writers for the entire compaction duration.
 - **Reason**: Refactoring to a 3-phase pattern (lock → I/O → lock) requires `do_compaction` to not take `&self` with the lock — a deep architectural change. Reachable from explicit `compact()`/`flush()` API calls and from the L0 stop-trigger write-stall path (already a deliberate stall). The background compaction path correctly releases the lock during I/O. Re-checked 2026-07-03: function unchanged by v4.0 (only error-call migration); still applies.
 
 ### [MEDIUM] db: `freeze_and_flush` holds db_mutex during SST write I/O
-- **Where**: src/db.rs:2414 (freeze_and_flush)
+- **Where**: src/db.rs:2429 (freeze_and_flush)
 - **What**: Writes an entire SST file while the caller holds the DB lock.
 - **Reason**: Only called from `close()` (shutdown path). Refactoring is disproportionate risk for a non-hot path. The background flush path correctly uses the 3-phase pattern. Re-checked 2026-07-03: unchanged; still applies.
 
@@ -78,7 +78,7 @@
 ### [LOW] db_iter: forward iteration level filter may be too strict for same-level entries
 - **Where**: src/iterator/db_iter.rs (forward path level filter), src/iterator/range_del.rs (level-filtered lookup)
 - **What**: Level filter uses `level >= src_lvl`, which assumes a tombstone at level L never needs to delete entries also tagged level L.
-- **Reason**: Dormant: DB-constructed sources are untagged (`IterSource.level` is always `usize::MAX` in production; the `with_level()` setter was removed in v4.0 as dead code), so the filter never actually excludes a tombstone. Naïvely tagging every source level 0 would be incorrect — a same-level delete is real (an active-memtable tombstone `[a,c)@10` must hide an immutable-memtable/L0 entry `b@5`, and distinct L0 files are the same "level"). Any future source-level tagging must assign distinct source indices per memtable/L0 file, not per LSM level. Re-checked 2026-07-03 (v4.0): still dormant (setter confirmed removed); still applies.
+- **Reason**: Dormant: DB-constructed sources are untagged (`IterSource.level` is always `usize::MAX` in production; the `with_level()` setter was removed in v4.0 as dead code), so the filter never actually excludes a tombstone. Naïvely tagging every source level 0 would be incorrect — a same-level delete is real (an active-memtable tombstone `[a,c)@10` must hide an immutable-memtable/L0 entry `b@5`, and distinct L0 files are the same "level"). Any future source-level tagging must assign distinct source indices per memtable/L0 file, not per LSM level. Re-checked 2026-07-03 (v4.0.2): the prefix-clamp changes in db_iter.rs touch adjacent code but not the level filter; still dormant, still applies.
 
 ### [LOW] test: test_write_options_no_slowdown discards its behavioral signal
 - **Where**: tests/integration.rs:808

@@ -3,6 +3,8 @@
 //! Simulates crash scenarios by abruptly closing the DB
 //! and verifying data integrity on reopen.
 
+use std::fs;
+
 use mmdb::CompressionType;
 use mmdb::{DB, DbOptions, WriteBatch, WriteOptions};
 
@@ -256,7 +258,7 @@ fn test_crash_partial_wal_record() {
 
     // Truncate the WAL file mid-record: find the WAL, chop off some bytes
     {
-        let mut wal_files: Vec<_> = std::fs::read_dir(&path)
+        let mut wal_files: Vec<_> = fs::read_dir(&path)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| e.path().extension().is_some_and(|ext| ext == "wal"))
@@ -264,13 +266,10 @@ fn test_crash_partial_wal_record() {
         wal_files.sort_by_key(|e| e.path());
         assert!(!wal_files.is_empty(), "expected at least one WAL file");
         let wal_path = wal_files.last().unwrap().path();
-        let len = std::fs::metadata(&wal_path).unwrap().len();
+        let len = fs::metadata(&wal_path).unwrap().len();
         // Truncate off the last 4 bytes to corrupt the tail record
         assert!(len > 4, "WAL too small to truncate");
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&wal_path)
-            .unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&wal_path).unwrap();
         file.set_len(len - 4).unwrap();
     }
 
@@ -316,7 +315,7 @@ fn test_torn_wal_tail_ignores_empty_higher_recovery_orphan() {
         db.simulate_crash();
     }
 
-    let mut wal_files: Vec<_> = std::fs::read_dir(&path)
+    let mut wal_files: Vec<_> = fs::read_dir(&path)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -330,16 +329,16 @@ fn test_torn_wal_tail_ignores_empty_higher_recovery_orphan() {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap();
 
-    let len = std::fs::metadata(&active_wal).unwrap().len();
+    let len = fs::metadata(&active_wal).unwrap().len();
     assert!(len > 4, "WAL too small to truncate");
-    let file = std::fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .write(true)
         .open(&active_wal)
         .unwrap();
     file.set_len(len - 4).unwrap();
 
     let empty_orphan = path.join(format!("{:06}.wal", active_num + 1));
-    std::fs::File::create(&empty_orphan).unwrap();
+    fs::File::create(&empty_orphan).unwrap();
 
     let db = DB::open(make_opts(), &path).unwrap();
     assert_eq!(db.get(b"good1").unwrap(), Some(b"value1".to_vec()));
@@ -371,7 +370,7 @@ fn test_crash_midlog_wal_corruption_fails_open() {
     // the records for mid_key1/mid_key2 still follow it — this is mid-log
     // corruption, not a torn tail).
     let wal_path = {
-        let mut wal_files: Vec<_> = std::fs::read_dir(&path)
+        let mut wal_files: Vec<_> = fs::read_dir(&path)
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -382,10 +381,7 @@ fn test_crash_midlog_wal_corruption_fails_open() {
     };
     {
         use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&wal_path)
-            .unwrap();
+        let mut file = fs::OpenOptions::new().write(true).open(&wal_path).unwrap();
         // 7-byte WAL header, then payload: seq(8) + count(4) + entry...
         file.seek(SeekFrom::Start(7 + 12)).unwrap();
         file.write_all(b"XXXX").unwrap();
@@ -425,7 +421,7 @@ fn test_earlier_wal_corrupt_tail_fails_open_when_newer_wal_exists() {
         db.simulate_crash();
     }
 
-    let mut wal_files: Vec<_> = std::fs::read_dir(&path)
+    let mut wal_files: Vec<_> = fs::read_dir(&path)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -440,11 +436,11 @@ fn test_earlier_wal_corrupt_tail_fails_open_when_newer_wal_exists() {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap();
     let newer_wal = path.join(format!("{:06}.wal", earlier_num + 1));
-    std::fs::copy(&earlier_wal, &newer_wal).unwrap();
+    fs::copy(&earlier_wal, &newer_wal).unwrap();
 
     {
         use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = fs::OpenOptions::new()
             .write(true)
             .open(&earlier_wal)
             .unwrap();
@@ -483,7 +479,7 @@ fn test_recovery_removes_orphan_sst() {
     // Simulate a crash that left an output SST behind without a MANIFEST
     // reference (e.g. kill -9 between SST write and MANIFEST install).
     let orphan = path.join("999999.sst");
-    std::fs::write(&orphan, b"not a real sst, never referenced").unwrap();
+    fs::write(&orphan, b"not a real sst, never referenced").unwrap();
 
     // Phase 2: reopen — recovery must delete the orphan and keep live data.
     {
@@ -534,7 +530,7 @@ fn test_crash_during_flush() {
 
     // Remove all SST files to simulate a crash where the SST was only
     // partially written / never made it to disk
-    let sst_files: Vec<_> = std::fs::read_dir(&path)
+    let sst_files: Vec<_> = fs::read_dir(&path)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
@@ -542,7 +538,7 @@ fn test_crash_during_flush() {
         .collect();
     let has_sst_files = !sst_files.is_empty();
     for sst in &sst_files {
-        std::fs::remove_file(sst).unwrap();
+        fs::remove_file(sst).unwrap();
     }
 
     // Phase 2: reopen — with SST files deleted but MANIFEST referencing them,

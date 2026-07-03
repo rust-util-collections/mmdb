@@ -142,13 +142,25 @@ impl WalReader {
             // Check if we need to skip to the next block
             let leftover = BLOCK_SIZE - self.block_offset;
             if leftover < HEADER_SIZE {
-                // Skip the remaining bytes in this block
+                // Skip the trailer padding. A clean EOF at the trailer start is
+                // a normal end of file; a partial trailer is a torn tail and is
+                // surfaced like a partial header, so only the recoverable
+                // active WAL tolerates it.
                 if leftover > 0 {
-                    let mut skip = vec![0u8; leftover];
-                    match self.reader.read_exact(&mut skip) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-                        Err(e) => return Err(e).ctx(),
+                    let mut skip = [0u8; HEADER_SIZE];
+                    let mut skipped = 0;
+                    while skipped < leftover {
+                        match self.reader.read(&mut skip[skipped..leftover]) {
+                            Ok(0) if skipped == 0 => return Ok(None),
+                            Ok(0) => {
+                                return Err(Error::corruption(
+                                    "truncated WAL block trailer".to_string(),
+                                ));
+                            }
+                            Ok(n) => skipped += n,
+                            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                            Err(e) => return Err(e).ctx(),
+                        }
                     }
                 }
                 self.block_offset = 0;
@@ -295,5 +307,41 @@ mod tests {
         let mut reader = WalReader::new(&path).unwrap();
         let result = reader.read_record();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_block_trailer_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailer.wal");
+
+        // First record ends 6 bytes before the block boundary (< HEADER_SIZE),
+        // so the writer emits 6 bytes of trailer padding before record two.
+        let trailer_len = 6u64;
+        let payload = vec![0x42_u8; BLOCK_SIZE - HEADER_SIZE - trailer_len as usize];
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(&payload).unwrap();
+            writer.add_record(b"next_block").unwrap();
+            writer.sync().unwrap();
+        }
+        let trailer_start = (BLOCK_SIZE as u64) - trailer_len;
+
+        // Truncated mid-trailer: committed records in the next block were
+        // lost, so this must surface as corruption, not clean EOF.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(trailer_start + 3).unwrap();
+        drop(file);
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), payload);
+        assert!(reader.read_record().is_err());
+
+        // Truncated exactly at the trailer start: a legitimate end of file
+        // (the writer only pads when it is about to append another record).
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(trailer_start).unwrap();
+        drop(file);
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), payload);
+        assert!(reader.read_record().unwrap().is_none());
     }
 }
