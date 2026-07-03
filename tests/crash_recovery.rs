@@ -289,6 +289,63 @@ fn test_crash_partial_wal_record() {
 }
 
 #[test]
+fn test_torn_wal_tail_ignores_empty_higher_recovery_orphan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        db.put_with_options(
+            &WriteOptions {
+                sync: true,
+                ..Default::default()
+            },
+            b"good1",
+            b"value1",
+        )
+        .unwrap();
+        db.put_with_options(
+            &WriteOptions {
+                sync: true,
+                ..Default::default()
+            },
+            b"good2",
+            b"value2",
+        )
+        .unwrap();
+        db.simulate_crash();
+    }
+
+    let mut wal_files: Vec<_> = std::fs::read_dir(&path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
+        .collect();
+    wal_files.sort();
+    let active_wal = wal_files.last().unwrap().clone();
+    let active_num = active_wal
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap();
+
+    let len = std::fs::metadata(&active_wal).unwrap().len();
+    assert!(len > 4, "WAL too small to truncate");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&active_wal)
+        .unwrap();
+    file.set_len(len - 4).unwrap();
+
+    let empty_orphan = path.join(format!("{:06}.wal", active_num + 1));
+    std::fs::File::create(&empty_orphan).unwrap();
+
+    let db = DB::open(make_opts(), &path).unwrap();
+    assert_eq!(db.get(b"good1").unwrap(), Some(b"value1".to_vec()));
+}
+
+#[test]
 fn test_crash_midlog_wal_corruption_fails_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
@@ -345,6 +402,64 @@ fn test_crash_midlog_wal_corruption_fails_open() {
     assert!(
         wal_path.exists(),
         "corrupt WAL should not be deleted by a failed open"
+    );
+}
+
+#[test]
+fn test_earlier_wal_corrupt_tail_fails_open_when_newer_wal_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        db.flush().unwrap();
+        db.put_with_options(
+            &WriteOptions {
+                sync: true,
+                ..Default::default()
+            },
+            b"newer_wal_key",
+            b"newer_wal_value",
+        )
+        .unwrap();
+        db.simulate_crash();
+    }
+
+    let mut wal_files: Vec<_> = std::fs::read_dir(&path)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
+        .collect();
+    wal_files.sort();
+    assert_eq!(wal_files.len(), 1, "test setup should leave one active WAL");
+    let earlier_wal = wal_files[0].clone();
+    let earlier_num = earlier_wal
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap();
+    let newer_wal = path.join(format!("{:06}.wal", earlier_num + 1));
+    std::fs::copy(&earlier_wal, &newer_wal).unwrap();
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&earlier_wal)
+            .unwrap();
+        file.seek(SeekFrom::Start(7 + 12)).unwrap();
+        file.write_all(b"XXXX").unwrap();
+    }
+
+    let result = DB::open(make_opts(), &path);
+    assert!(
+        result.is_err(),
+        "open should fail when an earlier WAL has a corrupt zero-padded tail"
+    );
+    assert!(
+        earlier_wal.exists(),
+        "corrupt earlier WAL should not be deleted by failed recovery"
     );
 }
 

@@ -202,6 +202,21 @@ impl DBIterator {
         }
     }
 
+    fn effective_forward_target(&self, target: &[u8]) -> Vec<u8> {
+        let mut effective = target;
+        if let Some(lb) = self.iterate_lower_bound.as_deref()
+            && effective < lb
+        {
+            effective = lb;
+        }
+        if let Some(prefix) = self.prefix.as_deref()
+            && effective < prefix
+        {
+            effective = prefix;
+        }
+        effective.to_vec()
+    }
+
     /// Set an exclusive upper bound on user keys.
     /// Iteration stops when user key >= this bound.
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
@@ -354,7 +369,11 @@ impl DBIterator {
                         else if let Some(ref pfx) = self.prefix
                             && !ikey_ref[..uk_len].starts_with(pfx)
                         {
-                            return None;
+                            if &ikey_ref[..uk_len] < pfx.as_slice() {
+                                Action::Skip
+                            } else {
+                                return None;
+                            }
                         }
                         // Upper bound check
                         else if let Some(ref ub) = self.iterate_upper_bound
@@ -485,6 +504,10 @@ impl DBIterator {
             if let Some(ref pfx) = self.prefix
                 && !ikey_ref[..uk_len].starts_with(pfx)
             {
+                if &ikey_ref[..uk_len] < pfx.as_slice() {
+                    self.merger.advance_entry();
+                    continue;
+                }
                 return None;
             }
 
@@ -554,21 +577,17 @@ impl DBIterator {
     /// Seek to the first key >= target.
     pub fn seek(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
-        let target = self
-            .iterate_lower_bound
-            .as_deref()
-            .filter(|lb| target < *lb)
-            .unwrap_or(target);
+        let target = self.effective_forward_target(target);
         // Seek the merger to a synthetic internal key with max sequence
-        let seek_key = InternalKey::new(target, MAX_SEQUENCE_NUMBER, ValueType::Value);
+        let seek_key = InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::Value);
         // TrySeekUsingNext: if the new target is strictly after the last seek target, use
         // incremental advancement instead of full re-seek.
         let try_next = self
             .last_seek_key
             .as_ref()
-            .is_some_and(|prev| target > prev.as_slice());
+            .is_some_and(|prev| target.as_slice() > prev.as_slice());
         self.merger.seek_opt(seek_key.as_bytes(), try_next);
-        self.last_seek_key = Some(target.to_vec());
+        self.last_seek_key = Some(target);
         self.has_last_key = false;
         self.needs_advance = true;
         self.current = None;
@@ -577,7 +596,10 @@ impl DBIterator {
     }
 
     pub fn seek_to_first(&mut self) {
-        // Use seek_to_first directly instead of seeking with empty key.
+        if self.prefix.is_some() || self.iterate_lower_bound.is_some() {
+            self.seek(b"");
+            return;
+        }
         self.merger.seek_to_first();
         self.has_last_key = false;
         self.needs_advance = true;
@@ -994,6 +1016,37 @@ mod tests {
         assert_eq!(iter.key().unwrap(), b"cherry");
 
         iter.seek(b"zzz");
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_prefix_iterator_forward_reposition_clamps_to_prefix() {
+        let source = sort_lex(vec![
+            make_entry(b"aaa", 1, ValueType::Value, b"before"),
+            make_entry(b"foo1", 2, ValueType::Value, b"one"),
+            make_entry(b"foo2", 3, ValueType::Value, b"two"),
+            make_entry(b"zzz", 4, ValueType::Value, b"after"),
+        ]);
+
+        let mut iter = DBIterator::from_sources_with_prefix(
+            vec![IterSource::new(source)],
+            10,
+            b"foo".to_vec(),
+        );
+
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"foo1");
+
+        iter.seek(b"a");
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"foo1");
+
+        iter.seek(b"foo2");
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"foo2");
+
+        iter.seek(b"g");
         assert!(!iter.valid());
     }
 

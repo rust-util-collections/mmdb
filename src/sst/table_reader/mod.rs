@@ -2,10 +2,12 @@
 mod iterator;
 pub use iterator::TableIterator;
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 use parking_lot::{Mutex, MutexGuard};
 

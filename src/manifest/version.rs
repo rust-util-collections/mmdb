@@ -1,7 +1,6 @@
 //! Version: an immutable snapshot of which SST files exist at each level.
 
-use std::fmt;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use crate::manifest::version_edit::FileMetaData;
 use crate::sst::table_reader::TableReader;

@@ -1,7 +1,6 @@
 //! Configuration options for MMDB.
 
-use std::fmt;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use crate::sst::format::CompressionType;
 
@@ -39,7 +38,8 @@ pub struct DbOptions {
     pub compression: CompressionType,
     /// Block cache capacity in bytes. 0 disables caching.
     pub block_cache_capacity: u64,
-    /// Maximum number of open SST files cached.
+    /// Maximum number of TableReader entries retained by the table cache.
+    /// Live Versions and iterators can pin additional readers.
     pub max_open_files: u64,
     /// Number of L0 files that triggers write slowdown.
     pub l0_slowdown_trigger: usize,

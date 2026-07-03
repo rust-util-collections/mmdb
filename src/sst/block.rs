@@ -18,8 +18,7 @@
 //! └──────────────────────────────────────────────────┘
 //! ```
 
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::{Error, Result};
 

@@ -1,7 +1,9 @@
-//! Table cache: caches open SST file readers to avoid repeated file open/parse.
+//! Table cache: caches SST table readers to avoid repeated file open/parse.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::cache::block_cache::BlockCache;
 use crate::error::{Result, ResultExt};
@@ -18,7 +20,8 @@ pub struct TableCache {
 
 impl TableCache {
     /// Create a new table cache.
-    /// `max_open_files` is the maximum number of SST files to keep open.
+    /// `max_open_files` is the maximum number of TableReader entries retained by
+    /// this cache; live Versions and iterators can pin additional readers.
     #[cfg(test)]
     pub fn new(db_path: &Path, max_open_files: u64, block_cache: Option<Arc<BlockCache>>) -> Self {
         Self::new_with_stats(db_path, max_open_files, block_cache, None)

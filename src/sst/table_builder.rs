@@ -8,11 +8,13 @@
 //! builder.finish()?;
 //! ```
 
-use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::{
+    cmp::Ordering,
+    collections::HashSet,
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 use crate::error::{Error, Result, ResultExt};
 use crate::sst::block_builder::BlockBuilder;

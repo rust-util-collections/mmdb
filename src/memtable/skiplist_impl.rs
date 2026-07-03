@@ -12,13 +12,13 @@
 //!
 //! Max height 12, probability p = 0.25.
 
-use std::cell::UnsafeCell;
+use std::{
+    cell::UnsafeCell,
+    ptr,
+    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+};
 #[cfg(test)]
-use std::cmp::Ordering as CmpOrdering;
-#[cfg(test)]
-use std::ops::RangeBounds;
-use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::{cmp::Ordering as CmpOrdering, ops::RangeBounds};
 
 /// Maximum height of the skip list.
 const MAX_HEIGHT: usize = 12;

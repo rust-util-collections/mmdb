@@ -25,11 +25,7 @@
 //! `Error` is `Clone + Send + Sync`, so a single failure can be distributed
 //! to multiple waiters (e.g. group-commit followers) without stringification.
 
-use std::error::Error as StdError;
-use std::fmt;
-use std::io;
-use std::panic::Location;
-use std::sync::Arc;
+use std::{error::Error as StdError, fmt, io, panic::Location, sync::Arc};
 
 /// Result type used throughout MMDB.
 pub type Result<T> = std::result::Result<T, Error>;

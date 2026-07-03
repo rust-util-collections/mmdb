@@ -26,7 +26,7 @@ use crate::manifest::version_set::VersionSet;
 use crate::options::{CompactionFilterDecision, DbOptions};
 use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuilder};
-use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator};
+use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator, TableReader};
 use crate::stats::DbStats;
 use crate::types::{
     InternalKey, InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType,
@@ -488,6 +488,14 @@ fn cleanup_output_files(
     if let Some(number) = active_file_number {
         let orphan = db_path.join(format!("{:06}.sst", number));
         let _ = remove_file(&orphan);
+    }
+}
+
+fn evict_table_cache_files(table_cache: Option<&Arc<TableCache>>, files: &[(u32, FileMetaData)]) {
+    if let Some(cache) = table_cache {
+        for (_, meta) in files {
+            cache.evict(meta.number);
+        }
     }
 }
 
@@ -1244,11 +1252,11 @@ impl LeveledCompaction {
         db_path: &Path,
         stats: Option<&Arc<DbStats>>,
     ) -> Result<PostCompactionCleanup> {
-        // Guard against stale compaction results: if any input file has already
-        // been removed from the current version (e.g. by a concurrent inline
-        // compaction), this output is based on outdated data and must be
-        // discarded.  Delete orphaned output SSTs and return early.
-        {
+        // Guard against stale compaction results. If any input file has already
+        // been removed, or if a concurrent install added an unexpected target-level
+        // overlap while this compaction was doing I/O, this output is based on an
+        // outdated version and must be discarded.
+        let precheck = {
             let version = versions.current();
             let stale = output.input_files.iter().any(|(level, expected)| {
                 let level = *level as usize;
@@ -1259,20 +1267,31 @@ impl LeveledCompaction {
                         .any(|tf| tf.meta == *expected)
             });
             if stale {
-                // Clean up output SST files that were written during the
-                // (now-invalidated) I/O phase.
-                for (_, meta) in &output.edit.new_files {
-                    let orphan = db_path.join(format!("{:06}.sst", meta.number));
-                    let _ = remove_file(&orphan);
-                }
-                if let Some(cache) = table_cache {
-                    for (_, meta) in &output.edit.new_files {
-                        cache.evict(meta.number);
-                    }
-                }
+                Ok(true)
+            } else {
+                Self::outputs_overlap_unexpected_current_files(
+                    &output,
+                    &version,
+                    table_cache,
+                    block_cache,
+                    db_path,
+                    stats,
+                )
+            }
+        };
+        match precheck {
+            Ok(true) => {
+                cleanup_output_files(db_path, &output.edit.new_files, None);
+                evict_table_cache_files(table_cache, &output.edit.new_files);
                 return Ok(PostCompactionCleanup {
                     files_to_delete: HashSet::new(),
                 });
+            }
+            Ok(false) => {}
+            Err(e) => {
+                cleanup_output_files(db_path, &output.edit.new_files, None);
+                evict_table_cache_files(table_cache, &output.edit.new_files);
+                return Err(e).ctx();
             }
         }
 
@@ -1288,11 +1307,7 @@ impl LeveledCompaction {
         let output_files = output.edit.new_files.clone();
         if let Err(e) = versions.log_and_apply(output.edit) {
             cleanup_output_files(db_path, &output_files, None);
-            if let Some(cache) = table_cache {
-                for (_, meta) in &output_files {
-                    cache.evict(meta.number);
-                }
-            }
+            evict_table_cache_files(table_cache, &output_files);
             return Err(e).ctx();
         }
 
@@ -1314,6 +1329,76 @@ impl LeveledCompaction {
         Ok(PostCompactionCleanup {
             files_to_delete: output.input_file_numbers,
         })
+    }
+
+    fn outputs_overlap_unexpected_current_files(
+        output: &CompactionOutput,
+        version: &Version,
+        table_cache: Option<&Arc<TableCache>>,
+        block_cache: Option<&Arc<BlockCache>>,
+        db_path: &Path,
+        stats: Option<&Arc<DbStats>>,
+    ) -> Result<bool> {
+        let deleted: HashSet<(u32, u64)> = output.edit.deleted_files.iter().copied().collect();
+        for (level, meta) in &output.edit.new_files {
+            let level_idx = *level as usize;
+            if level_idx == 0 || level_idx >= version.num_levels {
+                continue;
+            }
+
+            let mut extents = Vec::new();
+            if !meta.smallest_key.is_empty() && !meta.largest_key.is_empty() {
+                extents.push(UserKeyRange::File {
+                    smallest: user_key(&meta.smallest_key).to_vec(),
+                    largest: user_key(&meta.largest_key).to_vec(),
+                });
+            }
+            if meta.has_range_deletions {
+                let reader = if let Some(cache) = table_cache {
+                    cache.get_reader(meta.number)
+                } else {
+                    let path = db_path.join(format!("{:06}.sst", meta.number));
+                    TableReader::open_with_all(
+                        &path,
+                        meta.number,
+                        block_cache.cloned(),
+                        stats.cloned(),
+                    )
+                    .map(Arc::new)
+                }
+                .with_ctx(|| {
+                    format!(
+                        "failed to open compaction output {:06} for stale-overlap validation",
+                        meta.number
+                    )
+                })?;
+                for (begin, end, _) in reader.get_range_tombstones().ctx()? {
+                    extents.push(UserKeyRange::Tombstone { begin, end });
+                }
+            }
+            if extents.is_empty() {
+                continue;
+            }
+
+            for current in version.level_files(level_idx) {
+                if deleted.contains(&(*level, current.meta.number)) {
+                    continue;
+                }
+                if extents
+                    .iter()
+                    .any(|extent| file_overlaps_extent(current, extent))
+                {
+                    tracing::warn!(
+                        "discarding stale compaction output {:06}: overlaps current L{} file {:06}",
+                        meta.number,
+                        level_idx,
+                        current.meta.number
+                    );
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Delete old SST files after manifest has been synced.

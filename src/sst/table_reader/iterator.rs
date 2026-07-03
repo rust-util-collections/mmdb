@@ -1,5 +1,4 @@
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::sst::block::{Block, decode_entry_reuse};
 use crate::types::{LazyValue, compare_internal_key, user_key};
@@ -900,8 +899,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
 
     use super::*;
     use crate::options::{BlockPropertyCollector, BlockPropertyFilter};

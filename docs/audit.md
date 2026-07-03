@@ -1,7 +1,7 @@
 # Audit Findings
 
 > Auto-managed by /x-review and /x-fix.
-> Last review: 2026-07-03 (v4.0.0 commit f6575c8 — 9 subsystems reviewed; 2 LOW findings found **and fixed** same session; 13 Won't Fix entries re-verified, 1 deleted as code-removed, 1 narrowed, citations refreshed)
+> Last review: 2026-07-03 (full codebase audit: 9 findings — 8 fixed, 1 Won't Fix; relevant Won't Fix entries re-verified)
 
 ## Open
 
@@ -19,6 +19,11 @@
 > - If the entry is now fixable with reasonable effort, promote it back to `## Open`.
 > - If the entry is no longer relevant (code removed / refactored away), delete it.
 > Do NOT treat this section as a permanent exemption list.
+
+### [HIGH] cache: `max_open_files` is not a hard process-wide file descriptor cap
+- **Where**: src/cache/table_cache.rs:20-38; src/manifest/version.rs:8-24; src/manifest/version_set.rs:322-343; src/sst/table_reader/mod.rs:56-64
+- **What**: `max_open_files` limits the moka table-cache entries, but live `Version`s and iterators hold `Arc<TableReader>` references; each `TableReader` holds an open SST file descriptor so live readers can keep reading an SST after compaction unlinks it.
+- **Reason**: A contained metadata-only `TableReader` change breaks iterator/snapshot safety: once compaction unlinks an obsolete SST and invalidates its blocks, a live iterator over an old `SuperVersion` may need an uncached block and would fail to reopen the deleted path. A correct hard-FD-cap design requires a broader architecture: metadata-only `Version`s, on-demand table handles, and deferred obsolete-file deletion until no live reader can reference the file. Current code keeps stable file handles to preserve snapshot/iterator correctness; docs now state that `max_open_files` is a table-cache entry limit, not a hard process-wide FD cap. Re-checked 2026-07-03: still applies after self-review of the metadata-only attempt.
 
 ### [HIGH] sst: corrupt block entry could read restart-array bytes / iteration degrades to EOF
 - **Where**: src/sst/block.rs:393-528 (decode_entry_at / decode_entry_reuse); src/sst/table_reader/mod.rs:420-442 (CRC verification)
@@ -110,6 +115,10 @@ Unknown value type tags map to `Deletion` rather than erroring (`InternalKeyRef:
 
 CRC32 verification (per-block, checked before any decoder runs — including the v4.0 `fill_cache=false` scan path) blocks corrupt blocks. The window exists only under CRC32 collision (~2^-32 probability).
 
+### Table Cache FD Cap Is Best-Effort
+
+`max_open_files` bounds table-cache entries, not every live `TableReader` held by snapshots/iterators. Stable file handles are required so old readers remain valid after compaction unlinks obsolete SST paths.
+
 ### WAL Mid-Log Corruption Fails Open (Design Decision)
 
-Recovery tolerates a corrupt WAL record only when nothing but zero padding follows it (torn tail). Corruption followed by real data fails `DB::open` loudly and preserves the WAL file, rather than silently recovering a prefix and deleting later committed writes.
+Recovery tolerates a corrupt WAL record only in the highest non-empty recovered WAL and only when nothing but zero padding follows it (torn active tail). Corruption in earlier WALs, or followed by real data, fails `DB::open` loudly and preserves the WAL file, rather than silently recovering a prefix and deleting later committed writes.

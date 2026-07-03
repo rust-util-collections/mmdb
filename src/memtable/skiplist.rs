@@ -1,7 +1,6 @@
 //! SkipList-based MemTable implementation using a custom concurrent skiplist.
 
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use super::skiplist_impl::ConcurrentSkipList;
 use crate::iterator::merge::SeekableIterator;

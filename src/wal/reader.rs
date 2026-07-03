@@ -88,7 +88,9 @@ impl WalReader {
                     self.eof = true;
                     if in_fragmented_record {
                         tracing::warn!("WAL: partial record without end (truncated)");
-                        return Ok(None);
+                        return Err(Error::corruption(
+                            "partial WAL record without end".to_string(),
+                        ));
                     }
                     return Ok(None);
                 }
@@ -153,12 +155,21 @@ impl WalReader {
                 continue;
             }
 
-            // Read the header
+            // Read the header. A clean EOF before the first header byte is normal;
+            // a partial header is a torn tail and must be surfaced to recovery so
+            // only the active WAL can tolerate it.
             let mut header_buf = [0u8; HEADER_SIZE];
-            match self.reader.read_exact(&mut header_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(e).ctx(),
+            let mut header_read = 0;
+            while header_read < HEADER_SIZE {
+                match self.reader.read(&mut header_buf[header_read..]) {
+                    Ok(0) if header_read == 0 => return Ok(None),
+                    Ok(0) => {
+                        return Err(Error::corruption("truncated WAL record header".to_string()));
+                    }
+                    Ok(n) => header_read += n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e).ctx(),
+                }
             }
 
             let (checksum, length, record_type) = decode_header(&header_buf);
@@ -187,8 +198,9 @@ impl WalReader {
             match self.reader.read_exact(&mut data) {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    // Crash-truncated tail record: treat as clean end-of-data
-                    return Ok(None);
+                    return Err(Error::corruption(
+                        "truncated WAL record payload".to_string(),
+                    ));
                 }
                 Err(e) => return Err(e).ctx(),
             }

@@ -1,17 +1,18 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
-use std::collections::{HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
-use std::io;
-use std::mem;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Condvar as StdCondvar, Mutex as StdMutex,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+use std::{
+    collections::{HashSet, VecDeque},
+    fs::{self, OpenOptions},
+    io, mem,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar as StdCondvar, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use parking_lot::{Condvar, Mutex, RwLock};
@@ -341,6 +342,20 @@ impl DB {
         // lose subsequently-acknowledged writes.
         versions.ensure_file_number_at_least(max_disk_file_number + 1);
 
+        let recoverable_tail_wal_num = wal_numbers.iter().rev().copied().find(|wal_num| {
+            let wal_path = path.join(format!("{:06}.wal", wal_num));
+            match fs::metadata(&wal_path) {
+                Ok(meta) => meta.len() != 0,
+                Err(e) => {
+                    tracing::warn!(
+                        "could not stat WAL {} while selecting recoverable tail: {}",
+                        wal_num,
+                        e
+                    );
+                    true
+                }
+            }
+        });
         for wal_num in &wal_numbers {
             let wal_path = path.join(format!("{:06}.wal", wal_num));
             let mut reader = WalReader::new(&wal_path).ctx()?;
@@ -351,23 +366,23 @@ impl DB {
                             .ctx()?;
                     }
                     Ok(None) => break,
-                    // A torn tail (crash mid-append) surfaces either as a
-                    // truncated record — already handled as Ok(None) by the
-                    // reader — or as a corrupt record followed only by zero
-                    // padding / a zero-extended file tail. Tolerate exactly
-                    // that case: recover the prefix and continue with the next
-                    // (higher-numbered) WAL.
+                    // A torn tail (crash mid-append) can surface as a corrupt
+                    // record followed only by zero padding / a zero-extended
+                    // file tail. Tolerate exactly that case for the highest
+                    // non-empty recovered WAL: it was the active append target at
+                    // crash. Empty higher WALs can be recovery-created orphans
+                    // from a crash before the new log_number reached MANIFEST.
                     //
-                    // Corruption in the MIDDLE of a WAL (non-zero data follows
-                    // the bad record) is NOT a torn tail: no valid record can
-                    // follow a torn one, so committed writes would follow the
-                    // corrupt record. Silently recovering the prefix would drop
-                    // them while still replaying newer WALs (a causal hole),
-                    // and the post-recovery cleanup would then delete the WAL,
-                    // destroying the data permanently. Fail the open loudly
-                    // instead and preserve the file for inspection.
+                    // Corruption in any earlier WAL, or corruption followed by
+                    // non-zero data, is NOT a torn active tail. Silently
+                    // recovering the prefix would drop committed records while
+                    // still replaying newer WALs (a causal hole), and the
+                    // post-recovery cleanup would then delete the WAL. Fail the
+                    // open loudly instead and preserve the file for inspection.
                     Err(e) => {
-                        if reader.rest_is_zero_padding().unwrap_or(false) {
+                        if Some(*wal_num) == recoverable_tail_wal_num
+                            && reader.rest_is_zero_padding().unwrap_or(false)
+                        {
                             tracing::warn!(
                                 "WAL {} has corrupt tail, stopping replay: {}",
                                 wal_num,
@@ -377,7 +392,7 @@ impl DB {
                         }
                         return Err(e).with_ctx(|| {
                             format!(
-                                "WAL {:06} is corrupt mid-log (data follows the corrupt record); \
+                                "WAL {:06} is corrupt before the recoverable active tail; \
                              refusing prefix recovery to avoid silent data loss",
                                 wal_num
                             )
@@ -2366,7 +2381,7 @@ impl DB {
                                     // persist the edit, so these files must be deleted.
                                     for num in &output_numbers {
                                         let path = self.path.join(format!("{:06}.sst", num));
-                                        let _ = std::fs::remove_file(&path);
+                                        let _ = fs::remove_file(&path);
                                     }
                                     // The frozen memtable is still live in
                                     // `immutable_memtables` and its WAL is intact, but a
@@ -2429,7 +2444,7 @@ impl DB {
             // Clean up orphan SST files produced by the failed flush install.
             for num in &output_numbers {
                 let path = self.path.join(format!("{:06}.sst", num));
-                let _ = std::fs::remove_file(&path);
+                let _ = fs::remove_file(&path);
             }
             self.set_bg_error(format!("flush install failed: {}", e));
             return Err(e);
@@ -2466,7 +2481,7 @@ impl DB {
             // Clean up orphan SST files: log_and_apply did not persist the edit.
             for num in &output_numbers {
                 let path = self.path.join(format!("{:06}.sst", num));
-                let _ = std::fs::remove_file(&path);
+                let _ = fs::remove_file(&path);
             }
             self.set_bg_error(format!("flush install failed: {}", e));
             return Err(e);

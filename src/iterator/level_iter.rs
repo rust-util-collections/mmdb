@@ -4,8 +4,7 @@
 //! and opens one file's TableIterator at a time. This reduces MergingIterator heap size
 //! from O(total_files) to O(L0_count + num_levels).
 
-use std::cmp::Ordering;
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use crate::iterator::merge::SeekableIterator;
 use crate::manifest::version::TableFile;
