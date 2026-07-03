@@ -1,4 +1,4 @@
-.PHONY: all fmt lint check test bench clean
+.PHONY: all fmt lint check test bench clean update publish
 
 all: fmt lint test
 
@@ -21,3 +21,9 @@ bench:
 
 clean:
 	cargo clean
+
+update:
+	cargo update
+
+publish:
+	cargo publish
