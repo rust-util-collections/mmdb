@@ -162,7 +162,8 @@ impl DBIterator {
     }
 
     /// Set range tombstones with level info for cross-level pruning.
-    /// A tombstone from level L can only delete keys from levels > L.
+    /// A tombstone from level L may cover keys at level L or deeper; a
+    /// tombstone strictly deeper than a key's source level never covers it.
     pub(crate) fn set_range_tombstones_with_levels(
         &mut self,
         tombstones: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,

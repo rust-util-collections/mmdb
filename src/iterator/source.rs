@@ -176,8 +176,9 @@ impl IterSource {
 
     /// Tag this source with the LSM level it was read from (memtable/L0 = 0,
     /// L1 = 1, etc.). Required for cross-level range-tombstone pruning — a
-    /// tombstone can only delete keys from levels strictly deeper than its
-    /// own. Sources left untagged (`usize::MAX`) disable the level filter for
+    /// tombstone may cover keys from its own level or deeper, but a tombstone
+    /// strictly deeper than a key's source level must never cover it. Sources
+    /// left untagged (`usize::MAX`) disable the level filter for
     /// that source's entries, so every construction site feeding a
     /// `MergingIterator` used for tombstone-aware iteration must call this.
     pub(crate) fn with_level(mut self, level: usize) -> Self {

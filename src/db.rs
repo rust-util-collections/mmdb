@@ -116,6 +116,29 @@ fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
     }));
 }
 
+/// RAII release for file numbers claimed in `DB::compacting_files` while a
+/// compaction pick is in flight (between `pick_compaction` and
+/// `install_compaction`/discard). The numbers are inserted under the pick
+/// phase's lock (atomically with the pick itself); this guard is constructed
+/// immediately afterwards so that EVERY exit — success, compaction-I/O
+/// error, install error — releases the claim. A leaked claim would
+/// permanently exclude those files from all future picks
+/// (`pick_l0_compaction` refuses to run while any current L0 file is
+/// claimed), silently disabling L0 compaction for the life of the process.
+struct CompactionClaim {
+    claims: Arc<Mutex<HashSet<u64>>>,
+    numbers: Vec<u64>,
+}
+
+impl Drop for CompactionClaim {
+    fn drop(&mut self) {
+        let mut claimed = self.claims.lock();
+        for num in &self.numbers {
+            claimed.remove(num);
+        }
+    }
+}
+
 /// The core database handle.
 pub struct DB {
     path: PathBuf,
@@ -638,6 +661,12 @@ impl DB {
                                                 claimed_numbers,
                                             )) = pick
                                             {
+                                                // Claim released on every exit
+                                                // (success or `?`) via Drop.
+                                                let _claim = CompactionClaim {
+                                                    claims: Arc::clone(&bg_compacting_files),
+                                                    numbers: claimed_numbers,
+                                                };
                                                 // Phase 2: I/O (no lock)
                                                 let ctx = CompactionContext {
                                                     db_path: &bg_path,
@@ -690,13 +719,6 @@ impl DB {
                                                                 e
                                                             )
                                                         })?;
-                                                    {
-                                                        let mut claimed =
-                                                            bg_compacting_files.lock();
-                                                        for num in &claimed_numbers {
-                                                            claimed.remove(num);
-                                                        }
-                                                    }
                                                     bg_l0_count.store(
                                                         inner.versions.current().l0_file_count(),
                                                         Ordering::Relaxed,
@@ -804,6 +826,13 @@ impl DB {
                                     else {
                                         break;
                                     };
+                                    // Claim released on every exit (success or
+                                    // `?`) via Drop — dropped before the next
+                                    // loop iteration re-picks.
+                                    let _claim = CompactionClaim {
+                                        claims: Arc::clone(&bg_compacting_files),
+                                        numbers: claimed_numbers,
+                                    };
 
                                     // Phase 2: I/O (no lock held)
                                     let ctx = CompactionContext {
@@ -838,22 +867,24 @@ impl DB {
                                             Some(&bg_stats),
                                         )
                                         .map_err(|e| format!("compaction install error: {}", e))?;
-                                        // Release the claim now that this compaction has
-                                        // installed or been discarded, either way.
-                                        {
-                                            let mut claimed = bg_compacting_files.lock();
-                                            for num in &claimed_numbers {
-                                                claimed.remove(num);
-                                            }
-                                        }
-                                        // Only unpin L0 inputs that this install actually
-                                        // consumed — install_compaction discards stale
-                                        // results (e.g. raced by another compaction
-                                        // thread) without deleting their input files, and
-                                        // those files' pinned blocks must stay pinned.
-                                        for num in &l0_inputs {
-                                            if cleanup.files_to_delete.contains(num) {
-                                                bg_block_cache.unpin_file(*num);
+                                        // Unpin L0 inputs that actually left L0.
+                                        // Covers both a normal install (input
+                                        // consumed and scheduled for deletion)
+                                        // and a trivial move (same physical file
+                                        // relabeled to L1, so not in
+                                        // files_to_delete). A discarded (stale,
+                                        // raced) install leaves the file in L0
+                                        // and its first-block pin must stay.
+                                        if !l0_inputs.is_empty() {
+                                            let current = inner.versions.current();
+                                            for num in &l0_inputs {
+                                                if !current
+                                                    .level_files(0)
+                                                    .iter()
+                                                    .any(|tf| tf.meta.number == *num)
+                                                {
+                                                    bg_block_cache.unpin_file(*num);
+                                                }
                                             }
                                         }
                                         bg_l0_count.store(
@@ -1338,7 +1369,8 @@ impl DB {
         // replacing the old inline-collection + full-scan preload approach.
         if any_range_deletions {
             // Collect tombstones with level info for cross-level pruning.
-            // A tombstone from level L can only delete keys from levels > L.
+            // A tombstone from level L may cover keys at level L or deeper;
+            // one strictly deeper than a key's source level never covers it.
             let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
             // Memtable tombstones are at level 0 (highest priority).
             if active_mem.has_range_deletions() {
@@ -1988,11 +2020,20 @@ impl DB {
                     Some(&self.stats),
                 )
                 .ctx()?;
-                // Only unpin L0 inputs this install actually consumed — a
-                // discarded (stale) install leaves those files live.
-                for num in &l0_inputs {
-                    if cleanup.files_to_delete.contains(num) {
-                        self.block_cache.unpin_file(*num);
+                // Unpin L0 inputs that actually left L0 — a trivial move
+                // relabels the same physical file to L1 (not in
+                // files_to_delete), while a discarded (stale) install leaves
+                // the file in L0 and its first-block pin must stay.
+                if !l0_inputs.is_empty() {
+                    let current = inner.versions.current();
+                    for num in &l0_inputs {
+                        if !current
+                            .level_files(0)
+                            .iter()
+                            .any(|tf| tf.meta.number == *num)
+                        {
+                            self.block_cache.unpin_file(*num);
+                        }
                     }
                 }
                 cleanup
@@ -2838,6 +2879,12 @@ impl DB {
             else {
                 break;
             };
+            // Claim released on every exit (success or `?`) via Drop —
+            // dropped before the next loop iteration re-picks.
+            let _claim = CompactionClaim {
+                claims: Arc::clone(&self.compacting_files),
+                numbers: claimed_numbers,
+            };
 
             // Phase 2: I/O (no lock held)
             let ctx = CompactionContext {
@@ -2869,19 +2916,21 @@ impl DB {
                     Some(&self.stats),
                 )
                 .ctx()?;
-                // Release the claim now that this compaction has installed
-                // or been discarded, either way.
-                {
-                    let mut claimed = self.compacting_files.lock();
-                    for num in &claimed_numbers {
-                        claimed.remove(num);
-                    }
-                }
-                // Only unpin L0 inputs this install actually consumed — a
-                // discarded (stale) install leaves those files live.
-                for num in &l0_inputs {
-                    if cleanup.files_to_delete.contains(num) {
-                        self.block_cache.unpin_file(*num);
+                // Unpin L0 inputs that actually left L0. Covers both a
+                // normal install (input consumed and scheduled for deletion)
+                // and a trivial move (same physical file relabeled to L1, so
+                // not in files_to_delete). A discarded (stale, raced) install
+                // leaves the file in L0 and its first-block pin must stay.
+                if !l0_inputs.is_empty() {
+                    let current = inner.versions.current();
+                    for num in &l0_inputs {
+                        if !current
+                            .level_files(0)
+                            .iter()
+                            .any(|tf| tf.meta.number == *num)
+                        {
+                            self.block_cache.unpin_file(*num);
+                        }
                     }
                 }
                 self.l0_file_count

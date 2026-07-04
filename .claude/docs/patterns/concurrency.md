@@ -62,19 +62,19 @@ Compaction threads must not hold `db_mutex` while performing I/O (reading/writin
 2. Perform compaction/flush I/O (no mutex)
 3. Acquire mutex → apply VersionEdit → release mutex
 
-Flush never runs on the background compaction threads (`do_compaction` only compacts SSTs; it never freezes/flushes a memtable). The real flush paths are:
+Flush never runs on the background compaction threads (they only compact SSTs; they never freeze/flush a memtable). The real flush paths are:
 - **Write-path auto-flush** (`write_batch_group`): freezes under `db_mutex`, drops the lock during the SST write, re-acquires to install
 - **Explicit `flush()` / `compact_range()`**: same pattern — lock released during the SST write
 - **`close()`** via `freeze_and_flush`: holds the lock throughout (shutdown path, not performance-critical)
 
-`do_compaction` holds `db_mutex` for its entire run; it is invoked by explicit `flush()`/`compact()`/`compact_range()` calls AND inline from the write path when L0 reaches `l0_stop_trigger` (`maybe_throttle_writes`).
+Synchronous compaction entry points follow the same 3-phase pattern: `drain_l0` (used by `flush()`'s post-flush trigger AND inline from the write path when L0 reaches `l0_stop_trigger` in `maybe_throttle_writes`) loops short-lock pick → unlocked merge I/O → short-lock install → unlocked manifest sync. `force_compact_all` (only reachable from the explicit `compact()` / `compact_range(None, None)` admin APIs) first runs `drain_l0`, then force-merges each level via `force_merge_level`, which holds `db_mutex` for that level's merge I/O — acceptable for the administrative path, but it must never become reachable from the ordinary write path.
 
 **Check**: Verify I/O operations happen between mutex release and re-acquire. For auto-flush in the write path, verify the lock is dropped before SST write and re-acquired after.
 
 ### INV-CC5: Write Stall Behavior (L0 Backpressure)
 When L0 file count (cached in an atomic, no lock) exceeds a threshold, the write path applies backpressure — without any condvar:
 - Slowdown (`l0_slowdown_trigger`): progressive `thread::sleep` delay, longer as L0 count grows
-- Stop (`l0_stop_trigger`): the writer runs **inline** `do_compaction()` synchronously to reduce L0 count; if that compaction fails, the DB fail-stops (background error is set) rather than admitting the write
+- Stop (`l0_stop_trigger`): the writer runs **inline** `drain_l0()` synchronously (short-lock pick/install pattern — the merge I/O itself runs without `db_mutex`) to reduce L0 count; if that compaction fails, the DB fail-stops (background error is set) rather than admitting the write
 
 **Check**: Verify the atomic L0 counter is refreshed after every install that changes L0 (flush install, compaction install, inline compaction). Verify the stop path fail-stops on compaction error instead of silently admitting writes.
 

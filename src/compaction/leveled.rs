@@ -1291,6 +1291,26 @@ impl LeveledCompaction {
         db_path: &Path,
         stats: Option<&Arc<DbStats>>,
     ) -> Result<PostCompactionCleanup> {
+        // Files this compaction physically CREATED. A trivial move's "new"
+        // file is the live input file itself (same number, relabeled to the
+        // target level), so it must never be deleted or evicted by the
+        // discard/error paths below — the current version still references
+        // it at the source level, and deleting it would permanently destroy
+        // data the MANIFEST points at. Normal outputs use freshly reserved
+        // numbers that can never collide with an input's.
+        let input_numbers: HashSet<u64> = output
+            .input_files
+            .iter()
+            .map(|(_, meta)| meta.number)
+            .collect();
+        let created_files: Vec<(u32, FileMetaData)> = output
+            .edit
+            .new_files
+            .iter()
+            .filter(|(_, meta)| !input_numbers.contains(&meta.number))
+            .cloned()
+            .collect();
+
         // Guard against stale compaction results. If any input file has already
         // been removed, or if a concurrent install added an unexpected target-level
         // overlap while this compaction was doing I/O, this output is based on an
@@ -1308,8 +1328,8 @@ impl LeveledCompaction {
             stale || Self::outputs_overlap_unexpected_current_files(&output, &version)
         };
         if discard {
-            cleanup_output_files(db_path, &output.edit.new_files, None);
-            evict_table_cache_files(table_cache, &output.edit.new_files);
+            cleanup_output_files(db_path, &created_files, None);
+            evict_table_cache_files(table_cache, &created_files);
             return Ok(PostCompactionCleanup {
                 files_to_delete: HashSet::new(),
             });
@@ -1322,12 +1342,12 @@ impl LeveledCompaction {
         output
             .edit
             .set_next_file_number(versions.next_file_number());
-        // Capture the output file list so we can delete the freshly-written SSTs
-        // if installing the edit fails (otherwise they would be orphaned on disk).
-        let output_files = output.edit.new_files.clone();
         if let Err(e) = versions.log_and_apply(output.edit) {
-            cleanup_output_files(db_path, &output_files, None);
-            evict_table_cache_files(table_cache, &output_files);
+            // Delete only the freshly-written SSTs (otherwise they would be
+            // orphaned on disk) — `created_files` excludes a trivial move's
+            // still-live input file.
+            cleanup_output_files(db_path, &created_files, None);
+            evict_table_cache_files(table_cache, &created_files);
             return Err(e).ctx();
         }
 
@@ -1894,6 +1914,119 @@ impl LeveledCompaction {
 mod tests {
     use crate::db::DB;
     use crate::options::DbOptions;
+
+    #[test]
+    fn test_discarded_trivial_move_preserves_live_input_file() {
+        use std::collections::HashSet;
+
+        use super::{CompactionOutput, LeveledCompaction, OutputTombstones};
+        use crate::manifest::version_edit::{FileMetaData, VersionEdit};
+        use crate::manifest::version_set::VersionSet;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        fn build_sst(
+            dir: &std::path::Path,
+            number: u64,
+            first: &[u8],
+            last: &[u8],
+        ) -> FileMetaData {
+            let path = dir.join(format!("{:06}.sst", number));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    internal_keys: true,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for key in [first, last] {
+                let ik = InternalKey::new(key, 1, ValueType::Value).into_bytes();
+                builder.add(&ik, b"v").unwrap();
+            }
+            let result = builder.finish().unwrap();
+            FileMetaData {
+                number,
+                file_size: result.file_size,
+                smallest_key: result.smallest_key.unwrap(),
+                largest_key: result.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut versions = VersionSet::create(dir.path(), 4).unwrap();
+
+        // Live input file #1 at L1, range [e, f].
+        let meta1 = build_sst(dir.path(), 1, b"e", b"f");
+        let mut edit = VersionEdit::new();
+        edit.add_file(1, meta1.clone());
+        edit.set_next_file_number(versions.next_file_number());
+        versions.log_and_apply(edit).unwrap();
+
+        // Conflicting file #2 at L2 spanning [a, z] — simulates a concurrent
+        // install (e.g. a force_merge_level hull output) landing while the
+        // trivial move below was in its unlocked pick→install window.
+        let meta2 = build_sst(dir.path(), 2, b"a", b"z");
+        let mut edit = VersionEdit::new();
+        edit.add_file(2, meta2.clone());
+        edit.set_next_file_number(versions.next_file_number());
+        versions.log_and_apply(edit).unwrap();
+
+        // The trivial-move output exactly as execute_compaction_io builds it:
+        // relabel file #1 from L1 to L2. `input_file_numbers` is empty
+        // because no new physical file was written — the "new" file at L2 is
+        // the same live 000001.sst.
+        let mut edit = VersionEdit::new();
+        edit.delete_file(1, meta1.number);
+        edit.add_file(2, meta1.clone());
+        let output = CompactionOutput {
+            edit,
+            input_files: vec![(1, meta1.clone())],
+            input_file_numbers: HashSet::new(),
+            next_file_number_hint: versions.next_file_number(),
+            output_tombstones: OutputTombstones::new(),
+        };
+
+        // Install must DISCARD the move (file #1's range now overlaps the
+        // unexpected live L2 file #2, so installing would break L2
+        // disjointness) — and the discard must NOT physically delete the
+        // still-referenced input file.
+        let cleanup = LeveledCompaction::install_compaction(
+            output,
+            &mut versions,
+            None,
+            None,
+            dir.path(),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            cleanup.files_to_delete.is_empty(),
+            "a discarded install must not schedule any deletions"
+        );
+        assert!(
+            dir.path().join("000001.sst").exists(),
+            "discarding a trivial move must not delete the live input SST"
+        );
+        let version = versions.current();
+        assert!(
+            version
+                .level_files(1)
+                .iter()
+                .any(|tf| tf.meta.number == meta1.number),
+            "input file must remain at L1 after the discard"
+        );
+        assert!(
+            version
+                .level_files(2)
+                .iter()
+                .all(|tf| tf.meta.number != meta1.number),
+            "discarded move must not appear at L2"
+        );
+    }
 
     #[test]
     fn test_compaction_trigger() {
