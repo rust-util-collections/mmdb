@@ -1441,7 +1441,21 @@ impl LeveledCompaction {
             .unwrap_or(SequenceNumber::MAX);
         let version = versions.current();
         let files = version.level_files(level);
-        if files.len() <= 1 {
+        if files.is_empty() {
+            return Ok(());
+        }
+        // A single file with a no-op filter is already in its final form —
+        // rewriting would waste I/O for no benefit. When the filter can
+        // actually remove or change entries (e.g. lazy-delete dead keys),
+        // even a single file must be reprocessed so every key-value pair
+        // passes through the filter.
+        if files.len() == 1
+            && ctx
+                .options
+                .compaction_filter
+                .as_ref()
+                .is_none_or(|f| f.is_noop())
+        {
             return Ok(());
         }
         let is_bottommost =
