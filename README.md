@@ -34,7 +34,7 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | WAL with group commit & crash recovery | Implemented |
 | SST files with prefix-compressed blocks | Implemented |
 | Bloom filters (per-key + prefix bloom) | Implemented |
-| Block cache (moka LRU) with L0 pinning (insert_pinned) | Implemented |
+| Block cache (moka LRU) with L0 first-block pinning (insert_pinned) | Implemented |
 | Table cache (open file handles) | Implemented |
 | MANIFEST version tracking + compaction | Implemented |
 | Leveled compaction with trivial move | Implemented |
@@ -120,7 +120,7 @@ Key optimizations:
 - **Cursor-based block iteration**: Decodes entries one-at-a-time from raw block data — no per-block Vec allocation
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
 - **Sequential readahead**: `posix_fadvise(WILLNEED)` after detecting sequential block access
-- **L0 metadata pinning**: Index/data blocks pinned for L0 files via `insert_pinned`; unpinned on compaction
+- **L0 first-block pinning**: Each L0 file's first data block (smallest key) is pinned via `insert_pinned` so `init_heap`'s first `peek()` is always a cache hit; unpinned on compaction. Index and filter blocks are held directly as `TableReader` fields and never go through `block_cache`
 - **Sweep-line range tombstone tracking**: O(1) amortized per key
 - **Lazy index loading**: Index parsed on first use
 - **Atomic L0 counter**: Write-throttle checks use an atomic counter, avoiding mutex contention on writes

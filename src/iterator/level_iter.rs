@@ -384,6 +384,21 @@ impl super::merge::SeekableIterator for LevelIterator {
         }
     }
 
+    fn prefetch_first_block(&mut self) {
+        // Lazily open the file at file_index (skipping filtered files) if
+        // none is open yet, mirroring the lazy-open pattern used by
+        // next()/next_into(). Without this, a cold-start LevelIterator has
+        // no open TableIterator to delegate the prefetch hint to, making
+        // the hint a no-op for every L1+ level.
+        if self.current_iter.is_none() && self.error.is_none() && self.file_index < self.files.len()
+        {
+            self.open_file_and_seek(None);
+        }
+        if let Some(ref mut iter) = self.current_iter {
+            iter.prefetch_first_block();
+        }
+    }
+
     fn set_bounds(&mut self, _lower: Option<&[u8]>, upper: Option<&[u8]>) {
         self.upper_bound = upper.map(|b| b.to_vec());
         // Propagate to the currently open table iterator, if any

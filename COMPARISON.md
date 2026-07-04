@@ -5,7 +5,7 @@
 | Feature | RocksDB | Pebble | mmdb | Notes |
 |---------|---------|--------|------|-------|
 | MergingIterator (heap-based) | Yes | Yes | Yes | O(N log K) merge |
-| Direction switch optimization (in-heap tracking) | Yes | Yes | Yes | Only re-seek off-heap sources |
+| Direction switch (bidirectional iteration) | Yes | Yes | Yes | Re-seeks all sources on switch — removed the in-heap tracking optimization since peeked entries in the heap belong to the wrong ordering (min vs max) after a switch |
 | TrySeekUsingNext | Yes | Yes | Yes | Step-forward instead of full seek when target >= current |
 | NextPrefix skip | No | Yes | Yes | O(log N) inter-prefix jump |
 | SeekGEWithLimit / IterAtLimit | No | Yes | No | Soft limit for distributed shard scanning |

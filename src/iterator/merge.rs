@@ -36,14 +36,6 @@ pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
     /// Fast path: bypass heap when exactly one source exists.
     /// Models RocksDB's MergeIteratorBuilder single-source optimization.
     single_source: bool,
-    /// Tracks which source indices are currently in the valid heap region.
-    /// Used by direction-switch methods to avoid re-seeking sources that
-    /// are already properly positioned.
-    in_heap: Vec<bool>,
-    /// Inclusive lower bound on user keys (for bounds propagation).
-    lower_bound: Option<Vec<u8>>,
-    /// Exclusive upper bound on user keys (for bounds propagation).
-    upper_bound: Option<Vec<u8>>,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
@@ -59,9 +51,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             direction: Direction::Forward,
             single_source: single,
             current_key: Vec::new(),
-            in_heap: vec![false; n],
-            lower_bound: None,
-            upper_bound: None,
         }
     }
 
@@ -91,14 +80,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
         self.heap = valid;
         self.heap_size = self.heap.len();
-
-        // Update in_heap tracking
-        for flag in self.in_heap.iter_mut() {
-            *flag = false;
-        }
-        for i in 0..self.heap_size {
-            self.in_heap[self.heap[i]] = true;
-        }
 
         // Build heap (bottom-up)
         if self.heap_size > 1 {
@@ -195,7 +176,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             self.sift_down(0);
         } else {
             // Source exhausted — remove from heap
-            self.in_heap[min_idx] = false;
             self.heap_size -= 1;
             if self.heap_size > 0 {
                 self.heap.swap(0, self.heap_size);
@@ -249,7 +229,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             self.sift_down(0);
         } else {
             // Source exhausted backward — remove from heap
-            self.in_heap[max_idx] = false;
             self.heap_size -= 1;
             if self.heap_size > 0 {
                 self.heap.swap(0, self.heap_size);
@@ -261,9 +240,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     }
 
     /// Switch from backward to forward direction.
-    /// Only re-seeks sources not currently in the heap; sources still in
-    /// the heap already hold valid peeked entries and just need the heap
-    /// rebuilt for forward (min-heap) ordering.
     fn switch_to_forward(&mut self) {
         self.direction = Direction::Forward;
         if self.current_key.is_empty() {
@@ -472,7 +448,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if self.sources[min_idx].has_peeked {
             self.sift_down(0);
         } else {
-            self.in_heap[min_idx] = false;
             self.heap_size -= 1;
             if self.heap_size > 0 {
                 self.heap.swap(0, self.heap_size);
@@ -508,7 +483,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if self.sources[min_idx].has_peeked {
             self.sift_down(0);
         } else {
-            self.in_heap[min_idx] = false;
             self.heap_size -= 1;
             if self.heap_size > 0 {
                 self.heap.swap(0, self.heap_size);
@@ -548,8 +522,6 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Set iteration bounds and propagate them to all sub-iterators.
     /// `lower` is inclusive, `upper` is exclusive (user keys).
     pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
-        self.lower_bound = lower.map(|b| b.to_vec());
-        self.upper_bound = upper.map(|b| b.to_vec());
         for source in self.sources.iter_mut() {
             source.set_bounds(lower, upper);
         }

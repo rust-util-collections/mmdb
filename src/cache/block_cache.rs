@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
@@ -18,11 +19,19 @@ type CacheValue = Arc<Vec<u8>>;
 type FileOffsets = Arc<Mutex<HashMap<u64, HashSet<u64>>>>;
 
 /// Thread-safe LRU cache for SST data blocks.
-/// Supports pinning entries that should never be evicted (e.g., L0 index/filter blocks).
+/// Supports pinning entries that should never be evicted — in practice this is
+/// just the first data block of each L0 file (see `insert_pinned`).
 pub struct BlockCache {
     inner: moka::sync::Cache<CacheKey, CacheValue>,
     /// Pinned entries — never evicted by LRU. Protected by mutex.
     pinned: Mutex<HashMap<CacheKey, CacheValue>>,
+    /// Fast-path hint: number of entries currently in `pinned`. `get()` checks
+    /// this atomic before acquiring `pinned`'s mutex so the common case (no
+    /// pinned entries at all, or a lookup for a key that isn't one) skips the
+    /// lock entirely. `Relaxed` is sufficient since this is only a hint —
+    /// `pinned` (guarded by its own mutex) remains the authoritative state and
+    /// is always consulted whenever the counter reads nonzero.
+    pinned_count: AtomicUsize,
     /// Track which offsets belong to each file for bulk invalidation.
     file_offsets: FileOffsets,
     /// When true (capacity 0), caching is disabled: inserts are no-ops and
@@ -57,6 +66,7 @@ impl BlockCache {
         Self {
             inner,
             pinned: Mutex::new(HashMap::new()),
+            pinned_count: AtomicUsize::new(0),
             file_offsets,
             disabled: capacity_bytes == 0,
         }
@@ -68,7 +78,12 @@ impl BlockCache {
             return None;
         }
         let key = (file_number, block_offset);
-        if let Some(v) = self.pinned.lock().get(&key) {
+        // Fast path: `pinned` is empty for the vast majority of lookups (only
+        // one data block per L0 file is ever pinned), so skip its mutex
+        // entirely unless the hint counter says there's something to find.
+        if self.pinned_count.load(Ordering::Relaxed) != 0
+            && let Some(v) = self.pinned.lock().get(&key)
+        {
             return Some(v.clone());
         }
         self.inner.get(&key)
@@ -90,7 +105,10 @@ impl BlockCache {
     }
 
     /// Insert a pinned block — never evicted by LRU.
-    /// Used for L0 index and filter blocks.
+    /// Used to pin the first data block (smallest key) of an L0 file, so the
+    /// merging iterator's initial `peek()` is always a cache hit. Index and
+    /// filter blocks are held directly as fields on `TableReader` and never
+    /// pass through this cache at all.
     pub fn insert_pinned(
         &self,
         file_number: u64,
@@ -102,7 +120,9 @@ impl BlockCache {
             return arc;
         }
         let key = (file_number, block_offset);
-        self.pinned.lock().insert(key, arc.clone());
+        if self.pinned.lock().insert(key, arc.clone()).is_none() {
+            self.pinned_count.fetch_add(1, Ordering::Relaxed);
+        }
         self.file_offsets
             .lock()
             .entry(file_number)
@@ -113,7 +133,13 @@ impl BlockCache {
 
     /// Unpin all entries for a specific file (e.g., when L0 file is compacted away).
     pub fn unpin_file(&self, file_number: u64) {
-        self.pinned.lock().retain(|&(f, _), _| f != file_number);
+        let mut pinned = self.pinned.lock();
+        let before = pinned.len();
+        pinned.retain(|&(f, _), _| f != file_number);
+        let removed = before - pinned.len();
+        if removed != 0 {
+            self.pinned_count.fetch_sub(removed, Ordering::Relaxed);
+        }
     }
 
     /// Invalidate all cached blocks for a specific file.
@@ -155,5 +181,53 @@ mod tests {
 
         // Miss
         assert!(cache.get(3, 0).is_none());
+    }
+
+    #[test]
+    fn test_block_cache_pinned_fast_path() {
+        let cache = BlockCache::new(1024 * 1024);
+
+        // Nothing pinned yet: the hint counter is zero, so get() must take the
+        // fast path (skip `pinned`'s mutex) and still miss cleanly.
+        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 0);
+        assert!(cache.get(1, 0).is_none());
+
+        // Pinning bumps the counter and is immediately visible via get().
+        cache.insert_pinned(1, 0, vec![9, 9, 9]);
+        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+        assert_eq!(*cache.get(1, 0).unwrap(), vec![9, 9, 9]);
+
+        // Re-pinning the same key must not double-count.
+        cache.insert_pinned(1, 0, vec![9, 9, 9]);
+        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+
+        // A normal (non-pinned) insert for another key doesn't touch the counter,
+        // and is still reachable once the fast path falls through to moka.
+        cache.insert(2, 0, vec![1, 2, 3]);
+        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+        assert_eq!(*cache.get(2, 0).unwrap(), vec![1, 2, 3]);
+
+        // Unpinning drops the counter back to zero; pinned entries are never
+        // mirrored into the moka-backed store, so the lookup now misses entirely.
+        cache.unpin_file(1);
+        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 0);
+        assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn test_block_cache_unpin_file_multiple_pinned_entries() {
+        let cache = BlockCache::new(1024 * 1024);
+        cache.insert_pinned(1, 0, vec![1]);
+        cache.insert_pinned(1, 4096, vec![2]);
+        cache.insert_pinned(2, 0, vec![3]);
+        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 3);
+
+        // Unpinning one file must decrement by exactly the number of entries
+        // removed for that file, leaving other files' pinned entries intact.
+        cache.unpin_file(1);
+        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+        assert!(cache.get(1, 0).is_none());
+        assert!(cache.get(1, 4096).is_none());
+        assert_eq!(*cache.get(2, 0).unwrap(), vec![3]);
     }
 }

@@ -15,9 +15,9 @@ Load this document FIRST before performing any review or debug analysis.
 
 ### 1.2 Group Commit Ordering
 **Pattern**: If a refactor changes the group commit leader to process WAL writes and MemTable inserts in separate passes (e.g., all WAL writes first, then all MemTable inserts), a reordering or partial-visibility window could emerge where batch B is visible in the MemTable before batch A, despite A having a lower sequence number.
-**Where**: `db.rs` write path — `write_batch_group()`. Currently correct: processes each batch sequentially (assign seq → WAL write → MemTable insert) in a single forward-order loop.
+**Where**: `db.rs` write path — `write_batch_group()`. Currently correct: sequence numbers for the whole group are reserved in bulk upfront, then one loop writes all WAL records, then a single fsync/flush, then a separate loop inserts into the MemTable — both loops iterate the batch group in the same fixed order, so relative ordering is preserved across the phase split.
 **Impact**: Would violate linearizability. A reader could see a later write but not an earlier one.
-**Check**: Verify the per-batch loop order is maintained: sequence assignment → WAL append → MemTable insert, all in the same forward pass. Watch for refactors that split these into separate passes.
+**Check**: Verify both the WAL-write loop and the MemTable-insert loop iterate the batch group in identical order. Watch for refactors that reorder within either phase, or that make one loop skip/reorder entries relative to the other.
 
 ### 1.3 Compaction + Flush Race
 **Pattern**: Flush produces a new L0 file while compaction is reading the file list. Compaction's `VersionEdit` overwrites the flush's `VersionEdit`.

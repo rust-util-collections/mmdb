@@ -287,7 +287,21 @@ pub enum CompactionFilterDecision {
 
 /// Trait for custom compaction filters.
 ///
-/// During compaction, each key-value pair is passed to the filter for a decision.
+/// [`filter`](Self::filter) is not invoked for every key-value pair a
+/// compaction touches — only when all of the following hold:
+///
+/// - The compaction's target level is the bottommost level for the affected
+///   key range. Applying `Remove` or `ChangeValue` above the bottommost level
+///   could otherwise resurrect stale data, since an older, unfiltered version
+///   of the same key may still live in a lower level and would then
+///   incorrectly become visible.
+/// - No snapshots are currently active. Removing or changing a value while a
+///   snapshot is open could change what that snapshot observes, violating its
+///   MVCC visibility guarantee. This means filtering silently pauses for as
+///   long as any snapshot remains open — including one leaked via a forgotten
+///   iterator — and resumes once the last snapshot is released.
+/// - The entry is a `Value`. `Deletion` and `RangeDeletion` entries are never
+///   passed to the filter.
 pub trait CompactionFilter: Send + Sync {
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionFilterDecision;
 

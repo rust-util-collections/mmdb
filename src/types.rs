@@ -182,6 +182,22 @@ impl<'a> InternalKeyRef<'a> {
         ValueType::from_u8((trailer & 0xFF) as u8).unwrap_or(ValueType::Deletion)
     }
 
+    /// Like [`value_type`](Self::value_type), but returns `Error::corruption`
+    /// instead of silently coercing an unrecognized trailer byte to
+    /// `Deletion`. Use this at decision points where mistaking a corrupted
+    /// `Value`/`RangeDeletion` entry for a `Deletion` would cause the entry
+    /// to be permanently and silently dropped (e.g. compaction's bottommost
+    /// tombstone/deletion-drop logic) — bit-rot surviving a checksum, or a
+    /// future on-disk variant, must fail loudly there rather than destroy
+    /// data irrecoverably.
+    #[inline]
+    pub fn value_type_checked(&self) -> Result<ValueType> {
+        let trailer = self.trailer();
+        let raw = (trailer & 0xFF) as u8;
+        ValueType::from_u8(raw)
+            .ok_or_else(|| Error::corruption(format!("invalid value_type byte {} in trailer", raw)))
+    }
+
     #[inline]
     fn trailer(&self) -> u64 {
         let offset = self.encoded.len() - 8;

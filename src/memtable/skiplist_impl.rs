@@ -40,7 +40,6 @@ const ARENA_MAX_BLOCK: usize = 1 << 20; // 1MB
 struct Arena {
     blocks: UnsafeCell<Vec<Vec<u8>>>,
     current_offset: UnsafeCell<usize>,
-    bytes_allocated: AtomicUsize,
 }
 
 impl Arena {
@@ -48,7 +47,6 @@ impl Arena {
         Self {
             blocks: UnsafeCell::new(Vec::new()),
             current_offset: UnsafeCell::new(0),
-            bytes_allocated: AtomicUsize::new(0),
         }
     }
 
@@ -69,9 +67,7 @@ impl Arena {
                 let aligned = (base + *offset + align - 1) & !(align - 1);
                 let new_offset = aligned - base + size;
                 if new_offset <= block.capacity() {
-                    let actual = new_offset - *offset; // includes alignment padding
                     *offset = new_offset;
-                    self.bytes_allocated.fetch_add(actual, Ordering::Relaxed);
                     return aligned as *mut u8;
                 }
             }
@@ -90,7 +86,6 @@ impl Arena {
             let aligned = (base + align - 1) & !(align - 1);
             let actual = aligned - base + size; // padding + size
             *offset = actual;
-            self.bytes_allocated.fetch_add(actual, Ordering::Relaxed);
             blocks.push(block);
             aligned as *mut u8
         }

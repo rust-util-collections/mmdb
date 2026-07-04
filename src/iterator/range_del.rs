@@ -238,10 +238,19 @@ impl FragmentedRangeTombstoneList {
         self.max_covering_tombstone_seq_for_level(user_key, snapshot, None)
     }
 
-    /// Level-aware variant: only considers tombstones from levels strictly less
-    /// than `source_level`. A tombstone from level L can only delete keys from
-    /// levels > L (deeper levels hold older data).
-    /// Pass `None` for no level filtering (backward compatible).
+    /// Level-aware variant: excludes tombstones from levels strictly deeper
+    /// than `source_level`. A tombstone that is *at or shallower than* the
+    /// key's own level may still delete it — that is the ordinary, essential
+    /// way range deletes (and same-level Put+DeleteRange, e.g. entirely
+    /// within one MemTable) work, and must not be excluded. Only a tombstone
+    /// strictly *deeper* than the key is excluded: since compaction only
+    /// ever moves data to deeper levels over time, a tombstone that has
+    /// already been compacted past the key's own level cannot represent a
+    /// legitimate later-in-time delete of that key — trusting it would risk
+    /// hiding a key whose sequence was zeroed at the bottommost level
+    /// (`is_bottommost && seq < oldest_snapshot_seq`) based on a coincidental
+    /// but unrelated deeper tombstone. Pass `None` for no level filtering
+    /// (backward compatible).
     pub fn max_covering_tombstone_seq_for_level(
         &self,
         user_key: &[u8],
@@ -272,9 +281,10 @@ impl FragmentedRangeTombstoneList {
             if seq > snapshot {
                 continue;
             }
-            // Only tombstones from shallower levels can delete this key.
+            // Only tombstones strictly deeper than the key are excluded;
+            // same-level and shallower tombstones may always cover it.
             if let Some(src_lvl) = source_level
-                && level >= src_lvl
+                && level > src_lvl
             {
                 continue;
             }

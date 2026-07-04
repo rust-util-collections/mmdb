@@ -652,8 +652,11 @@ fn execute_sub_compaction_io(
         }
 
         if ikr.value_type() == ValueType::RangeDeletion {
-            range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
-            range_tombstones.reset();
+            // Not re-added to `range_tombstones` here: `all_raw_tombstones`
+            // already pre-populated the tracker with every tombstone in the
+            // input set (including this one) before the loop started, so
+            // re-adding it on every native occurrence would just duplicate
+            // entries and force a full re-sort per tombstone for no benefit.
             if let Some(ref last) = last_range_del_key
                 && last.as_slice() == ikey.as_slice()
             {
@@ -695,9 +698,14 @@ fn execute_sub_compaction_io(
             last_written_seq = ikr.sequence();
             snapshot_idx = ctx.active_snapshots.len();
 
-            if ikr.value_type() == ValueType::Deletion
-                && params.is_bottommost
+            // Only a genuine Deletion may be dropped here, and only at the
+            // bottommost level below the oldest snapshot — use the strict
+            // decode so a corrupted trailer byte fails the compaction loudly
+            // instead of being silently misread as Deletion and permanently
+            // destroyed (the original input files are untouched on error).
+            if params.is_bottommost
                 && ikr.sequence() < params.oldest_snapshot_seq
+                && ikr.value_type_checked().ctx()? == ValueType::Deletion
             {
                 continue;
             }
@@ -870,10 +878,25 @@ impl LeveledCompaction {
     }
 
     /// Check if compaction is needed and return a task if so.
-    pub fn pick_compaction(version: &Version, options: &DbOptions) -> Option<CompactionTask> {
+    ///
+    /// `in_flight` excludes file numbers already claimed by another
+    /// concurrent compaction's pick (see `DB::compacting_files`) — with
+    /// `max_background_compactions > 1`, multiple threads call this
+    /// independently, and without exclusion two threads could pick the same
+    /// input files and redundantly re-process them before
+    /// `install_compaction`'s stale-input check discards the loser. Pass an
+    /// empty set for read-only "is compaction pending"-style checks that
+    /// don't actually claim the result.
+    pub fn pick_compaction(
+        version: &Version,
+        options: &DbOptions,
+        in_flight: &HashSet<u64>,
+    ) -> Option<CompactionTask> {
         // Priority 1: L0 → L1 when L0 has too many files
-        if version.l0_file_count() >= options.l0_compaction_trigger {
-            return Self::pick_l0_compaction(version);
+        if version.l0_file_count() >= options.l0_compaction_trigger
+            && let Some(task) = Self::pick_l0_compaction(version, in_flight)
+        {
+            return Some(task);
         }
 
         // Priority 2: Check each level for size overflow
@@ -884,18 +907,29 @@ impl LeveledCompaction {
                 .map(|f| f.meta.file_size)
                 .sum();
             let max_size = Self::max_bytes_for_level(options, level);
-            if level_size > max_size {
-                return Self::pick_level_compaction(version, level);
+            if level_size > max_size
+                && let Some(task) = Self::pick_level_compaction(version, level, in_flight)
+            {
+                return Some(task);
             }
         }
 
         None
     }
 
-    /// Pick L0 → L1 compaction.
-    fn pick_l0_compaction(version: &Version) -> Option<CompactionTask> {
+    /// Pick L0 → L1 compaction. Returns `None` (deferring to another
+    /// priority) if any current L0 file is already claimed by another
+    /// in-flight compaction — L0 compaction always includes the *entire*
+    /// current L0 file set, so a partial pick isn't meaningful here; the
+    /// caller's next loop iteration retries once the other compaction
+    /// installs or is discarded and clears its claim.
+    fn pick_l0_compaction(version: &Version, in_flight: &HashSet<u64>) -> Option<CompactionTask> {
         let l0_files = version.level_files(0);
-        if l0_files.is_empty() {
+        if l0_files.is_empty()
+            || l0_files
+                .iter()
+                .any(|tf| in_flight.contains(&tf.meta.number))
+        {
             return None;
         }
 
@@ -911,6 +945,12 @@ impl LeveledCompaction {
         } else {
             Self::overlapping_files(version.level_files(1), &smallest, &largest)
         };
+        if input_l1
+            .iter()
+            .any(|tf| in_flight.contains(&tf.meta.number))
+        {
+            return None;
+        }
 
         Some(CompactionTask {
             level: 0,
@@ -919,15 +959,24 @@ impl LeveledCompaction {
         })
     }
 
-    /// Pick Ln → Ln+1 compaction.
-    fn pick_level_compaction(version: &Version, level: usize) -> Option<CompactionTask> {
+    /// Pick Ln → Ln+1 compaction. Returns `None` (deferring to another
+    /// priority/level) if the selected input file or any overlapping
+    /// next-level file is already claimed by another in-flight compaction.
+    fn pick_level_compaction(
+        version: &Version,
+        level: usize,
+        in_flight: &HashSet<u64>,
+    ) -> Option<CompactionTask> {
         let files = version.level_files(level);
         if files.is_empty() {
             return None;
         }
 
-        // Pick the largest file in this level
-        let target = files.iter().max_by_key(|f| f.meta.file_size)?;
+        // Pick the largest file in this level that isn't already claimed.
+        let target = files
+            .iter()
+            .filter(|f| !in_flight.contains(&f.meta.number))
+            .max_by_key(|f| f.meta.file_size)?;
         let input_level = vec![target.clone()];
 
         let (smallest, largest) = Self::total_key_range(&input_level);
@@ -941,6 +990,12 @@ impl LeveledCompaction {
         } else {
             Vec::new()
         };
+        if input_next
+            .iter()
+            .any(|tf| in_flight.contains(&tf.meta.number))
+        {
+            return None;
+        }
 
         Some(CompactionTask {
             level,
@@ -1002,88 +1057,6 @@ impl LeveledCompaction {
         None
     }
 
-    /// Execute compaction with optional table cache for eviction and rate limiter.
-    ///
-    /// `active_snapshots` lists sequence numbers of all open snapshots.
-    /// At the bottommost level, keys with sequence numbers below the smallest
-    /// active snapshot get their sequence zeroed and tombstones below that
-    /// snapshot are dropped.
-    /// Convenience wrapper: runs compaction I/O and installs the result.
-    /// Requires `&mut VersionSet` for the entire duration — use
-    /// `execute_compaction_io` + `install_compaction` separately when
-    /// you want to release the lock during I/O.
-    pub(crate) fn execute_compaction_with_cache(
-        ctx: &CompactionContext<'_>,
-        task: &CompactionTask,
-        versions: &mut VersionSet,
-        table_cache: Option<&Arc<TableCache>>,
-        block_cache: Option<&Arc<BlockCache>>,
-    ) -> Result<()> {
-        let target_level = task.level + 1;
-
-        // Trivial move optimization: if there's exactly one input file and no
-        // overlap with the next level, just move the metadata without rewriting.
-        // Skip the optimisation when the compaction filter could remove or
-        // change entries — it needs to see every key-value pair. A filter that
-        // reports itself a no-op (e.g. lazy-delete with no user filter and no
-        // registered dead keys) still permits the move.
-        if task.input_files_level.len() == 1
-            && task.input_files_next.is_empty()
-            && ctx
-                .options
-                .compaction_filter
-                .as_ref()
-                .is_none_or(|f| f.is_noop())
-        {
-            let tf = &task.input_files_level[0];
-            let mut edit = VersionEdit::new();
-            edit.delete_file(task.level as u32, tf.meta.number);
-            edit.add_file(target_level as u32, tf.meta.clone());
-            edit.set_next_file_number(versions.next_file_number());
-            versions.log_and_apply(edit).ctx()?;
-            if let Some(s) = ctx.stats {
-                s.record_compaction_completed();
-            }
-            return Ok(());
-        }
-
-        let max_outputs = Self::max_output_files(task, ctx.options);
-        let file_number_start = versions.reserve_file_numbers(max_outputs);
-
-        let version = versions.current();
-        let all_inputs: Vec<_> = task
-            .input_files_level
-            .iter()
-            .chain(task.input_files_next.iter())
-            .cloned()
-            .collect();
-        let is_bottom =
-            Self::is_bottommost_level(&version, target_level, ctx.options.num_levels, &all_inputs);
-
-        let output = Self::execute_compaction_io(
-            ctx,
-            task,
-            file_number_start,
-            file_number_start.saturating_add(max_outputs),
-            is_bottom,
-        )
-        .ctx()?;
-
-        let cleanup = Self::install_compaction(
-            output,
-            versions,
-            table_cache,
-            block_cache,
-            ctx.db_path,
-            ctx.stats,
-        )
-        .ctx()?;
-        // This path holds &mut VersionSet for the duration, so sync here.
-        versions.sync_manifest().ctx()?;
-        Self::run_post_compaction_cleanup(&cleanup, ctx.db_path);
-        Ok(())
-    }
-
     /// Pure I/O phase of compaction — does NOT require any lock.
     ///
     /// Merges input files, writes output SSTs using pre-allocated file numbers,
@@ -1100,6 +1073,47 @@ impl LeveledCompaction {
         is_bottommost: bool,
     ) -> Result<CompactionOutput> {
         let target_level = task.level + 1;
+
+        // Trivial move optimization: if there's exactly one input file and no
+        // overlap with the next level, just move the metadata without
+        // rewriting. Skip it when the compaction filter could remove or
+        // change entries — it needs to see every key-value pair. A filter
+        // that reports itself a no-op (e.g. lazy-delete with no user filter
+        // and no registered dead keys) still permits the move. Building this
+        // as a normal `CompactionOutput` (rather than applying it directly)
+        // means it goes through `install_compaction`'s stale-input check
+        // like any other compaction — required now that every caller of
+        // this function (including concurrent background workers) can reach
+        // this path, not just the single-threaded `do_compaction`.
+        if task.input_files_level.len() == 1
+            && task.input_files_next.is_empty()
+            && ctx
+                .options
+                .compaction_filter
+                .as_ref()
+                .is_none_or(|f| f.is_noop())
+        {
+            let tf = &task.input_files_level[0];
+            let mut edit = VersionEdit::new();
+            edit.delete_file(task.level as u32, tf.meta.number);
+            edit.add_file(target_level as u32, tf.meta.clone());
+            return Ok(CompactionOutput {
+                edit,
+                input_files: vec![(task.level as u32, tf.meta.clone())],
+                // Empty, NOT `{tf.meta.number}`: a trivial move relabels the
+                // same physical file to a new level rather than replacing it
+                // with a newly-written one. `input_file_numbers` drives both
+                // cache eviction and (via `PostCompactionCleanup`) physical
+                // deletion in `install_compaction` — including this file's
+                // number here would delete the very file this edit just
+                // added back into the version.
+                input_file_numbers: HashSet::new(),
+                // No new file numbers are consumed by a metadata-only move.
+                next_file_number_hint: file_number_start,
+                output_tombstones: OutputTombstones::new(),
+            });
+        }
+
         let oldest_snapshot_seq = ctx
             .active_snapshots
             .iter()
@@ -1562,9 +1576,12 @@ impl LeveledCompaction {
                 last_written_seq = ikr.sequence();
                 snapshot_idx = ctx.active_snapshots.len();
 
-                if ikr.value_type() == ValueType::Deletion
-                    && is_bottommost
+                // See execute_sub_compaction_io: strict decode so a corrupted
+                // trailer byte fails loudly instead of being silently
+                // misread as Deletion and permanently destroyed.
+                if is_bottommost
                     && ikr.sequence() < oldest_snapshot_seq
+                    && ikr.value_type_checked().ctx()? == ValueType::Deletion
                 {
                     continue;
                 }
@@ -1753,6 +1770,7 @@ impl LeveledCompaction {
     pub fn pick_compaction_for_hint(
         version: &Version,
         hint: &CompactionHint,
+        in_flight: &HashSet<u64>,
     ) -> Option<CompactionTask> {
         let level = hint.level;
         if level == 0 || level >= version.num_levels.saturating_sub(1) {
@@ -1763,7 +1781,7 @@ impl LeveledCompaction {
             return None;
         }
         // Pick the largest file at the hinted level.
-        Self::pick_level_compaction(version, level)
+        Self::pick_level_compaction(version, level, in_flight)
     }
 
     /// Maximum bytes for a given level.

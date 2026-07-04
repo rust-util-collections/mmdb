@@ -676,10 +676,12 @@ impl Iterator for TableIterator {
             if self.at_first_key_from_index {
                 self.at_first_key_from_index = false;
                 self.materialize_deferred_block();
+                if self.err.is_some() {
+                    return None;
+                }
                 if let Some(entry) = self.cursor_next() {
                     return Some(entry);
                 }
-                // Fall through to load_next_block if materialize failed
             }
             // Try cursor-based path first (forward iteration)
             if let Some(entry) = self.cursor_next() {
@@ -771,6 +773,9 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         if self.at_first_key_from_index {
             self.at_first_key_from_index = false;
             self.materialize_deferred_block();
+            if self.err.is_some() {
+                return false;
+            }
         }
         loop {
             // Try cursor-based path (forward iteration)
@@ -1314,5 +1319,92 @@ mod tests {
         }
 
         assert_eq!(seen, 20);
+    }
+
+    /// Regression test for the deferred-block-read error-swallowing bug:
+    /// `seek()` can position the iterator at a block's `first_key` without
+    /// reading the block (`at_first_key_from_index = true`), deferring the
+    /// actual I/O to `materialize_deferred_block()` on the first subsequent
+    /// `next()`. If that deferred read fails, `next()` must surface the
+    /// error immediately rather than silently falling through to the next
+    /// (readable) block as if the scan were undisturbed.
+    #[test]
+    fn test_deferred_block_read_error_does_not_skip_to_next_block() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        use crate::iterator::merge::SeekableIterator;
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deferred_err.sst");
+
+        // block_size: 1 forces exactly one entry per block, so each block's
+        // first_key equals its only key and seeking to that key deterministically
+        // triggers the deferred-read fast path in `seek()`.
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        const COUNT: usize = 6;
+        let keys: Vec<Vec<u8>> = (0..COUNT)
+            .map(|i| {
+                let user_key = format!("key_{:06}", i);
+                InternalKey::new(user_key.as_bytes(), (COUNT - i) as u64, ValueType::Value)
+                    .into_bytes()
+            })
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            builder.add(k, format!("value_{i}").as_bytes()).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        let entries = reader.cached_index_entries().unwrap();
+        assert_eq!(entries.len(), COUNT, "expected one block per entry");
+
+        // Corrupt only the stored CRC byte of block index 2's trailer, in place,
+        // without changing the file's length or touching any other block's bytes.
+        // Blocks 0 and 1 (before it) and 3..5 (after it) stay byte-for-byte intact,
+        // so block 3 remains genuinely readable — if the deferred error were
+        // silently swallowed, `next()` would incorrectly yield block 3's entry
+        // instead of surfacing the corruption.
+        let target = &entries[2];
+        let crc_byte_offset = target.handle.offset + target.handle.size + 1;
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(crc_byte_offset)).unwrap();
+            let mut byte = [0u8; 1];
+            f.read_exact(&mut byte).unwrap();
+            f.seek(SeekFrom::Start(crc_byte_offset)).unwrap();
+            f.write_all(&[byte[0].wrapping_add(1)]).unwrap();
+        }
+
+        let mut iter = TableIterator::new(Arc::new(reader));
+        iter.seek(&keys[2]);
+
+        let result = iter.next();
+        assert!(
+            result.is_none(),
+            "next() must return None on a deferred block read error instead of \
+             silently yielding an entry from the next block, got {:?}",
+            result
+        );
+        let err = iter.iter_error();
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("CRC")),
+            "iter_error() must report the deferred block CRC mismatch, got {:?}",
+            err
+        );
     }
 }

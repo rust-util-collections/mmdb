@@ -534,6 +534,11 @@ impl VersionSet {
         let mut new_writer = match WalWriter::new(&new_manifest_path).ctx() {
             Ok(writer) => writer,
             Err(e) => {
+                // WalWriter::new creates (and truncates) the file before its
+                // own parent-directory fsync, so a failure here (e.g. that
+                // fsync failing) can still leave an empty file on disk —
+                // clean it up like every other failure branch below.
+                let _ = fs::remove_file(&new_manifest_path);
                 tracing::warn!("MANIFEST compaction deferred creating snapshot: {}", e);
                 return;
             }

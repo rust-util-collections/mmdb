@@ -960,6 +960,71 @@ mod tests {
     }
 
     #[test]
+    fn test_db_iterator_deeper_level_tombstone_does_not_cover_key() {
+        // Regression test: a tombstone may only cover keys from its own
+        // level or shallower — NEVER from a level strictly deeper than
+        // itself (cross-level tombstone pruning, see iterator.md). This
+        // guards the sequence-zeroing interaction: once a bottommost-level
+        // key's sequence is zeroed by compaction (a legitimate optimization
+        // for keys with no live snapshot dependency), a naive seq-only
+        // tombstone comparison would treat ANY still-live tombstone as
+        // covering it, including one that has already been compacted deeper
+        // than the key and therefore cannot represent a legitimate
+        // later-in-time delete of it. The per-source level tag is what
+        // still correctly excludes such a tombstone in that case.
+        let key_source = sort_lex(vec![make_entry(
+            b"key5",
+            0,
+            ValueType::Value,
+            b"still_alive",
+        )]);
+        let mut iter =
+            DBIterator::from_sources(vec![IterSource::new(key_source).with_level(1)], 100);
+
+        // Tombstone ["a", "z") at level 2 — strictly DEEPER than the key's
+        // level 1. It must NOT cover the key despite having a much higher
+        // sequence number than the key's (zeroed) sequence.
+        iter.set_range_tombstones_with_levels(vec![(b"a".to_vec(), b"z".to_vec(), 50, 2)]);
+
+        let entries: Vec<_> = iter.collect();
+        assert_eq!(
+            entries,
+            vec![(b"key5".to_vec(), b"still_alive".to_vec())],
+            "deeper-level tombstone incorrectly hid a live key with a lower (zeroed) sequence number"
+        );
+    }
+
+    #[test]
+    fn test_db_iterator_shallower_or_same_level_tombstone_covers_key() {
+        // Complements the test above: a tombstone from the SAME level, or
+        // from a level STRICTLY SHALLOWER than the key's source level, must
+        // still be allowed to cover it — this is ordinary, essential range-
+        // delete behavior (e.g. a DeleteRange applied in the active
+        // MemTable must immediately hide matching keys already sitting in
+        // deeper, already-flushed/compacted levels, and a DeleteRange must
+        // also cover a Put in the very same MemTable). The invariant only
+        // excludes STRICTLY deeper tombstones (see test above).
+        for tombstone_level in [0usize, 1, 2] {
+            let key_source = sort_lex(vec![make_entry(b"key5", 0, ValueType::Value, b"stale")]);
+            let mut iter =
+                DBIterator::from_sources(vec![IterSource::new(key_source).with_level(2)], 100);
+            iter.set_range_tombstones_with_levels(vec![(
+                b"a".to_vec(),
+                b"z".to_vec(),
+                50,
+                tombstone_level,
+            )]);
+            let entries: Vec<_> = iter.collect();
+            assert!(
+                entries.is_empty(),
+                "level-{} tombstone should still cover a level-2 key, got {:?}",
+                tombstone_level,
+                entries
+            );
+        }
+    }
+
+    #[test]
     fn test_db_iterator_snapshot() {
         let source = sort_lex(vec![
             make_entry(b"a", 5, ValueType::Value, b"new"),

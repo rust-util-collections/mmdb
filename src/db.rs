@@ -144,6 +144,16 @@ pub struct DB {
     compaction_notify: Arc<(StdMutex<bool>, StdCondvar)>,
     /// Background compaction thread handles.
     compaction_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// File numbers currently claimed by an in-progress compaction pick
+    /// (between `pick_compaction` and `install_compaction`/discard). Lets
+    /// concurrent background compaction threads (multiple
+    /// `max_background_compactions`) avoid redundantly picking and fully
+    /// re-processing the same input files while one thread's pick is still
+    /// doing unlocked I/O. `install_compaction`'s stale-input check already
+    /// makes this safe on its own (the loser's output is discarded, never
+    /// installed) — this only avoids wasting the loser's merge/compress/
+    /// write work and rate-limiter budget.
+    compacting_files: Arc<Mutex<HashSet<u64>>>,
     /// Cached L0 file count for fast write-throttle checks.
     /// Updated after flush/compaction. Avoids locking `inner` on every write.
     l0_file_count: Arc<AtomicUsize>,
@@ -488,6 +498,7 @@ impl DB {
         let compaction_notify = Arc::new((StdMutex::new(false), StdCondvar::new()));
         let has_bg_error = Arc::new(AtomicBool::new(false));
         let bg_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let compacting_files: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
 
         // Wrap the user's compaction filter with lazy-delete support.
         let dead_keys = Arc::new(RwLock::new(HashSet::new()));
@@ -530,6 +541,7 @@ impl DB {
             let bg_snapshot_list = snapshot_list.clone();
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
+            let bg_compacting_files = compacting_files.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -569,8 +581,9 @@ impl DB {
                                             let pick = {
                                                 let mut inner = bg_inner.lock();
                                                 let version = inner.versions.current();
+                                                let mut claimed = bg_compacting_files.lock();
                                                 LeveledCompaction::pick_compaction_for_hint(
-                                                    &version, hint,
+                                                    &version, hint, &claimed,
                                                 )
                                                 .map(|task| {
                                                     let max_out =
@@ -596,6 +609,11 @@ impl DB {
                                                             bg_options.num_levels,
                                                             &all_inputs,
                                                         );
+                                                    let claimed_numbers: Vec<u64> = all_inputs
+                                                        .iter()
+                                                        .map(|f| f.meta.number)
+                                                        .collect();
+                                                    claimed.extend(claimed_numbers.iter().copied());
                                                     // Capture the snapshot list under the
                                                     // DB lock, consistent with the inputs.
                                                     let active_snaps =
@@ -606,6 +624,7 @@ impl DB {
                                                         file_limit,
                                                         is_bottom,
                                                         active_snaps,
+                                                        claimed_numbers,
                                                     )
                                                 })
                                             }; // lock released
@@ -616,6 +635,7 @@ impl DB {
                                                 file_limit,
                                                 is_bottom,
                                                 active_snaps,
+                                                claimed_numbers,
                                             )) = pick
                                             {
                                                 // Phase 2: I/O (no lock)
@@ -635,7 +655,24 @@ impl DB {
                                                         format!("hint compaction error: {}", e)
                                                     })?;
 
-                                                // Phase 3: install (short lock, no fsync)
+                                                // Pre-warm the table cache for the new
+                                                // output files while unlocked, so the
+                                                // install phase's log_and_apply (which
+                                                // opens each new file to install its
+                                                // reader) hits a warm cache instead of
+                                                // parsing footers/indexes under the lock.
+                                                bg_table_cache.prewarm(
+                                                    output
+                                                        .edit
+                                                        .new_files
+                                                        .iter()
+                                                        .map(|(_, meta)| meta.number),
+                                                );
+
+                                                // Phase 3: install (short lock; log_and_apply
+                                                // still does a directory fsync when new
+                                                // files were added, but the per-file SST
+                                                // open above is now warm)
                                                 let cleanup = {
                                                     let mut inner = bg_inner.lock();
                                                     let cleanup =
@@ -653,6 +690,13 @@ impl DB {
                                                                 e
                                                             )
                                                         })?;
+                                                    {
+                                                        let mut claimed =
+                                                            bg_compacting_files.lock();
+                                                        for num in &claimed_numbers {
+                                                            claimed.remove(num);
+                                                        }
+                                                    }
                                                     bg_l0_count.store(
                                                         inner.versions.current().l0_file_count(),
                                                         Ordering::Relaxed,
@@ -687,9 +731,11 @@ impl DB {
                                     let pick = {
                                         let mut inner = bg_inner.lock();
                                         let version = inner.versions.current();
+                                        let mut claimed = bg_compacting_files.lock();
                                         match LeveledCompaction::pick_compaction(
                                             &version,
                                             &bg_options,
+                                            &claimed,
                                         ) {
                                             Some(task) => {
                                                 let l0_inputs: Vec<u64> = if task.level == 0 {
@@ -720,6 +766,15 @@ impl DB {
                                                         bg_options.num_levels,
                                                         &all_inputs,
                                                     );
+                                                // Claim all input file numbers so a
+                                                // concurrent compaction thread's next
+                                                // pick skips them until we install or
+                                                // discard (see below).
+                                                let claimed_numbers: Vec<u64> = all_inputs
+                                                    .iter()
+                                                    .map(|f| f.meta.number)
+                                                    .collect();
+                                                claimed.extend(claimed_numbers.iter().copied());
                                                 // Capture the snapshot list under the DB
                                                 // lock, consistent with the picked inputs.
                                                 let active_snaps = bg_snapshot_list.as_sorted_vec();
@@ -730,6 +785,7 @@ impl DB {
                                                     l0_inputs,
                                                     is_bottom,
                                                     active_snaps,
+                                                    claimed_numbers,
                                                 ))
                                             }
                                             None => None,
@@ -743,6 +799,7 @@ impl DB {
                                         l0_inputs,
                                         is_bottom,
                                         active_snaps,
+                                        claimed_numbers,
                                     )) = pick
                                     else {
                                         break;
@@ -761,7 +818,15 @@ impl DB {
                                     )
                                     .map_err(|e| format!("compaction error: {}", e))?;
 
-                                    // Phase 3: install (short lock, no fsync)
+                                    // Pre-warm the table cache for the new output files
+                                    // while unlocked (see hint-compaction branch above).
+                                    bg_table_cache.prewarm(
+                                        output.edit.new_files.iter().map(|(_, meta)| meta.number),
+                                    );
+
+                                    // Phase 3: install (short lock; log_and_apply still
+                                    // does a directory fsync when new files were added,
+                                    // but the per-file SST open above is now warm)
                                     let cleanup = {
                                         let mut inner = bg_inner.lock();
                                         let cleanup = LeveledCompaction::install_compaction(
@@ -773,8 +838,23 @@ impl DB {
                                             Some(&bg_stats),
                                         )
                                         .map_err(|e| format!("compaction install error: {}", e))?;
+                                        // Release the claim now that this compaction has
+                                        // installed or been discarded, either way.
+                                        {
+                                            let mut claimed = bg_compacting_files.lock();
+                                            for num in &claimed_numbers {
+                                                claimed.remove(num);
+                                            }
+                                        }
+                                        // Only unpin L0 inputs that this install actually
+                                        // consumed — install_compaction discards stale
+                                        // results (e.g. raced by another compaction
+                                        // thread) without deleting their input files, and
+                                        // those files' pinned blocks must stay pinned.
                                         for num in &l0_inputs {
-                                            bg_block_cache.unpin_file(*num);
+                                            if cleanup.files_to_delete.contains(num) {
+                                                bg_block_cache.unpin_file(*num);
+                                            }
                                         }
                                         bg_l0_count.store(
                                             inner.versions.current().l0_file_count(),
@@ -847,6 +927,7 @@ impl DB {
             compaction_shutdown,
             compaction_notify,
             compaction_handles: Mutex::new(compaction_handles),
+            compacting_files,
             l0_file_count,
             super_version,
             read_compaction_hints,
@@ -1163,7 +1244,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_memtable(cursor));
+            sources.push(IterSource::from_memtable(cursor).with_level(0));
         }
 
         // Immutable memtables
@@ -1172,7 +1253,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_memtable(cursor));
+            sources.push(IterSource::from_memtable(cursor).with_level(0));
         }
 
         // SST files — only include files whose key range overlaps [lower_bound, upper_bound].
@@ -1202,7 +1283,7 @@ impl DB {
             if !options.block_property_filters.is_empty() {
                 iter = iter.with_block_filters(options.block_property_filters.clone());
             }
-            sources.push(IterSource::from_table_iter(iter));
+            sources.push(IterSource::from_table_iter(iter).with_level(0));
         }
         for level in 1..version.num_levels {
             let files = version.level_files(level);
@@ -1226,7 +1307,7 @@ impl DB {
             if !options.block_property_filters.is_empty() {
                 level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
             }
-            sources.push(IterSource::from_level_iter(level_iter));
+            sources.push(IterSource::from_level_iter(level_iter).with_level(level));
         }
 
         let mut db_iter = DBIterator::from_sources(sources, seq);
@@ -1363,7 +1444,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_memtable(cursor));
+            sources.push(IterSource::from_memtable(cursor).with_level(0));
         }
 
         // Immutable memtables
@@ -1372,7 +1453,7 @@ impl DB {
                 any_range_deletions = true;
             }
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_memtable(cursor));
+            sources.push(IterSource::from_memtable(cursor).with_level(0));
         }
 
         // Compute prefix upper bound once, share across all uses.
@@ -1419,7 +1500,7 @@ impl DB {
             if !options.block_property_filters.is_empty() {
                 iter = iter.with_block_filters(options.block_property_filters.clone());
             }
-            sources.push(IterSource::from_table_iter(iter));
+            sources.push(IterSource::from_table_iter(iter).with_level(0));
         }
         // L1+: one LevelIterator per level with lazy file opening.
         for level in 1..version.num_levels {
@@ -1442,7 +1523,7 @@ impl DB {
             if !options.block_property_filters.is_empty() {
                 level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
             }
-            sources.push(IterSource::from_level_iter(level_iter));
+            sources.push(IterSource::from_level_iter(level_iter).with_level(level));
         }
 
         let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix_owned.to_vec());
@@ -1555,24 +1636,24 @@ impl DB {
         let mut sources: Vec<IterSource> = Vec::with_capacity(est_sources);
 
         // Batch source first (highest priority due to higher sequence numbers).
-        sources.push(IterSource::new(batch_entries));
+        sources.push(IterSource::new(batch_entries).with_level(0));
 
         // Active memtable.
         {
             let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_memtable(cursor));
+            sources.push(IterSource::from_memtable(cursor).with_level(0));
         }
 
         // Immutable memtables.
         for imm in imm_mems.iter() {
             let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_memtable(cursor));
+            sources.push(IterSource::from_memtable(cursor).with_level(0));
         }
 
         // SST files: L0 individually, L1+ via LevelIterator.
         for tf in version.level_files(0) {
             let iter = TableIterator::new(tf.reader.clone());
-            sources.push(IterSource::from_table_iter(iter));
+            sources.push(IterSource::from_table_iter(iter).with_level(0));
         }
         for level in 1..version.num_levels {
             let files = version.level_files(level);
@@ -1580,7 +1661,7 @@ impl DB {
                 continue;
             }
             let level_iter = LevelIterator::new(files.to_vec());
-            sources.push(IterSource::from_level_iter(level_iter));
+            sources.push(IterSource::from_level_iter(level_iter).with_level(level));
         }
 
         let mut db_iter = DBIterator::from_sources(sources, seq);
@@ -1715,7 +1796,11 @@ impl DB {
             "block-cache-usage" => Some(self.block_cache.entry_count().to_string()),
             "compaction-pending" => {
                 let version = inner.versions.current();
-                let needed = LeveledCompaction::pick_compaction(&version, &self.options).is_some();
+                // Informational only (not an actual pick+claim), so don't
+                // bother excluding in-flight files here.
+                let needed =
+                    LeveledCompaction::pick_compaction(&version, &self.options, &HashSet::new())
+                        .is_some();
                 Some(if needed { "1" } else { "0" }.to_string())
             }
             "stats.bytes_written" => {
@@ -1780,16 +1865,21 @@ impl DB {
         let old_wal = frozen.old_wal_number;
         self.post_flush_cleanup(old_wal).ctx()?;
         if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger {
-            self.do_compaction().ctx()?;
+            self.drain_l0().ctx()?;
         }
         Ok(())
     }
 
-    /// Run compaction if needed (L0 → L1 or Ln → Ln+1).
+    /// Run compaction if needed: drains L0, then force-merges every level
+    /// (L1..Ln) down to as few files as possible — a full, deliberate
+    /// compaction of the whole database, similar in spirit to calling
+    /// `compact_range(None, None)`. For light, incremental L0 relief only
+    /// (e.g. from application code reacting to write throttling), prefer
+    /// relying on background compaction instead of calling this directly.
     pub fn compact(&self) -> Result<()> {
         self.check_usable().ctx()?;
         let _wg = self.write_queue.lock();
-        self.do_compaction()
+        self.force_compact_all()
     }
 
     /// Compact all keys in the given range across all levels.
@@ -1815,7 +1905,7 @@ impl DB {
 
         // If no range specified, fall back to full compaction
         if begin.is_none() && end.is_none() {
-            return self.do_compaction();
+            return self.force_compact_all();
         }
 
         // Range-filtered compaction: compact files overlapping [begin, end)
@@ -1882,6 +1972,11 @@ impl DB {
             )
             .ctx()?;
 
+            // Pre-warm the table cache for the new output files while
+            // unlocked (see the background compaction loop for rationale).
+            self.table_cache
+                .prewarm(output.edit.new_files.iter().map(|(_, meta)| meta.number));
+
             let cleanup = {
                 let mut inner = self.inner.lock();
                 let cleanup = LeveledCompaction::install_compaction(
@@ -1893,8 +1988,12 @@ impl DB {
                     Some(&self.stats),
                 )
                 .ctx()?;
+                // Only unpin L0 inputs this install actually consumed — a
+                // discarded (stale) install leaves those files live.
                 for num in &l0_inputs {
-                    self.block_cache.unpin_file(*num);
+                    if cleanup.files_to_delete.contains(num) {
+                        self.block_cache.unpin_file(*num);
+                    }
                 }
                 cleanup
             };
@@ -1922,6 +2021,11 @@ impl DB {
     /// during the next compaction that encounters it, without writing a
     /// tombstone. This avoids write amplification for bulk cleanup.
     ///
+    /// If the number of accumulated dead keys newly crosses
+    /// `lazy_delete_compaction_threshold`, a background compaction is
+    /// automatically signalled (same behavior as
+    /// [`lazy_delete_batch`](Self::lazy_delete_batch)).
+    ///
     /// **Note:** The key remains readable via `get()` until compaction
     /// physically removes it. Use regular `delete()` if immediate
     /// invisibility is required.
@@ -1932,8 +2036,15 @@ impl DB {
     /// the keys will remain in the database permanently unless
     /// re-registered.
     pub fn lazy_delete(&self, key: &[u8]) {
+        let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
+        let prev_len = set.len();
         set.insert(key.to_vec());
+        let len = set.len();
+        drop(set);
+        if threshold > 0 && len >= threshold && prev_len < threshold {
+            self.signal_compaction();
+        }
     }
 
     /// Batch version of [`lazy_delete`](Self::lazy_delete).
@@ -2124,8 +2235,13 @@ impl DB {
         let l0_count = self.l0_file_count.load(Ordering::Relaxed);
 
         if l0_count >= self.options.l0_stop_trigger {
-            // Slow path: do inline compaction to reduce L0 count.
-            if let Err(e) = self.do_compaction() {
+            // Slow path: drain L0 to reduce the file count. Uses drain_l0
+            // (not force_compact_all) so an ordinary write only pays for
+            // enough compaction to relieve L0 pressure — not a full
+            // multi-level database compaction — and does not hold db_mutex
+            // for the duration of the merge I/O (drain_l0 follows the
+            // standard short-lock pick/install pattern).
+            if let Err(e) = self.drain_l0() {
                 // The stop trigger is the last line of defense against
                 // unbounded L0 growth. If compaction is failing, admitting
                 // the write would silently disable the stall exactly when it
@@ -2435,11 +2551,10 @@ impl DB {
 
         if let Some(old_wal) = flush_wal {
             if let Err(e) = self.post_flush_cleanup(old_wal) {
-                tracing::warn!(
-                    "post-flush cleanup failed for WAL {}: {} — manifest sync may have failed",
-                    old_wal,
-                    e
-                );
+                // post_flush_cleanup already fail-stops (set_bg_error) on
+                // manifest-sync failure; just log here since this path
+                // can't propagate a Result to a caller.
+                tracing::warn!("post-flush cleanup failed for WAL {}: {}", old_wal, e);
             }
             self.signal_compaction();
         }
@@ -2549,7 +2664,7 @@ impl DB {
         frozen: &FrozenMemtable,
     ) -> Result<Vec<(u64, TableBuildResult)>> {
         let mut numbers = frozen.sst_numbers.iter().copied();
-        Self::write_memtable_ssts(
+        let results = Self::write_memtable_ssts(
             &frozen.old_mem,
             &self.path,
             &|| self.flush_build_opts(),
@@ -2560,7 +2675,14 @@ impl DB {
                     )
                 })
             },
-        )
+        )?;
+        // Pre-warm the table cache for the new SSTs while unlocked, so
+        // install_flush's log_and_apply (which opens each new file to
+        // install its reader) hits a warm cache instead of parsing
+        // footers/indexes while db_mutex is held.
+        self.table_cache
+            .prewarm(results.iter().map(|(number, _)| *number));
+        Ok(results)
     }
 
     /// Phase 3 (under lock, fast): install flush result into version.
@@ -2613,12 +2735,24 @@ impl DB {
 
     /// Sync the manifest and delete the old WAL after install_flush.
     /// Must be called outside the main lock.
+    ///
+    /// By the time this runs, `install_flush` has already applied the
+    /// VersionEdit and removed the memtable from `immutable_memtables`, so
+    /// the only remaining risk is manifest durability: a later successful
+    /// flush would advance `log_number` past this WAL (stale reads + lost
+    /// recovery), so a sync failure here fail-stops via `set_bg_error` for
+    /// every caller (explicit `flush()`/`compact_range()`, and the hot
+    /// auto-flush path, which cannot otherwise propagate this failure to
+    /// any caller since the enclosing write still needs to return `Ok`).
     fn post_flush_cleanup(&self, old_wal_number: u64) -> Result<()> {
         {
             let handle = self.inner.lock().versions.manifest_sync_handle();
             let mut w = handle.lock();
-            if let Some(ref mut writer) = *w {
-                writer.sync().ctx()?;
+            if let Some(ref mut writer) = *w
+                && let Err(e) = writer.sync()
+            {
+                self.set_bg_error(format!("post-flush manifest sync failed: {}", e));
+                return Err(e).ctx();
             }
         }
         let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
@@ -2628,54 +2762,173 @@ impl DB {
         Ok(())
     }
 
-    fn do_compaction(&self) -> Result<()> {
-        // Force-compact: use trigger=1 to compact any L0 files.
+    /// Drain L0 down below its compaction trigger. Follows the same
+    /// short-lock pick → unlocked I/O → short-lock install → unlocked sync
+    /// pattern used by the background compaction thread pool
+    /// (`.claude/docs/patterns/concurrency.md` INV-CC4), so this does not
+    /// stall other `db_mutex` consumers (writers, other compactions, admin
+    /// calls) for the duration of the merge I/O — unlike the previous
+    /// `do_compaction`, which held the lock for its entire run. Used by the
+    /// inline write-throttle path and by `flush()`'s post-flush trigger,
+    /// neither of which should pay for a full-database compaction.
+    fn drain_l0(&self) -> Result<()> {
         let force_opts = DbOptions {
             l0_compaction_trigger: 1,
             ..self.options.clone()
         };
-
-        let mut inner = self.inner.lock();
-        // Capture the snapshot list under the DB lock (consistent with the inputs
-        // picked below, which all have sequence <= the current sequence). Any
-        // snapshot registered after this point also registers under the DB lock,
-        // so its sequence is >= the inputs' max sequence and needs no GC'd version.
-        let active_snaps = self.snapshot_list.as_sorted_vec();
-        let ctx = CompactionContext {
-            db_path: &self.path,
-            options: &force_opts,
-            rate_limiter: Some(&self.rate_limiter),
-            stats: Some(&self.stats),
-            active_snapshots: &active_snaps,
-        };
         loop {
-            let version = inner.versions.current();
-            match LeveledCompaction::pick_compaction(&version, &force_opts) {
-                Some(task) => {
-                    let l0_inputs: Vec<u64> = if task.level == 0 {
-                        task.input_files_level
+            // Phase 1: pick + pre-allocate (short lock)
+            let pick = {
+                let mut inner = self.inner.lock();
+                let version = inner.versions.current();
+                let mut claimed = self.compacting_files.lock();
+                match LeveledCompaction::pick_compaction(&version, &force_opts, &claimed) {
+                    Some(task) => {
+                        let l0_inputs: Vec<u64> = if task.level == 0 {
+                            task.input_files_level
+                                .iter()
+                                .map(|f| f.meta.number)
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let max_out = LeveledCompaction::max_output_files(&task, &force_opts);
+                        let file_start = inner.versions.reserve_file_numbers(max_out);
+                        let file_limit = file_start.saturating_add(max_out);
+                        let all_inputs: Vec<_> = task
+                            .input_files_level
                             .iter()
-                            .map(|f| f.meta.number)
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    LeveledCompaction::execute_compaction_with_cache(
-                        &ctx,
-                        &task,
-                        &mut inner.versions,
-                        Some(&self.table_cache),
-                        Some(&self.block_cache),
-                    )
-                    .ctx()?;
-                    for num in &l0_inputs {
+                            .chain(task.input_files_next.iter())
+                            .cloned()
+                            .collect();
+                        let is_bottom = LeveledCompaction::is_bottommost_level(
+                            &version,
+                            task.level + 1,
+                            force_opts.num_levels,
+                            &all_inputs,
+                        );
+                        let claimed_numbers: Vec<u64> =
+                            all_inputs.iter().map(|f| f.meta.number).collect();
+                        claimed.extend(claimed_numbers.iter().copied());
+                        // Capture the snapshot list under the DB lock,
+                        // consistent with the inputs just picked.
+                        let active_snaps = self.snapshot_list.as_sorted_vec();
+                        Some((
+                            task,
+                            file_start,
+                            file_limit,
+                            l0_inputs,
+                            is_bottom,
+                            active_snaps,
+                            claimed_numbers,
+                        ))
+                    }
+                    None => None,
+                }
+            }; // lock released
+            let Some((
+                task,
+                file_start,
+                file_limit,
+                l0_inputs,
+                is_bottom,
+                active_snaps,
+                claimed_numbers,
+            )) = pick
+            else {
+                break;
+            };
+
+            // Phase 2: I/O (no lock held)
+            let ctx = CompactionContext {
+                db_path: &self.path,
+                options: &force_opts,
+                rate_limiter: Some(&self.rate_limiter),
+                stats: Some(&self.stats),
+                active_snapshots: &active_snaps,
+            };
+            let output = LeveledCompaction::execute_compaction_io(
+                &ctx, &task, file_start, file_limit, is_bottom,
+            )
+            .ctx()?;
+
+            // Pre-warm the table cache for the new output files while
+            // unlocked (see the background compaction loop for rationale).
+            self.table_cache
+                .prewarm(output.edit.new_files.iter().map(|(_, meta)| meta.number));
+
+            // Phase 3: install (short lock)
+            let cleanup = {
+                let mut inner = self.inner.lock();
+                let cleanup = LeveledCompaction::install_compaction(
+                    output,
+                    &mut inner.versions,
+                    Some(&self.table_cache),
+                    Some(&self.block_cache),
+                    &self.path,
+                    Some(&self.stats),
+                )
+                .ctx()?;
+                // Release the claim now that this compaction has installed
+                // or been discarded, either way.
+                {
+                    let mut claimed = self.compacting_files.lock();
+                    for num in &claimed_numbers {
+                        claimed.remove(num);
+                    }
+                }
+                // Only unpin L0 inputs this install actually consumed — a
+                // discarded (stale) install leaves those files live.
+                for num in &l0_inputs {
+                    if cleanup.files_to_delete.contains(num) {
                         self.block_cache.unpin_file(*num);
                     }
                 }
-                None => break,
+                self.l0_file_count
+                    .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+                self.install_super_version(&inner);
+                cleanup
+            };
+            // Phase 4: sync manifest + delete old SSTs (no lock)
+            {
+                let handle = self.inner.lock().versions.manifest_sync_handle();
+                let mut w = handle.lock();
+                if let Some(ref mut writer) = *w {
+                    writer.sync().ctx()?;
+                }
             }
+            LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
         }
+        Ok(())
+    }
+
+    /// Drain L0, then force-merge every level down to as few files as
+    /// possible. This is the full, deliberate compaction used by the
+    /// explicit, user-invoked `compact()` / `compact_range(None, None)`
+    /// entry points — NOT by the inline write-throttle path or `flush()`,
+    /// which only need `drain_l0` to relieve L0 backpressure. The lock is
+    /// released between `drain_l0` and each level (and between levels), so
+    /// this does not hold `db_mutex` for the whole operation in one shot,
+    /// though each individual level's merge I/O is still performed under
+    /// lock (`force_merge_level` requires `&mut VersionSet` throughout) —
+    /// acceptable here since this path is administrative, not the write hot
+    /// path that `drain_l0` was split out to protect.
+    fn force_compact_all(&self) -> Result<()> {
+        self.drain_l0()?;
+        let force_opts = DbOptions {
+            l0_compaction_trigger: 1,
+            ..self.options.clone()
+        };
         for level in 1..self.options.num_levels {
+            let mut inner = self.inner.lock();
+            let active_snaps = self.snapshot_list.as_sorted_vec();
+            let ctx = CompactionContext {
+                db_path: &self.path,
+                options: &force_opts,
+                rate_limiter: Some(&self.rate_limiter),
+                stats: Some(&self.stats),
+                active_snapshots: &active_snaps,
+            };
             LeveledCompaction::force_merge_level(
                 &ctx,
                 level,
@@ -2684,10 +2937,10 @@ impl DB {
                 Some(&self.block_cache),
             )
             .ctx()?;
+            self.l0_file_count
+                .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+            self.install_super_version(&inner);
         }
-        self.l0_file_count
-            .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
-        self.install_super_version(&inner);
         Ok(())
     }
 
@@ -3002,8 +3255,15 @@ impl DB {
     /// Useful for testing WAL recovery without zombie compaction threads.
     pub fn simulate_crash(mut self) {
         self.closed.store(true, Ordering::Release);
-        self.compaction_shutdown.store(true, Ordering::Release);
-        self.compaction_notify.1.notify_all();
+        // Hold the condvar's mutex while setting the shutdown flag and
+        // notifying, so a waiter that has just re-checked its condition
+        // cannot miss this wakeup and block forever (lost-wakeup race).
+        {
+            let (lock, cvar) = &*self.compaction_notify;
+            let _guard = lock.lock().unwrap();
+            self.compaction_shutdown.store(true, Ordering::Release);
+            cvar.notify_all();
+        }
         for handle in self.compaction_handles.lock().drain(..) {
             let _ = handle.join();
         }
@@ -3025,8 +3285,15 @@ impl Drop for DB {
             }
         }
         // Shut down background compaction threads: set shutdown flag, wake all, join.
-        self.compaction_shutdown.store(true, Ordering::Release);
-        self.compaction_notify.1.notify_all();
+        // Hold the condvar's mutex across the flag-set + notify so a waiter
+        // that just re-checked its condition cannot miss this wakeup and
+        // block forever (lost-wakeup race) — mirrors signal_compaction().
+        {
+            let (lock, cvar) = &*self.compaction_notify;
+            let _guard = lock.lock().unwrap();
+            self.compaction_shutdown.store(true, Ordering::Release);
+            cvar.notify_all();
+        }
         for handle in self.compaction_handles.lock().drain(..) {
             let _ = handle.join();
         }

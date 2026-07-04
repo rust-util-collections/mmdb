@@ -61,6 +61,22 @@ impl TableCache {
             .with_ctx(|| format!("table cache load failed for file {:06}", file_number))
     }
 
+    /// Best-effort pre-warm for newly-built SST files, meant to be called
+    /// from a caller's *unlocked* I/O phase (flush/compaction), before the
+    /// short locked phase that calls `VersionSet::log_and_apply`.
+    /// `log_and_apply` itself calls `get_reader` for every new file to
+    /// install its `Arc<TableReader>` into the new `Version` — if that file
+    /// is already warm here, that call becomes a cache hit instead of a
+    /// blocking file open + footer/index/filter parse while `db_mutex` is
+    /// held. Errors are silently ignored: this is purely an optimization,
+    /// the authoritative open (and its error handling) still happens inside
+    /// `log_and_apply`.
+    pub fn prewarm(&self, file_numbers: impl IntoIterator<Item = u64>) {
+        for number in file_numbers {
+            let _ = self.get_reader(number);
+        }
+    }
+
     /// Evict a file from the cache.
     pub fn evict(&self, file_number: u64) {
         self.inner.invalidate(&file_number);
