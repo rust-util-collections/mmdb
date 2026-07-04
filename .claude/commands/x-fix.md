@@ -45,6 +45,10 @@ For each open finding, in severity order:
 1. Remove all fixed entries from `## Open`.
 2. Add `**Reason**` to entries moved to `## Won't Fix`.
 3. Write the updated `docs/audit.md`.
+   **NEVER include timestamps, dates, "Last review", "Last sweep", "Last cleared",
+   or any time-based markers in the file.** Dates bias future reviews toward
+   shallowness ("it was just reviewed, I can skip"). The file must carry
+   zero information about *when* it was last touched.
 
 ## Phase 2: Self-Review
 

@@ -14,6 +14,9 @@ Execute `/x-review all` — the Full Audit Protocol in `.claude/commands/x-revie
 2. Launch parallel agents per Subsystem Map row; each agent reads all its source files plus its pattern guide(s) and performs the deep analysis (invariants, boundary conditions, failure paths, concurrency, unsafe audit, style rules).
 3. Aggregate and deduplicate all findings.
 4. Update `docs/audit.md` — prune fixed entries, merge new findings sorted by severity.
+   **NEVER include timestamps, dates, "Last review", "Last sweep", "Last cleared",
+   or any time-based markers in the file.** Dates bias future reviews toward
+   shallowness. The file must carry zero information about *when* it was last touched.
 
 ## Phase 2: Fix
 

@@ -84,6 +84,10 @@ After completing the analysis:
    - Promote fixable entries back to `## Open`; delete entries that no longer apply with an audit timestamp note.
    Do NOT silently carry forward Won't Fix entries — each must earn its place again against the latest code.
 5. Write the updated `docs/audit.md`.
+   **NEVER include timestamps, dates, "Last review", "Last sweep", "Last cleared",
+   or any time-based markers in the file.** Dates bias future reviews toward
+   shallowness ("it was just reviewed, I can skip"). The file must carry
+   zero information about *when* it was last touched.
 
 File format:
 
