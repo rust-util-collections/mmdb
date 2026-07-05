@@ -79,8 +79,12 @@ pub struct DbOptions {
     pub block_property_collectors:
         Vec<Arc<dyn Fn() -> Box<dyn BlockPropertyCollector> + Send + Sync>>,
     /// When the number of keys registered via [`DB::lazy_delete_batch`]
-    /// reaches this threshold, a background compaction is automatically
-    /// signalled. Set to 0 to disable auto-triggering.
+    /// reaches this threshold, a background sweep is automatically
+    /// scheduled: every populated level is force-rewritten through the
+    /// compaction filter so the registered keys are physically removed
+    /// even when no organic compaction is pending. Comparable in cost to
+    /// an explicit [`DB::compact`] over the whole store. Set to 0 to
+    /// disable auto-triggering.
     pub lazy_delete_compaction_threshold: usize,
 }
 

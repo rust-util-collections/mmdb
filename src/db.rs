@@ -198,6 +198,13 @@ pub struct DB {
     /// Keys registered for lazy deletion. Checked during compaction
     /// and dropped without writing tombstones.
     dead_keys: Arc<RwLock<HashSet<Vec<u8>>>>,
+    /// Set when lazy-delete registrations newly cross
+    /// `lazy_delete_compaction_threshold`; consumed by the background
+    /// compaction thread, which then force-rewrites every populated level
+    /// through the compaction filter. Debt-driven picks alone would never
+    /// revisit an already-settled store (L0 below its trigger, no level
+    /// oversized), leaving registered keys in place forever.
+    dead_key_sweep: Arc<AtomicBool>,
 }
 
 // SAFETY: the raw `*mut WriteRequest` pointers held in `write_queue` reference
@@ -532,6 +539,7 @@ impl DB {
             };
             options.compaction_filter = Some(Arc::new(lazy_filter));
         }
+        let dead_key_sweep = Arc::new(AtomicBool::new(false));
 
         let (l0_file_count, super_version) = {
             let g = inner.lock();
@@ -565,6 +573,7 @@ impl DB {
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
             let bg_compacting_files = compacting_files.clone();
+            let bg_dead_key_sweep = dead_key_sweep.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -909,6 +918,47 @@ impl DB {
                                         &cleanup, &bg_path,
                                     );
                                 }
+
+                                // Dead-key sweep: lazy_delete[_batch] crossing
+                                // its threshold requests a full filtered
+                                // rewrite. The debt-driven picks above only
+                                // run where compaction is already needed — a
+                                // settled store (e.g. a single L0 or L1 file)
+                                // would never be revisited and the registered
+                                // keys would linger forever. force_merge_level
+                                // rewrites each populated level in place
+                                // (single-file levels included whenever the
+                                // filter is non-noop) and applies the filter
+                                // wherever bottommost-safety allows, exactly
+                                // like the explicit compact() path.
+                                if bg_dead_key_sweep.swap(false, Ordering::AcqRel) {
+                                    for level in 0..bg_options.num_levels {
+                                        let mut inner = bg_inner.lock();
+                                        let active_snaps = bg_snapshot_list.as_sorted_vec();
+                                        let ctx = CompactionContext {
+                                            db_path: &bg_path,
+                                            options: &bg_options,
+                                            rate_limiter: Some(&bg_rate_limiter),
+                                            stats: Some(&bg_stats),
+                                            active_snapshots: &active_snaps,
+                                        };
+                                        LeveledCompaction::force_merge_level(
+                                            &ctx,
+                                            level,
+                                            &mut inner.versions,
+                                            Some(&bg_table_cache),
+                                            Some(&bg_block_cache),
+                                        )
+                                        .map_err(|e| {
+                                            format!("dead-key sweep error at L{}: {}", level, e)
+                                        })?;
+                                        bg_l0_count.store(
+                                            inner.versions.current().l0_file_count(),
+                                            Ordering::Relaxed,
+                                        );
+                                        refresh_super_version(&bg_sv, &inner);
+                                    }
+                                }
                                 Ok(())
                             },
                         ));
@@ -966,6 +1016,7 @@ impl DB {
             snapshot_list,
             _lock_file,
             dead_keys,
+            dead_key_sweep,
         };
 
         // Kick the background compaction threads once at startup. A DB
@@ -2087,9 +2138,15 @@ impl DB {
     /// tombstone. This avoids write amplification for bulk cleanup.
     ///
     /// If the number of accumulated dead keys newly crosses
-    /// `lazy_delete_compaction_threshold`, a background compaction is
-    /// automatically signalled (same behavior as
-    /// [`lazy_delete_batch`](Self::lazy_delete_batch)).
+    /// `lazy_delete_compaction_threshold`, a background sweep is
+    /// automatically scheduled: every populated level is force-rewritten
+    /// through the compaction filter (same behavior as
+    /// [`lazy_delete_batch`](Self::lazy_delete_batch)), so the keys are
+    /// physically removed even when the store has no organic compaction
+    /// debt. Removal is subject to the usual bottommost-safety rule: a
+    /// version shadowing an older version at a deeper level is kept until
+    /// later compactions reach that data, exactly as with
+    /// [`compact`](Self::compact).
     ///
     /// **Note:** The key remains readable via `get()` until compaction
     /// physically removes it. Use regular `delete()` if immediate
@@ -2108,7 +2165,7 @@ impl DB {
         let len = set.len();
         drop(set);
         if threshold > 0 && len >= threshold && prev_len < threshold {
-            self.signal_compaction();
+            self.request_dead_key_sweep();
         }
     }
 
@@ -2118,8 +2175,9 @@ impl DB {
     /// for durability caveats.
     ///
     /// If the number of accumulated dead keys newly crosses
-    /// `lazy_delete_compaction_threshold`, a background compaction is
-    /// automatically signalled.
+    /// `lazy_delete_compaction_threshold`, a background sweep is
+    /// automatically scheduled — see [`lazy_delete`](Self::lazy_delete)
+    /// for its exact semantics.
     pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
@@ -2130,8 +2188,19 @@ impl DB {
         let len = set.len();
         drop(set);
         if threshold > 0 && len >= threshold && prev_len < threshold {
-            self.signal_compaction();
+            self.request_dead_key_sweep();
         }
+    }
+
+    /// Arm the background dead-key sweep and wake the compaction thread.
+    /// The sweep force-rewrites every populated level through the
+    /// compaction filter — a plain `signal_compaction()` is not enough,
+    /// because the background thread's debt-driven picks find nothing to
+    /// do on a settled store and the registered keys would never be
+    /// physically removed.
+    fn request_dead_key_sweep(&self) {
+        self.dead_key_sweep.store(true, Ordering::Release);
+        self.signal_compaction();
     }
 
     /// Returns the current number of keys registered for lazy deletion.

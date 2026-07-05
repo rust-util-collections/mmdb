@@ -231,3 +231,56 @@ fn lazy_delete_single_file_at_l1_removed_by_compact() {
         );
     }
 }
+
+/// Regression: crossing the threshold must trigger the sweep even when the
+/// store is fully settled (no compaction debt). Previously the crossing only
+/// called `signal_compaction()`; the woken background thread found nothing
+/// debt-driven to pick (L0 below its trigger, no oversized level, read hints
+/// only fire for multi-file L2+ levels) and went back to sleep — the dead
+/// keys were never physically removed. The original auto-trigger test above
+/// passed only when the 20 puts happened to leave L0 exactly at the
+/// compaction trigger; on machines where the background thread drained L0
+/// before `lazy_delete_batch` ran, it timed out.
+#[test]
+fn lazy_delete_sweeps_settled_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            lazy_delete_compaction_threshold: 5,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    for i in 0u32..20 {
+        db.put(&i.to_be_bytes(), &[i as u8; 64]).unwrap();
+    }
+    // Settle the store: one L0 file, below the L0 trigger — no debt anywhere.
+    db.flush().unwrap();
+
+    let dead: Vec<Vec<u8>> = (0u32..6).map(|i| i.to_be_bytes().to_vec()).collect();
+    db.lazy_delete_batch(&dead);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let all_gone = (0u32..6).all(|i| db.get(&i.to_be_bytes()).unwrap().is_none());
+        if all_gone {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "dead keys were not swept on a settled store"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    for i in 6u32..20 {
+        assert!(
+            db.get(&i.to_be_bytes()).unwrap().is_some(),
+            "key {} should survive",
+            i
+        );
+    }
+}
