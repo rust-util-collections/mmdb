@@ -154,8 +154,11 @@ impl VersionSet {
             let edit = VersionEdit::decode(&data).ctx()?;
             edits_replayed += 1;
 
+            // Forward-only, mirroring `log_and_apply`'s bookkeeping: replayed
+            // edits are chronological, so a lower value is necessarily stale
+            // and taking it would re-issue already-consumed file numbers.
             if let Some(n) = edit.next_file_number {
-                next_file_number = n;
+                next_file_number = next_file_number.max(n);
             }
             if let Some(n) = edit.log_number {
                 log_number = n;
@@ -348,9 +351,18 @@ impl VersionSet {
                     }
                 }
                 Err(e) => {
+                    // Nothing has been persisted or applied at this point —
+                    // the edit is rejected wholesale. Include an existence
+                    // probe so a post-mortem can distinguish "file vanished"
+                    // (unlinked between build and install) from "file present
+                    // but unreadable" (open raced a transient failure).
+                    let sst_path = self.db_path.join(format!("{:06}.sst", meta.number));
                     return Err(Error::corruption(format!(
-                        "failed to open new SST {}: {}",
-                        meta.number, e
+                        "failed to open new SST {} (path {}, exists_now={}): {}",
+                        meta.number,
+                        sst_path.display(),
+                        sst_path.exists(),
+                        e
                     )));
                 }
             }
@@ -409,9 +421,12 @@ impl VersionSet {
             }
         }
 
-        // Update bookkeeping
+        // Update bookkeeping. Forward-only: file numbers are never reused,
+        // so an edit carrying a stale (lower) counter value must never move
+        // the allocator backwards — a regression would re-issue numbers of
+        // files that may still exist on disk or be referenced by the version.
         if let Some(n) = edit.next_file_number {
-            self.next_file_number = n;
+            self.next_file_number = self.next_file_number.max(n);
         }
         if let Some(n) = edit.log_number {
             self.log_number = n;
@@ -493,6 +508,15 @@ impl VersionSet {
     /// Number of the MANIFEST file currently being appended to.
     pub fn manifest_number(&self) -> u64 {
         self.manifest_number
+    }
+
+    /// Whether the MANIFEST writer is poisoned (a record append failed
+    /// mid-write or a rotation's durability could not be confirmed).
+    /// While poisoned, every `log_and_apply` fails fast without applying
+    /// anything; only a reopen recovers. Callers use this to distinguish
+    /// a fail-stop condition from a cleanly-rejected (retryable) edit.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub fn last_sequence(&self) -> SequenceNumber {
@@ -721,6 +745,76 @@ mod tests {
         // Recovery must fail because SST file 10 does not exist
         let result = VersionSet::recover(path, 7);
         assert!(result.is_err(), "recovery should fail on missing SST");
+    }
+
+    /// A `log_and_apply` whose new SST cannot be opened must reject the
+    /// edit wholesale — nothing applied in memory, nothing persisted, no
+    /// MANIFEST poisoning — so the caller can retry from a fresh pick.
+    /// This is the contract `DB::flush` relies on to treat a failed
+    /// post-flush L0 drain as non-fatal.
+    #[test]
+    fn test_log_and_apply_missing_sst_rejected_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        let before = vs.next_file_number();
+
+        let mut edit = VersionEdit::new();
+        edit.set_next_file_number(vs.next_file_number());
+        edit.add_file(
+            1,
+            FileMetaData {
+                number: 999_999,
+                file_size: 4096,
+                smallest_key: b"aaa".to_vec(),
+                largest_key: b"zzz".to_vec(),
+                has_range_deletions: false,
+            },
+        );
+        let err = vs.log_and_apply(edit).unwrap_err();
+        assert!(err.to_string().contains("failed to open new SST"));
+        assert!(err.to_string().contains("exists_now=false"));
+
+        // Nothing applied, not poisoned, counter intact.
+        assert_eq!(vs.current().total_files(), 0);
+        assert!(!vs.is_poisoned());
+        assert_eq!(vs.next_file_number(), before);
+
+        // A subsequent valid edit still applies, and recovery replays a
+        // MANIFEST that never saw the rejected edit.
+        let mut ok_edit = VersionEdit::new();
+        ok_edit.set_last_sequence(7);
+        ok_edit.set_next_file_number(vs.next_file_number());
+        vs.log_and_apply(ok_edit).unwrap();
+        assert_eq!(vs.last_sequence(), 7);
+        drop(vs);
+
+        let recovered = VersionSet::recover(path, 7).unwrap();
+        assert_eq!(recovered.current().total_files(), 0);
+        assert_eq!(recovered.last_sequence(), 7);
+    }
+
+    /// The file-number allocator must never move backwards, even if an edit
+    /// carries a stale (lower) `next_file_number` — a regression would
+    /// re-issue numbers of files that may still exist on disk.
+    #[test]
+    fn test_next_file_number_never_regresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        let reserved = vs.reserve_file_numbers(100);
+        assert!(vs.next_file_number() >= reserved + 100);
+
+        let mut stale_edit = VersionEdit::new();
+        stale_edit.set_next_file_number(reserved); // stale: lower than current
+        vs.log_and_apply(stale_edit).unwrap();
+        assert_eq!(
+            vs.next_file_number(),
+            reserved + 100,
+            "stale edit must not regress the allocator"
+        );
     }
 
     #[test]

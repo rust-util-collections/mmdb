@@ -1884,6 +1884,16 @@ impl DB {
     }
 
     /// Force flush the active MemTable to SST.
+    ///
+    /// Durability is achieved once the memtable's SSTs are installed and the
+    /// old WAL is retired. The post-flush L0 drain that may follow is
+    /// best-effort backpressure relief: if it fails without leaving the
+    /// engine in a fail-stop state (no background error, MANIFEST not
+    /// poisoned), the failure is logged and `Ok` is returned — nothing from
+    /// the rejected compaction was persisted or applied, and the next flush
+    /// tick / background compaction retries it from a fresh pick. Persistent
+    /// compaction trouble still surfaces loudly through the write path's
+    /// L0 stop trigger and the background thread's fail-stop policy.
     pub fn flush(&self) -> Result<()> {
         self.check_usable().ctx()?;
         let _wg = self.write_queue.lock(); // serialize with writers
@@ -1896,8 +1906,22 @@ impl DB {
         self.flush_and_install_frozen(&frozen).ctx()?;
         let old_wal = frozen.old_wal_number;
         self.post_flush_cleanup(old_wal).ctx()?;
-        if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger {
-            self.drain_l0().ctx()?;
+        if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger
+            && let Err(e) = self.drain_l0()
+        {
+            // Fatal states: a background error was recorded (e.g. a failed
+            // MANIFEST sync inside drain_l0) or the MANIFEST writer is
+            // poisoned. Both mean the engine must fail-stop, so propagate.
+            let fatal = self.has_bg_error.load(Ordering::Acquire)
+                || self.inner.lock().versions.is_poisoned();
+            if fatal {
+                return Err(e).ctx();
+            }
+            // Non-fatal: the failed step was rejected wholesale before
+            // anything was persisted (log_and_apply's error contract) and
+            // its output files were already cleaned up. The flush itself —
+            // the caller's durability request — has fully succeeded.
+            tracing::warn!("post-flush L0 drain failed (will retry): {}", e);
         }
         Ok(())
     }
@@ -2942,8 +2966,17 @@ impl DB {
             {
                 let handle = self.inner.lock().versions.manifest_sync_handle();
                 let mut w = handle.lock();
-                if let Some(ref mut writer) = *w {
-                    writer.sync().ctx()?;
+                if let Some(ref mut writer) = *w
+                    && let Err(e) = writer.sync()
+                {
+                    // The edit is applied in memory but its durability could
+                    // not be confirmed — the same condition the background
+                    // thread treats as fail-stop. Record it so `flush()` and
+                    // `check_usable` see a fatal engine state, not a
+                    // retryable hiccup.
+                    drop(w);
+                    self.set_bg_error(format!("drain_l0 manifest sync failed: {}", e));
+                    return Err(e).ctx();
                 }
             }
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);

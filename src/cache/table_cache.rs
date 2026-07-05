@@ -68,12 +68,16 @@ impl TableCache {
     /// install its `Arc<TableReader>` into the new `Version` — if that file
     /// is already warm here, that call becomes a cache hit instead of a
     /// blocking file open + footer/index/filter parse while `db_mutex` is
-    /// held. Errors are silently ignored: this is purely an optimization,
-    /// the authoritative open (and its error handling) still happens inside
-    /// `log_and_apply`.
+    /// held. Failures don't abort anything (the authoritative open, and its
+    /// error handling, still happen inside `log_and_apply`), but they are
+    /// logged: a freshly-written SST failing to open here is always
+    /// anomalous and is the earliest available signal for issues that would
+    /// otherwise only surface as an install failure moments later.
     pub fn prewarm(&self, file_numbers: impl IntoIterator<Item = u64>) {
         for number in file_numbers {
-            let _ = self.get_reader(number);
+            if let Err(e) = self.get_reader(number) {
+                tracing::warn!("prewarm of freshly-built SST {:06} failed: {}", number, e);
+            }
         }
     }
 

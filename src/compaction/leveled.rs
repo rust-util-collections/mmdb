@@ -1335,9 +1335,13 @@ impl LeveledCompaction {
             });
         }
 
-        // Ensure next_file_number accounts for all numbers consumed by
-        // sub-compaction threads (which use an atomic counter that may
-        // exceed the pre-allocated range in edge cases).
+        // Belt-and-braces: `allocate_output_file_number` enforces
+        // `file_number_limit`, so the sub-compaction counter cannot exceed
+        // the range reserved under the DB lock, and the reservation already
+        // advanced `next_file_number` past `file_number_limit` — this call
+        // is expected to be a no-op. Keep it as a cheap forward-only guard
+        // so file numbers stay collision-free even if a future edge case
+        // violates that reasoning.
         versions.ensure_file_number_at_least(output.next_file_number_hint);
         output
             .edit
