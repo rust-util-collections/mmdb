@@ -5,7 +5,10 @@ use std::{
     fs,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::cache::table_cache::TableCache;
@@ -40,14 +43,19 @@ pub struct VersionSet {
     table_cache: Option<Arc<TableCache>>,
     /// Count of edits since last MANIFEST snapshot (for Phase I compaction).
     edits_since_snapshot: u64,
-    /// Set when the MANIFEST writer is in an unrecoverable state: either a
-    /// record append failed mid-write (leaving a torn record in the stream —
+    /// Set when the MANIFEST writer is in an unrecoverable state: a record
+    /// append failed mid-write (leaving a torn record in the stream —
     /// appending more records after it would make the file unrecoverable
-    /// mid-file), or a rotation published a new MANIFEST whose durability
-    /// could not be confirmed. While poisoned, `log_and_apply` fails fast
-    /// *before* applying anything, so callers can rely on the invariant
-    /// "Err ⇒ edit not applied". Recovery on reopen truncates any torn tail.
-    poisoned: bool,
+    /// mid-file), a sync could not confirm durability of appended records,
+    /// or a rotation published a new MANIFEST whose durability could not be
+    /// confirmed. While poisoned, `log_and_apply` fails fast *before*
+    /// applying anything, so callers can rely on the invariant "Err ⇒ edit
+    /// not applied". Recovery on reopen truncates any torn tail.
+    ///
+    /// Shared (`Arc`) so the DB can observe poisoning lock-free in
+    /// `check_usable` and poison it from `manifest_sync_handle` sync sites
+    /// that bypass [`Self::sync_manifest`].
+    poisoned: Arc<AtomicBool>,
 }
 
 impl VersionSet {
@@ -81,7 +89,7 @@ impl VersionSet {
             manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
             table_cache,
             edits_since_snapshot: 0,
-            poisoned: false,
+            poisoned: Arc::new(AtomicBool::new(false)),
         };
 
         // Write initial snapshot edit
@@ -273,7 +281,7 @@ impl VersionSet {
             manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
             table_cache,
             edits_since_snapshot: edits_replayed,
-            poisoned: false,
+            poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -297,7 +305,7 @@ impl VersionSet {
     /// memory nor durably. Callers rely on this to safely delete output SSTs
     /// referenced by a failed edit.
     pub fn log_and_apply(&mut self, edit: VersionEdit) -> Result<()> {
-        if self.poisoned {
+        if self.is_poisoned() {
             return Err(Error::corruption(
                 "MANIFEST writer poisoned by an earlier write failure; \
                  reopen the database to recover"
@@ -416,7 +424,7 @@ impl VersionSet {
                 // *tail* corruption is tolerated). Poison the writer so no
                 // more records can follow; recovery truncates the torn tail.
                 drop(w);
-                self.poisoned = true;
+                self.poisoned.store(true, Ordering::Release);
                 return Err(e).ctx();
             }
         }
@@ -456,8 +464,16 @@ impl VersionSet {
     /// needs to fsync the MANIFEST writer itself.
     pub fn sync_manifest(&self) -> Result<()> {
         let mut w = self.manifest_writer.lock();
-        if let Some(ref mut writer) = *w {
-            writer.sync().ctx()?;
+        if let Some(ref mut writer) = *w
+            && let Err(e) = writer.sync()
+        {
+            // A failed fsync may leave dirty pages marked clean (fsyncgate):
+            // a later "successful" sync would falsely report durability of
+            // the records that this sync failed to persist. Poison the writer
+            // so no further records are appended; reopen to recover.
+            drop(w);
+            self.poisoned.store(true, Ordering::Release);
+            return Err(e).ctx();
         }
         Ok(())
     }
@@ -511,12 +527,21 @@ impl VersionSet {
     }
 
     /// Whether the MANIFEST writer is poisoned (a record append failed
-    /// mid-write or a rotation's durability could not be confirmed).
-    /// While poisoned, every `log_and_apply` fails fast without applying
-    /// anything; only a reopen recovers. Callers use this to distinguish
-    /// a fail-stop condition from a cleanly-rejected (retryable) edit.
+    /// mid-write, a sync could not confirm durability, or a rotation's
+    /// durability could not be confirmed). While poisoned, every
+    /// `log_and_apply` fails fast without applying anything; only a reopen
+    /// recovers. Callers use this to distinguish a fail-stop condition from
+    /// a cleanly-rejected (retryable) edit.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Shared handle to the poison flag. The DB stores this to observe
+    /// poisoning lock-free in `check_usable`, and to poison the writer from
+    /// sync sites that go through [`Self::manifest_sync_handle`] rather than
+    /// [`Self::sync_manifest`].
+    pub fn poison_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.poisoned)
     }
 
     pub fn last_sequence(&self) -> SequenceNumber {
@@ -527,12 +552,15 @@ impl VersionSet {
     /// This prevents unbounded MANIFEST growth.
     ///
     /// Called from `log_and_apply` *after* the edit has been applied, so this
-    /// must never surface an error. Pre-publish failures are deferred (the
-    /// rotation is retried on a later edit). A post-publish directory-fsync
-    /// failure poisons the writer instead: at that point both the old and the
-    /// new MANIFEST durably contain every applied edit, but a crash could
-    /// recover either one — blocking further edits keeps the two from
-    /// diverging, and the old MANIFEST is retained as a fallback.
+    /// must never surface an error. Pre-publish failures on the *new* file are
+    /// deferred (the file is discarded and the rotation retried on a later
+    /// edit). Failures that compromise the writer that stays in service poison
+    /// it instead: a failed old-writer sync (a later sync could falsely report
+    /// durability of records this one failed to persist), or a post-publish
+    /// directory-fsync failure — at that point both the old and the new
+    /// MANIFEST durably contain every applied edit, but a crash could recover
+    /// either one, so blocking further edits keeps the two from diverging
+    /// (the old MANIFEST is retained as a fallback).
     pub fn maybe_compact_manifest(&mut self) {
         const MANIFEST_COMPACTION_THRESHOLD: u64 = 1000;
 
@@ -596,7 +624,17 @@ impl VersionSet {
                 drop(w);
                 drop(new_writer);
                 let _ = fs::remove_file(&new_manifest_path);
-                tracing::warn!("MANIFEST compaction deferred syncing old manifest: {}", e);
+                // Unlike the new-writer failures above (whose file is simply
+                // discarded), this fsync failed on the writer that stays in
+                // service: a later sync of it could falsely report durability
+                // of the records this one failed to persist (fsyncgate).
+                // Poison instead of deferring.
+                self.poisoned.store(true, Ordering::Release);
+                tracing::error!(
+                    "MANIFEST compaction could not sync the old manifest; \
+                     poisoning manifest writer (reopen the database to recover): {}",
+                    e
+                );
                 return;
             }
         }
@@ -629,7 +667,7 @@ impl VersionSet {
             // MANIFEST. Both contain every applied edit thanks to the old-
             // writer sync above. Poison further edits so the two files cannot
             // diverge, and keep the old MANIFEST as the fallback.
-            self.poisoned = true;
+            self.poisoned.store(true, Ordering::Release);
             tracing::error!(
                 "MANIFEST rotation could not fsync the DB directory; \
                  poisoning manifest writer (reopen the database to recover): {}",

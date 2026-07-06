@@ -157,6 +157,11 @@ pub struct DB {
     /// Background error (e.g. WAL sync failure). Once set, all subsequent
     /// operations are rejected. Models RocksDB's background error state.
     bg_error: Arc<Mutex<Option<String>>>,
+    /// Shared view of `VersionSet::poisoned` (see `poison_flag`). Lets
+    /// `check_usable` fail fast on a poisoned MANIFEST without locking
+    /// `inner`, and lets sync sites that go through `manifest_sync_handle`
+    /// poison the writer when durability cannot be confirmed.
+    manifest_poisoned: Arc<AtomicBool>,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
     rate_limiter: Arc<RateLimiter>,
@@ -515,6 +520,8 @@ impl DB {
         let sequence_start = Arc::new(AtomicU64::new(next_sequence));
         let committed_sequence = Arc::new(AtomicU64::new(max_sequence));
 
+        let manifest_poisoned = versions.poison_flag();
+
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
             immutable_memtables: Vec::new(),
@@ -574,6 +581,7 @@ impl DB {
             let bg_error_msg = bg_error.clone();
             let bg_compacting_files = compacting_files.clone();
             let bg_dead_key_sweep = dead_key_sweep.clone();
+            let bg_manifest_poisoned = manifest_poisoned.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -742,10 +750,21 @@ impl DB {
                                                         .versions
                                                         .manifest_sync_handle();
                                                     let mut w = handle.lock();
-                                                    if let Some(ref mut writer) = *w {
-                                                        writer.sync().map_err(|e| {
-                                                            format!("manifest sync error: {}", e)
-                                                        })?;
+                                                    if let Some(ref mut writer) = *w
+                                                        && let Err(e) = writer.sync()
+                                                    {
+                                                        // Durability of the applied edit is
+                                                        // unconfirmed and a later sync could
+                                                        // falsely report it durable — poison
+                                                        // the writer (fail-stop, reopen to
+                                                        // recover).
+                                                        drop(w);
+                                                        bg_manifest_poisoned
+                                                            .store(true, Ordering::Release);
+                                                        return Err(format!(
+                                                            "manifest sync error: {}",
+                                                            e
+                                                        ));
                                                     }
                                                 }
                                                 LeveledCompaction::run_post_compaction_cleanup(
@@ -908,10 +927,16 @@ impl DB {
                                         let handle =
                                             bg_inner.lock().versions.manifest_sync_handle();
                                         let mut w = handle.lock();
-                                        if let Some(ref mut writer) = *w {
-                                            writer.sync().map_err(|e| {
-                                                format!("manifest sync error: {}", e)
-                                            })?;
+                                        if let Some(ref mut writer) = *w
+                                            && let Err(e) = writer.sync()
+                                        {
+                                            // Durability of the applied edit is
+                                            // unconfirmed and a later sync could
+                                            // falsely report it durable — poison the
+                                            // writer (fail-stop, reopen to recover).
+                                            drop(w);
+                                            bg_manifest_poisoned.store(true, Ordering::Release);
+                                            return Err(format!("manifest sync error: {}", e));
                                         }
                                     }
                                     LeveledCompaction::run_post_compaction_cleanup(
@@ -1001,6 +1026,7 @@ impl DB {
             closed: AtomicBool::new(false),
             has_bg_error,
             bg_error,
+            manifest_poisoned,
             block_cache,
             table_cache,
             rate_limiter,
@@ -1964,7 +1990,7 @@ impl DB {
             // MANIFEST sync inside drain_l0) or the MANIFEST writer is
             // poisoned. Both mean the engine must fail-stop, so propagate.
             let fatal = self.has_bg_error.load(Ordering::Acquire)
-                || self.inner.lock().versions.is_poisoned();
+                || self.manifest_poisoned.load(Ordering::Acquire);
             if fatal {
                 return Err(e).ctx();
             }
@@ -2049,6 +2075,28 @@ impl DB {
                         // with the inputs just picked, so no concurrently-acquired
                         // snapshot can be missed.
                         let active_snaps = self.snapshot_list.as_sorted_vec();
+                        // Claim the inputs so concurrent background threads
+                        // don't redundantly pick and fully re-process the same
+                        // files while this unlocked I/O runs. The pick itself
+                        // stays claim-blind (`pick_compaction_for_range` takes
+                        // no claimed-set): an explicit range compaction must
+                        // consider every overlapping file, even one a
+                        // background thread is currently rewriting —
+                        // `install_compaction`'s stale-input check settles any
+                        // race safely, and a discarded install just re-picks.
+                        // Filter out numbers already claimed by a background
+                        // thread: double-claiming would let this claim's Drop
+                        // release the other thread's claim while it still runs.
+                        let claimed_inputs: Vec<u64> = {
+                            let mut claimed = self.compacting_files.lock();
+                            let nums: Vec<u64> = all_inputs
+                                .iter()
+                                .map(|f| f.meta.number)
+                                .filter(|n| !claimed.contains(n))
+                                .collect();
+                            claimed.extend(nums.iter().copied());
+                            nums
+                        };
                         Some((
                             task,
                             file_start,
@@ -2056,15 +2104,21 @@ impl DB {
                             l0_inputs,
                             is_bottom,
                             active_snaps,
+                            claimed_inputs,
                         ))
                     }
                     None => None,
                 }
             };
 
-            let Some((task, file_start, file_limit, l0_inputs, is_bottom, active_snaps)) = pick
+            let Some((task, file_start, file_limit, l0_inputs, is_bottom, active_snaps, claimed)) =
+                pick
             else {
                 break;
+            };
+            let _claim = CompactionClaim {
+                claims: Arc::clone(&self.compacting_files),
+                numbers: claimed,
             };
 
             let ctx = CompactionContext {
@@ -2117,8 +2171,18 @@ impl DB {
             {
                 let handle = self.inner.lock().versions.manifest_sync_handle();
                 let mut w = handle.lock();
-                if let Some(ref mut writer) = *w {
-                    writer.sync().ctx()?;
+                if let Some(ref mut writer) = *w
+                    && let Err(e) = writer.sync()
+                {
+                    // The edit is applied in memory but its durability could
+                    // not be confirmed — the same fail-stop condition as
+                    // drain_l0 and the background threads. Poison the writer
+                    // and record the background error so every entry point
+                    // sees a fatal engine state, not a retryable hiccup.
+                    drop(w);
+                    self.manifest_poisoned.store(true, Ordering::Release);
+                    self.set_bg_error(format!("compact_range manifest sync failed: {}", e));
+                    return Err(e).ctx();
                 }
             }
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
@@ -2342,6 +2406,18 @@ impl DB {
             && let Some(ref msg) = *self.bg_error.lock()
         {
             return Err(Error::background(msg.clone()));
+        }
+        // A poisoned MANIFEST writer is a fail-stop condition even when no
+        // background error was recorded (e.g. a rotation's directory fsync
+        // failed inside `maybe_compact_manifest`, which must not surface an
+        // error to its caller). Checked after `bg_error` so the richer
+        // message wins when both are set.
+        if self.manifest_poisoned.load(Ordering::Acquire) {
+            return Err(Error::corruption(
+                "MANIFEST writer poisoned by an earlier write failure; \
+                 reopen the database to recover"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -2885,6 +2961,11 @@ impl DB {
             if let Some(ref mut writer) = *w
                 && let Err(e) = writer.sync()
             {
+                // Poison first: a later "successful" sync could falsely
+                // report durability of the records this sync failed to
+                // persist (fsyncgate).
+                drop(w);
+                self.manifest_poisoned.store(true, Ordering::Release);
                 self.set_bg_error(format!("post-flush manifest sync failed: {}", e));
                 return Err(e).ctx();
             }
@@ -3040,10 +3121,11 @@ impl DB {
                 {
                     // The edit is applied in memory but its durability could
                     // not be confirmed — the same condition the background
-                    // thread treats as fail-stop. Record it so `flush()` and
-                    // `check_usable` see a fatal engine state, not a
-                    // retryable hiccup.
+                    // thread treats as fail-stop. Poison the writer and
+                    // record it so `flush()` and `check_usable` see a fatal
+                    // engine state, not a retryable hiccup.
                     drop(w);
+                    self.manifest_poisoned.store(true, Ordering::Release);
                     self.set_bg_error(format!("drain_l0 manifest sync failed: {}", e));
                     return Err(e).ctx();
                 }

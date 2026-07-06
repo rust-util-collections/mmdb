@@ -31,6 +31,14 @@ pub struct BlockCache {
     /// lock entirely. `Relaxed` is sufficient since this is only a hint —
     /// `pinned` (guarded by its own mutex) remains the authoritative state and
     /// is always consulted whenever the counter reads nonzero.
+    ///
+    /// Ordering invariant: the counter is incremented *before* a new entry is
+    /// inserted (both under the `pinned` mutex) and decremented only while
+    /// holding the mutex after removal. A reader that observes 0 therefore
+    /// sees a correct miss ("insert not yet complete"); a reader that observes
+    /// nonzero takes the mutex and blocks until the in-flight insert finishes.
+    /// Incrementing *after* the insert would leave a window where a concurrent
+    /// `get()` skips the map even though the entry is already present.
     pinned_count: AtomicUsize,
     /// Track which offsets belong to each file for bulk invalidation.
     file_offsets: FileOffsets,
@@ -120,8 +128,16 @@ impl BlockCache {
             return arc;
         }
         let key = (file_number, block_offset);
-        if self.pinned.lock().insert(key, arc.clone()).is_none() {
-            self.pinned_count.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut pinned = self.pinned.lock();
+            // Increment BEFORE inserting (see `pinned_count` invariant): the
+            // lock-free reader in `get()` never takes this mutex when it reads
+            // 0, so counting after the insert would let it miss an entry that
+            // is already in the map.
+            if !pinned.contains_key(&key) {
+                self.pinned_count.fetch_add(1, Ordering::Relaxed);
+            }
+            pinned.insert(key, arc.clone());
         }
         self.file_offsets
             .lock()

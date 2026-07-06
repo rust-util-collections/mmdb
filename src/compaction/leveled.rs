@@ -1468,22 +1468,30 @@ impl LeveledCompaction {
         if files.is_empty() {
             return Ok(());
         }
+        let is_bottommost =
+            Self::is_bottommost_level(&version, level, ctx.options.num_levels, files);
         // A single file with a no-op filter is already in its final form —
-        // rewriting would waste I/O for no benefit. When the filter can
+        // rewriting would waste I/O for no benefit. The same holds when a
+        // non-noop filter cannot fire anyway (the merge loop only applies
+        // filters at the bottommost level with no active snapshots): the
+        // rewrite would be byte-for-byte identical to its input. Skipping
+        // also forgoes snapshot-dedup/seq-zeroing for that file, but that
+        // only retains extra data — always read-safe, and picked up by the
+        // next compaction that touches the file. When the filter can
         // actually remove or change entries (e.g. lazy-delete dead keys),
         // even a single file must be reprocessed so every key-value pair
         // passes through the filter.
+        let filter_can_apply = is_bottommost && ctx.active_snapshots.is_empty();
         if files.len() == 1
-            && ctx
-                .options
-                .compaction_filter
-                .as_ref()
-                .is_none_or(|f| f.is_noop())
+            && (!filter_can_apply
+                || ctx
+                    .options
+                    .compaction_filter
+                    .as_ref()
+                    .is_none_or(|f| f.is_noop()))
         {
             return Ok(());
         }
-        let is_bottommost =
-            Self::is_bottommost_level(&version, level, ctx.options.num_levels, files);
 
         let mut sources: Vec<IterSource> = Vec::new();
         for tf in files {

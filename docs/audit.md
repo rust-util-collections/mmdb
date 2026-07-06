@@ -16,6 +16,27 @@
 
 ## Won't Fix
 
+### [LOW] rate_limiter: `request()` f64 subtraction is a no-op for values ≳ 2.5e17, theoretical infinite loop
+- **Where**: `src/rate_limiter.rs` (`request`, the `remaining -= chunk` convergence loop)
+- **What**: For a single request of ~hundreds of petabytes, `chunk` can fall below `ULP(remaining)/2`, making the f64 subtraction a no-op and the loop non-terminating. Mathematically confirmed.
+- **Reason**: Not practically reachable. Every call site passes single-entry sizes (internal key + value bytes, bounded by allocatable memory); triggering the loop requires first materializing a ~2.5e17-byte entry in RAM. The module is private, so no external caller can inject an arbitrary value. Guarding would add cost/complexity to a hot path for an input that cannot occur. Revisit if `request()` is ever exposed to sizes not backed by in-memory buffers.
+
+---
+
+### [REJECTED] db: Dead-key sweep `?` on `force_merge_level` error "permanently kills the background compaction thread"
+- **Where**: `src/db.rs` (dead-key sweep block in the background compaction loop)
+- **What**: External review claimed a transient sweep error breaks the thread's main loop, silently and permanently disabling all future compaction.
+- **Reason**: Rejected — not a bug. The error path calls `set_error`, which sets `has_bg_error`; from then on **every** public entry point fails loudly via `check_usable()`. This is the engine's deliberate fail-stop-until-reopen policy, identical to every other background error path (debt-driven picks, hint compactions, flush). Nothing is silent, and "no further compaction" is exactly the intended fail-stop behavior.
+
+---
+
+### [REJECTED] db: Dead-key sweep's L0 pass "never fires the filter because L0 is never bottommost"
+- **Where**: `src/db.rs` (sweep loop starting at level 0), `src/compaction/leveled.rs` (`is_bottommost_level`)
+- **What**: External review claimed `is_bottommost` is always false for L0 when `num_levels > 1`, making the L0 sweep pass useless.
+- **Reason**: Rejected — factually wrong. `is_bottommost_level` is data-driven, not level-count-driven: it checks whether any *deeper level contains files overlapping the inputs*. On a settled store whose data sits only in L0 (the exact scenario the sweep exists for), it returns true and the filter fires at L0. When deeper overlapping data exists, skipping the filter at L0 is required for MVCC correctness (a newer L0 tombstone must not be filtered away below an older value). Residual single-file no-op rewrites are separately eliminated by the `force_merge_level` early-return fix.
+
+---
+
 ### [LOW] compaction: Near-duplicate merge-loop logic between `execute_sub_compaction_io` and `force_merge_level`
 - **Where**: `src/compaction/leveled.rs` — the tombstone/sequence/snapshot-dedup/filter merge logic (~150 lines) is duplicated nearly verbatim between the two functions.
 - **What**: Both implementations were independently verified correct and mutually consistent (same snapshot-retention algorithm, same sequence-zeroing condition, same filter gating). No functional bug today.
