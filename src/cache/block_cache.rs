@@ -263,6 +263,20 @@ impl BlockCache {
     }
 
     /// Insert a block into the cache.
+    ///
+    /// The moka write and the `index.add()` below are not atomic as a
+    /// pair. If a concurrent `invalidate_file()` for this file runs its
+    /// index read-and-clear (`take_file`) after the moka write lands but
+    /// before `index.add()` runs, the snapshot it reads misses this
+    /// offset, so `invalidate_file` never targets it — the block stays
+    /// live in moka past its file's removal, reclaimed only by later LRU
+    /// pressure. This is bounded, not a correctness bug: SST file numbers
+    /// are never reused, so the stray entry can never be misread as data
+    /// belonging to a different file, only reclaimed late instead of
+    /// promptly. Making the pair atomic would require locking per insert,
+    /// reintroducing the contention `FO_SHARDS` sharding exists to avoid,
+    /// so this is accepted as-is — a structurally similar cutoff-not-
+    /// barrier tradeoff to the one documented on the `detached` field.
     pub fn insert(&self, file_number: u64, block_offset: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let arc = Arc::new(data);
         if self.pool.disabled || self.detached.load(Ordering::Relaxed) {
@@ -352,6 +366,12 @@ impl BlockCache {
     /// Invalidate all cached blocks this member holds for a specific file.
     /// Called after compaction removes an SST file. Other members'
     /// same-numbered files (unrelated DBs) are untouched.
+    ///
+    /// Reads-and-clears the reverse index (`take_file`) and invalidates
+    /// only the offsets that snapshot contains — see `insert()`'s doc for
+    /// the narrow race where a concurrently-inserted offset for this file
+    /// can land in the index just after that snapshot and be missed here.
+    /// Accepted as a bounded, benign tradeoff rather than fixed.
     pub fn invalidate_file(&self, file_number: u64) {
         if self.detached.load(Ordering::Relaxed) {
             return;

@@ -15,6 +15,9 @@ use std::sync::{
 };
 use std::thread::scope;
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
 use crate::error::{Error, Result, ResultExt};
@@ -32,6 +35,13 @@ use crate::types::{
     InternalKey, InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType,
     compare_internal_key, user_key,
 };
+
+/// Test-only instrumentation: incremented each time `execute_compaction_io`
+/// takes the parallel (`thread::scope`) sub-compaction path (`actual_subs > 1`),
+/// so tests can directly prove real multi-threaded execution was exercised
+/// rather than silently falling back to the always-available serial path.
+#[cfg(test)]
+static PARALLEL_SUB_COMPACTIONS_TAKEN: AtomicUsize = AtomicUsize::new(0);
 
 /// A hint from the read path that a specific level may benefit from compaction.
 /// Accumulated by the DB and drained by the compaction worker.
@@ -478,13 +488,6 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
 
 /// Collect raw tombstone triples from input files.
 type RawTombstone = (Vec<u8>, Vec<u8>, SequenceNumber);
-
-fn task_has_range_deletions(task: &CompactionTask) -> bool {
-    task.input_files_level
-        .iter()
-        .chain(task.input_files_next.iter())
-        .any(|tf| tf.meta.has_range_deletions)
-}
 
 fn cleanup_output_files(
     db_path: &Path,
@@ -1142,7 +1145,15 @@ impl LeveledCompaction {
         // L0 files overlap arbitrarily, so every sub-task would have to
         // include all L0 sources — redundant I/O with no benefit.
         // Sub-compaction is only useful for Ln→Ln+1 (level >= 1).
-        let max_subs = if task.level == 0 || task_has_range_deletions(task) {
+        //
+        // Range deletions do NOT require serializing to a single sub-task:
+        // `all_range_del_entries`/`all_raw_tombstones` below are collected
+        // once from ALL input files and shared (by reference) with every
+        // sub-task's `SubCompactionParams`, so each sub-compaction already
+        // gets full, complete tombstone visibility regardless of its own
+        // key range — the cross-sub-task sharing this data structure exists
+        // for (INV-C2a) works correctly with `actual_subs > 1`.
+        let max_subs = if task.level == 0 {
             1
         } else {
             ctx.options.max_subcompactions.max(1)
@@ -1184,6 +1195,8 @@ impl LeveledCompaction {
             vec![execute_sub_compaction_io(ctx, &sub_tasks[0], &sub_params).ctx()?]
         } else {
             // Parallel sub-compactions
+            #[cfg(test)]
+            PARALLEL_SUB_COMPACTIONS_TAKEN.fetch_add(1, Ordering::Relaxed);
             let thread_results: Vec<Result<SubCompactionOutput>> = scope(|s| {
                 let handles: Vec<_> = sub_tasks
                     .iter()
@@ -2529,5 +2542,136 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_execute_compaction_io_actually_parallelizes_with_max_subcompactions() {
+        // Regression test: db.compact()/db.compact_range(None, None) always
+        // route through force_compact_all -> force_merge_level, which never
+        // reads max_subcompactions and never takes execute_compaction_io's
+        // `thread::scope` parallel branch. Prior "sub_compaction"-named
+        // tests in this file only exercised that always-serial path despite
+        // setting max_subcompactions > 1, so the real parallel branch had
+        // zero test coverage anywhere in the repository. This test calls
+        // `execute_compaction_io` directly (mirroring
+        // `test_discarded_trivial_move_preserves_live_input_file`'s
+        // hand-built-VersionSet pattern) with enough target-level files to
+        // force `actual_subs > 1`, and asserts — via the test-only
+        // `PARALLEL_SUB_COMPACTIONS_TAKEN` counter — that the parallel path
+        // was genuinely taken, not just that the (already well-tested)
+        // serial merge logic produced correct output.
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        use super::{
+            CompactionContext, CompactionTask, LeveledCompaction, PARALLEL_SUB_COMPACTIONS_TAKEN,
+        };
+        use crate::manifest::version::TableFile;
+        use crate::manifest::version_edit::FileMetaData;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, InternalKeyRef, ValueType};
+
+        fn build_sst(dir: &std::path::Path, number: u64, keys: &[usize]) -> TableFile {
+            let path = dir.join(format!("{:06}.sst", number));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut smallest = Vec::new();
+            let mut largest = Vec::new();
+            for (idx, &i) in keys.iter().enumerate() {
+                let uk = format!("key_{:06}", i);
+                let ik = InternalKey::new(uk.as_bytes(), 10, ValueType::Value);
+                let val = format!("val_{}", i);
+                if idx == 0 {
+                    smallest = ik.as_bytes().to_vec();
+                }
+                largest = ik.as_bytes().to_vec();
+                builder.add(ik.as_bytes(), val.as_bytes()).unwrap();
+            }
+            let result = builder.finish().unwrap();
+            TableFile {
+                meta: FileMetaData {
+                    number,
+                    file_size: result.file_size,
+                    smallest_key: result.smallest_key.unwrap_or(smallest),
+                    largest_key: result.largest_key.unwrap_or(largest),
+                    has_range_deletions: false,
+                },
+                reader: Arc::new(crate::sst::table_reader::TableReader::open(&path).unwrap()),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Source level (L1): one file spanning the whole key range 0..300.
+        let source_keys: Vec<usize> = (0..300).collect();
+        let source_file = build_sst(dir.path(), 1, &source_keys);
+
+        // Target level (L2): 3 files with disjoint, evenly-spaced key
+        // ranges, so `compute_split_points` has 2 real boundaries to work
+        // with (`next_files.len() > 1`), forcing `actual_subs > 1` when
+        // `max_subcompactions` is at least 3.
+        let target_files = vec![
+            build_sst(dir.path(), 2, &(0..100).collect::<Vec<_>>()),
+            build_sst(dir.path(), 3, &(100..200).collect::<Vec<_>>()),
+            build_sst(dir.path(), 4, &(200..300).collect::<Vec<_>>()),
+        ];
+
+        let task = CompactionTask {
+            level: 1,
+            input_files_level: vec![source_file],
+            input_files_next: target_files,
+        };
+
+        let options = DbOptions {
+            max_subcompactions: 4,
+            ..Default::default()
+        };
+        let ctx = CompactionContext {
+            db_path: dir.path(),
+            options: &options,
+            rate_limiter: None,
+            stats: None,
+            active_snapshots: &[],
+        };
+
+        let before = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
+        let output =
+            LeveledCompaction::execute_compaction_io(&ctx, &task, 100, u64::MAX, true).unwrap();
+        let after = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
+
+        assert_eq!(
+            after,
+            before + 1,
+            "execute_compaction_io should have taken the parallel (actual_subs > 1) \
+             path exactly once given 3 disjoint target-level files and \
+             max_subcompactions=4, but the counter did not increment — the \
+             parallel branch has zero test coverage otherwise"
+        );
+
+        // Sanity: the merge still produced a correct, complete output
+        // (multiple output files whose union covers the whole input range).
+        let mut all_keys: Vec<u32> = Vec::new();
+        for (_, meta) in &output.edit.new_files {
+            let path = dir.path().join(format!("{:06}.sst", meta.number));
+            let reader = crate::sst::table_reader::TableReader::open(&path).unwrap();
+            for (k, _) in reader.iter().unwrap() {
+                let ik = InternalKeyRef::new(&k);
+                let uk = std::str::from_utf8(ik.user_key()).unwrap();
+                let n: u32 = uk.trim_start_matches("key_").parse().unwrap();
+                all_keys.push(n);
+            }
+        }
+        all_keys.sort_unstable();
+        let expected: Vec<u32> = (0..300).collect();
+        assert_eq!(
+            all_keys, expected,
+            "parallel sub-compaction output must cover every input key exactly once"
+        );
     }
 }

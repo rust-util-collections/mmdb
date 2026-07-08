@@ -117,6 +117,9 @@ impl Block {
     }
 
     /// Iterate over all key-value pairs in the block.
+    /// If the block data is corrupted mid-iteration, `next()` returns `None`
+    /// (as it would on clean exhaustion) but records the failure — call
+    /// `error()` after iteration ends to distinguish the two cases.
     pub fn iter(&self) -> BlockIterator<'_> {
         BlockIterator {
             block: self,
@@ -124,19 +127,21 @@ impl Block {
             key: Vec::new(),
             value_start: 0,
             value_len: 0,
+            error: None,
         }
     }
 
     /// Binary search for a key using a custom comparator, then linear scan.
-    /// Returns Some((key, value)) for the first key where compare(key, target) >= Equal,
-    /// or None if all keys are less than target.
+    /// Returns `Ok(Some((key, value)))` for the first key where `compare(key, target) >= Equal`,
+    /// `Ok(None)` if all keys are less than target, or `Err` if a block entry is
+    /// malformed (corrupted data — never a legitimate outcome of a well-formed block).
     pub fn seek_by<F: Fn(&[u8], &[u8]) -> Ordering>(
         &self,
         target: &[u8],
         compare: F,
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         if self.restart_offset == 0 {
-            return None;
+            return Ok(None);
         }
         // Binary search on restart points
         let mut left = 0u32;
@@ -146,13 +151,11 @@ impl Block {
             let mid = left + (right - left) / 2;
             let rp = self.restart_point(mid) as usize;
 
-            match decode_entry_at(&self.data, rp, &[]) {
-                Some((key, _, _)) if compare(&key, target) == Ordering::Less => {
-                    left = mid + 1;
-                }
-                Some(_) | None => {
-                    right = mid;
-                }
+            let (key, _, _) = decode_entry_at(&self.data, rp, &[])?;
+            if compare(&key, target) == Ordering::Less {
+                left = mid + 1;
+            } else {
+                right = mid;
             }
         }
 
@@ -167,30 +170,27 @@ impl Block {
         let mut current_key = Vec::new();
 
         while offset < self.restart_offset {
-            match decode_entry_at(&self.data, offset, &current_key) {
-                Some((key, value, next_off)) => {
-                    if compare(&key, target) != Ordering::Less {
-                        return Some((key, value));
-                    }
-                    current_key = key;
-                    offset = next_off;
-                }
-                None => break,
+            let (key, value, next_off) = decode_entry_at(&self.data, offset, &current_key)?;
+            if compare(&key, target) != Ordering::Less {
+                return Ok(Some((key, value)));
             }
+            current_key = key;
+            offset = next_off;
         }
 
-        None
+        Ok(None)
     }
 
     /// Seek to the last entry where compare(key, target) <= Equal.
     /// Uses binary search on restart points, then forward scan to find the last entry <= target.
+    /// Returns `Err` if a block entry is malformed (corrupted data).
     pub fn seek_for_prev_by<F: Fn(&[u8], &[u8]) -> Ordering>(
         &self,
         target: &[u8],
         compare: F,
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         if self.restart_offset == 0 {
-            return None;
+            return Ok(None);
         }
         // Binary search on restart points to find the last restart point whose
         // key is <= target.
@@ -201,13 +201,11 @@ impl Block {
             let mid = left + (right - left) / 2;
             let rp = self.restart_point(mid) as usize;
 
-            match decode_entry_at(&self.data, rp, &[]) {
-                Some((key, _, _)) if compare(&key, target) != Ordering::Greater => {
-                    left = mid + 1;
-                }
-                Some(_) | None => {
-                    right = mid;
-                }
+            let (key, _, _) = decode_entry_at(&self.data, rp, &[])?;
+            if compare(&key, target) != Ordering::Greater {
+                left = mid + 1;
+            } else {
+                right = mid;
             }
         }
 
@@ -224,30 +222,27 @@ impl Block {
         let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
 
         while offset < self.restart_offset {
-            match decode_entry_at(&self.data, offset, &current_key) {
-                Some((key, value, next_off)) => {
-                    if compare(&key, target) != Ordering::Greater {
-                        best = Some((key.clone(), value));
-                    } else {
-                        // All subsequent entries will be > target, we're done
-                        break;
-                    }
-                    current_key = key;
-                    offset = next_off;
-                }
-                None => break,
+            let (key, value, next_off) = decode_entry_at(&self.data, offset, &current_key)?;
+            if compare(&key, target) != Ordering::Greater {
+                best = Some((key.clone(), value));
+            } else {
+                // All subsequent entries will be > target, we're done
+                break;
             }
+            current_key = key;
+            offset = next_off;
         }
 
-        best
+        Ok(best)
     }
 
     /// Decode all entries from the given restart point index through the end of
     /// the data region. Returns a Vec of (key, value) pairs.
     /// This is used by TableIterator::prev() to re-decode a block from a restart point.
-    pub fn iter_from_restart(&self, restart_index: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// Returns `Err` if a block entry is malformed (corrupted data).
+    pub fn iter_from_restart(&self, restart_index: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if restart_index >= self.num_restarts {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let start = self.restart_point(restart_index) as usize;
@@ -256,24 +251,21 @@ impl Block {
         let mut entries = Vec::new();
 
         while offset < self.restart_offset {
-            match decode_entry_at(&self.data, offset, &current_key) {
-                Some((key, value, next_off)) => {
-                    entries.push((key.clone(), value));
-                    current_key = key;
-                    offset = next_off;
-                }
-                None => break,
-            }
+            let (key, value, next_off) = decode_entry_at(&self.data, offset, &current_key)?;
+            entries.push((key.clone(), value));
+            current_key = key;
+            offset = next_off;
         }
 
-        entries
+        Ok(entries)
     }
 
     /// Decode entries from the given restart point index to the next restart point.
     /// Returns only entries within this single segment (not the rest of the block).
-    pub fn iter_restart_segment(&self, restart_index: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// Returns `Err` if a block entry is malformed (corrupted data).
+    pub fn iter_restart_segment(&self, restart_index: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if restart_index >= self.num_restarts {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let start = self.restart_point(restart_index) as usize;
@@ -288,28 +280,26 @@ impl Block {
         let mut entries = Vec::new();
 
         while offset < end {
-            match decode_entry_at(&self.data, offset, &current_key) {
-                Some((key, value, next_off)) => {
-                    entries.push((key.clone(), value));
-                    current_key = key;
-                    offset = next_off;
-                }
-                None => break,
-            }
+            let (key, value, next_off) = decode_entry_at(&self.data, offset, &current_key)?;
+            entries.push((key.clone(), value));
+            current_key = key;
+            offset = next_off;
         }
 
-        entries
+        Ok(entries)
     }
 
     /// Decode only the first key at the given restart point (zero shared prefix).
     /// O(1) — decodes a single entry, no segment walk needed.
-    pub fn first_key_at_restart(&self, restart_index: u32) -> Option<Vec<u8>> {
+    /// Returns `Err` if the entry at this restart point is malformed (corrupted data).
+    pub fn first_key_at_restart(&self, restart_index: u32) -> Result<Option<Vec<u8>>> {
         if restart_index >= self.num_restarts {
-            return None;
+            return Ok(None);
         }
         let offset = self.restart_point(restart_index) as usize;
         // At a restart point, shared_len is always 0, so prev_key can be empty.
-        decode_entry_at(&self.data, offset, &[]).map(|(key, _, _)| key)
+        let (key, _, _) = decode_entry_at(&self.data, offset, &[])?;
+        Ok(Some(key))
     }
 
     /// Return the number of restart points in this block.
@@ -336,6 +326,9 @@ impl Block {
     /// Binary search for a key using restart points, then linear scan.
     /// Returns Some((key, value)) for exact user key match at the latest sequence,
     /// or None if not found.
+    /// Test-only helper: panics on malformed block data (never expected in test
+    /// fixtures — see `decode_entry_at`'s doc comment for why any error here is
+    /// unambiguously corruption, not clean EOF).
     #[cfg(test)]
     pub fn seek(&self, target: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
         if self.restart_offset == 0 {
@@ -350,13 +343,12 @@ impl Block {
             let rp = self.restart_point(mid) as usize;
 
             // Decode the key at restart point (shared_len is always 0 at restart)
-            match decode_entry_at(&self.data, rp, &[]) {
-                Some((key, _, _)) if key.as_slice() < target => {
-                    left = mid + 1;
-                }
-                Some(_) | None => {
-                    right = mid;
-                }
+            let (key, _, _) =
+                decode_entry_at(&self.data, rp, &[]).expect("corrupted test block data");
+            if key.as_slice() < target {
+                left = mid + 1;
+            } else {
+                right = mid;
             }
         }
 
@@ -371,16 +363,13 @@ impl Block {
         let mut current_key = Vec::new();
 
         while offset < self.restart_offset {
-            match decode_entry_at(&self.data, offset, &current_key) {
-                Some((key, value, next_off)) => {
-                    if key.as_slice() >= target {
-                        return Some((key, value));
-                    }
-                    current_key = key;
-                    offset = next_off;
-                }
-                None => break,
+            let (key, value, next_off) = decode_entry_at(&self.data, offset, &current_key)
+                .expect("corrupted test block data");
+            if key.as_slice() >= target {
+                return Some((key, value));
             }
+            current_key = key;
+            offset = next_off;
         }
 
         None
@@ -389,40 +378,56 @@ impl Block {
 
 /// Decode one entry at `offset` with the given `prev_key` for prefix decompression.
 /// Returns (full_key, value, next_offset).
+///
+/// Every caller of this function only ever passes an `offset` that its own loop
+/// condition (or a restart-point index validated at `Block::new()` time) has
+/// already guaranteed is `< restart_offset <= data.len()`. There is therefore no
+/// legitimate "ran cleanly off the end of the block" case reachable here — any
+/// internal failure (bad varint, truncated payload, or a shared-prefix length
+/// that exceeds the previous key) unambiguously means the entry itself is
+/// malformed/corrupted, and must be reported as an error rather than silently
+/// treated as "no more entries" (which would let callers mistake corruption for
+/// clean iterator exhaustion).
 fn decode_entry_at(
     data: &[u8],
     offset: usize,
     prev_key: &[u8],
-) -> Option<(Vec<u8>, Vec<u8>, usize)> {
+) -> Result<(Vec<u8>, Vec<u8>, usize)> {
     if offset > data.len() {
-        return None;
+        return Err(Error::corruption("block entry offset past end of data"));
     }
     let mut pos = offset;
 
-    let (shared_len, n) = decode_varint(&data[pos..]).ok()?;
+    let (shared_len, n) = decode_varint(&data[pos..])?;
     pos += n;
     if pos > data.len() {
-        return None;
+        return Err(Error::corruption("block entry header truncated"));
     }
-    let (unshared_len, n) = decode_varint(&data[pos..]).ok()?;
+    let (unshared_len, n) = decode_varint(&data[pos..])?;
     pos += n;
     if pos > data.len() {
-        return None;
+        return Err(Error::corruption("block entry header truncated"));
     }
-    let (value_len, n) = decode_varint(&data[pos..]).ok()?;
+    let (value_len, n) = decode_varint(&data[pos..])?;
     pos += n;
 
     let shared = shared_len as usize;
     let unshared = unshared_len as usize;
     let vlen = value_len as usize;
 
-    let key_end = pos.checked_add(unshared)?;
-    let value_end = key_end.checked_add(vlen)?;
+    let key_end = pos
+        .checked_add(unshared)
+        .ok_or_else(|| Error::corruption("block entry key length overflow"))?;
+    let value_end = key_end
+        .checked_add(vlen)
+        .ok_or_else(|| Error::corruption("block entry value length overflow"))?;
     if value_end > data.len() {
-        return None;
+        return Err(Error::corruption("block entry extends past end of data"));
     }
     if shared > prev_key.len() {
-        return None;
+        return Err(Error::corruption(
+            "block entry shared prefix exceeds previous key length",
+        ));
     }
 
     let mut key = Vec::with_capacity(shared + unshared);
@@ -431,46 +436,56 @@ fn decode_entry_at(
 
     let value = data[key_end..value_end].to_vec();
 
-    Some((key, value, value_end))
+    Ok((key, value, value_end))
 }
 
 /// Decode one entry at `offset`, reusing `key_buf` for the key (zero-alloc for key).
 /// Returns (value_start, value_len, next_offset) — value is a slice into `data`.
 /// The key is reconstructed in-place in `key_buf`.
+///
+/// See `decode_entry_at`'s doc comment: every caller-supplied `offset` is already
+/// guaranteed in-bounds, so any internal failure here means corruption, not clean
+/// EOF, and must be surfaced as an error.
 pub(crate) fn decode_entry_reuse(
     data: &[u8],
     offset: usize,
     key_buf: &mut Vec<u8>,
-) -> Option<(usize, usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     if offset > data.len() {
-        return None;
+        return Err(Error::corruption("block entry offset past end of data"));
     }
     let mut pos = offset;
 
-    let (shared_len, n) = decode_varint(&data[pos..]).ok()?;
+    let (shared_len, n) = decode_varint(&data[pos..])?;
     pos += n;
     if pos > data.len() {
-        return None;
+        return Err(Error::corruption("block entry header truncated"));
     }
-    let (unshared_len, n) = decode_varint(&data[pos..]).ok()?;
+    let (unshared_len, n) = decode_varint(&data[pos..])?;
     pos += n;
     if pos > data.len() {
-        return None;
+        return Err(Error::corruption("block entry header truncated"));
     }
-    let (value_len, n) = decode_varint(&data[pos..]).ok()?;
+    let (value_len, n) = decode_varint(&data[pos..])?;
     pos += n;
 
     let shared = shared_len as usize;
     let unshared = unshared_len as usize;
     let vlen = value_len as usize;
 
-    let key_end = pos.checked_add(unshared)?;
-    let value_end = key_end.checked_add(vlen)?;
+    let key_end = pos
+        .checked_add(unshared)
+        .ok_or_else(|| Error::corruption("block entry key length overflow"))?;
+    let value_end = key_end
+        .checked_add(vlen)
+        .ok_or_else(|| Error::corruption("block entry value length overflow"))?;
     if value_end > data.len() {
-        return None;
+        return Err(Error::corruption("block entry extends past end of data"));
     }
     if shared > key_buf.len() {
-        return None;
+        return Err(Error::corruption(
+            "block entry shared prefix exceeds previous key length",
+        ));
     }
 
     // Reconstruct key in-place: truncate to shared prefix, append unshared suffix
@@ -478,35 +493,51 @@ pub(crate) fn decode_entry_reuse(
     key_buf.extend_from_slice(&data[pos..key_end]);
     let value_start = key_end;
 
-    Some((value_start, vlen, value_end))
+    Ok((value_start, vlen, value_end))
 }
 
 /// Iterator over entries in a block.
+///
+/// `next()` returns `None` both on clean exhaustion and on corruption; call
+/// `error()` after iteration ends to distinguish the two (mirrors the
+/// `err`/`iter_error()` convention used by `TableIterator`).
 pub struct BlockIterator<'a> {
     block: &'a Block,
     offset: usize,
     key: Vec<u8>,
     value_start: usize,
     value_len: usize,
+    error: Option<Error>,
+}
+
+impl<'a> BlockIterator<'a> {
+    /// Return the corruption error encountered during iteration, if any.
+    /// `None` means iteration reached the clean end of the block.
+    pub fn error(&self) -> Option<&Error> {
+        self.error.as_ref()
+    }
 }
 
 impl<'a> Iterator for BlockIterator<'a> {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.block.restart_offset {
+        if self.error.is_some() || self.offset >= self.block.restart_offset {
             return None;
         }
 
         match decode_entry_at(&self.block.data, self.offset, &self.key) {
-            Some((key, value, next_off)) => {
+            Ok((key, value, next_off)) => {
                 self.key = key.clone();
                 self.value_start = next_off - value.len();
                 self.value_len = value.len();
                 self.offset = next_off;
                 Some((key, value))
             }
-            None => None,
+            Err(e) => {
+                self.error = Some(e);
+                None
+            }
         }
     }
 }
@@ -692,28 +723,37 @@ mod tests {
         let compare = |a: &[u8], b: &[u8]| a.cmp(b);
 
         // Exact match: seek_for_prev to key_0010 (exists)
-        let (k, v) = block.seek_for_prev_by(b"key_0010", compare).unwrap();
+        let (k, v) = block
+            .seek_for_prev_by(b"key_0010", compare)
+            .unwrap()
+            .unwrap();
         assert_eq!(k, b"key_0010");
         assert_eq!(v, b"val_5");
 
         // Between entries: seek_for_prev to key_0011 (between key_0010 and key_0012)
-        let (k, _) = block.seek_for_prev_by(b"key_0011", compare).unwrap();
+        let (k, _) = block
+            .seek_for_prev_by(b"key_0011", compare)
+            .unwrap()
+            .unwrap();
         assert_eq!(k, b"key_0010");
 
         // After last: seek_for_prev to "zzz" should return last entry
-        let (k, _) = block.seek_for_prev_by(b"zzz", compare).unwrap();
+        let (k, _) = block.seek_for_prev_by(b"zzz", compare).unwrap().unwrap();
         assert_eq!(k, b"key_0038");
 
         // Before first: seek_for_prev to "aaa" should return None
-        assert!(block.seek_for_prev_by(b"aaa", compare).is_none());
+        assert!(block.seek_for_prev_by(b"aaa", compare).unwrap().is_none());
 
         // Exactly first key
-        let (k, v) = block.seek_for_prev_by(b"key_0000", compare).unwrap();
+        let (k, v) = block
+            .seek_for_prev_by(b"key_0000", compare)
+            .unwrap()
+            .unwrap();
         assert_eq!(k, b"key_0000");
         assert_eq!(v, b"val_0");
 
         // Just before first key
-        assert!(block.seek_for_prev_by(b"key_", compare).is_none());
+        assert!(block.seek_for_prev_by(b"key_", compare).unwrap().is_none());
     }
 
     #[test]
@@ -730,22 +770,22 @@ mod tests {
         let block = Block::from_vec(data).unwrap();
 
         // Restart 0: entries 0..4 and beyond
-        let entries = block.iter_from_restart(0);
+        let entries = block.iter_from_restart(0).unwrap();
         assert_eq!(entries.len(), 12);
         assert_eq!(entries[0].0, b"key_0000");
 
         // Restart 1: entries 4..8 and beyond
-        let entries = block.iter_from_restart(1);
+        let entries = block.iter_from_restart(1).unwrap();
         assert_eq!(entries.len(), 8); // entries 4 through 11
         assert_eq!(entries[0].0, b"key_0004");
 
         // Restart 2: entries 8..12
-        let entries = block.iter_from_restart(2);
+        let entries = block.iter_from_restart(2).unwrap();
         assert_eq!(entries.len(), 4); // entries 8 through 11
         assert_eq!(entries[0].0, b"key_0008");
 
         // Out of bounds
-        let entries = block.iter_from_restart(100);
+        let entries = block.iter_from_restart(100).unwrap();
         assert!(entries.is_empty());
     }
 }

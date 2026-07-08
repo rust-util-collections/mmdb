@@ -47,8 +47,11 @@ pub struct DBIterator {
     iterate_lower_bound: Option<Vec<u8>>,
     /// Overshoot buffer for backward iteration: when collecting entries for one
     /// user key, we may read the first entry of the *previous* user key. This
-    /// field saves that entry so the next backward walk consumes it first.
-    prev_overshoot: Option<(Vec<u8>, LazyValue)>,
+    /// field saves that entry — along with the LSM level it came from
+    /// (captured via `peek_source_level()` at the time it was taken, mirroring
+    /// the forward path) — so the next backward walk consumes it first with
+    /// correct cross-level tombstone pruning.
+    prev_overshoot: Option<(Vec<u8>, LazyValue, usize)>,
     /// True when the last operation was a backward resolution (prev/seek_to_last).
     /// On the next forward iteration (next_visible), the merger must be re-seeked
     /// past the current user key to resume forward scanning correctly.
@@ -246,21 +249,6 @@ impl DBIterator {
     /// from I/O failures.
     pub fn error(&self) -> Option<String> {
         self.merger.error()
-    }
-
-    /// Check if a user key is covered by any range tombstone visible at our snapshot,
-    /// without cross-level pruning. Used for backward iteration where the source level
-    /// of the winning entry is not reliably tracked (backward collection aggregates
-    /// entries from multiple sources).
-    fn is_range_deleted_no_level_filter(&self, user_key: &[u8], seq: SequenceNumber) -> bool {
-        if self.range_tombstones.is_empty() {
-            return false;
-        }
-        self.range_tombstones.max_covering_tombstone_seq_for_level(
-            user_key,
-            self.tombstone_snapshot(),
-            None,
-        ) > seq
     }
 
     /// Set a skip-point callback. During iteration, any user key for which
@@ -670,6 +658,18 @@ impl DBIterator {
         self.resolve_prev_user_key(Some(&bound));
     }
 
+    /// Fetch the next backward entry from the merger along with the LSM level
+    /// it came from. Mirrors the forward path's `peek_entry()`, `peek_source_level()`,
+    /// `take_entry()` ordering: `peek_source_level()` is called immediately before
+    /// `prev_entry()`, so it reads the level of the entry `prev_entry()` is about to
+    /// pop (`prev_entry()` takes from `self.sources[self.heap[0]]`, exactly what
+    /// `peek_source_level()` reads).
+    #[inline]
+    fn prev_entry_with_level(&mut self) -> Option<(Vec<u8>, LazyValue, usize)> {
+        let level = self.merger.peek_source_level();
+        self.merger.prev_entry().map(|(k, v)| (k, v, level))
+    }
+
     /// Internal: given the merger positioned backward at or before target,
     /// find the previous visible user key and position on it.
     ///
@@ -693,18 +693,22 @@ impl DBIterator {
             let mut best_seq: SequenceNumber = 0;
             // Track if best visible version is a deletion
             let mut best_is_deletion = false;
+            // LSM level the current best_entry came from (for cross-level
+            // tombstone pruning), captured via peek_source_level() at the
+            // time the entry was taken from the merger.
+            let mut best_level: usize = usize::MAX;
 
             // First, consume any overshoot entry saved from a previous backward walk
             let first_entry = self
                 .prev_overshoot
                 .take()
-                .or_else(|| self.merger.prev_entry());
+                .or_else(|| self.prev_entry_with_level());
 
             let mut iter_entry = first_entry;
 
-            while let Some((ikey, value)) = iter_entry.take() {
+            while let Some((ikey, value, level)) = iter_entry.take() {
                 if ikey.len() < 8 {
-                    iter_entry = self.merger.prev_entry();
+                    iter_entry = self.prev_entry_with_level();
                     continue;
                 }
 
@@ -729,7 +733,7 @@ impl DBIterator {
                 if let Some(ref bound) = current_bound
                     && uk >= bound.as_slice()
                 {
-                    iter_entry = self.merger.prev_entry();
+                    iter_entry = self.prev_entry_with_level();
                     continue;
                 }
 
@@ -745,8 +749,9 @@ impl DBIterator {
                     Some(cuk) => {
                         if uk != cuk.as_slice() {
                             // We've moved to a different (earlier) user key.
-                            // Save this entry as overshoot for next iteration.
-                            self.prev_overshoot = Some((ikey, value));
+                            // Save this entry (with its level) as overshoot for
+                            // next iteration.
+                            self.prev_overshoot = Some((ikey, value, level));
                             break;
                         }
                     }
@@ -754,7 +759,7 @@ impl DBIterator {
 
                 // Skip range deletion entries — tombstones are pre-loaded.
                 if vt == ValueType::RangeDeletion {
-                    iter_entry = self.merger.prev_entry();
+                    iter_entry = self.prev_entry_with_level();
                     continue;
                 }
 
@@ -764,6 +769,7 @@ impl DBIterator {
                 // are correctly picked up when best_seq starts at 0.
                 if self.is_visible(seq) && seq >= best_seq {
                     best_seq = seq;
+                    best_level = level;
                     best_is_deletion = vt == ValueType::Deletion;
                     if !best_is_deletion {
                         // Truncate ikey to user key in-place
@@ -775,7 +781,7 @@ impl DBIterator {
                     }
                 }
 
-                iter_entry = self.merger.prev_entry();
+                iter_entry = self.prev_entry_with_level();
             }
 
             match candidate_uk {
@@ -787,11 +793,21 @@ impl DBIterator {
                     }
                     match best_entry {
                         Some((uk, val)) => {
-                            // Check range tombstone coverage (O(log T) binary search).
-                            // Use no-level-filter variant: backward collection aggregates
-                            // entries from multiple sources, so the winning entry's source
-                            // level is not reliably tracked.
-                            if self.is_range_deleted_no_level_filter(&uk, best_seq) {
+                            // Check range tombstone coverage (O(log T) binary search),
+                            // excluding tombstones strictly deeper than best_level —
+                            // mirrors next_visible()'s Action::TakeCheckTombstone handling.
+                            let level_filter = if best_level != usize::MAX {
+                                Some(best_level)
+                            } else {
+                                None
+                            };
+                            let covered =
+                                self.range_tombstones.max_covering_tombstone_seq_for_level(
+                                    &uk,
+                                    self.tombstone_snapshot(),
+                                    level_filter,
+                                ) > best_seq;
+                            if covered {
                                 // Covered by range tombstone — skip
                                 current_bound = Some(cuk);
                                 continue;
@@ -1023,6 +1039,110 @@ mod tests {
                 entries
             );
         }
+    }
+
+    #[test]
+    fn test_db_iterator_prev_deeper_level_tombstone_does_not_cover_key() {
+        // Backward-direction counterpart to
+        // test_db_iterator_deeper_level_tombstone_does_not_cover_key: the
+        // same cross-level tombstone pruning must hold when the key is
+        // reached via seek_to_last()/prev() (resolve_prev_user_key's
+        // collection loop), not just forward next_visible(). Before the fix,
+        // resolve_prev_user_key always called is_range_deleted_no_level_filter
+        // (level_filter=None), so this deeper tombstone would have incorrectly
+        // hidden the key during backward traversal despite being correctly
+        // excluded during forward traversal.
+        let key_source = sort_lex(vec![make_entry(
+            b"key5",
+            0,
+            ValueType::Value,
+            b"still_alive",
+        )]);
+        let mut iter =
+            DBIterator::from_sources(vec![IterSource::new(key_source).with_level(1)], 100);
+
+        // Tombstone ["a", "z") at level 2 — strictly DEEPER than the key's
+        // level 1. It must NOT cover the key despite having a much higher
+        // sequence number than the key's (zeroed) sequence.
+        iter.set_range_tombstones_with_levels(vec![(b"a".to_vec(), b"z".to_vec(), 50, 2)]);
+
+        iter.seek_to_last();
+        assert!(
+            iter.valid(),
+            "deeper-level tombstone incorrectly hid a live key with a lower (zeroed) \
+             sequence number during backward traversal"
+        );
+        assert_eq!(iter.key().unwrap(), b"key5");
+        assert_eq!(iter.value().unwrap(), b"still_alive");
+
+        // No earlier key exists — prev() must report exhaustion, not resurrect
+        // the tombstone-adjacent key incorrectly.
+        iter.prev();
+        assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_db_iterator_prev_shallower_or_same_level_tombstone_covers_key() {
+        // Backward-direction counterpart to
+        // test_db_iterator_shallower_or_same_level_tombstone_covers_key:
+        // same-level and shallower-level tombstones must still cover the key
+        // when reached via seek_to_last()/resolve_prev_user_key.
+        for tombstone_level in [0usize, 1, 2] {
+            let key_source = sort_lex(vec![make_entry(b"key5", 0, ValueType::Value, b"stale")]);
+            let mut iter =
+                DBIterator::from_sources(vec![IterSource::new(key_source).with_level(2)], 100);
+            iter.set_range_tombstones_with_levels(vec![(
+                b"a".to_vec(),
+                b"z".to_vec(),
+                50,
+                tombstone_level,
+            )]);
+            iter.seek_to_last();
+            assert!(
+                !iter.valid(),
+                "level-{} tombstone should still cover a level-2 key during backward \
+                 traversal, but iterator landed on a key",
+                tombstone_level,
+            );
+        }
+    }
+
+    #[test]
+    fn test_db_iterator_prev_overshoot_preserves_level_across_calls() {
+        // Regression test for the prev_overshoot level-tracking fix: when
+        // resolve_prev_user_key overshoots into the next (earlier) user key
+        // while draining the current one, the overshot entry's level must be
+        // captured and carried across to the NEXT resolve_prev_user_key
+        // invocation (via prev_overshoot), not just within a single call.
+        //
+        // "z" (level 0) is the last key and is unrelated to the tombstone.
+        // "key5" (level 1, seq 0) sits inside the tombstone's range and must
+        // survive a level-2 (strictly deeper) tombstone. Walking backward via
+        // seek_to_last() + prev() forces "key5" to be produced through the
+        // prev_overshoot path captured while draining "z"'s group.
+        let key_source = sort_lex(vec![
+            make_entry(b"z", 20, ValueType::Value, b"unrelated_last"),
+            make_entry(b"key5", 0, ValueType::Value, b"still_alive"),
+        ]);
+        let mut iter =
+            DBIterator::from_sources(vec![IterSource::new(key_source).with_level(1)], 100);
+        iter.set_range_tombstones_with_levels(vec![(b"a".to_vec(), b"z".to_vec(), 50, 2)]);
+
+        iter.seek_to_last();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"z");
+        assert_eq!(iter.value().unwrap(), b"unrelated_last");
+
+        iter.prev();
+        assert!(
+            iter.valid(),
+            "deeper-level tombstone incorrectly hid a live key carried via prev_overshoot"
+        );
+        assert_eq!(iter.key().unwrap(), b"key5");
+        assert_eq!(iter.value().unwrap(), b"still_alive");
+
+        iter.prev();
+        assert!(!iter.valid());
     }
 
     #[test]

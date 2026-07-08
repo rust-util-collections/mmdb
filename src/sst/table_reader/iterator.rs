@@ -1,5 +1,6 @@
 use std::{cmp::Ordering, sync::Arc};
 
+use crate::error::Result;
 use crate::sst::block::{Block, decode_entry_reuse};
 use crate::types::{LazyValue, compare_internal_key, user_key};
 
@@ -204,7 +205,13 @@ impl TableIterator {
         }
         let data = block.data();
         let (value_start, value_len, next_offset) =
-            decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key)?;
+            match decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.err = Some(format!("block entry decode error: {e}"));
+                    return None;
+                }
+            };
         // Check upper bound before returning entry
         if let Some(ref ub) = self.upper_bound
             && user_key(&self.block_cursor_key) >= ub.as_slice()
@@ -292,6 +299,8 @@ impl TableIterator {
     }
 
     /// Position the cursor at the first entry >= `target` within `block`.
+    /// If the block contains a malformed entry, records the corruption via
+    /// `self.err` instead of silently treating it as "not found" or clean EOF.
     fn seek_within_block<F: Fn(&[u8], &[u8]) -> Ordering>(
         &mut self,
         block: Block,
@@ -313,14 +322,17 @@ impl TableIterator {
                 as usize;
             tmp_key.clear();
             match decode_entry_reuse(block_data, rp, &mut tmp_key) {
-                Some(_) => {
+                Ok(_) => {
                     if compare(&tmp_key, target) == Ordering::Less {
                         left = mid + 1;
                     } else {
                         right = mid;
                     }
                 }
-                None => right = mid,
+                Err(e) => {
+                    self.err = Some(format!("block entry decode error in seek: {e}"));
+                    return;
+                }
             }
         }
 
@@ -344,7 +356,7 @@ impl TableIterator {
             prev_key_snapshot.extend_from_slice(&self.block_cursor_key);
 
             match decode_entry_reuse(block_data, offset, &mut self.block_cursor_key) {
-                Some((_, _, next_off)) => {
+                Ok((_, _, next_off)) => {
                     if compare(&self.block_cursor_key, target) != Ordering::Less {
                         // Found first entry >= target.
                         // Restore key buffer to pre-decode state so cursor_next()
@@ -358,7 +370,10 @@ impl TableIterator {
                     }
                     offset = next_off;
                 }
-                None => break,
+                Err(e) => {
+                    self.err = Some(format!("block entry decode error in seek: {e}"));
+                    return;
+                }
             }
         }
         // All entries < target
@@ -416,15 +431,32 @@ impl TableIterator {
                     break;
                 }
                 Ok(block) => match block.seek_for_prev_by(target, compare_internal_key) {
-                    Some((found_key, _found_val)) => {
+                    Ok(Some((found_key, _found_val))) => {
                         // Determine which restart segment this entry belongs to
                         // and decode all entries from that segment to end of block.
                         // Using iter_from_restart (not iter_restart_segment) ensures
                         // that a subsequent next() will see all remaining entries in
                         // this block before advancing to the next block.
-                        let restart_idx =
-                            self.find_restart_for_key(&block, &found_key, compare_internal_key);
-                        let entries_from_restart = block.iter_from_restart(restart_idx);
+                        let restart_idx = match self.find_restart_for_key(
+                            &block,
+                            &found_key,
+                            compare_internal_key,
+                        ) {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                self.err =
+                                    Some(format!("block entry decode error in seek_for_prev: {e}"));
+                                break;
+                            }
+                        };
+                        let entries_from_restart = match block.iter_from_restart(restart_idx) {
+                            Ok(entries) => entries,
+                            Err(e) => {
+                                self.err =
+                                    Some(format!("block entry decode error in seek_for_prev: {e}"));
+                                break;
+                            }
+                        };
                         // Find position of found entry within the decoded range
                         let pos_in_entries = entries_from_restart
                             .iter()
@@ -442,8 +474,12 @@ impl TableIterator {
                         found = true;
                         break;
                     }
-                    None => {
+                    Ok(None) => {
                         // No entry <= target in this block; try previous
+                    }
+                    Err(e) => {
+                        self.err = Some(format!("block entry decode error in seek_for_prev: {e}"));
+                        break;
                     }
                 }, // Ok(block) => match seek_for_prev_by
             } // match block_result
@@ -464,32 +500,34 @@ impl TableIterator {
 
     /// Find the restart index that contains a given key.
     /// Uses O(log R) binary search with O(1) per probe (single entry decode).
+    /// Returns `Err` if a restart-point entry is malformed (corrupted data).
     fn find_restart_for_key<F: Fn(&[u8], &[u8]) -> Ordering>(
         &self,
         block: &Block,
         key: &[u8],
         compare: F,
-    ) -> u32 {
+    ) -> Result<u32> {
         let num = block.num_restarts();
         if num <= 1 {
-            return 0;
+            return Ok(0);
         }
         // Binary search: find last restart point whose first key <= key
         let mut left = 0u32;
         let mut right = num;
         while left < right {
             let mid = left + (right - left) / 2;
-            if let Some(first_key) = block.first_key_at_restart(mid) {
-                if compare(&first_key, key) != Ordering::Greater {
-                    left = mid + 1;
-                } else {
-                    right = mid;
+            match block.first_key_at_restart(mid)? {
+                Some(first_key) => {
+                    if compare(&first_key, key) != Ordering::Greater {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
                 }
-            } else {
-                right = mid;
+                None => right = mid,
             }
         }
-        left.saturating_sub(1)
+        Ok(left.saturating_sub(1))
     }
 
     /// Move to the previous entry. Returns the entry at the new position,
@@ -509,10 +547,18 @@ impl TableIterator {
             && let Some(ref block) = self.backward_block
         {
             self.current_restart_index -= 1;
-            self.current_block_entries = block.iter_restart_segment(self.current_restart_index);
-            if !self.current_block_entries.is_empty() {
-                self.block_pos = self.current_block_entries.len() - 1;
-                return Some(self.current_block_entries[self.block_pos].clone());
+            match block.iter_restart_segment(self.current_restart_index) {
+                Ok(entries) => {
+                    self.current_block_entries = entries;
+                    if !self.current_block_entries.is_empty() {
+                        self.block_pos = self.current_block_entries.len() - 1;
+                        return Some(self.current_block_entries[self.block_pos].clone());
+                    }
+                }
+                Err(e) => {
+                    self.err = Some(format!("block entry decode error in prev: {e}"));
+                    return None;
+                }
             }
         }
 
@@ -550,7 +596,15 @@ impl TableIterator {
                 Ok(data) => match Block::new(data) {
                     Ok(block) => {
                         let last_restart = block.num_restarts().saturating_sub(1);
-                        self.current_block_entries = block.iter_restart_segment(last_restart);
+                        match block.iter_restart_segment(last_restart) {
+                            Ok(entries) => {
+                                self.current_block_entries = entries;
+                            }
+                            Err(e) => {
+                                self.err = Some(format!("block entry decode error in prev: {e}"));
+                                return None;
+                            }
+                        }
                         if self.current_block_entries.is_empty() {
                             if prev_block_index == 0 {
                                 return None;
@@ -745,13 +799,21 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             Ok(data) => match Block::new(data) {
                 Ok(block) => {
                     let last_restart = block.num_restarts().saturating_sub(1);
-                    self.current_block_entries = block.iter_restart_segment(last_restart);
-                    if !self.current_block_entries.is_empty() {
-                        self.block_pos = self.current_block_entries.len() - 1;
-                        self.index_pos = last_idx + 1;
-                        self.current_restart_index = last_restart;
-                        self.backward_block = Some(block);
-                        self.backward_block_index = last_idx;
+                    match block.iter_restart_segment(last_restart) {
+                        Ok(entries) => {
+                            self.current_block_entries = entries;
+                            if !self.current_block_entries.is_empty() {
+                                self.block_pos = self.current_block_entries.len() - 1;
+                                self.index_pos = last_idx + 1;
+                                self.current_restart_index = last_restart;
+                                self.backward_block = Some(block);
+                                self.backward_block_index = last_idx;
+                            }
+                        }
+                        Err(e) => {
+                            self.err =
+                                Some(format!("block entry decode error in seek_to_last: {e}"));
+                        }
                     }
                 }
                 Err(e) => {
@@ -783,21 +845,26 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 && self.block_cursor_offset < self.block_data_end
             {
                 let data = block.data();
-                if let Some((vs, vl, next)) =
-                    decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key)
+                match decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key)
                 {
-                    // Check upper bound before returning entry
-                    if let Some(ref ub) = self.upper_bound
-                        && user_key(&self.block_cursor_key) >= ub.as_slice()
-                    {
+                    Ok((vs, vl, next)) => {
+                        // Check upper bound before returning entry
+                        if let Some(ref ub) = self.upper_bound
+                            && user_key(&self.block_cursor_key) >= ub.as_slice()
+                        {
+                            return false;
+                        }
+                        self.block_cursor_offset = next;
+                        key_buf.clear();
+                        key_buf.extend_from_slice(&self.block_cursor_key);
+                        value_buf.clear();
+                        value_buf.extend_from_slice(&data[vs..vs + vl]);
+                        return true;
+                    }
+                    Err(e) => {
+                        self.err = Some(format!("block entry decode error: {e}"));
                         return false;
                     }
-                    self.block_cursor_offset = next;
-                    key_buf.clear();
-                    key_buf.extend_from_slice(&self.block_cursor_key);
-                    value_buf.clear();
-                    value_buf.extend_from_slice(&data[vs..vs + vl]);
-                    return true;
                 }
             }
             // Try materialized entries (backward iteration)
@@ -863,21 +930,27 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 let data = block.data();
                 let result =
                     decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key);
-                if let Some((value_start, value_len, next_offset)) = result {
-                    // Check upper bound
-                    if let Some(ref ub) = self.upper_bound
-                        && user_key(&self.block_cursor_key) >= ub.as_slice()
-                    {
+                match result {
+                    Ok((value_start, value_len, next_offset)) => {
+                        // Check upper bound
+                        if let Some(ref ub) = self.upper_bound
+                            && user_key(&self.block_cursor_key) >= ub.as_slice()
+                        {
+                            return None;
+                        }
+                        self.block_cursor_offset = next_offset;
+                        key_buf.clear();
+                        key_buf.extend_from_slice(&self.block_cursor_key);
+                        return Some(LazyValue::BlockRef {
+                            data: block.data_arc().clone(),
+                            offset: value_start as u32,
+                            len: value_len as u32,
+                        });
+                    }
+                    Err(e) => {
+                        self.err = Some(format!("block entry decode error: {e}"));
                         return None;
                     }
-                    self.block_cursor_offset = next_offset;
-                    key_buf.clear();
-                    key_buf.extend_from_slice(&self.block_cursor_key);
-                    return Some(LazyValue::BlockRef {
-                        data: block.data_arc().clone(),
-                        offset: value_start as u32,
-                        len: value_len as u32,
-                    });
                 }
             }
             // Materialized entries path (backward iteration)

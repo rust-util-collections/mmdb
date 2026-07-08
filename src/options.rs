@@ -3,6 +3,7 @@
 use std::{fmt, sync::Arc};
 
 use crate::sst::format::CompressionType;
+use crate::types::SequenceNumber;
 
 /// Callback that returns `true` for user keys that should be skipped during iteration.
 pub type SkipPointFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
@@ -70,8 +71,12 @@ pub struct DbOptions {
     pub max_subcompactions: usize,
 
     // ---- Cache behavior ----
-    /// Pin L0 index and filter blocks in block cache (never evict). Default: true.
-    /// RocksDB equivalent: `pin_l0_filter_and_index_blocks_in_cache`.
+    /// Eagerly warm the index-entry cache and pin each newly-flushed L0
+    /// file's first data block in the block cache (never evict). Default:
+    /// true. Unlike RocksDB's option of the same name, index and filter
+    /// blocks are never stored in `block_cache` — they are always held as
+    /// direct `TableReader` fields regardless of this setting.
+    /// RocksDB equivalent (name only, not behavior): `pin_l0_filter_and_index_blocks_in_cache`.
     pub pin_l0_filter_and_index_blocks_in_cache: bool,
 
     /// Factories for block property collectors. Each factory is called once per SST
@@ -83,8 +88,15 @@ pub struct DbOptions {
     /// scheduled: every populated level is force-rewritten through the
     /// compaction filter so the registered keys are physically removed
     /// even when no organic compaction is pending. Comparable in cost to
-    /// an explicit [`DB::compact`] over the whole store. Set to 0 to
-    /// disable auto-triggering.
+    /// an explicit [`DB::compact`] over the whole store — **and, unlike
+    /// `compact()`, each level's rewrite holds the DB's write-serializing
+    /// lock for its full duration** (the same lock `put`/`write`/new
+    /// snapshots need), so writers and new-snapshot creation stall for
+    /// however long the largest populated level takes to rewrite. Default:
+    /// `0` (disabled) — this is an explicit opt-in for callers who accept
+    /// that tradeoff for guaranteed physical removal of dead keys; use
+    /// [`DB::compact`]/[`DB::compact_range`] for an administrative,
+    /// caller-invoked equivalent instead if the stall is unacceptable.
     pub lazy_delete_compaction_threshold: usize,
     /// Optional shared block-cache pool. `None` (the default) gives this
     /// DB a private cache sized by `block_cache_capacity` — the
@@ -125,7 +137,7 @@ impl Default for DbOptions {
             max_subcompactions: 1,
             pin_l0_filter_and_index_blocks_in_cache: true,
             block_property_collectors: Vec::new(),
-            lazy_delete_compaction_threshold: 10_000,
+            lazy_delete_compaction_threshold: 0,
             block_cache: None,
         }
     }
@@ -230,7 +242,7 @@ pub struct ReadOptions {
     /// [`crate::Snapshot::read_options`]); a raw sequence number that is not
     /// registered as a snapshot may see its data garbage-collected by
     /// compaction.
-    pub snapshot: Option<u64>,
+    pub snapshot: Option<SequenceNumber>,
     /// Whether a block-cache miss inserts the block into the cache. Default: true.
     ///
     /// Set to `false` for large scans (analytics, backups, bulk exports) so

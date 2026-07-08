@@ -405,8 +405,18 @@ impl VersionSet {
         // (The file *contents* are already fsynced by `TableBuilder::finish`.)
         // Otherwise a crash could leave the MANIFEST referencing an SST whose
         // directory entry was lost.
-        if !edit.new_files.is_empty() {
-            Self::fsync_directory(&self.db_path).ctx()?;
+        if !edit.new_files.is_empty()
+            && let Err(e) = Self::fsync_directory(&self.db_path)
+        {
+            // A failed directory fsync means these files' directory entries
+            // are not confirmed durable (fsyncgate): a later "successful"
+            // fsync of the same directory (e.g. from a sibling background
+            // compaction thread, since this is the only durability guard for
+            // SST directory entries) could falsely report durability of the
+            // entries this one failed to persist. Poison the writer so no
+            // further edits are appended; reopen to recover.
+            self.poisoned.store(true, Ordering::Release);
+            return Err(e).ctx();
         }
 
         // Version built successfully — now persist to MANIFEST (write only, no sync).
@@ -641,16 +651,23 @@ impl VersionSet {
 
         // Publish CURRENT in two phases so a post-rename fsync failure cannot
         // leave the live process appending to a different MANIFEST than CURRENT.
+        // The temp file is named per-attempt (suffixed with new_manifest_number,
+        // which is freshly allocated above) so a retry after a deferred failure
+        // never truncates-in-place a prior attempt's inode.
+        let current_tmp_path = self
+            .db_path
+            .join(format!("CURRENT.tmp.{}", new_manifest_number));
         if let Err(e) = Self::write_current_file_tmp(&self.db_path, new_manifest_number).ctx() {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
+            let _ = fs::remove_file(&current_tmp_path);
             tracing::warn!("MANIFEST compaction deferred writing CURRENT: {}", e);
             return;
         }
-        if let Err(e) = Self::rename_current_file(&self.db_path).ctx() {
+        if let Err(e) = Self::rename_current_file(&self.db_path, new_manifest_number).ctx() {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
-            let _ = fs::remove_file(self.db_path.join("CURRENT.tmp"));
+            let _ = fs::remove_file(&current_tmp_path);
             tracing::warn!("MANIFEST compaction deferred publishing CURRENT: {}", e);
             return;
         }
@@ -691,14 +708,18 @@ impl VersionSet {
 
     fn set_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {
         Self::write_current_file_tmp(db_path, manifest_number).ctx()?;
-        Self::rename_current_file(db_path).ctx()?;
+        Self::rename_current_file(db_path, manifest_number).ctx()?;
         Self::fsync_directory(db_path).ctx()?;
         Ok(())
     }
 
     fn write_current_file_tmp(db_path: &Path, manifest_number: u64) -> Result<()> {
         let contents = format!("MANIFEST-{:06}\n", manifest_number);
-        let tmp_path = db_path.join("CURRENT.tmp");
+        // Unique per-attempt name (suffixed with the manifest number being
+        // published) so a retry after a failed attempt never reuses the same
+        // inode: `fs::File::create` on a fixed name would truncate whatever
+        // partially-written file a prior failed attempt left behind.
+        let tmp_path = db_path.join(format!("CURRENT.tmp.{}", manifest_number));
 
         // Write and fsync the temp file before rename to ensure durability
         let file = fs::File::create(&tmp_path).ctx()?;
@@ -710,8 +731,8 @@ impl VersionSet {
         Ok(())
     }
 
-    fn rename_current_file(db_path: &Path) -> Result<()> {
-        let tmp_path = db_path.join("CURRENT.tmp");
+    fn rename_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {
+        let tmp_path = db_path.join(format!("CURRENT.tmp.{}", manifest_number));
         // Atomic rename
         fs::rename(&tmp_path, db_path.join("CURRENT")).ctx()?;
         Ok(())

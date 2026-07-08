@@ -412,6 +412,33 @@ impl super::merge::SeekableIterator for LevelIterator {
             .clone()
             .or_else(|| self.current_iter.as_ref().and_then(|it| it.iter_error()))
     }
+
+    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
+        if self.error.is_some() {
+            return None;
+        }
+        loop {
+            if self.current_iter.is_none() && self.file_index < self.files.len() {
+                self.open_file_and_seek(None);
+                self.current_iter.as_ref()?;
+            }
+            if let Some(ref mut iter) = self.current_iter {
+                if let Some(lv) = iter.next_lazy(key_buf) {
+                    return Some(lv);
+                }
+                if let Some(e) = iter.iter_error() {
+                    self.error = Some(e);
+                    self.current_iter = None;
+                    return None;
+                }
+            }
+            self.current_iter = None;
+            self.file_index += 1;
+            if self.file_index >= self.files.len() {
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

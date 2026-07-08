@@ -112,7 +112,7 @@ impl TableReader {
         // Read filters and range-del handle from metaindex
         let meta = Self::read_metaindex(&mut file, &metaindex_handle, file_size).ctx()?;
 
-        Ok(Self {
+        let reader = Self {
             file_number,
             index_block,
             filter_data: meta.bloom,
@@ -124,7 +124,26 @@ impl TableReader {
             index_entry_cache: OnceLock::new(),
             range_tombstone_cache: OnceLock::new(),
             range_del_handle: meta.range_del_handle,
-        })
+        };
+
+        // Eagerly warm the range-tombstone cache at open time for files using
+        // the dedicated range-del block (any file written by current code
+        // that actually has range deletions — `write_range_del_block` only
+        // produces a non-default handle in that case). This removes the
+        // lazy-first-access gap that otherwise lets `file_overlaps_extent()`
+        // perform blocking disk I/O from inside compaction's pick/install
+        // phases, which run under the DB's write-serializing lock (see
+        // `is_bottommost_level` and `outputs_overlap_unexpected_current_files`).
+        // The legacy fallback path (no dedicated block; `range_del_handle` is
+        // `None`) is intentionally left lazy — populating it requires
+        // scanning every data block in the file, which would regress open()
+        // for every old-format file regardless of whether it actually has
+        // range deletions.
+        if reader.range_del_handle.is_some() {
+            reader.cached_range_tombstones().ctx()?;
+        }
+
+        Ok(reader)
     }
 
     /// Get cached index entries (shared across all TableIterators for this file).
@@ -216,6 +235,7 @@ impl TableReader {
         let handle = match self
             .index_block
             .seek_by(seek_key.as_bytes(), compare_internal_key)
+            .ctx()?
         {
             Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).ctx()?,
             None => return Ok(None),
@@ -226,7 +246,10 @@ impl TableReader {
 
         // Seek within the data block. The first entry >= seek_key with matching user_key
         // is our answer (because entries are sorted user_key ASC, seq DESC).
-        match block.seek_by(seek_key.as_bytes(), compare_internal_key) {
+        match block
+            .seek_by(seek_key.as_bytes(), compare_internal_key)
+            .ctx()?
+        {
             Some((encoded_ikey, value)) if encoded_ikey.len() >= 8 => {
                 let ik = InternalKeyRef::new(&encoded_ikey);
                 if ik.user_key() == user_key {
@@ -264,6 +287,7 @@ impl TableReader {
         let handle = match self
             .index_block
             .seek_by(seek_key.as_bytes(), compare_internal_key)
+            .ctx()?
         {
             Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).ctx()?,
             None => return Ok(None),
@@ -272,7 +296,10 @@ impl TableReader {
         let block_data = self.read_block_cached_opt(&handle, fill_cache).ctx()?;
         let block = Block::new(block_data).ctx()?;
 
-        match block.seek_by(seek_key.as_bytes(), compare_internal_key) {
+        match block
+            .seek_by(seek_key.as_bytes(), compare_internal_key)
+            .ctx()?
+        {
             Some((encoded_ikey, value)) if encoded_ikey.len() >= 8 => {
                 let ik = InternalKeyRef::new(&encoded_ikey);
                 if ik.user_key() == user_key {
@@ -325,7 +352,8 @@ impl TableReader {
             // New path: read from dedicated range-del block
             let block_data = self.read_block_cached(handle).ctx()?;
             let block = Block::new(block_data).ctx()?;
-            for (k, v) in block.iter() {
+            let mut iter = block.iter();
+            for (k, v) in &mut iter {
                 if k.len() < 8 {
                     continue;
                 }
@@ -334,14 +362,19 @@ impl TableReader {
                     triples.push((ikr.user_key().to_vec(), v, ikr.sequence()));
                 }
             }
+            if let Some(e) = iter.error() {
+                return Err(e.clone()).ctx();
+            }
         } else {
             // Backward compatibility: old SST format without range-del block
-            for (_, handle_bytes) in self.index_block.iter() {
+            let mut index_iter = self.index_block.iter();
+            for (_, handle_bytes) in &mut index_iter {
                 let handle = BlockHandle::decode(&handle_bytes).ctx()?;
                 let block_data = self.read_block_cached(&handle).ctx()?;
                 let block = Block::new(block_data).ctx()?;
 
-                for (k, v) in block.iter() {
+                let mut iter = block.iter();
+                for (k, v) in &mut iter {
                     if k.len() < 8 {
                         continue;
                     }
@@ -351,6 +384,12 @@ impl TableReader {
                     }
                     triples.push((ikr.user_key().to_vec(), v, ikr.sequence()));
                 }
+                if let Some(e) = iter.error() {
+                    return Err(e.clone()).ctx();
+                }
+            }
+            if let Some(e) = index_iter.error() {
+                return Err(e.clone()).ctx();
             }
         }
 
@@ -365,13 +404,21 @@ impl TableReader {
     pub fn iter(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut result = Vec::new();
 
-        for (_, handle_bytes) in self.index_block.iter() {
+        let mut index_iter = self.index_block.iter();
+        for (_, handle_bytes) in &mut index_iter {
             let handle = BlockHandle::decode(&handle_bytes).ctx()?;
             let block_data = self.read_block_cached(&handle).ctx()?;
             let block = Block::new(block_data).ctx()?;
-            for entry in block.iter() {
+            let mut iter = block.iter();
+            for entry in &mut iter {
                 result.push(entry);
             }
+            if let Some(e) = iter.error() {
+                return Err(e.clone()).ctx();
+            }
+        }
+        if let Some(e) = index_iter.error() {
+            return Err(e.clone()).ctx();
         }
 
         Ok(result)
@@ -464,7 +511,36 @@ impl TableReader {
                     .ctx()?
             }
             CompressionType::Zstd => {
-                zstd::bulk::decompress(data.as_slice(), MAX_DECOMPRESSED_BLOCK_SIZE)
+                // zstd::bulk::compress() embeds the frame's uncompressed content
+                // size by default (confirmed by the zstd crate's own test suite).
+                // Read it via the stable zstd_safe API to right-size the
+                // allocation, instead of always allocating the full
+                // MAX_DECOMPRESSED_BLOCK_SIZE regardless of actual block size
+                // (the alternative, `Decompressor::upper_bound()`, requires the
+                // unstable "experimental" cargo feature, which is not enabled).
+                // The claimed size is still bounded against
+                // MAX_DECOMPRESSED_BLOCK_SIZE before use, exactly like the LZ4
+                // path above, since a corrupted/adversarial frame header could
+                // otherwise claim an oversized value.
+                let capacity = match zstd::zstd_safe::get_frame_content_size(&data) {
+                    Ok(Some(size)) => {
+                        let size = size as usize;
+                        if size > MAX_DECOMPRESSED_BLOCK_SIZE {
+                            return Err(Error::corruption(format!(
+                                "Zstd decompressed size {} exceeds limit {}",
+                                size, MAX_DECOMPRESSED_BLOCK_SIZE
+                            )));
+                        }
+                        size
+                    }
+                    // Frame doesn't embed a content size — fall back to the
+                    // conservative bound (matches prior behavior for this case).
+                    Ok(None) => MAX_DECOMPRESSED_BLOCK_SIZE,
+                    Err(_) => {
+                        return Err(Error::corruption("malformed Zstd frame header"));
+                    }
+                };
+                zstd::bulk::decompress(data.as_slice(), capacity)
                     .map_err(|e| Error::corruption(format!("Zstd decompression error: {}", e)))
                     .ctx()?
             }

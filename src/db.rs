@@ -1520,7 +1520,7 @@ impl DB {
     /// 1. **Range pruning** — skips SST files whose `[smallest, largest]` key
     ///    range does not overlap the prefix.
     /// 2. **Bloom filter pruning** — among the remaining files, skips those
-    ///    whose per-block bloom filters report that `prefix` is absent.
+    ///    whose file-level bloom filter reports that `prefix` is absent.
     ///
     /// For cross-prefix ranges (e.g. `[b"m", b"z")`) use `iter_with_range()`
     /// instead, as there is no single prefix that covers the query.
@@ -2175,6 +2175,18 @@ impl DB {
                         }
                     }
                 }
+                // Publish the new SuperVersion after every iteration (not
+                // just once after the whole range-compaction cascade) so
+                // this iteration's already-unlinked input files' Arc<TableReader>
+                // references — and their disk space — are released promptly,
+                // mirroring drain_l0's per-iteration refresh. Deferring this
+                // to a single post-loop refresh would keep every superseded
+                // file across the whole multi-level cascade open until the
+                // entire compact_range call finished, transiently doubling
+                // disk usage for an API whose purpose is reclaiming space.
+                self.l0_file_count
+                    .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+                self.install_super_version(&inner);
                 cleanup
             };
             // Sync manifest + delete old SSTs outside the main lock
@@ -2198,12 +2210,6 @@ impl DB {
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
         }
 
-        // Update cached L0 count and install new SuperVersion so readers
-        // see the compacted state immediately.
-        let inner = self.inner.lock();
-        self.l0_file_count
-            .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
-        self.install_super_version(&inner);
         Ok(())
     }
 
@@ -2212,15 +2218,23 @@ impl DB {
     /// tombstone. This avoids write amplification for bulk cleanup.
     ///
     /// If the number of accumulated dead keys newly crosses
-    /// `lazy_delete_compaction_threshold`, a background sweep is
-    /// automatically scheduled: every populated level is force-rewritten
-    /// through the compaction filter (same behavior as
+    /// `lazy_delete_compaction_threshold` (default: `0`, i.e. disabled —
+    /// this is an opt-in feature), a background sweep is automatically
+    /// scheduled: every populated level is force-rewritten through the
+    /// compaction filter (same behavior as
     /// [`lazy_delete_batch`](Self::lazy_delete_batch)), so the keys are
     /// physically removed even when the store has no organic compaction
     /// debt. Removal is subject to the usual bottommost-safety rule: a
     /// version shadowing an older version at a deeper level is kept until
     /// later compactions reach that data, exactly as with
     /// [`compact`](Self::compact).
+    ///
+    /// **Warning:** unlike [`compact`](Self::compact), each level's sweep
+    /// rewrite holds the DB's write-serializing lock for its full
+    /// duration, stalling writers and new-snapshot creation for however
+    /// long the largest populated level takes to rewrite. Only opt in
+    /// (set a nonzero threshold) if that stall is acceptable for your
+    /// workload; see `DbOptions::lazy_delete_compaction_threshold`.
     ///
     /// **Note:** The key remains readable via `get()` until compaction
     /// physically removes it. Use regular `delete()` if immediate
@@ -2249,9 +2263,10 @@ impl DB {
     /// for durability caveats.
     ///
     /// If the number of accumulated dead keys newly crosses
-    /// `lazy_delete_compaction_threshold`, a background sweep is
-    /// automatically scheduled — see [`lazy_delete`](Self::lazy_delete)
-    /// for its exact semantics.
+    /// `lazy_delete_compaction_threshold` (default: `0`, i.e. disabled —
+    /// opt-in only), a background sweep is automatically scheduled — see
+    /// [`lazy_delete`](Self::lazy_delete) for its exact semantics and the
+    /// write-stall tradeoff of opting in.
     pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();

@@ -269,7 +269,7 @@ impl<'a> Iterator for WalIterator<'a> {
 mod tests {
     use super::*;
     use crate::wal::writer::WalWriter;
-    use std::io::SeekFrom;
+    use std::{fs::OpenOptions, io::SeekFrom};
 
     #[test]
     fn test_empty_wal() {
@@ -299,7 +299,7 @@ mod tests {
         // Corrupt the data portion (after the 7-byte header)
         {
             use std::io::Write;
-            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let mut file = OpenOptions::new().write(true).open(&path).unwrap();
             file.seek(SeekFrom::Start(HEADER_SIZE as u64)).unwrap();
             file.write_all(b"CORRUPTED").unwrap();
         }
@@ -328,7 +328,7 @@ mod tests {
 
         // Truncated mid-trailer: committed records in the next block were
         // lost, so this must surface as corruption, not clean EOF.
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(trailer_start + 3).unwrap();
         drop(file);
         let mut reader = WalReader::new(&path).unwrap();
@@ -337,7 +337,7 @@ mod tests {
 
         // Truncated exactly at the trailer start: a legitimate end of file
         // (the writer only pads when it is about to append another record).
-        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(trailer_start).unwrap();
         drop(file);
         let mut reader = WalReader::new(&path).unwrap();

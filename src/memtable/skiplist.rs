@@ -133,10 +133,22 @@ impl SkipListMemTable {
 pub struct MemTableCursorIter {
     /// Arc to keep the underlying memtable (and its skiplist) alive.
     _memtable: Arc<crate::memtable::MemTable>,
-    /// Current node pointer in the level-0 chain. null = exhausted.
+    /// Current node pointer in the level-0 chain. null = exhausted (either
+    /// freshly past-the-end, or before-the-start — see `exhausted_backward`
+    /// to distinguish the two).
     cursor: *const (),
     /// Reference to the skiplist for node_kv/node_next0 access.
     skiplist: *const ConcurrentSkipList<OrdInternalKey, Vec<u8>>,
+    /// Set by `prev()` when it finds no predecessor, i.e. the cursor has
+    /// moved before the first entry. A null `cursor` alone is ambiguous
+    /// between "freshly past-the-end" (prev() should jump to the last
+    /// entry) and "already exhausted backward" (prev() must keep returning
+    /// `None`) — this flag disambiguates the two so repeated `prev()` calls
+    /// don't wrap around to the last entry. Cleared by every method that
+    /// repositions the cursor by other means (`next()`/`next_into()`/
+    /// `next_lazy()`, `seek_to`, `seek_to_first`, `seek_to_last`,
+    /// `seek_for_prev`).
+    exhausted_backward: bool,
 }
 
 // SAFETY: The skiplist nodes are heap-allocated with stable pointers.
@@ -154,6 +166,7 @@ impl MemTableCursorIter {
             _memtable: memtable,
             cursor: head,
             skiplist,
+            exhausted_backward: false,
         }
     }
 
@@ -166,6 +179,9 @@ impl MemTableCursorIter {
     fn seek_internal(&mut self, target: &[u8]) {
         let search = OrdInternalKey(target.to_vec());
         self.cursor = self.sl().seek_ge_raw(&search);
+        // Repositioned by an explicit seek — no longer in the "exhausted
+        // backward" state (if we were even in it).
+        self.exhausted_backward = false;
     }
 }
 
@@ -174,9 +190,23 @@ impl Iterator for MemTableCursorIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor.is_null() {
-            return None;
+            if !self.exhausted_backward {
+                return None;
+            }
+            // The cursor was parked before the first entry by a previous
+            // `prev()` call that found no predecessor. Resuming forward
+            // from there starts back at the first entry (mirrors
+            // `seek_to_first()`), instead of staying stuck at `None`.
+            self.cursor = self.sl().head_ptr();
+            if self.cursor.is_null() {
+                // Skiplist is empty — nothing to resume to.
+                return None;
+            }
         }
-        // SAFETY: cursor is either null or a node pointer returned by this skiplist.
+        self.exhausted_backward = false;
+        // SAFETY: cursor is non-null here (the null case returned above) and
+        // is a node pointer returned by this skiplist (either the
+        // pre-existing cursor or `head_ptr()`).
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         let result = (k.as_bytes().to_vec(), v.clone());
         // SAFETY: same cursor validity as above; node_next0 only reads an atomic link.
@@ -203,9 +233,20 @@ impl SeekableIterator for MemTableCursorIter {
     /// After the first call, subsequent calls are memcpy-only (zero heap allocation).
     fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
         if self.cursor.is_null() {
-            return false;
+            if !self.exhausted_backward {
+                return false;
+            }
+            // See `next()`: resume forward from before-the-start at the
+            // first entry instead of staying stuck.
+            self.cursor = self.sl().head_ptr();
+            if self.cursor.is_null() {
+                return false;
+            }
         }
-        // SAFETY: cursor is non-null and comes from this skiplist.
+        self.exhausted_backward = false;
+        // SAFETY: cursor is non-null here (the null case returned above) and
+        // is a node pointer returned by this skiplist (either the
+        // pre-existing cursor or `head_ptr()`).
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
         key_buf.extend_from_slice(k.as_bytes());
@@ -220,9 +261,20 @@ impl SeekableIterator for MemTableCursorIter {
     /// Writes key into caller buffer, returns value as LazyValue directly.
     fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
         if self.cursor.is_null() {
-            return None;
+            if !self.exhausted_backward {
+                return None;
+            }
+            // See `next()`: resume forward from before-the-start at the
+            // first entry instead of staying stuck.
+            self.cursor = self.sl().head_ptr();
+            if self.cursor.is_null() {
+                return None;
+            }
         }
-        // SAFETY: cursor is non-null and comes from this skiplist.
+        self.exhausted_backward = false;
+        // SAFETY: cursor is non-null here (the null case returned above) and
+        // is a node pointer returned by this skiplist (either the
+        // pre-existing cursor or `head_ptr()`).
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
         key_buf.extend_from_slice(k.as_bytes());
@@ -233,6 +285,14 @@ impl SeekableIterator for MemTableCursorIter {
     }
 
     fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        if self.exhausted_backward {
+            // Already moved before the first entry on a previous `prev()`
+            // call. A null `cursor` here does NOT mean "freshly past the
+            // end" (which would jump to the last entry below) — it means
+            // we're still stuck before the start, so keep returning `None`
+            // instead of re-entering that branch and wrapping around.
+            return None;
+        }
         let ptr = if self.cursor.is_null() {
             self.sl().tail_ptr()
         } else {
@@ -242,6 +302,7 @@ impl SeekableIterator for MemTableCursorIter {
         };
         if ptr.is_null() {
             self.cursor = std::ptr::null();
+            self.exhausted_backward = true;
             return None;
         }
         // SAFETY: ptr is non-null and either the previous node or skiplist tail.
@@ -261,15 +322,20 @@ impl SeekableIterator for MemTableCursorIter {
             // Position on this entry — next call to next() returns it
             self.cursor = ptr;
         }
+        // Repositioned by an explicit seek — no longer in the "exhausted
+        // backward" state (if we were even in it).
+        self.exhausted_backward = false;
     }
 
     fn seek_to_first(&mut self) {
         self.cursor = self.sl().head_ptr();
+        self.exhausted_backward = false;
     }
 
     fn seek_to_last(&mut self) {
         let ptr = self.sl().tail_ptr();
         self.cursor = ptr;
+        self.exhausted_backward = false;
     }
 }
 
@@ -381,5 +447,143 @@ mod tests {
         assert_eq!(user_keys[0], b"c");
         assert_eq!(user_keys[1], b"b");
         assert_eq!(user_keys[2], b"a");
+    }
+
+    // --- MemTableCursorIter: prev()/seek_for_prev()/current() coverage ---
+    //
+    // Regression tests for the double-exhaustion bug: `prev()` used to
+    // overload `cursor.is_null()` to mean both "freshly past-the-end" and
+    // "already exhausted backward", so a second `prev()` call after
+    // backward exhaustion would wrongly resurrect the last entry.
+
+    /// Build a MemTable with the given (user_key, seq, value) entries.
+    fn make_memtable_with_entries(
+        entries: &[(&[u8], u64, &[u8])],
+    ) -> Arc<crate::memtable::MemTable> {
+        let memtable = Arc::new(crate::memtable::MemTable::new());
+        for (key, seq, value) in entries {
+            memtable.put(key, value, *seq, ValueType::Value);
+        }
+        memtable
+    }
+
+    /// Extract the user-key portion from a cursor `(encoded_key, LazyValue)` entry.
+    fn user_key_of(entry: &Option<(Vec<u8>, LazyValue)>) -> Option<Vec<u8>> {
+        entry
+            .as_ref()
+            .map(|(k, _)| InternalKeyRef::new(k).user_key().to_vec())
+    }
+
+    #[test]
+    fn test_cursor_iter_prev_traversal_end_to_end() {
+        // (b) Normal prev() traversal works correctly end-to-end.
+        let memtable =
+            make_memtable_with_entries(&[(b"a", 1, b"1"), (b"b", 2, b"2"), (b"c", 3, b"3")]);
+        let mut iter = MemTableCursorIter::new(memtable);
+
+        // seek_to_last() + current() peeks the last entry without advancing.
+        iter.seek_to_last();
+        assert_eq!(user_key_of(&iter.current()), Some(b"c".to_vec()));
+        assert_eq!(
+            user_key_of(&iter.current()),
+            Some(b"c".to_vec()),
+            "current() must not advance the cursor"
+        );
+
+        // Walk backward: c (current) -> b -> a -> exhausted.
+        assert_eq!(user_key_of(&iter.prev()), Some(b"b".to_vec()));
+        assert_eq!(user_key_of(&iter.prev()), Some(b"a".to_vec()));
+        assert!(iter.prev().is_none());
+    }
+
+    #[test]
+    fn test_cursor_iter_prev_double_exhaustion_does_not_wrap() {
+        // (a) The specific double-exhaustion regression: once prev() has
+        // moved before the first entry, calling it again must keep
+        // returning None instead of wrapping around to the last entry.
+        let memtable =
+            make_memtable_with_entries(&[(b"a", 1, b"1"), (b"b", 2, b"2"), (b"c", 3, b"3")]);
+        let mut iter = MemTableCursorIter::new(memtable);
+
+        iter.seek_to_last();
+        assert_eq!(user_key_of(&iter.current()), Some(b"c".to_vec()));
+
+        // Drain backward until exhausted.
+        assert_eq!(user_key_of(&iter.prev()), Some(b"b".to_vec()));
+        assert_eq!(user_key_of(&iter.prev()), Some(b"a".to_vec()));
+        assert!(
+            iter.prev().is_none(),
+            "first backward exhaustion must be None"
+        );
+
+        // Regression: repeated prev() calls after exhaustion must keep
+        // returning None, never resurrecting "c" (the last entry).
+        assert!(
+            iter.prev().is_none(),
+            "second prev() after exhaustion must stay None, not wrap to the last entry"
+        );
+        assert!(
+            iter.prev().is_none(),
+            "third prev() after exhaustion must also stay None"
+        );
+    }
+
+    #[test]
+    fn test_cursor_iter_next_resumes_after_backward_exhaustion() {
+        // (c) next() after backward-exhaustion correctly resumes forward
+        // traversal, instead of staying stuck at None because the cursor
+        // is still null from the exhaustion.
+        let memtable =
+            make_memtable_with_entries(&[(b"a", 1, b"1"), (b"b", 2, b"2"), (b"c", 3, b"3")]);
+        let mut iter = MemTableCursorIter::new(memtable);
+
+        iter.seek_to_last();
+        assert_eq!(user_key_of(&iter.current()), Some(b"c".to_vec()));
+        assert_eq!(user_key_of(&iter.prev()), Some(b"b".to_vec()));
+        assert_eq!(user_key_of(&iter.prev()), Some(b"a".to_vec()));
+        assert!(iter.prev().is_none(), "exhausted backward");
+
+        // Direction switch: next() must resume forward at the first entry.
+        let extract = |e: Option<(Vec<u8>, Vec<u8>)>| {
+            e.map(|(k, _)| InternalKeyRef::new(&k).user_key().to_vec())
+        };
+        assert_eq!(extract(Iterator::next(&mut iter)), Some(b"a".to_vec()));
+        assert_eq!(extract(Iterator::next(&mut iter)), Some(b"b".to_vec()));
+        assert_eq!(extract(Iterator::next(&mut iter)), Some(b"c".to_vec()));
+        assert_eq!(
+            extract(Iterator::next(&mut iter)),
+            None,
+            "must be forward-exhausted again after re-consuming all entries"
+        );
+    }
+
+    #[test]
+    fn test_cursor_iter_seek_for_prev_and_current() {
+        // seek_for_prev()/current() direct coverage, including the
+        // "no predecessor" edge case behaving consistently with prev().
+        let memtable =
+            make_memtable_with_entries(&[(b"a", 1, b"1"), (b"c", 1, b"3"), (b"e", 1, b"5")]);
+        let mut iter = MemTableCursorIter::new(memtable);
+
+        // Exact match.
+        let search = InternalKey::new(b"c", 1, ValueType::Value);
+        iter.seek_for_prev(search.as_bytes());
+        assert_eq!(user_key_of(&iter.current()), Some(b"c".to_vec()));
+
+        // Target between entries finds the largest entry <= target.
+        let search = InternalKey::new(b"d", 1, ValueType::Value);
+        iter.seek_for_prev(search.as_bytes());
+        assert_eq!(user_key_of(&iter.current()), Some(b"c".to_vec()));
+
+        // Backward traversal from here still behaves correctly and stays
+        // exhausted afterward (does not wrap to "e").
+        assert_eq!(user_key_of(&iter.prev()), Some(b"a".to_vec()));
+        assert!(iter.prev().is_none());
+        assert!(iter.prev().is_none());
+
+        // Target smaller than every key: no predecessor exists.
+        let search = InternalKey::new(b"\0", 1, ValueType::Value);
+        iter.seek_for_prev(search.as_bytes());
+        assert!(iter.current().is_none());
     }
 }
