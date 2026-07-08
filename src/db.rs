@@ -337,7 +337,13 @@ impl DB {
         };
 
         // Create caches and infra
-        let block_cache = Arc::new(BlockCache::new(options.block_cache_capacity));
+        let block_cache = Arc::new(match options.block_cache {
+            // Shared pool supplied by the caller: attach as a member
+            // (block_cache_capacity is ignored — capacity is the pool's).
+            Some(ref pool) => pool.attach(),
+            // Private single-member pool — the historical behavior.
+            None => BlockCache::new(options.block_cache_capacity),
+        });
         let rate_limiter = Arc::new(RateLimiter::new(options.rate_limiter_bytes_per_sec));
         let stats = Arc::new(DbStats::new());
         let table_cache = Arc::new(TableCache::new_with_stats(
@@ -2311,6 +2317,12 @@ impl DB {
             first_error = Some(e);
         }
 
+        // Leave the block-cache pool (idempotent; `Drop` also calls it).
+        // Runs regardless of flush/sync errors: the DB is closed either
+        // way, and a shared pool must not keep carrying a closed
+        // member's blocks until LRU pressure notices.
+        self.block_cache.detach();
+
         match first_error {
             Some(e) => Err(e),
             None => Ok(()),
@@ -3530,6 +3542,10 @@ impl Drop for DB {
         for handle in self.compaction_handles.lock().drain(..) {
             let _ = handle.join();
         }
+        // Leave the block-cache pool (idempotent — a preceding `close()`
+        // already detached). After the compaction threads are joined, no
+        // code path of this DB touches the cache again.
+        self.block_cache.detach();
     }
 }
 

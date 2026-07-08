@@ -86,6 +86,15 @@ pub struct DbOptions {
     /// an explicit [`DB::compact`] over the whole store. Set to 0 to
     /// disable auto-triggering.
     pub lazy_delete_compaction_threshold: usize,
+    /// Optional shared block-cache pool. `None` (the default) gives this
+    /// DB a private cache sized by `block_cache_capacity` — the
+    /// historical behavior, unchanged. `Some(pool)` attaches this DB to
+    /// the caller-owned pool: DBs given the same `Arc` share one LRU
+    /// capacity (every key is namespaced by a per-DB member id, so
+    /// sharing is a capacity decision, never a correctness one), and
+    /// **`block_cache_capacity` is ignored** — capacity belongs to the
+    /// pool.
+    pub block_cache: Option<Arc<crate::cache::block_cache::BlockCachePool>>,
 }
 
 impl Default for DbOptions {
@@ -117,6 +126,7 @@ impl Default for DbOptions {
             pin_l0_filter_and_index_blocks_in_cache: true,
             block_property_collectors: Vec::new(),
             lazy_delete_compaction_threshold: 10_000,
+            block_cache: None,
         }
     }
 }
@@ -171,6 +181,7 @@ impl fmt::Debug for DbOptions {
                 "lazy_delete_compaction_threshold",
                 &self.lazy_delete_compaction_threshold,
             )
+            .field("block_cache", &self.block_cache.as_ref().map(|_| ".."))
             .finish()
     }
 }

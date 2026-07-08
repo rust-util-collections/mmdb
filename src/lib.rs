@@ -22,6 +22,7 @@ mod types;
 mod wal;
 
 // ---- Primary API ----
+pub use cache::block_cache::{BlockCache, BlockCachePool};
 pub use db::{DB, Snapshot};
 pub use error::{Error, ErrorKind, Result, ResultExt};
 pub use iterator::{BidiIterator, DBIterator};
