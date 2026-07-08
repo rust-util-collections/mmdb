@@ -12,9 +12,13 @@
 //! builds a private single-member pool internally, so callers that
 //! never share see exactly the old behavior.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+};
 
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;

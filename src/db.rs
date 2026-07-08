@@ -1874,7 +1874,11 @@ impl DB {
     /// Supported properties:
     /// - `"num-files-at-level{N}"` — number of SST files at level N
     /// - `"total-sst-size"` — total size of all SST files in bytes
-    /// - `"block-cache-usage"` — approximate block cache entry count
+    /// - `"block-cache-usage"` — approximate block cache entry count.
+    ///   When `DbOptions::block_cache` attaches this DB to a shared
+    ///   [`BlockCachePool`](crate::BlockCachePool), the count is the
+    ///   **pool-wide** LRU total across every attached member (plus this
+    ///   DB's own pinned entries) — not this DB's share of it.
     /// - `"compaction-pending"` — "1" if compaction is needed, "0" otherwise
     /// - `"stats.bytes_written"` — total user bytes written
     /// - `"stats.bytes_read"` — total user bytes read

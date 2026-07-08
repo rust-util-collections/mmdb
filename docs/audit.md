@@ -14,6 +14,32 @@
 
 ---
 
+## Resolved
+
+### [LOW] cache: `get_property("block-cache-usage")` doc doesn't caveat pool-wide aggregation under a shared `BlockCachePool`
+- **Where**: `src/db.rs` (doc comment on `get_property`, and the `"block-cache-usage"` match arm); `src/cache/block_cache.rs` (`BlockCache::entry_count`)
+- **What**: `BlockCache::entry_count()` returns `self.pool.entry_count() + self.pinned.lock().len()`, where `pool.entry_count()` is the whole `BlockCachePool`'s moka entry count summed across every attached member — not just the calling DB's own share. `DB::get_property("block-cache-usage")` forwards this value verbatim, but its doc comment ("approximate block cache entry count") was not updated when `DbOptions::block_cache` pool-sharing was introduced, and doesn't mention that an idle DB sharing a pool with a busy DB will report (almost) the busy DB's entry count as its own. Empirically confirmed during review: two DBs sharing one pool, only one written/read — the idle DB's `get_property("block-cache-usage")` reports nearly the same non-zero number as the active one.
+- **Why**: Doc-code alignment (public API changes must update corresponding docs) and API-contract stability (observable behavior changes for adopters of the new opt-in sharing feature). Severity is LOW, not MEDIUM: the feature is opt-in (`None` default is byte-for-byte unchanged from pre-commit behavior), the lower-level `BlockCache`/`BlockCachePool::entry_count()` and `DbOptions::block_cache` doc comments already accurately describe the pool-wide/shared-capacity semantics, and the property is purely observational (no internal control-flow depends on it) — per this project's own severity rubric, stale/incomplete documentation is a LOW-severity finding.
+- **Suggested fix**: Add a caveat clause to the `get_property` doc list entry, e.g. "approximate block cache entry count (pool-wide total when `DbOptions::block_cache` is a shared pool — see `BlockCachePool`)".
+- **Resolution**: Fixed — the `get_property` doc entry now states the count is the pool-wide LRU total across every attached member (plus this DB's own pinned entries) when a shared `BlockCachePool` is attached.
+
+---
+
+### [LOW] cache: un-merged `std::sync` imports in `block_cache.rs`
+- **Where**: `src/cache/block_cache.rs` (top-of-file imports)
+- **What**: `use std::sync::Arc;` and `use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};` are two separate `use` statements sharing the `std::sync::` prefix. The commit that introduced the shared-pool feature modified the second line (adding `AtomicBool`/`AtomicU64`) without merging it with the adjacent, unchanged `Arc` import.
+- **Why**: Violates the project's grouped-imports convention (CLAUDE.md: "merge common prefixes: `use std::sync::{Arc, Mutex};`"). `src/compaction/leveled.rs` is the exact precedent in this codebase for the merged form of this same `Arc` + `atomic::{...}` combination. `block_cache.rs` is the only file in `src/` with two separate top-level `std::sync::` import lines.
+- **Suggested fix**:
+  ```rust
+  use std::sync::{
+      Arc,
+      atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+  };
+  ```
+- **Resolution**: Fixed — all `std::` imports in `block_cache.rs` merged into one grouped block (`collections` + `sync::{Arc, atomic::{...}}`), matching the `compaction/leveled.rs` precedent.
+
+---
+
 ## Won't Fix
 
 ### [LOW] rate_limiter: `request()` f64 subtraction is a no-op for values ≳ 2.5e17, theoretical infinite loop
