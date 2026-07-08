@@ -31,7 +31,7 @@ MSRV: Rust 1.89 (edition 2024)
 | Iterator | `src/iterator/` | Heap merge, range tombstones, bidirectional |
 | Compaction | `src/compaction/leveled.rs` | Leveled strategy, sub-compaction parallelism |
 | Manifest | `src/manifest/` | VersionSet, atomic version edits |
-| Cache | `src/cache/` | Block cache (moka LRU), table handle cache |
+| Cache | `src/cache/` | Block cache (moka SegmentedCache via BlockCachePool), table handle cache |
 
 ## Commands
 

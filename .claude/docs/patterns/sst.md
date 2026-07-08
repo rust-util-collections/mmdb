@@ -3,7 +3,7 @@
 ## Files
 - `src/sst/table_builder.rs` (~27KB) — SST file writer
 - `src/sst/table_reader/mod.rs` (~25KB) — SST file reader (open, block read/cache, point lookup)
-- `src/sst/table_reader/iterator.rs` (~48KB) — TableIterator, complex seek logic
+- `src/sst/table_reader/iterator.rs` (~52KB) — TableIterator, complex seek logic
 - `src/sst/block.rs` (~25KB) — data block codec, prefix compression
 - `src/sst/block_builder.rs` — block construction with restart points
 - `src/sst/filter.rs` (~9KB) — bloom filter (double hashing)

@@ -69,7 +69,7 @@ Flush never runs on the background compaction threads (they only compact SSTs; t
 
 Synchronous compaction entry points follow the same 3-phase pattern: `drain_l0` (used by `flush()`'s post-flush trigger AND inline from the write path when L0 reaches `l0_stop_trigger` in `maybe_throttle_writes`) loops short-lock pick → unlocked merge I/O → short-lock install → unlocked manifest sync. `force_compact_all` (only reachable from the explicit `compact()` / `compact_range(None, None)` admin APIs) first runs `drain_l0`, then force-merges each level via `force_merge_level`, which holds `db_mutex` for that level's merge I/O — acceptable for the administrative path, but it must never become reachable from the ordinary write path.
 
-Error policy per caller of `drain_l0` (v4.0.8):
+Error policy per caller of `drain_l0` (v4.1.0):
 - **`flush()`'s post-flush trigger**: a drain failure is non-fatal *unless* the engine is in a fail-stop state (background error set, or MANIFEST writer poisoned). A pre-persist rejection (e.g. `log_and_apply` refusing an edit) leaves nothing applied and nothing on disk, so `flush()` logs a warning and returns `Ok` — the memtable durability the caller asked for has already been achieved, and the next tick / background thread retries from a fresh pick.
 - **`maybe_throttle_writes` (stop trigger)**: any failure fail-stops (sets background error) — last line of defense against unbounded L0 growth.
 - **Inside `drain_l0` itself**: a manifest *sync* failure sets the background error before propagating (the edit is applied in memory but durability is unconfirmed — same policy as the background thread).

@@ -1,7 +1,7 @@
 # Iterator Subsystem Review Patterns
 
 ## Files
-- `src/iterator/db_iter.rs` (~49KB) — user-facing DBIterator
+- `src/iterator/db_iter.rs` (~53KB) — user-facing DBIterator
 - `src/iterator/merge.rs` (~25KB) — MergingIterator (heap-based)
 - `src/iterator/source.rs` (~20KB) — IterSource wrapper + SeekableIterator trait (extracted from merge.rs)
 - `src/iterator/level_iter.rs` (~25KB) — lazy two-level iterator for L1+
