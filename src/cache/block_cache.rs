@@ -35,6 +35,21 @@ type CacheValue = Arc<Vec<u8>>;
 /// every eviction-listener callback of every member DB would serialize
 /// on one lock; sharding bounds that fan-in.
 const FO_SHARDS: usize = 16;
+
+/// Number of internal segments in the pool's LRU store.
+///
+/// A pool concentrates the hit traffic of every member DB (e.g. 16
+/// engine shards x N reader threads) onto one cache instance; a plain
+/// `moka::sync::Cache` serializes enough of that on its internal
+/// read-op bookkeeping to regress all-hit concurrent reads measurably
+/// (vsdb Q1 bench, 8 threads x 16 members, 100%-hit uniform reads:
+/// +14.6% vs private caches unsegmented; +6.8% at 16 segments; noise
+/// at 64 segments, while the skewed-load win stays at -72%/-81%).
+/// `SegmentedCache` partitions by key hash, restoring the parallelism
+/// the private-per-DB layout had; capacity semantics stay pool-global
+/// (each segment holds capacity/64 of a hash-uniform key sample, so a
+/// hot member's working set still spreads across every segment).
+const LRU_SEGMENTS: usize = 64;
 const _: () = assert!(FO_SHARDS.is_power_of_two());
 
 /// One shard of the reverse index: `(member, file_number)` → offsets.
@@ -119,7 +134,7 @@ impl FileOffsetsIndex {
 /// `DbOptions::block_cache`); DBs given the same pool share capacity,
 /// DBs given none keep a private pool.
 pub struct BlockCachePool {
-    inner: moka::sync::Cache<CacheKey, CacheValue>,
+    inner: moka::sync::SegmentedCache<CacheKey, CacheValue>,
     /// Track which offsets belong to each (member, file) for bulk invalidation.
     index: Arc<FileOffsetsIndex>,
     /// Member-id allocator for [`attach`](Self::attach).
@@ -136,7 +151,7 @@ impl BlockCachePool {
     pub fn new(capacity_bytes: u64) -> Self {
         let index = Arc::new(FileOffsetsIndex::new());
         let listener_index = index.clone();
-        let inner = moka::sync::Cache::builder()
+        let inner = moka::sync::SegmentedCache::builder(LRU_SEGMENTS)
             .max_capacity(capacity_bytes)
             .weigher(|_key: &CacheKey, value: &CacheValue| -> u32 {
                 value.len().min(u32::MAX as usize) as u32
