@@ -2645,11 +2645,10 @@ mod tests {
             LeveledCompaction::execute_compaction_io(&ctx, &task, 100, u64::MAX, true).unwrap();
         let after = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
 
-        assert_eq!(
-            after,
-            before + 1,
+        assert!(
+            after > before,
             "execute_compaction_io should have taken the parallel (actual_subs > 1) \
-             path exactly once given 3 disjoint target-level files and \
+             path given 3 disjoint target-level files and \
              max_subcompactions=4, but the counter did not increment — the \
              parallel branch has zero test coverage otherwise"
         );
@@ -2672,6 +2671,233 @@ mod tests {
         assert_eq!(
             all_keys, expected,
             "parallel sub-compaction output must cover every input key exactly once"
+        );
+    }
+
+    #[test]
+    fn test_execute_compaction_io_parallelizes_with_range_deletions() {
+        // Regression test: range deletions must not force execute_compaction_io
+        // back to the serial path. A tombstone spanning a sub-compaction split
+        // boundary must be visible to every sub-task so bottommost GC matches
+        // the serial result exactly.
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        use super::{
+            CompactionContext, CompactionOutput, CompactionTask, LeveledCompaction,
+            PARALLEL_SUB_COMPACTIONS_TAKEN,
+        };
+        use crate::manifest::version::TableFile;
+        use crate::manifest::version_edit::FileMetaData;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, InternalKeyRef, ValueType, compare_internal_key};
+
+        /// (user_key, sequence, value_type, value) for one decoded point entry.
+        type PointEntry = (String, u64, ValueType, String);
+        /// (begin_key, end_key, sequence) for one decoded range tombstone.
+        type TombstoneEntry = (Vec<u8>, Vec<u8>, u64);
+
+        fn key(i: usize) -> String {
+            format!("key_{:06}", i)
+        }
+
+        fn value(prefix: &str, i: usize) -> String {
+            format!("{}_{:06}", prefix, i)
+        }
+
+        fn build_sst(
+            dir: &std::path::Path,
+            number: u64,
+            mut entries: Vec<(String, u64, ValueType, Vec<u8>)>,
+        ) -> TableFile {
+            entries.sort_by(|(ak, aseq, av, _), (bk, bseq, bv, _)| {
+                compare_internal_key(
+                    InternalKey::new(ak.as_bytes(), *aseq, *av).as_bytes(),
+                    InternalKey::new(bk.as_bytes(), *bseq, *bv).as_bytes(),
+                )
+            });
+
+            let path = dir.join(format!("{:06}.sst", number));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    internal_keys: true,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for (user_key, seq, value_type, value) in entries {
+                let ikey = InternalKey::new(user_key.as_bytes(), seq, value_type);
+                builder.add(ikey.as_bytes(), &value).unwrap();
+            }
+            let result = builder.finish().unwrap();
+            TableFile {
+                meta: FileMetaData {
+                    number,
+                    file_size: result.file_size,
+                    smallest_key: result.smallest_key.unwrap_or_default(),
+                    largest_key: result.largest_key.unwrap_or_default(),
+                    has_range_deletions: result.has_range_deletions,
+                },
+                reader: Arc::new(crate::sst::table_reader::TableReader::open(&path).unwrap()),
+            }
+        }
+
+        fn build_inputs(dir: &std::path::Path) -> CompactionTask {
+            let mut source_entries = Vec::new();
+            for i in 0..300 {
+                source_entries.push((
+                    key(i),
+                    10,
+                    ValueType::Value,
+                    value("source", i).into_bytes(),
+                ));
+            }
+            for i in [130, 180] {
+                source_entries.push((key(i), 60, ValueType::Value, value("fresh", i).into_bytes()));
+            }
+            source_entries.push((
+                key(120),
+                50,
+                ValueType::RangeDeletion,
+                key(220).into_bytes(),
+            ));
+            let source_file = build_sst(dir, 1, source_entries);
+
+            let mut target_files = Vec::new();
+            for (number, range) in [(2, 0..100), (3, 100..200), (4, 200..300)] {
+                let entries = range
+                    .map(|i| (key(i), 5, ValueType::Value, value("target", i).into_bytes()))
+                    .collect();
+                target_files.push(build_sst(dir, number, entries));
+            }
+
+            CompactionTask {
+                level: 1,
+                input_files_level: vec![source_file],
+                input_files_next: target_files,
+            }
+        }
+
+        fn collect_output(
+            dir: &std::path::Path,
+            output: &CompactionOutput,
+        ) -> (Vec<PointEntry>, Vec<TombstoneEntry>) {
+            let mut points = Vec::new();
+            let mut tombstones = Vec::new();
+            for (_, meta) in &output.edit.new_files {
+                let path = dir.join(format!("{:06}.sst", meta.number));
+                let reader = crate::sst::table_reader::TableReader::open(&path).unwrap();
+                for (ikey, value) in reader.iter().unwrap() {
+                    let ikr = InternalKeyRef::new(&ikey);
+                    points.push((
+                        std::str::from_utf8(ikr.user_key()).unwrap().to_string(),
+                        ikr.sequence(),
+                        ikr.value_type(),
+                        String::from_utf8(value).unwrap(),
+                    ));
+                }
+                tombstones.extend(reader.get_range_tombstones().unwrap());
+            }
+            points.sort_by(|a, b| (&a.0, a.1, a.2 as u8, &a.3).cmp(&(&b.0, b.1, b.2 as u8, &b.3)));
+            tombstones.sort();
+            (points, tombstones)
+        }
+
+        fn run_compaction(
+            max_subcompactions: usize,
+            is_bottommost: bool,
+            active_snapshots: &[u64],
+            file_number_start: u64,
+        ) -> (Vec<PointEntry>, Vec<TombstoneEntry>, usize) {
+            let dir = tempfile::tempdir().unwrap();
+            let task = build_inputs(dir.path());
+            let options = DbOptions {
+                max_subcompactions,
+                ..Default::default()
+            };
+            let ctx = CompactionContext {
+                db_path: dir.path(),
+                options: &options,
+                rate_limiter: None,
+                stats: None,
+                active_snapshots,
+            };
+
+            let before = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
+            let output = LeveledCompaction::execute_compaction_io(
+                &ctx,
+                &task,
+                file_number_start,
+                u64::MAX,
+                is_bottommost,
+            )
+            .unwrap();
+            let after = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
+            let (points, tombstones) = collect_output(dir.path(), &output);
+            (points, tombstones, after - before)
+        }
+
+        let (parallel_points, parallel_tombstones, parallel_count) =
+            run_compaction(4, true, &[], 100);
+        assert!(
+            parallel_count >= 1,
+            "range deletions must still exercise the parallel sub-compaction path"
+        );
+        assert!(
+            parallel_tombstones.is_empty(),
+            "bottommost compaction without snapshots should drop obsolete range tombstones"
+        );
+
+        let expected_points: Vec<_> = (0..300)
+            .filter_map(|i| {
+                if (120..220).contains(&i) && i != 130 && i != 180 {
+                    None
+                } else {
+                    let prefix = if i == 130 || i == 180 {
+                        "fresh"
+                    } else {
+                        "source"
+                    };
+                    Some((key(i), 0, ValueType::Value, value(prefix, i)))
+                }
+            })
+            .collect();
+        assert_eq!(
+            parallel_points, expected_points,
+            "parallel range-deletion compaction kept the wrong logical key set"
+        );
+        assert!(
+            !parallel_points.iter().any(|(k, _, _, _)| {
+                let n: usize = k.trim_start_matches("key_").parse().unwrap();
+                (120..220).contains(&n) && n != 130 && n != 180
+            }),
+            "covered keys below the tombstone sequence must be absent"
+        );
+
+        let (serial_points, serial_tombstones, _serial_count) = run_compaction(1, true, &[], 200);
+        assert_eq!(
+            parallel_points, serial_points,
+            "parallel and serial bottommost GC must produce identical logical output"
+        );
+        assert_eq!(parallel_tombstones, serial_tombstones);
+
+        let (snapshot_points, snapshot_tombstones, snapshot_parallel_count) =
+            run_compaction(4, false, &[25], 300);
+        assert!(
+            snapshot_parallel_count >= 1,
+            "non-bottommost snapshot case should still take the parallel path"
+        );
+        assert!(
+            snapshot_tombstones.contains(&(key(120).into_bytes(), key(220).into_bytes(), 50)),
+            "a snapshot below the tombstone sequence must retain the range tombstone"
+        );
+        assert!(
+            snapshot_points.iter().any(|(k, seq, _, v)| {
+                k == &key(150) && *seq == 10 && v == &value("source", 150)
+            }),
+            "covered keys must be retained when a snapshot below the tombstone needs them"
         );
     }
 }

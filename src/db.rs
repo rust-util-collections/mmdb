@@ -3239,8 +3239,9 @@ impl DB {
     /// - `.sst` files absent from the recovered version — crash orphans from
     ///   an interrupted flush/compaction, or compaction inputs whose deletion
     ///   edit was durable but whose unlink never ran,
-    /// - `MANIFEST-*` files other than the current one, plus `CURRENT.tmp` —
-    ///   leftovers from an interrupted MANIFEST compaction.
+    /// - `MANIFEST-*` files other than the current one, plus `CURRENT.tmp` /
+    ///   `CURRENT.tmp.<N>` — leftovers from an interrupted MANIFEST rotation
+    ///   (the unsuffixed form is only produced by pre-4.1.1 versions).
     ///
     /// Called from `open()` after the recovered state (including the fresh
     /// `log_number`) is durable in the MANIFEST, while the directory LOCK is
@@ -3279,7 +3280,9 @@ impl DB {
             {
                 num != versions.manifest_number()
             } else {
-                name == "CURRENT.tmp"
+                // Keep the unsuffixed literal: dirs written by pre-4.1.1
+                // versions may still hold a plain `CURRENT.tmp`.
+                name == "CURRENT.tmp" || name.starts_with("CURRENT.tmp.")
             };
             if obsolete {
                 let file_path = entry.path();

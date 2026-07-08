@@ -161,22 +161,28 @@ impl TableReader {
 
     /// Parse index entries from the index block, propagating decode errors.
     fn parse_index_entries(index_block: &Block) -> Result<Vec<IndexEntry>> {
-        index_block
-            .iter()
-            .map(|(k, v)| {
-                let d = decode_index_value_with_props(&v).ctx()?;
-                Ok(IndexEntry {
-                    separator_key: k,
-                    handle: d.handle,
-                    first_key: d.first_key.map(|fk| fk.to_vec()),
-                    properties: d
-                        .properties
-                        .into_iter()
-                        .map(|(n, p)| (n.to_vec(), p.to_vec()))
-                        .collect(),
-                })
-            })
-            .collect()
+        let mut iter = index_block.iter();
+        let mut entries = Vec::new();
+        for (k, v) in &mut iter {
+            let d = decode_index_value_with_props(&v).ctx()?;
+            entries.push(IndexEntry {
+                separator_key: k,
+                handle: d.handle,
+                first_key: d.first_key.map(|fk| fk.to_vec()),
+                properties: d
+                    .properties
+                    .into_iter()
+                    .map(|(n, p)| (n.to_vec(), p.to_vec()))
+                    .collect(),
+            });
+        }
+        // A corrupt index entry makes the iterator stop early with the error
+        // recorded internally; without this check the truncated entry list
+        // would silently hide every data block past the corruption point.
+        if let Some(e) = iter.error() {
+            return Err(e.clone()).ctx();
+        }
+        Ok(entries)
     }
 
     /// Look up a key in the SST (exact byte match). Returns the value if found.
@@ -573,7 +579,8 @@ impl TableReader {
         let mut prefix_len = None;
         let mut range_del_handle = None;
 
-        for (key, value) in metaindex.iter() {
+        let mut iter = metaindex.iter();
+        for (key, value) in &mut iter {
             if key == b"filter.bloom" {
                 let handle = BlockHandle::decode(&value).ctx()?;
                 bloom = Some(Self::read_block_data_with_size(file, &handle, file_size).ctx()?);
@@ -593,6 +600,13 @@ impl TableReader {
             } else if key == RANGE_DEL_BLOCK_NAME.as_bytes() {
                 range_del_handle = Some(BlockHandle::decode(&value).ctx()?);
             }
+        }
+        // Metaindex keys sort `filter.*` before `rangedelblock`: a corrupt
+        // entry silently ending the scan early would drop `range_del_handle`,
+        // and the legacy data-block fallback would then cache an *empty*
+        // tombstone list for a new-format file — resurrecting deleted data.
+        if let Some(e) = iter.error() {
+            return Err(e.clone()).ctx();
         }
 
         Ok(MetaIndexData {

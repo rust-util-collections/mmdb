@@ -164,6 +164,56 @@ fn lazy_delete_batch_auto_triggers_compaction() {
     }
 }
 
+/// Verify the default threshold is zero: lazy-delete bookkeeping still records
+/// dead keys, but no automatic sweep runs until an explicit compaction is
+/// requested.
+#[test]
+fn lazy_delete_batch_default_threshold_zero_requires_manual_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    for i in 0u32..50 {
+        db.put(&i.to_be_bytes(), &[i as u8; 64]).unwrap();
+    }
+    db.flush().unwrap();
+
+    let dead: Vec<Vec<u8>> = (0u32..50).map(|i| i.to_be_bytes().to_vec()).collect();
+    db.lazy_delete_batch(&dead);
+    assert_eq!(db.dead_key_count(), 50);
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    for i in 0u32..50 {
+        assert!(
+            db.get(&i.to_be_bytes()).unwrap().is_some(),
+            "threshold 0 must not auto-sweep key {}",
+            i
+        );
+    }
+
+    db.compact_range(None::<&[u8]>, None::<&[u8]>).unwrap();
+    for i in 0u32..50 {
+        assert!(
+            db.get(&i.to_be_bytes()).unwrap().is_none(),
+            "manual compaction should reclaim dead key {}",
+            i
+        );
+    }
+}
+
+/// Pin the default lazy-delete sweep threshold at zero so future flips are
+/// intentional and update the default-behavior tests.
+#[test]
+fn db_options_default_lazy_delete_compaction_threshold_is_zero() {
+    assert_eq!(DbOptions::default().lazy_delete_compaction_threshold, 0);
+}
+
 /// Verify that `lazy_delete_batch` accepts `&[&[u8]]` slices (not just
 /// `Vec<u8>`), confirming the generic `impl AsRef<[u8]>` signature works.
 #[test]

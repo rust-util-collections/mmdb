@@ -1145,6 +1145,119 @@ mod tests {
         assert!(!iter.valid());
     }
 
+    /// Pins heap-backed backward iteration: a shallower range tombstone must
+    /// prune deeper source keys, while a deeper tombstone must not hide keys
+    /// from a shallower source in the same reverse scan.
+    #[test]
+    fn test_db_iterator_prev_multi_source_cross_level_tombstone_pruning() {
+        let l0 = sort_lex(vec![
+            make_entry(b"a", 10, ValueType::Value, b"l0_a"),
+            make_entry(b"e", 10, ValueType::Value, b"l0_e"),
+            make_entry(b"g", 10, ValueType::Value, b"l0_g"),
+            make_entry(b"i", 10, ValueType::Value, b"l0_i"),
+        ]);
+        let l2 = sort_lex(vec![
+            make_entry(b"b", 10, ValueType::Value, b"l2_b"),
+            make_entry(b"c", 10, ValueType::Value, b"l2_c"),
+            make_entry(b"d", 10, ValueType::Value, b"l2_d"),
+            make_entry(b"f", 10, ValueType::Value, b"l2_f"),
+            make_entry(b"h", 10, ValueType::Value, b"l2_h"),
+        ]);
+        let mut iter = DBIterator::from_sources(
+            vec![
+                IterSource::new(l0).with_level(0),
+                IterSource::new(l2).with_level(2),
+            ],
+            100,
+        );
+        iter.set_range_tombstones_with_levels(vec![
+            (b"b".to_vec(), b"e".to_vec(), 50, 0),
+            (b"e".to_vec(), b"i".to_vec(), 50, 2),
+        ]);
+
+        iter.seek_to_last();
+        let mut seen = Vec::new();
+        while iter.valid() {
+            seen.push((iter.key().unwrap().to_vec(), iter.value().unwrap().to_vec()));
+            iter.prev();
+        }
+
+        assert_eq!(
+            seen,
+            vec![
+                (b"i".to_vec(), b"l0_i".to_vec()),
+                (b"g".to_vec(), b"l0_g".to_vec()),
+                (b"e".to_vec(), b"l0_e".to_vec()),
+                (b"a".to_vec(), b"l0_a".to_vec()),
+            ],
+            "heap-backed prev must attribute each popped entry to its real source level"
+        );
+    }
+
+    /// Pins a forward-to-backward direction switch with multiple heap sources:
+    /// after the heap is rebuilt for `prev()`, the candidate key's source level
+    /// must still prevent a deeper tombstone from hiding a shallower entry.
+    #[test]
+    fn test_db_iterator_prev_after_forward_switch_preserves_heap_source_level() {
+        let l0 = sort_lex(vec![make_entry(b"a", 10, ValueType::Value, b"l0_a")]);
+        let l2 = sort_lex(vec![
+            make_entry(b"b", 10, ValueType::Value, b"l2_b"),
+            make_entry(b"c", 10, ValueType::Value, b"l2_c"),
+        ]);
+        let mut iter = DBIterator::from_sources(
+            vec![
+                IterSource::new(l0).with_level(0),
+                IterSource::new(l2).with_level(2),
+            ],
+            100,
+        );
+        iter.set_range_tombstones_with_levels(vec![(b"a".to_vec(), b"b".to_vec(), 50, 2)]);
+
+        iter.seek_to_first();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"a");
+        iter.advance();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"b");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"a");
+        assert_eq!(iter.value().unwrap(), b"l0_a");
+    }
+
+    /// Pins half-open range tombstone boundaries during heap-backed backward
+    /// iteration: `seek_for_prev(end)` must keep `end`, then `prev()` skips
+    /// covered keys at and after `start` and lands before the range.
+    #[test]
+    fn test_db_iterator_seek_for_prev_multi_source_range_tombstone_end_exclusive() {
+        let l0 = sort_lex(vec![make_entry(b"z", 10, ValueType::Value, b"l0_z")]);
+        let l2 = sort_lex(vec![
+            make_entry(b"a", 10, ValueType::Value, b"l2_a"),
+            make_entry(b"b", 10, ValueType::Value, b"l2_b"),
+            make_entry(b"c", 10, ValueType::Value, b"l2_c"),
+            make_entry(b"d", 10, ValueType::Value, b"l2_d"),
+        ]);
+        let mut iter = DBIterator::from_sources(
+            vec![
+                IterSource::new(l0).with_level(0),
+                IterSource::new(l2).with_level(2),
+            ],
+            100,
+        );
+        iter.set_range_tombstones_with_levels(vec![(b"b".to_vec(), b"d".to_vec(), 50, 0)]);
+
+        iter.seek_for_prev(b"d");
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"d");
+        assert_eq!(iter.value().unwrap(), b"l2_d");
+
+        iter.prev();
+        assert!(iter.valid());
+        assert_eq!(iter.key().unwrap(), b"a");
+        assert_eq!(iter.value().unwrap(), b"l2_a");
+    }
+
     #[test]
     fn test_db_iterator_snapshot() {
         let source = sort_lex(vec![

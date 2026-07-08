@@ -1480,4 +1480,231 @@ mod tests {
             err
         );
     }
+
+    /// Corrupt one byte inside the block at `handle` (relative offset
+    /// `rel_off`), then recompute the trailer CRC over the corrupted bytes
+    /// so the whole-block CRC check passes and the mid-block entry-decode
+    /// path is what must catch it.
+    fn corrupt_block_byte_recompute_crc(
+        path: &Path,
+        handle_offset: u64,
+        handle_size: u64,
+        rel_off: usize,
+    ) {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut block = vec![0u8; handle_size as usize];
+        f.seek(SeekFrom::Start(handle_offset)).unwrap();
+        f.read_exact(&mut block).unwrap();
+        let mut type_byte = [0u8; 1];
+        f.read_exact(&mut type_byte).unwrap();
+
+        // 0xFF sets the varint continuation bit → shared-prefix length
+        // >= 127, always exceeding the previous key → decode error.
+        block[rel_off] = 0xFF;
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&block);
+        hasher.update(&type_byte);
+        let crc = hasher.finalize();
+
+        f.seek(SeekFrom::Start(handle_offset)).unwrap();
+        f.write_all(&block).unwrap();
+        f.seek(SeekFrom::Current(1)).unwrap(); // skip type byte
+        f.write_all(&crc.to_le_bytes()).unwrap();
+    }
+
+    /// Read a block's restart array from the raw file and return the byte
+    /// offset (relative to the block start) of restart point `idx`.
+    fn restart_entry_offset(
+        path: &Path,
+        handle_offset: u64,
+        handle_size: u64,
+        idx: usize,
+    ) -> usize {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut f = OpenOptions::new().read(true).open(path).unwrap();
+        let mut block = vec![0u8; handle_size as usize];
+        f.seek(SeekFrom::Start(handle_offset)).unwrap();
+        f.read_exact(&mut block).unwrap();
+
+        let n = u32::from_le_bytes(block[block.len() - 4..].try_into().unwrap()) as usize;
+        assert!(idx < n, "restart index {idx} out of range ({n} restarts)");
+        let restarts_start = block.len() - 4 - 4 * n;
+        u32::from_le_bytes(
+            block[restarts_start + 4 * idx..restarts_start + 4 * idx + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize
+    }
+
+    /// Regression test for the missed-caller gap in the corruption-vs-EOF
+    /// fix: `parse_index_entries` iterated the index block without checking
+    /// `BlockIterator::error()`, so a CRC-passing corrupt index entry
+    /// silently truncated the cached entry list — every data block past the
+    /// corruption point vanished from scans and seeks (and from compaction
+    /// inputs) with `iter_error() == None`, while point lookups through
+    /// `seek_by` errored loudly on the same corruption.
+    #[test]
+    fn test_corrupt_index_entry_is_error_not_silent_truncation() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom};
+
+        use crate::iterator::merge::SeekableIterator;
+        use crate::sst::format::{FOOTER_SIZE, decode_footer};
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_index.sst");
+
+        // block_size: 1 → one entry per data block → 6 index entries;
+        // block_restart_interval: 1 → every index entry is a restart point,
+        // so the index block's restart array gives exact entry offsets.
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                block_restart_interval: 1,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        const COUNT: usize = 6;
+        let keys: Vec<Vec<u8>> = (0..COUNT)
+            .map(|i| {
+                let user_key = format!("key_{:06}", i);
+                InternalKey::new(user_key.as_bytes(), (COUNT - i) as u64, ValueType::Value)
+                    .into_bytes()
+            })
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            builder.add(k, format!("value_{i}").as_bytes()).unwrap();
+        }
+        builder.finish().unwrap();
+
+        // Locate the index block via the footer.
+        let (index_offset, index_size) = {
+            let mut f = OpenOptions::new().read(true).open(&path).unwrap();
+            let file_len = f.metadata().unwrap().len();
+            f.seek(SeekFrom::Start(file_len - FOOTER_SIZE as u64))
+                .unwrap();
+            let mut footer = [0u8; FOOTER_SIZE];
+            f.read_exact(&mut footer).unwrap();
+            let (_meta, index_handle) = decode_footer(&footer).unwrap();
+            (index_handle.offset, index_handle.size)
+        };
+
+        // Corrupt index entry #3 of 6 (mid-block) and re-seal the CRC.
+        let entry3 = restart_entry_offset(&path, index_offset, index_size, 3);
+        corrupt_block_byte_recompute_crc(&path, index_offset, index_size, entry3);
+
+        let reader = TableReader::open(&path).unwrap();
+
+        // The cached index parse must fail loudly...
+        assert!(
+            reader.cached_index_entries().is_err(),
+            "cached_index_entries() must propagate a corrupt index entry, \
+             not return a silently truncated list"
+        );
+
+        // ...and a production scan must surface the error rather than
+        // silently yielding only the first 3 of 6 entries.
+        let mut iter = TableIterator::new(Arc::new(reader));
+        iter.seek_to_first();
+        let mut yielded = 0;
+        while iter.next().is_some() {
+            yielded += 1;
+        }
+        assert!(
+            iter.iter_error().is_some(),
+            "scan over a corrupt index must set iter_error(), got {} entries \
+             with no error",
+            yielded
+        );
+    }
+
+    /// Regression test for the metaindex sibling of the same gap:
+    /// `read_metaindex` iterated without checking `BlockIterator::error()`.
+    /// Metaindex keys sort `filter.*` before `rangedelblock`, so a corrupt
+    /// earlier entry silently dropped `range_del_handle`; the legacy
+    /// data-block fallback then cached an empty tombstone list for a
+    /// new-format file (whose tombstones live only in the dedicated block),
+    /// permanently resurrecting range-deleted data. Open must fail instead.
+    #[test]
+    fn test_corrupt_metaindex_entry_fails_open_not_silent_tombstone_loss() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom};
+
+        use crate::sst::format::{FOOTER_SIZE, decode_footer};
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt_metaindex.sst");
+
+        // bloom on + range tombstone → metaindex holds `filter.bloom`
+        // followed by `rangedelblock`.
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_restart_interval: 1,
+                bloom_bits_per_key: 10,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"aaa", 10, ValueType::Value).as_bytes(),
+                b"val_a",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"bbb", 9, ValueType::RangeDeletion).as_bytes(),
+                b"ccc",
+            )
+            .unwrap();
+        builder.finish().unwrap();
+
+        // Sanity: intact file opens and holds exactly one range tombstone.
+        {
+            let reader = TableReader::open(&path).unwrap();
+            let tombstones = reader.get_range_tombstones().unwrap();
+            assert_eq!(tombstones.len(), 1, "fixture must carry a range tombstone");
+        }
+
+        // Locate the metaindex block via the footer and corrupt its first
+        // entry (`filter.bloom` — sorted before `rangedelblock`).
+        let (meta_offset, meta_size) = {
+            let mut f = OpenOptions::new().read(true).open(&path).unwrap();
+            let file_len = f.metadata().unwrap().len();
+            f.seek(SeekFrom::Start(file_len - FOOTER_SIZE as u64))
+                .unwrap();
+            let mut footer = [0u8; FOOTER_SIZE];
+            f.read_exact(&mut footer).unwrap();
+            let (meta_handle, _index) = decode_footer(&footer).unwrap();
+            (meta_handle.offset, meta_handle.size)
+        };
+        // Entry #1 (second entry) keeps the corruption strictly mid-block.
+        let entry1 = restart_entry_offset(&path, meta_offset, meta_size, 1);
+        corrupt_block_byte_recompute_crc(&path, meta_offset, meta_size, entry1);
+
+        // Open must fail loudly instead of succeeding with zero tombstones.
+        assert!(
+            TableReader::open(&path).is_err(),
+            "a corrupt metaindex entry must fail open(), not silently drop \
+             the range-tombstone block handle"
+        );
+    }
 }

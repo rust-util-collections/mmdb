@@ -788,4 +788,65 @@ mod tests {
         let entries = block.iter_from_restart(100).unwrap();
         assert!(entries.is_empty());
     }
+
+    /// Regression test for the corruption-vs-EOF conflation fix: a
+    /// structurally malformed entry mid-block (its shared-prefix varint
+    /// inflated past the previous key's length) must surface as a hard
+    /// error from every decode path — never as a silent early end of the
+    /// block, which would hide all entries past the corruption point.
+    #[test]
+    fn test_mid_block_entry_corruption_is_error_not_eof() {
+        // restart_interval: 1 → every entry is a restart point, so the
+        // restart array gives the exact byte offset of each entry.
+        let mut builder = BlockBuilder::new(1);
+        const COUNT: usize = 5;
+        for i in 0..COUNT {
+            let key = format!("key_{:04}", i);
+            let val = format!("val_{}", i);
+            builder.add(key.as_bytes(), val.as_bytes());
+        }
+        let mut data = builder.finish();
+
+        // Locate entry #2 via the restart array: [entries][u32 offsets x n][n: u32].
+        let n = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap()) as usize;
+        assert_eq!(n, COUNT);
+        let restarts_start = data.len() - 4 - 4 * n;
+        let entry2_off = u32::from_le_bytes(
+            data[restarts_start + 8..restarts_start + 12]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+
+        // Corrupt entry #2's shared-len varint: 0xFF sets the continuation
+        // bit, decoding to >= 127 — always larger than the previous key,
+        // so a linear scan hits the "shared prefix exceeds previous key"
+        // corruption arm exactly at entry #2.
+        data[entry2_off] = 0xFF;
+        let block = Block::from_vec(data).unwrap();
+
+        // Full iteration: entries 0..2 yielded, then error() must be set
+        // (clean EOF would leave it None).
+        let mut iter = block.iter();
+        let yielded: Vec<_> = (&mut iter).collect();
+        assert_eq!(yielded.len(), 2, "expected truncation exactly at entry #2");
+        assert_eq!(yielded[1].0, b"key_0001");
+        assert!(
+            iter.error().is_some(),
+            "mid-block corruption must set BlockIterator::error(), not read as clean EOF"
+        );
+
+        // seek_by: the linear scan toward a key at/after the corruption
+        // point must propagate the decode error, not report "not found".
+        let compare = |a: &[u8], b: &[u8]| a.cmp(b);
+        assert!(
+            block.seek_by(b"key_0003", compare).is_err(),
+            "seek_by through a corrupt entry must return Err, not Ok(None)"
+        );
+
+        // iter_restart_segment over the corrupt entry must also error.
+        assert!(
+            block.iter_from_restart(2).is_err(),
+            "iter_from_restart at the corrupt entry must return Err"
+        );
+    }
 }

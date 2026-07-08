@@ -901,3 +901,47 @@ fn test_crash_after_compaction() {
         }
     }
 }
+
+/// Regression test for orphan cleanup of MANIFEST-rotation temp files:
+/// the CURRENT publish step writes per-attempt `CURRENT.tmp.<N>` files
+/// (pre-4.1.1 versions wrote a fixed `CURRENT.tmp`), and a crash between
+/// the temp write and the atomic rename leaves one behind. Reopen must
+/// sweep both spellings — and must not touch unrelated files.
+#[test]
+fn test_reopen_removes_stale_current_tmp_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // Create a DB and close it cleanly.
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    // Plant crash leftovers: the modern per-attempt name, the legacy fixed
+    // name, and an unrelated file that the sweep must NOT remove.
+    fs::write(path.join("CURRENT.tmp.12345"), b"MANIFEST-000042\n").unwrap();
+    fs::write(path.join("CURRENT.tmp"), b"MANIFEST-000041\n").unwrap();
+    fs::write(path.join("unrelated.txt"), b"keep me").unwrap();
+
+    // Reopen: recovery's orphan sweep runs before backgrounds start.
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"value".to_vec()));
+    }
+
+    assert!(
+        !path.join("CURRENT.tmp.12345").exists(),
+        "stale per-attempt CURRENT.tmp.<N> must be removed on reopen"
+    );
+    assert!(
+        !path.join("CURRENT.tmp").exists(),
+        "legacy fixed-name CURRENT.tmp must still be removed on reopen"
+    );
+    assert!(
+        path.join("unrelated.txt").exists(),
+        "orphan sweep must not delete unrelated files"
+    );
+    assert!(path.join("CURRENT").exists(), "CURRENT itself must survive");
+}

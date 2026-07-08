@@ -266,7 +266,7 @@ impl Snapshot<'_> {
 }
 
 struct ReadOptions {
-    pub snapshot: Option<u64>,                 // from Snapshot::sequence()
+    pub snapshot: Option<SequenceNumber>,      // from Snapshot::sequence()
     pub fill_cache: bool,                      // false = scans don't evict hot blocks
     pub skip_point: Option<SkipPointFn>,
     pub block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
