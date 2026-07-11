@@ -3,6 +3,9 @@
 //! Uses the "double hashing" technique from Kirsch & Mitzenmacher
 //! to generate k hash functions from two base hashes.
 
+use crate::error::{Error, Result};
+use crate::sst::META_BLOCK_HARD_LIMIT;
+
 /// A bloom filter builder + checker.
 pub struct BloomFilter {
     /// Bits per key.
@@ -24,9 +27,11 @@ impl BloomFilter {
     }
 
     /// Build a filter for the given set of keys.
-    /// Returns the filter data.
-    pub fn create_filter(&self, keys: &[&[u8]]) -> Vec<u8> {
-        let filter_size = Self::projected_size(keys.len(), self.bits_per_key);
+    ///
+    /// Returns an error before allocation if the encoded filter would exceed
+    /// the SST reader's metadata-block limit.
+    pub fn create_filter(&self, keys: &[&[u8]]) -> Result<Vec<u8>> {
+        let filter_size = Self::checked_size("bloom filter", keys.len(), self.bits_per_key)?;
         let bytes = filter_size - 1;
         let bits = (bytes as u32) * 8;
 
@@ -44,7 +49,7 @@ impl BloomFilter {
             }
         }
 
-        filter
+        Ok(filter)
     }
 
     /// Project the encoded filter size (payload plus the trailing hash-count
@@ -56,6 +61,18 @@ impl BloomFilter {
         bits.div_ceil(8)
             .min(Self::MAX_FILTER_BYTES)
             .saturating_add(1) as usize
+    }
+
+    /// Validate and return the encoded size without allocating the filter.
+    pub(crate) fn checked_size(label: &str, key_count: usize, bits_per_key: u32) -> Result<usize> {
+        let projected = Self::projected_size(key_count, bits_per_key);
+        if projected > META_BLOCK_HARD_LIMIT {
+            return Err(Error::invalid_argument(format!(
+                "{label} block size {projected} would exceed maximum readable block size \
+                 {META_BLOCK_HARD_LIMIT}"
+            )));
+        }
+        Ok(projected)
     }
 
     /// Check if a key might be in the filter.
@@ -139,7 +156,7 @@ mod tests {
         let bf = BloomFilter::new(10);
 
         let keys: Vec<&[u8]> = vec![b"hello", b"world", b"foo", b"bar"];
-        let filter = bf.create_filter(&keys);
+        let filter = bf.create_filter(&keys).unwrap();
 
         // All inserted keys should match
         for &key in &keys {
@@ -174,15 +191,28 @@ mod tests {
 
         assert_eq!(
             BloomFilter::projected_size(key_refs.len(), 10),
-            bf.create_filter(&key_refs).len()
+            bf.create_filter(&key_refs).unwrap().len()
         );
         assert_eq!(BloomFilter::projected_size(0, 10), 9);
     }
 
     #[test]
+    fn test_create_filter_rejects_oversized_output() {
+        use crate::error::ErrorKind;
+
+        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8) as u32;
+        let err = BloomFilter::new(bits_per_key)
+            .create_filter(&[b"k"])
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+        assert!(err.message().contains("bloom filter block size"));
+    }
+
+    #[test]
     fn test_bloom_filter_empty() {
         let bf = BloomFilter::new(10);
-        let filter = bf.create_filter(&[]);
+        let filter = bf.create_filter(&[]).unwrap();
         // With empty filter, no keys should match
         assert!(!BloomFilter::key_may_match(b"anything", &filter));
     }
@@ -194,7 +224,7 @@ mod tests {
             .map(|i| format!("key_{:06}", i).into_bytes())
             .collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let filter = bf.create_filter(&key_refs);
+        let filter = bf.create_filter(&key_refs).unwrap();
 
         // All keys should match
         for key in &keys {
@@ -220,7 +250,7 @@ mod tests {
         assert_eq!(bf.k, 1, "k should be clamped to minimum of 1");
 
         let keys: Vec<&[u8]> = vec![b"aaa", b"bbb", b"ccc"];
-        let filter = bf.create_filter(&keys);
+        let filter = bf.create_filter(&keys).unwrap();
 
         // Filter should still be valid (at least 2 bytes: min 64 bits -> 8 bytes + 1 for k)
         assert!(filter.len() >= 2);
@@ -246,7 +276,7 @@ mod tests {
             .map(|i| format!("key_{:04}", i).into_bytes())
             .collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let filter = bf.create_filter(&key_refs);
+        let filter = bf.create_filter(&key_refs).unwrap();
 
         // All inserted keys must match
         for key in &keys {
@@ -274,7 +304,7 @@ mod tests {
         // All keys are the same -- should not panic or produce invalid filter
         let bf = BloomFilter::new(10);
         let keys: Vec<&[u8]> = vec![b"same"; 1000];
-        let filter = bf.create_filter(&keys);
+        let filter = bf.create_filter(&keys).unwrap();
 
         // The identical key should always match
         assert!(BloomFilter::key_may_match(b"same", &filter));
@@ -295,7 +325,7 @@ mod tests {
         let k3: Vec<u8> = vec![0x00, 0xFF, 0x00, 0xFF];
         let k4: Vec<u8> = vec![]; // empty key
         let keys: Vec<&[u8]> = vec![&k1, &k2, &k3, &k4];
-        let filter = bf.create_filter(&keys);
+        let filter = bf.create_filter(&keys).unwrap();
 
         // All inserted keys must match
         assert!(BloomFilter::key_may_match(&k1, &filter));
