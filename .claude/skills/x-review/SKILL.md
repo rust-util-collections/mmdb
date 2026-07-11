@@ -85,7 +85,7 @@ Every candidate finding must include:
 Discard style preferences, unsupported speculation, and findings already
 covered by `.claude/docs/false-positive-guide.md`.
 
-### Phase 3: Adversarial verification
+### Phase 3: Critical verification
 
 The orchestrator re-reads every candidate with full context and actively tries
 to refute it. Use one independent read-only verifier only when the control flow

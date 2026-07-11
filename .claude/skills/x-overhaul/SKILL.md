@@ -27,7 +27,7 @@ Follow `/x-review all` without `--fix`:
    file must be accounted for exactly once in the depth pass.
 3. Run focused cross-subsystem and completeness passes only for gaps the depth
    pass cannot cover.
-4. Adversarially verify and deduplicate candidates.
+4. Critically verify and deduplicate candidates.
 5. Update `docs/audit.md`, including full re-evaluation of all existing `Open`,
    `Won't Fix`, and `Rejected` entries. Add no timestamps.
 6. If the registry changed, validate and commit that review inventory as one

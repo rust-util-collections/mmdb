@@ -129,7 +129,7 @@ FIX: minimal safe direction and regression test
 
 ### Severity
 
-- **CRITICAL**: data loss/corruption, undefined behavior, exploitable security,
+- **CRITICAL**: data loss/corruption, undefined behavior, memory safety violation,
   or unrecoverable durability violation.
 - **HIGH**: incorrect results, deadlock, realistic crash, resource exhaustion,
   or material hot-path regression.

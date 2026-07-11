@@ -12,7 +12,7 @@ Before reporting any finding, check it against this guide. If a finding matches 
 
 ## FP-2: Lock Held Across Entire Operation
 
-**Pattern**: Reporting a TOCTOU race when the relevant Mutex is held for the entire check-then-act sequence.
+**Pattern**: Reporting a check-then-act race when the relevant Mutex is held for the entire check-then-act sequence.
 **Rule**: If you see a potential race condition, FIRST verify that the lock protecting the shared state is held continuously from the check to the act. If it is, the race is impossible.
 **How to verify**: Trace the `MutexGuard` or `RwLockGuard` lifetime — it lives until the end of the scope or explicit `drop()`.
 

@@ -58,7 +58,7 @@ Binary search on the index block finds the wrong data block because the index ke
 Builder uses one seed for the bloom hash, reader uses another.
 **Check**: Verify both paths use the same double-hashing formula: `h1 + i * h2` for probes.
 
-### Decompression Buffer Overflow
+### Decompression Size Overflow
 Decompressed block size exceeds the allocated buffer because the original size is read from a corrupted/untrusted field.
 **Check**: Verify decompressed size is bounded by a maximum block size constant.
 
@@ -70,5 +70,5 @@ Decompressed block size exceeds the allocated buffer because the original size i
 - [ ] Compression type written and read consistently
 - [ ] Footer magic validated before using index/metaindex handles
 - [ ] Binary search on index block uses correct comparison
-- [ ] Decompressed block size bounded to prevent allocation bomb
+- [ ] Decompressed block size bounded to prevent excessive allocation
 - [ ] `TableReader::open_with_all()` retains owned-`File` RAII on every error path; any future raw-fd extraction restores ownership
