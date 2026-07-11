@@ -36,14 +36,6 @@
 
 ---
 
-### [MEDIUM] SST: entry decoding can consume the restart directory
-- **Where**: `src/sst/block.rs:75-105,379-496`
-- **What**: Entry decoders bound key/value ends against the full block allocation rather than the entry region ending at `restart_offset`.
-- **Why**: A malformed checksum-valid length can make an entry swallow restart offsets and the restart count, returning fabricated value bytes instead of corruption.
-- **Suggested fix**: Pass the entry-region limit into both decode helpers and reject any decoded end beyond it. Add iterator and seek regressions for trailer overrun.
-
----
-
 ### [MEDIUM] SST: zero prefix-filter length can create false negatives
 - **Where**: `src/sst/table_reader/mod.rs:560-629`, `src/sst/table_builder.rs:449-464`
 - **What**: The reader accepts a prefix-filter block paired with `prefix_len == 0`, a combination the writer never emits.

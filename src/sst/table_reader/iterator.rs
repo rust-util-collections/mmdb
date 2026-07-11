@@ -204,14 +204,18 @@ impl TableIterator {
             return None;
         }
         let data = block.data();
-        let (value_start, value_len, next_offset) =
-            match decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key) {
-                Ok(v) => v,
-                Err(e) => {
-                    self.err = Some(format!("block entry decode error: {e}"));
-                    return None;
-                }
-            };
+        let entry_data = &data[..self.block_data_end];
+        let (value_start, value_len, next_offset) = match decode_entry_reuse(
+            entry_data,
+            self.block_cursor_offset,
+            &mut self.block_cursor_key,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                self.err = Some(format!("block entry decode error: {e}"));
+                return None;
+            }
+        };
         // Check upper bound before returning entry
         if let Some(ref ub) = self.upper_bound
             && user_key(&self.block_cursor_key) >= ub.as_slice()
@@ -309,6 +313,7 @@ impl TableIterator {
     ) {
         let data_end = block.data_end_offset();
         let block_data = block.data();
+        let entry_data = &block_data[..data_end];
         let num_restarts = block.num_restarts();
 
         // Binary search on restart points to narrow the scan range
@@ -321,7 +326,7 @@ impl TableIterator {
             let rp = u32::from_le_bytes(block_data[rp_offset..rp_offset + 4].try_into().unwrap())
                 as usize;
             tmp_key.clear();
-            match decode_entry_reuse(block_data, rp, &mut tmp_key) {
+            match decode_entry_reuse(entry_data, rp, &mut tmp_key) {
                 Ok(_) => {
                     if compare(&tmp_key, target) == Ordering::Less {
                         left = mid + 1;
@@ -355,7 +360,7 @@ impl TableIterator {
             prev_key_snapshot.clear();
             prev_key_snapshot.extend_from_slice(&self.block_cursor_key);
 
-            match decode_entry_reuse(block_data, offset, &mut self.block_cursor_key) {
+            match decode_entry_reuse(entry_data, offset, &mut self.block_cursor_key) {
                 Ok((_, _, next_off)) => {
                     if compare(&self.block_cursor_key, target) != Ordering::Less {
                         // Found first entry >= target.
@@ -845,8 +850,12 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 && self.block_cursor_offset < self.block_data_end
             {
                 let data = block.data();
-                match decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key)
-                {
+                let entry_data = &data[..self.block_data_end];
+                match decode_entry_reuse(
+                    entry_data,
+                    self.block_cursor_offset,
+                    &mut self.block_cursor_key,
+                ) {
                     Ok((vs, vl, next)) => {
                         // Check upper bound before returning entry
                         if let Some(ref ub) = self.upper_bound
@@ -928,8 +937,12 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 && self.block_cursor_offset < self.block_data_end
             {
                 let data = block.data();
-                let result =
-                    decode_entry_reuse(data, self.block_cursor_offset, &mut self.block_cursor_key);
+                let entry_data = &data[..self.block_data_end];
+                let result = decode_entry_reuse(
+                    entry_data,
+                    self.block_cursor_offset,
+                    &mut self.block_cursor_key,
+                );
                 match result {
                     Ok((value_start, value_len, next_offset)) => {
                         // Check upper bound
