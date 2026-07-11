@@ -402,6 +402,70 @@ fn test_crash_midlog_wal_corruption_fails_open() {
 }
 
 #[test]
+fn test_crash_zeroed_midlog_wal_fragment_fails_open() {
+    const WAL_HEADER_SIZE: usize = 7;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        for i in 0..3 {
+            db.put_with_options(
+                &WriteOptions {
+                    sync: true,
+                    ..Default::default()
+                },
+                format!("zero_gap_key{i}").as_bytes(),
+                format!("zero_gap_value{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        db.simulate_crash();
+    }
+
+    let wal_path = {
+        let mut wal_files: Vec<_> = fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        wal_files.sort();
+        wal_files.into_iter().next().unwrap()
+    };
+
+    let mut bytes = fs::read(&wal_path).unwrap();
+    let physical_record_len = |offset: usize| {
+        WAL_HEADER_SIZE + u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]) as usize
+    };
+    let second_offset = physical_record_len(0);
+    let second_len = physical_record_len(second_offset);
+    let third_offset = second_offset + second_len;
+    assert!(
+        third_offset + WAL_HEADER_SIZE <= bytes.len(),
+        "expected a valid record after the fragment being zeroed"
+    );
+    assert_ne!(
+        &bytes[third_offset..third_offset + WAL_HEADER_SIZE],
+        &[0u8; WAL_HEADER_SIZE],
+        "the later record must remain non-zero"
+    );
+    bytes[second_offset..third_offset].fill(0);
+    fs::write(&wal_path, bytes).unwrap();
+
+    let result = DB::open(make_opts(), &path);
+    assert!(
+        result.is_err(),
+        "open should reject a zeroed middle WAL fragment instead of skipping it"
+    );
+    assert!(
+        wal_path.exists(),
+        "the corrupt WAL must be preserved after failed recovery"
+    );
+}
+
+#[test]
 fn test_earlier_wal_corrupt_tail_fails_open_when_newer_wal_exists() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();

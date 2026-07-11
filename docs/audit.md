@@ -12,14 +12,6 @@
 
 ## Open
 
-### [CRITICAL] WAL: zeroed mid-log fragments are accepted as padding
-- **Where**: `src/wal/reader.rs:175-245`, `src/db.rs:396-452`
-- **What**: An all-zero physical-record header is skipped wherever it appears, without proving that the remaining WAL bytes are zero padding.
-- **Why**: If corruption zeros one complete fragment while a later record remains, alignment can be preserved and recovery silently omits the missing acknowledged batch, replays later batches, then deletes the WAL.
-- **Suggested fix**: Treat an all-zero header as terminal padding only when every remaining byte is zero; otherwise return corruption. Add a crash-recovery test with a zeroed middle fragment followed by a valid record.
-
----
-
 ### [HIGH] compaction: source-level range tombstones can be omitted before sequence zeroing
 - **Where**: `src/compaction/leveled.rs:968-1008,1882-1910`, `src/db.rs:1220-1262`
 - **What**: `pick_level_compaction` selects one L1+ source file and expands only into the next level, ignoring sibling files whose range-tombstone end extents overlap the selected source.

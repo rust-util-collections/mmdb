@@ -184,6 +184,15 @@ impl WalReader {
                 }
             }
 
+            // A full zero header is only valid in a zero-extended tail. Surface
+            // it as corruption so recovery can accept it only after proving
+            // that every remaining byte is also zero.
+            if header_buf == [0u8; HEADER_SIZE] {
+                return Err(Error::corruption(
+                    "zero WAL record before proven zero tail".to_string(),
+                ));
+            }
+
             let (checksum, length, record_type) = decode_header(&header_buf);
             let record_type = match record_type {
                 Some(rt) => rt,
@@ -219,11 +228,6 @@ impl WalReader {
 
             self.block_offset += HEADER_SIZE + length;
 
-            // All-zero physical headers are block padding. A decoded Zero record
-            // with any non-zero header field is corruption and must not bypass CRC.
-            if header_buf == [0u8; HEADER_SIZE] {
-                continue;
-            }
             if matches!(record_type, RecordType::Zero) {
                 return Err(Error::corruption("non-padding WAL zero record".to_string()));
             }
