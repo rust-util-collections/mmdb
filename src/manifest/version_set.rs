@@ -16,7 +16,7 @@ use crate::error::{Error, Result, ResultExt};
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::sst::table_reader::TableReader;
-use crate::types::{MAX_SEQUENCE_NUMBER, SequenceNumber, compare_internal_key};
+use crate::types::{MAX_SEQUENCE_NUMBER, SequenceNumber, compare_internal_key, user_key};
 use crate::wal::{WalReader, WalWriter};
 use parking_lot::Mutex;
 
@@ -80,6 +80,32 @@ impl VersionSet {
             )));
         }
         Ok(manifest_number)
+    }
+
+    /// Validate the L1+ invariant that point-lookup binary search relies on:
+    /// within each level >= 1, files sorted by `smallest_key` must have
+    /// pairwise-disjoint user-key ranges. Compaction cuts output files at
+    /// user-key boundaries, so two live L1+ files sharing a user key can only
+    /// come from a malformed MANIFEST or an internal logic bug — installing
+    /// them would make binary-search reads silently miss live keys.
+    fn validate_level_disjointness(version: &Version) -> Result<()> {
+        for level in 1..version.num_levels {
+            let files = version.level_files(level);
+            for pair in files.windows(2) {
+                let prev = &pair[0].meta;
+                let next = &pair[1].meta;
+                if prev.largest_key.is_empty() || next.smallest_key.is_empty() {
+                    continue;
+                }
+                if user_key(&prev.largest_key) >= user_key(&next.smallest_key) {
+                    return Err(Error::corruption(format!(
+                        "SST {} and SST {} have overlapping key ranges at level {}",
+                        prev.number, next.number, level
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Create a new VersionSet (for a fresh database). Test-only wrapper.
@@ -293,6 +319,9 @@ impl VersionSet {
             version.files[level]
                 .sort_by(|a, b| compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key));
         }
+        // The replayed record stream passed per-record checksums, but the
+        // recovered file set must still satisfy the read-path invariant.
+        Self::validate_level_disjointness(&version).ctx()?;
 
         // Reopen manifest for appending, truncating any corrupt tail
         let valid_offset = reader.last_valid_offset();
@@ -426,6 +455,12 @@ impl VersionSet {
                 )));
             }
         }
+
+        // The fully-applied shape must keep L1+ binary search sound. Reject
+        // the edit wholesale before anything is persisted (same contract as
+        // the level/deletion checks above); recovery enforces the identical
+        // invariant, so a persisted violation would also fail the next open.
+        Self::validate_level_disjointness(&new_version).ctx()?;
 
         // Before any MANIFEST record referencing the new SST files can become
         // durable — either via a later `sync_manifest()`/`manifest_sync_handle`
@@ -1005,5 +1040,83 @@ mod tests {
         let encoded = edit.encode();
         let decoded = VersionEdit::decode(&encoded).unwrap();
         assert_eq!(decoded.last_sequence, Some(42));
+    }
+
+    /// L1+ files must stay pairwise disjoint (binary-search read invariant):
+    /// a live edit producing an overlap is rejected before persisting, and a
+    /// persisted overlapping record fails the next recovery.
+    #[test]
+    fn test_overlapping_l1_files_rejected_live_and_on_recovery() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        fn build_sst(dir: &Path, number: u64, first: &[u8], last: &[u8]) -> FileMetaData {
+            let path = dir.join(format!("{number:06}.sst"));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    internal_keys: true,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for key in [first, last] {
+                let ik = InternalKey::new(key, 1, ValueType::Value).into_bytes();
+                builder.add(&ik, b"v").unwrap();
+            }
+            let result = builder.finish().unwrap();
+            FileMetaData {
+                number,
+                file_size: result.file_size,
+                smallest_key: result.smallest_key.unwrap(),
+                largest_key: result.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let mut vs = VersionSet::create(path, 7).unwrap();
+
+        let wide = build_sst(path, 10, b"a", b"z");
+        let inner = build_sst(path, 11, b"b", b"c");
+
+        let mut edit = VersionEdit::new();
+        edit.add_file(1, wide.clone());
+        vs.log_and_apply(edit).unwrap();
+
+        // Live apply: an edit creating an L1 overlap is rejected wholesale.
+        let mut overlap_edit = VersionEdit::new();
+        overlap_edit.add_file(1, inner.clone());
+        let err = vs.log_and_apply(overlap_edit).unwrap_err();
+        assert!(
+            err.to_string().contains("overlapping key ranges"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(vs.current().level_files(1).len(), 1, "edit must not apply");
+        assert!(!vs.is_poisoned(), "clean rejection must not poison");
+
+        // A persisted overlapping record (bypassing the live check, as a
+        // malformed-but-checksum-valid MANIFEST would) fails the next open.
+        {
+            let mut bad_edit = VersionEdit::new();
+            bad_edit.add_file(1, inner);
+            let encoded = bad_edit.encode();
+            let mut w = vs.manifest_writer.lock();
+            if let Some(ref mut writer) = *w {
+                writer.add_record(&encoded).unwrap();
+                writer.sync().unwrap();
+            }
+        }
+        drop(vs);
+        let err = match VersionSet::recover(path, 7) {
+            Ok(_) => panic!("recovery must reject overlapping L1 files"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("overlapping key ranges"),
+            "unexpected recovery error: {err}"
+        );
     }
 }
