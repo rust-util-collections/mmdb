@@ -7,15 +7,25 @@ Load this document FIRST before performing any review or debug analysis.
 
 ## Category 1: Concurrency & Atomicity Bugs
 
-### 1.1 SuperVersion Stale Read
-**Pattern**: Reading from a stale `SuperVersion` snapshot after a flush or compaction has completed but before `ArcSwap::store()` publishes the new version.
-**Where**: `db.rs` — any path that reads `self.super_version` without checking if a background job has committed a new `VersionEdit`.
-**Impact**: Reads return deleted keys or miss recently flushed data.
-**Check**: Verify that every code path calling `super_version.load()` either holds a `Guard` or explicitly accepts point-in-time staleness (e.g., snapshot reads).
+### 1.1 SuperVersion Used for a Latest-State Decision
+**Pattern**: Using a point-in-time `SuperVersion` for a mutation or maintenance
+decision that requires the latest installed Version.
+**Where**: `db.rs` — calls to `self.super_version.load()`.
+**Impact**: A compaction/cleanup decision can be built from superseded files.
+**Check**: Ordinary reads intentionally use a pinned, internally consistent
+`ArcSwap` snapshot; do not report that staleness. Paths that require latest
+state must revalidate under the DB lock before install (for example,
+`install_compaction` stale-output checks).
 
 ### 1.2 Group Commit Ordering
-**Pattern**: If a refactor changes the group commit leader to process WAL writes and MemTable inserts in separate passes (e.g., all WAL writes first, then all MemTable inserts), a reordering or partial-visibility window could emerge where batch B is visible in the MemTable before batch A, despite A having a lower sequence number.
-**Where**: `db.rs` write path — `write_batch_group()`. Currently correct: sequence numbers for the whole group are reserved in bulk upfront, then one loop writes all WAL records, then a single fsync/flush, then a separate loop inserts into the MemTable — both loops iterate the batch group in the same fixed order, so relative ordering is preserved across the phase split.
+**Pattern**: The WAL and MemTable phase split uses different request order, or
+publishes `committed_sequence` before every assigned MemTable insert completes.
+That can make batch B visible while lower-sequence batch A is absent.
+**Where**: `db.rs` write path — `write_batch_group()`. Currently correct:
+sequence numbers for the whole group are reserved in bulk upfront, then one
+loop appends every WAL-enabled request, a shared fsync/flush runs, and a second
+loop inserts assigned requests into the MemTable. Both loops preserve group
+order and `committed_sequence` is published after insertion.
 **Impact**: Would violate linearizability. A reader could see a later write but not an earlier one.
 **Check**: Verify both the WAL-write loop and the MemTable-insert loop iterate the batch group in identical order. Watch for refactors that reorder within either phase, or that make one loop skip/reorder entries relative to the other.
 
@@ -25,11 +35,14 @@ Load this document FIRST before performing any review or debug analysis.
 **Impact**: Lost L0 file reference — data silently disappears.
 **Check**: Verify that `VersionSet::log_and_apply()` is serialized (single Mutex) and that both flush and compaction go through the same path.
 
-### 1.4 Iterator Invalidation on Drop
-**Pattern**: An iterator holds references to MemTable or SST data. If the MemTable is dropped (flush completes) or SST is deleted (compaction completes) while the iterator is live, the references become dangling.
+### 1.4 Iterator Ownership Regression
+**Pattern**: A future iterator refactor borrows MemTable/SST data without
+retaining the owning `Arc` across flush, compaction, or cache eviction.
 **Where**: `iterator/db_iter.rs`, `iterator/merge.rs` — lifetime of internal iterators.
 **Impact**: Use-after-free or reading garbage data.
-**Check**: Verify iterators hold `Arc` references that prevent premature cleanup. Check `SuperVersion` pinning.
+**Check**: Current safe-Rust iterators own the required `Arc` references and
+pin a SuperVersion. Report only a concrete raw/borrowed ownership regression,
+not ordinary pathname deletion or cache eviction while an owner remains live.
 
 ---
 
@@ -39,7 +52,9 @@ Load this document FIRST before performing any review or debug analysis.
 **Pattern**: Assigning duplicate sequence numbers, or failing to increment the global sequence counter after a WriteBatch.
 **Where**: `db.rs` write path, `types.rs` sequence handling.
 **Impact**: MVCC corruption — snapshot reads return wrong versions.
-**Check**: Verify `last_sequence` is atomically incremented by exactly `batch.count()` after each write.
+**Check**: Verify `write_batch_group()` reserves one contiguous range equal to
+the total operation count, assigns it monotonically in group order, and
+publishes `committed_sequence` only after the corresponding MemTable inserts.
 
 ### 2.2 InternalKey Encoding/Decoding Mismatch
 **Pattern**: Encoding user_key as `[user_key][!pack(seq, type)]` but decoding with wrong byte order or wrong bit inversion.
@@ -71,9 +86,14 @@ Load this document FIRST before performing any review or debug analysis.
 
 ### 3.1 File Descriptor Leak on Error Path
 **Pattern**: SST file opened for reading but not closed when an error occurs during table_reader construction.
-**Where**: `sst/table_reader/mod.rs` — `TableReader::open()` error paths.
+**Where**: `sst/table_reader/mod.rs` — `TableReader::open_with_all()` error paths.
 **Impact**: FD exhaustion under sustained errors (e.g., corrupted files).
 **Check**: Verify all error paths either close the file or rely on RAII (`Drop`).
+
+> **Status**: Low current risk. `open_with_all()` owns its `File` locally, so
+> every `?` return closes it through RAII. This pattern becomes live only if a
+> future refactor leaks/forgets the file or extracts a raw descriptor whose
+> ownership is not restored.
 
 ### 3.2 WAL File Accumulation
 **Pattern**: Old WAL files not deleted after successful flush because the deletion is gated on a condition that's never met.
@@ -85,16 +105,23 @@ Load this document FIRST before performing any review or debug analysis.
 **Pattern**: L0 pinned blocks are never unpinned after compaction removes the L0 file.
 **Where**: `cache/block_cache.rs` — `insert_pinned()` and compaction cleanup.
 **Impact**: Unbounded cache growth during sustained L0 write pressure.
-**Check**: Verify compaction completion triggers `unpin()` for all blocks of deleted L0 files.
+**Check**: Verify file removal triggers `unpin_file()`/`invalidate_file()` for
+every deleted L0 file. See `patterns/cache.md`.
 
 ### 3.4 MemTable Size Tracking Drift
 **Pattern**: `approximate_size()` drifts from actual allocation due to missed accounting of range tombstone entries or skiplist node overhead.
 
-> **Status**: Resolved in current code. `MemTable::approximate_size()` (mod.rs:72-76) accounts for range tombstone entry overhead (`key.len() + value.len() + size_of::<MemRangeTombstone>()`) and skiplist Node overhead (~160 bytes per entry). The "Watch for" guidance below targets future changes that might add new entry types.
+> **Status**: Resolved in current code. `MemTable::put()` computes `entry_size`
+> (encoded key + value + approximate node overhead) and adds duplicated
+> range-tombstone storage for `ValueType::RangeDeletion`;
+> `approximate_size()` only reads the atomic counter. The check below targets
+> future entry/storage changes.
 
 **Where**: `memtable/mod.rs`, `memtable/skiplist.rs`.
 **Impact**: MemTable grows larger than `write_buffer_size` before triggering flush.
-**Check**: Verify all insert paths (put, delete, delete_range) update the size tracker. New entry types must add their overhead to the atomic size counter.
+**Check**: Verify `MemTable::put()` accounts for all `ValueType` variants
+(`Value`, `Deletion`, `RangeDeletion`). New entry types or duplicated storage
+must add their overhead to the atomic counter.
 
 ---
 
@@ -119,10 +146,14 @@ Load this document FIRST before performing any review or debug analysis.
 **Check**: Verify split boundaries use exclusive-start semantics and no key spans two sub-compaction ranges.
 
 ### 4.4 Trivial Move Incorrect Condition
-**Pattern**: Trivial move (rename without rewrite) applied when L(n+1) has overlapping files, or when a compaction filter needs to process entries.
+**Pattern**: Trivial move (metadata-only level change) applied when L(n+1) has
+overlapping files or when an effective compaction filter must process entries.
 **Where**: `compaction/leveled.rs` — trivial move check.
 **Impact**: Stale tombstones persist, overlapping key ranges at L(n+1), or compaction filter logic bypassed.
-**Check**: Verify trivial move requires ALL three conditions: (1) exactly 1 input file, (2) 0 overlapping files at target level, (3) no compaction filter installed (`compaction_filter.is_none()`).
+**Check**: Verify the ordinary trivial move requires exactly one input file, no
+target-level overlap, and no effective filter (`None` or `is_noop()`). Forced
+merge no-op shortcuts may also bypass rewriting when the filter cannot apply
+(not bottommost or snapshots are active).
 
 ---
 
@@ -150,7 +181,9 @@ Load this document FIRST before performing any review or debug analysis.
 
 ## Category 6: Unsafe Code Bugs
 
-> **Note**: The codebase has 66 unsafe blocks/functions across 4 files: `skiplist_impl.rs` (42), `skiplist.rs` (12), `db.rs` (11), `table_reader/mod.rs` (1). All have `// SAFETY:` comments. Block parsing (`block.rs`), key encoding (`types.rs`), and format parsing (`format.rs`) contain zero unsafe blocks.
+> **Note**: Unsafe code is concentrated in the skiplist, DB group-commit/file
+> locking, and SST readahead syscall paths. Derive the live inventory during
+> review and use `patterns/unsafe-audit.md`; do not rely on copied counts.
 
 ### 6.1 Skiplist Node Lifetime
 **Pattern**: Skiplist node contains raw pointers to other nodes. If a node is deallocated while another thread holds a pointer, it's use-after-free.
@@ -158,11 +191,14 @@ Load this document FIRST before performing any review or debug analysis.
 **Impact**: Memory corruption, undefined behavior, potential data loss.
 **Check**: Verify epoch-based reclamation or that nodes are never freed while any reader holds a reference.
 
-### 6.2 Block Slice Aliasing
-**Pattern**: `&[u8]` slice into block data is used after the block is evicted from cache or the underlying buffer is reallocated.
+### 6.2 Block Ownership Regression
+**Pattern**: A future refactor returns a borrowed block slice without retaining
+the owning allocation across cache eviction.
 **Where**: `sst/block.rs`, `sst/table_reader/`.
 **Impact**: Read garbage data or crash.
-**Check**: Verify block data lifetime is tied to cache handle or `Arc<Vec<u8>>`.
+**Check**: Current code is safe and `Arc<Vec<u8>>`-backed. Verify any new
+borrowed/raw-pointer path retains equivalent ownership; do not report ordinary
+cache eviction while an `Arc` is live.
 
 ### 6.3 Unaligned Read/Write
 **Pattern**: `ptr::read_unaligned` or `ptr::write_unaligned` not used when reading packed integer fields from byte slices.

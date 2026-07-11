@@ -2,11 +2,13 @@
 
 > Auto-managed by /x-review and /x-fix.
 >
-> **Won't Fix ≠ permanent.** Every entry under `## Won't Fix` must be
-> re-evaluated against the current codebase on each audit. Surrounding code
-> changes, new callers, or API evolution may make a previously-disproportionate
-> fix straightforward — or make the finding obsolete. Never silently carry
-> forward a Won't Fix entry without fresh assessment.
+> **Won't Fix ≠ permanent.** Re-evaluate an entry when a review touches its
+> code, callers, assumptions, or subsystem; a full audit re-evaluates every
+> entry.
+>
+> **Rejected is not Won't Fix.** Rejected entries are disproven claims, not
+> deferred defects. Re-check them only when their cited code or invariant
+> changes.
 
 ## Open
 
@@ -20,20 +22,6 @@
 - **Where**: `src/rate_limiter.rs` (`request`, the `remaining -= chunk` convergence loop)
 - **What**: For a single request of ~hundreds of petabytes, `chunk` can fall below `ULP(remaining)/2`, making the f64 subtraction a no-op and the loop non-terminating. Mathematically confirmed.
 - **Reason**: Not practically reachable. Every call site passes single-entry sizes (internal key + value bytes, bounded by allocatable memory); triggering the loop requires first materializing a ~2.5e17-byte entry in RAM. The module is private, so no external caller can inject an arbitrary value. Guarding would add cost/complexity to a hot path for an input that cannot occur. Revisit if `request()` is ever exposed to sizes not backed by in-memory buffers.
-
----
-
-### [REJECTED] db: Dead-key sweep `?` on `force_merge_level` error "permanently kills the background compaction thread"
-- **Where**: `src/db.rs` (dead-key sweep block in the background compaction loop)
-- **What**: External review claimed a transient sweep error breaks the thread's main loop, silently and permanently disabling all future compaction.
-- **Reason**: Rejected — not a bug. The error path calls `set_error`, which sets `has_bg_error`; from then on **every** public entry point fails loudly via `check_usable()`. This is the engine's deliberate fail-stop-until-reopen policy, identical to every other background error path (debt-driven picks, hint compactions, flush). Nothing is silent, and "no further compaction" is exactly the intended fail-stop behavior.
-
----
-
-### [REJECTED] db: Dead-key sweep's L0 pass "never fires the filter because L0 is never bottommost"
-- **Where**: `src/db.rs` (sweep loop starting at level 0), `src/compaction/leveled.rs` (`is_bottommost_level`)
-- **What**: External review claimed `is_bottommost` is always false for L0 when `num_levels > 1`, making the L0 sweep pass useless.
-- **Reason**: Rejected — factually wrong. `is_bottommost_level` is data-driven, not level-count-driven: it checks whether any *deeper level contains files overlapping the inputs*. On a settled store whose data sits only in L0 (the exact scenario the sweep exists for), it returns true and the filter fires at L0. When deeper overlapping data exists, skipping the filter at L0 is required for MVCC correctness (a newer L0 tombstone must not be filtered away below an older value). Residual single-file no-op rewrites are separately eliminated by the `force_merge_level` early-return fix.
 
 ---
 
@@ -62,3 +50,19 @@
 - **Where**: `src/iterator/merge.rs` (`seek`, `seek_to_first`, `seek_for_prev`), `src/iterator/source.rs` (`seek_to`/`seek_for_prev_to`/`seek_to_first_impl`, each combining position+decode into one synchronous call)
 - **What**: Every seek-based entry point (the mechanism `db.rs`'s `iter_with_prefix()` uses internally, and the pattern most of the test suite exercises via `iter.seek(...)`) positions each source sequentially and synchronously decodes its entry before `init_heap()`'s prefetch phase runs, eliminating I/O-overlap for the hot seek path. `LevelIterator::prefetch_first_block()` has been added (fixing the cold-start/no-seek case), but the seek path itself is unchanged.
 - **Reason**: `SeekableIterator`'s trait contract (in `src/iterator/source.rs`) has no split "position-only" phase — every seek implementation combines positioning and decoding into one call. Cleanly separating these would require changing the trait's method signatures/semantics across every implementor (`TableIterator`, `LevelIterator`, `MemTableCursorIter`, boxed/Vec sources), a cross-cutting, moderately invasive change with real regression risk to defer for a dedicated, focused effort rather than bundle into this audit cycle. The immediate, common-case win (cold-start prefetch for `LevelIterator`) has been captured; this residual gap only affects warm I/O-overlap opportunity, not correctness.
+
+---
+
+## Rejected
+
+### db: Dead-key sweep `?` on `force_merge_level` error "permanently kills the background compaction thread"
+- **Where**: `src/db.rs` (dead-key sweep block in the background compaction loop)
+- **Claim**: A transient sweep error breaks the thread's main loop, silently and permanently disabling all future compaction.
+- **Reason**: The error path calls `set_error`, which sets `has_bg_error`; from then on every public entry point fails loudly via `check_usable()`. This is the engine's deliberate fail-stop-until-reopen policy, identical to every other background error path (debt-driven picks, hint compactions, flush). Nothing is silent, and "no further compaction" is the intended fail-stop behavior.
+
+---
+
+### db: Dead-key sweep's L0 pass "never fires the filter because L0 is never bottommost"
+- **Where**: `src/db.rs` (sweep loop starting at level 0), `src/compaction/leveled.rs` (`is_bottommost_level`)
+- **Claim**: `is_bottommost` is always false for L0 when `num_levels > 1`, making the L0 sweep pass useless.
+- **Reason**: `is_bottommost_level` is data-driven, not level-count-driven: it checks whether any deeper level contains files overlapping the inputs. On a settled store whose data sits only in L0 (the scenario the sweep exists for), it returns true and the filter fires at L0. When deeper overlapping data exists, skipping the filter at L0 is required for MVCC correctness. Residual single-file no-op rewrites are separately eliminated by the `force_merge_level` early return.

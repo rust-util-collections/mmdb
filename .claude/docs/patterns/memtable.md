@@ -2,8 +2,8 @@
 
 ## Files
 - `src/memtable/mod.rs` — MemTable interface
-- `src/memtable/skiplist.rs` (~13KB) — SkipList wrapper
-- `src/memtable/skiplist_impl.rs` (~32KB) — lock-free skiplist implementation
+- `src/memtable/skiplist.rs` — SkipList wrapper
+- `src/memtable/skiplist_impl.rs` — lock-free skiplist implementation
 
 ## Architecture
 - Lock-free skiplist: single-writer, concurrent multi-reader
@@ -17,7 +17,9 @@
 
 ### INV-M1: Single-Writer Guarantee
 Only one thread may insert into the active MemTable at a time. The group commit leader serializes writes.
-**Check**: Verify `MemTable::put()` is only called under the write lock (db_mutex or equivalent).
+**Check**: Normal active-MemTable writes occur under DB write serialization.
+Recovery and test builders may call `put()` without that lock only while the
+MemTable is local and unpublished; no two writers may call it concurrently.
 
 ### INV-M2: Concurrent Read Safety
 Readers must see a consistent view even while a writer is inserting.
@@ -28,9 +30,14 @@ The skiplist must maintain `(user_key ASC, sequence_number DESC)` ordering. This
 **Check**: Verify OrdInternalKey comparator: compare user_key bytes first, then compare sequence number in REVERSE order.
 
 ### INV-M4: Size Tracking Accuracy
-`MemTable::approximate_size()` must not undercount by more than a small constant factor. Severe undercounting delays flush, causing OOM. The current implementation accounts for key length, value length, range tombstone entry overhead (`key.len() + value.len() + size_of::<MemRangeTombstone>()`), and skiplist `Node` overhead (~160 bytes per entry).
+`MemTable::put()` must update the atomic size estimate for every stored
+representation. Severe undercounting delays flush and can cause OOM. The
+current calculation includes encoded key/value bytes, approximate skiplist-node
+overhead, and the duplicated range-tombstone collection entry.
 
-**Check**: Verify every insert path (Put, Delete, DeleteRange) adds `key.len() + value.len() + overhead` to the size counter.
+**Check**: Verify all `ValueType` branches (`Value`, `Deletion`,
+`RangeDeletion`) flow through the size calculation and that new duplicated
+storage is included. `approximate_size()` itself is only the atomic read.
 
 ### INV-M5: Range Tombstone Isolation
 Range tombstones stored in the MemTable must be accessible independently from point entries, for the RangeTombstoneTracker.
@@ -51,7 +58,7 @@ Two entries with the same (user_key, seq, type) are inserted. The skiplist may k
 **Check**: Verify this case cannot happen (sequence numbers are unique) or that skiplist behavior is correct for duplicates.
 
 ## Review Checklist
-- [ ] `MemTable::put()` only called under write serialization
+- [ ] `MemTable::put()` has one writer at a time (DB lock in live paths; unpublished local ownership during recovery/setup)
 - [ ] Skiplist atomic ordering: Release for stores, Acquire for loads
 - [ ] OrdInternalKey comparison: user_key ASC, then seq DESC
 - [ ] Size tracker (`approximate_size()`) updated for all entry types (point + range tombstone + node overhead)

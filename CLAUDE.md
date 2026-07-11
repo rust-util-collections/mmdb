@@ -33,7 +33,10 @@ MSRV: Rust 1.89 (edition 2024)
 | Manifest | `src/manifest/` | VersionSet, atomic version edits |
 | Cache | `src/cache/` | Block cache (moka SegmentedCache via BlockCachePool), table handle cache |
 
-## Commands
+## Skills
+
+Project skills live under `.claude/skills/<name>/SKILL.md` and are
+user-invocable only.
 
 - `/x-review` — deep regression analysis of recent changes
 - `/x-fix` — fix audit backlog: resolve `docs/audit.md` → self-review → commit
@@ -41,13 +44,14 @@ MSRV: Rust 1.89 (edition 2024)
 - `/x-overhaul` — full codebase overhaul: review all → fix → commit
 
 Supporting documentation in `.claude/docs/`:
+- `workflow-policy.md` — shared worktree safety and one-issue-one-commit policy
 - `technical-patterns.md` — cataloged bug patterns for LSM-Tree/Rust
 - `review-core.md` — systematic review methodology + canonical Subsystem Map (file → subsystem → pattern guide)
 - `false-positive-guide.md` — rules for filtering spurious findings
-- `commit-protocol.md` — canonical validate → version-bump → commit procedure
-- `patterns/` — per-subsystem review guides (compaction, iterator, WAL, SST, memtable, concurrency, unsafe-audit)
+- `commit-protocol.md` — canonical atomic validate → commit → final version procedure
+- `patterns/` — per-subsystem review guides (compaction, iterator, WAL, SST, memtable, manifest, cache, concurrency, unsafe-audit)
 
-Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` and `/x-fix`; open findings sorted by severity plus a Won't Fix section.
+Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` and `/x-fix`; it separates actionable Open findings, accepted Won't Fix risks, and disproven Rejected claims.
 
 ## Conventions
 
@@ -61,5 +65,5 @@ Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` a
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
-- 66 unsafe blocks/functions concentrated in: `skiplist_impl.rs` (42), `skiplist.rs` (12), `db.rs` (11), `table_reader/mod.rs` (1) — all require `// SAFETY:` comments
+- Unsafe code is concentrated in the skiplist, group-commit/file-lock paths, and the SST readahead syscall; derive the live inventory and follow `.claude/docs/patterns/unsafe-audit.md`
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes

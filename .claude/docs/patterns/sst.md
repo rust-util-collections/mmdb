@@ -1,13 +1,14 @@
 # SST Subsystem Review Patterns
 
 ## Files
-- `src/sst/table_builder.rs` (~27KB) — SST file writer
-- `src/sst/table_reader/mod.rs` (~25KB) — SST file reader (open, block read/cache, point lookup)
-- `src/sst/table_reader/iterator.rs` (~52KB) — TableIterator, complex seek logic
-- `src/sst/block.rs` (~25KB) — data block codec, prefix compression
+- `src/sst/table_builder.rs` — SST file writer
+- `src/sst/table_reader/mod.rs` — SST file reader (open, block read/cache, point lookup)
+- `src/sst/table_reader/iterator.rs` — TableIterator and seek logic
+- `src/sst/block.rs` — data block codec and prefix compression
 - `src/sst/block_builder.rs` — block construction with restart points
-- `src/sst/filter.rs` (~9KB) — bloom filter (double hashing)
-- `src/sst/format.rs` (~9KB) — footer, BlockHandle, compression
+- `src/sst/filter.rs` — bloom filter (double hashing)
+- `src/sst/format.rs` — footer, BlockHandle, compression
+- `src/sst/mod.rs` — module boundary
 
 ## Architecture
 - Data blocks: prefix-compressed entries with restart points (every N entries)
@@ -70,4 +71,4 @@ Decompressed block size exceeds the allocated buffer because the original size i
 - [ ] Footer magic validated before using index/metaindex handles
 - [ ] Binary search on index block uses correct comparison
 - [ ] Decompressed block size bounded to prevent allocation bomb
-- [ ] File descriptor closed on all error paths in TableReader::open()
+- [ ] `TableReader::open_with_all()` retains owned-`File` RAII on every error path; any future raw-fd extraction restores ownership

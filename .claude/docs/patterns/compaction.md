@@ -1,7 +1,8 @@
 # Compaction Subsystem Review Patterns
 
 ## Files
-- `src/compaction/leveled.rs` (~93KB, most complex module)
+- `src/compaction/leveled.rs` — leveled and forced compaction
+- `src/compaction/mod.rs` — module boundary
 
 ## Architecture
 - Leveled compaction: L0 (overlapping) → L1+ (sorted, disjoint)
@@ -21,9 +22,15 @@ Tombstones at non-bottommost levels MUST be written to output. At bottommost lev
 **Check**: Verify `is_bottommost_level` accounts for ALL levels below, not just `level + 1`.
 
 ### INV-C2a: Range Tombstone Sub-Compaction Propagation
-When a range tombstone spans sub-compaction boundaries, it must be propagated to all sub-compactions whose key ranges intersect it. The `RangeTombstoneTracker` (pre-populated with all input range deletions) is shared across sub-compactions so that each sub-compaction's `CompactionIter` sees the complete set of covering tombstones.
+When a range tombstone spans sub-compaction boundaries, every intersecting
+sub-compaction must see it. The full input tombstone sets
+(`all_range_del_entries` and `all_raw_tombstones`) are collected once and shared
+by reference; each `execute_sub_compaction_io()` builds its own local
+`RangeTombstoneTracker` from that complete data.
 
-**Check**: Verify the `RangeTombstoneTracker` is fully constructed from all input files BEFORE sub-compactions are spawned. Sub-compaction boundaries must not truncate range tombstone coverage.
+**Check**: Verify the shared raw tombstone sets are complete before threads are
+spawned and every local tracker is pre-populated before its merge loop.
+Sub-compaction bounds must not truncate tombstone coverage.
 
 ### INV-C3: Sequence Number Zeroing
 Sequence numbers may only be zeroed at the bottommost level, and only for keys with no live snapshot dependency.
@@ -34,8 +41,11 @@ When splitting work across threads, the boundary key must be assigned to exactly
 **Check**: Verify exclusive-start or exclusive-end semantics at split points. A key equal to the boundary goes to exactly one side.
 
 ### INV-C5: Input File Deletion Safety
-Compaction input files may only be deleted after the output files are fully written AND the MANIFEST records the new version.
-**Check**: Verify file deletion happens AFTER `VersionSet::log_and_apply()` succeeds.
+Compaction input files may be physically deleted only after output files are
+fully written and the replacing MANIFEST edit is durably synced.
+**Check**: `install_compaction()` may evict caches and return a
+`PostCompactionCleanup` after `log_and_apply()`, but callers must sync the
+MANIFEST successfully before `run_post_compaction_cleanup()` unlinks inputs.
 
 ### INV-C5a: Stale-Output Detection in `install_compaction`
 After compaction I/O completes and the lock is re-acquired to install results, verify that the SuperVersion used to pick inputs has not been superseded by a concurrent flush or another compaction. If a newer version exists, the output files from this compaction may reference stale inputs and MUST be discarded rather than installed.
@@ -43,8 +53,12 @@ After compaction I/O completes and the lock is re-acquired to install results, v
 **Check**: Verify `install_compaction()` checks that its input files are still present in the current Version before applying the VersionEdit, and that no output overlaps a target-level file the edit neither deletes nor produced (concurrent-install race). Output files built from stale inputs must be deleted without being added to the MANIFEST. The precheck runs under the DB lock, so it must not read SST files: output tombstone extents come from `CompactionOutput::output_tombstones`, captured from `TableBuildResult` during the unlocked I/O phase.
 
 ### INV-C6: Compaction Filter Contract
-User-provided `CompactionFilter` receives every key-value pair exactly once. Filter decisions (Keep/Remove/ChangeValue) must be applied atomically per entry.
-**Check**: Verify filter is called inside the merge loop, not on intermediate state.
+When filtering is safe (bottommost compaction with no active snapshots), every
+eligible surviving `Value` entry is presented exactly once. Tombstones and
+versions eliminated by MVCC rules are not filter inputs. Decisions
+(Keep/Remove/ChangeValue) apply to that logical entry.
+**Check**: Verify the filter runs in the final merge loop after visibility
+decisions, and both normal and forced compaction enforce the same eligibility.
 
 ## Common Bug Patterns
 
@@ -73,7 +87,7 @@ When computing whether a file overlaps with deeper levels (for `is_bottommost_le
 - [ ] Sub-compaction boundaries don't duplicate or skip keys
 - [ ] MANIFEST updated before input file deletion
 - [ ] CompactionFilter called once per logical key-value
-- [ ] Trivial move conditions are sufficient (1 input file, no overlap, no compaction filter)
+- [ ] Trivial move/no-op conditions cannot bypass an effective compaction filter
 - [ ] Error handling: partial compaction failure leaves DB in consistent state
 - [ ] Rate limiter doesn't cause unbounded stalls
 - [ ] `install_compaction` checks for stale inputs before applying VersionEdit

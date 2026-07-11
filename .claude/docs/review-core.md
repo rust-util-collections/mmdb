@@ -1,161 +1,146 @@
 # MMDB Review Core Methodology
 
-This document defines the systematic review protocol for MMDB code changes.
+This document defines the evidence standard and canonical subsystem mapping for
+MMDB reviews.
 
----
+## 1. Context and coverage
 
-## Phase 1: Context Gathering
+Before analyzing a change:
 
-Before analyzing any change, gather context:
+1. Read the complete diff and surrounding functions.
+2. Map every changed code file through the Subsystem Map.
+3. Read all mapped guides, callers, and directly relevant tests.
+4. For a full audit, build a tracked-file ledger first; do not rely on a static
+   list or approximate file sizes.
 
-1. **Read the diff** — understand every changed line
-2. **Identify affected subsystems** — map changed files using the Subsystem Map below
-3. **Load subsystem patterns** — read every pattern guide mapped to an affected subsystem
-4. **Check call sites** — use grep/LSP to find all callers of changed functions
-5. **Check related tests** — identify which test files cover the changed code
+### Subsystem Map (canonical)
 
-### Subsystem Map (canonical — all commands reference this table)
+Every Rust source file has one primary row. Concurrency and unsafe guides are
+cross-cutting overlays, not substitutes for the primary guide.
 
-| Subsystem | Files | Pattern guide(s) |
-|-----------|-------|------------------|
-| write-path & read-path | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `concurrency.md`, `unsafe-audit.md` (db.rs unsafe) |
-| memtable | `src/memtable/` (mod.rs, skiplist.rs, skiplist_impl.rs) | `memtable.md`, `unsafe-audit.md` |
-| WAL | `src/wal/` (writer.rs, reader.rs, record.rs) | `wal.md` |
-| SST | `src/sst/` (table_builder.rs, table_reader/mod.rs, table_reader/iterator.rs, block.rs, block_builder.rs, filter.rs, format.rs) | `sst.md`, `unsafe-audit.md` (table_reader/mod.rs only) |
-| iterator | `src/iterator/` (db_iter.rs, merge.rs, source.rs, level_iter.rs, bidi_iter.rs, range_del.rs) | `iterator.md` |
-| compaction | `src/compaction/leveled.rs` | `compaction.md` |
-| manifest | `src/manifest/` (version_set.rs, version_edit.rs, version.rs) | `concurrency.md` |
-| cache | `src/cache/` (block_cache.rs, table_cache.rs) | `concurrency.md` |
-| types & encoding | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` §2 (cross-cutting) |
+| Subsystem | File patterns | Pattern guide(s) |
+|-----------|---------------|------------------|
+| write/read path | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/unsafe-audit.md` for `db.rs` |
+| memtable | `src/memtable/**/*.rs` | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
+| WAL | `src/wal/**/*.rs` | `patterns/wal.md` |
+| SST | `src/sst/**/*.rs` | `patterns/sst.md`, `patterns/unsafe-audit.md` for files containing `unsafe` |
+| iterator | `src/iterator/**/*.rs` | `patterns/iterator.md` |
+| compaction | `src/compaction/**/*.rs` | `patterns/compaction.md` |
+| manifest | `src/manifest/**/*.rs` | `patterns/manifest.md`, `patterns/concurrency.md` |
+| cache | `src/cache/**/*.rs` | `patterns/cache.md`, `patterns/concurrency.md` |
+| types and public API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` |
 
-Pattern guides live in `.claude/docs/patterns/`.
+Pattern guides live in `.claude/docs/patterns/`. Tests, benches, Cargo/CI
+configuration, public docs, and `.claude/` are supporting surfaces: map them to
+the subsystem whose behavior they specify, then check consistency.
 
-## Phase 2: Change Classification
+## 2. Risk classification
 
-Classify each change into one or more categories:
+| Category | Examples | Default risk |
+|----------|----------|--------------|
+| Concurrency/unsafe | atomics, raw pointers, lock order, thread lifecycle | CRITICAL |
+| Durability/encoding | WAL, MANIFEST, SST format, checksums | HIGH |
+| Control/resource flow | branches, loops, open/close, cleanup | HIGH |
+| API/behavior | public types, defaults, iterator semantics | HIGH |
+| Error handling | propagation, fail-stop policy, retry semantics | MEDIUM |
+| Performance | complexity, allocation, lock or I/O on hot path | context-dependent |
+| Tests/docs/config | coverage or contract alignment | LOW unless behavior is wrong |
 
-| Category | Description | Risk Level |
-|----------|-------------|------------|
-| Control flow | if/else, match, loop, early return changes | HIGH |
-| Resource lifecycle | open/close, alloc/dealloc, lock/unlock | HIGH |
-| Concurrency | Arc, Mutex, ArcSwap, atomic ops, thread spawn | CRITICAL |
-| Unsafe code | Any code in `unsafe {}` blocks | CRITICAL |
-| Error handling | Result, Option, unwrap, expect, ? operator | MEDIUM |
-| Data encoding | Key/value encoding, checksums, compression | HIGH |
-| Configuration | Options, defaults, thresholds | LOW |
-| Logging/metrics | tracing calls, stats updates | LOW |
-| Test changes | New or modified test cases | LOW |
+Classification prioritizes review effort; it is not itself a finding.
 
-## Phase 3: Regression Analysis
+## 3. Evidence protocol
 
-For each HIGH or CRITICAL change, perform deep analysis:
+For each risky change:
 
-### 3.1 Invariant Check
-Identify the invariants that the changed code must maintain:
-- **Ordering invariant**: Keys must be sorted within and across levels
-- **Uniqueness invariant**: No duplicate (user_key, seq) pairs in the same level (L1+)
-- **Tombstone invariant**: Tombstones retained until bottommost compaction with no covering snapshots
-- **WAL invariant**: Every committed write is recoverable from WAL until flushed
-- **MANIFEST invariant**: MANIFEST always reflects a consistent file set
-- **Sequence invariant**: Sequence numbers are strictly monotonic
-- **Iterator invariant**: Forward iteration yields keys in ascending order; no gaps, no duplicates at user-key level
+1. **State the invariant** from the mapped guide.
+2. **Construct a trigger** using realistic input, ordering, crash point, or
+   corruption boundary.
+3. **Trace the full path**, including callers, cleanup, and existing guards.
+4. **State the observable outcome**: wrong value, data loss, corruption, panic,
+   leak, deadlock, or quantified hot-path regression.
+5. **Check regression coverage** and identify the smallest test that would fail
+   before the fix.
 
-### 3.2 Boundary Condition Analysis
-Check edge cases specific to the change:
-- Empty database / single entry
-- Maximum key/value size (exceeding block size)
-- L0 file count at compaction trigger threshold
-- MemTable exactly at `write_buffer_size`
-- Single-file level vs multi-file level
-- First/last key in a block (restart point boundaries)
-- Sequence number at u64::MAX
+### Boundary conditions
 
-### 3.3 Failure Path Analysis
-For every new error path introduced:
-- Does the error path clean up all acquired resources?
-- Does partial failure leave the database in a consistent state?
-- Can the operation be retried safely after failure?
-- Is the error propagated with sufficient context?
+Consider empty/single-entry state, first/last block keys, restart boundaries,
+L0 thresholds, snapshot cutoffs, malformed persisted data, maximum supported
+sizes, and error paths after partial I/O.
 
-### 3.4 Concurrency Analysis
-For changes touching shared state:
-- What lock is held? For how long?
-- Can this create a new deadlock cycle?
-- Is the lock ordering consistent with existing patterns?
-- For lock-free paths: is the happens-before relationship correct?
-- For ArcSwap: is the publish order correct (write data first, then publish pointer)?
+### Concurrency
 
-## Phase 4: Cross-Cutting Concerns
+Build the actual lock/atomic protocol from current code. Check lock cycles,
+guard lifetimes, publication order, wait predicates, and thread shutdown.
+`Relaxed` is valid for counters or hints that carry no publication guarantee;
+require Acquire/Release only where a happens-before edge is needed.
 
-### 4.1 Crash Safety
-If the change touches the write path, flush, compaction, or MANIFEST:
-- What happens if the process crashes at every point in this code?
-- Is the WAL sufficient to recover?
-- Are MANIFEST updates atomic (write + fsync + rename)?
+### Crash safety
 
-### 4.2 Performance Regression
-- Does this change add a lock to a previously lock-free path?
-- Does this allocate on a hot path?
-- Does this change the algorithmic complexity?
-- Does this affect cache locality (data structure layout)?
+Enumerate crash points around file writes, file sync, directory sync, MANIFEST
+append/sync, CURRENT publication, and file deletion. Use
+`patterns/manifest.md` for the exact persistence ordering; MANIFEST append and
+CURRENT replacement are different protocols.
 
-### 4.3 API Contract
-- Does the change alter observable behavior for existing users?
-- Are new public APIs consistent with existing naming conventions?
-- Do new options have sensible defaults?
+### Performance
 
-### 4.4 Code Style Rules
-These are enforced project conventions — violations are findings (severity LOW):
-- **No lint suppression**: `#[allow(...)]` is forbidden. Warnings must be fixed, not silenced.
-- **Prefer imports over inline paths**: Avoid `std::foo::Bar::new()` inline in function bodies when the same path appears 3+ times in a file; add a `use` import at file top instead. Function-body `use` statements (scoped imports) are fine. 1-2 inline uses of common `std::` items are acceptable.
-- **Grouped imports**: Common prefixes must be merged — `use std::sync::{Arc, Mutex};` not two separate `use` lines.
-- **Doc-code alignment**: Public API changes must have matching doc comment / README / CLAUDE.md updates. Stale docs are a finding. When a change adds, removes, or renames a public type, module, or subsystem path, also verify:
-  - `CLAUDE.md` architecture table (paths, type names, dependency info)
-  - The Subsystem Map above (canonical file → subsystem → guide mapping)
-  - `.claude/docs/patterns/` guides — referenced file lists and invariants
+Require hot/warm-path evidence and quantify the added work. Cold-path
+micro-optimizations are not findings.
 
-## Phase 5: Audit Registry & Won't Fix Re-evaluation
+### API contract
 
-Before reporting, consult `docs/audit.md`:
+Only curated re-exports in `src/lib.rs` are public API. Check behavior,
+defaults, error semantics, and corresponding docs/tests when those exports
+change.
 
-1. **Won't Fix re-evaluation** (MANDATORY on every review):
-   - Read every `## Won't Fix` entry.
-   - Re-assess each against the **current** code state — the original deferral decision was
-     based on a snapshot that may no longer be accurate.
-   - **Promote** to `## Open` if: the surrounding code has changed, the fix is now
-     straightforward, or the severity was underestimated.
-   - **Delete** if: the referenced code no longer exists, the pattern guide has been
-     updated to cover it, or the entry is objectively no longer applicable.
-   - **Keep** only if: the original reasoning still holds against the latest code,
-     with a brief note confirming re-verification (e.g. "Re-checked 2026-07-02: still applies").
-   - Do NOT treat Won't Fix as a permanent exemption — every entry must earn its
-     place again on each audit.
+## 4. Deterministic and style checks
 
-2. **Open entries**: Verify each still exists in the current code; prune fixed ones.
+Formatting, compilation, and Clippy diagnostics belong to deterministic tools,
+not speculative review agents. Repository-specific conventions that tools do
+not enforce are still LOW findings:
 
-### Finding Format
-For each finding, report:
+- no `#[allow(...)]`;
+- import repeated inline paths and group common prefixes;
+- keep public API docs, `CLAUDE.md`, this map, and pattern guides aligned;
+- every unsafe operation has an accurate `// SAFETY:` contract.
 
-```
-[SEVERITY] subsystem: one-line summary
+## 5. Audit registry
 
+Consult `docs/audit.md` before final reporting:
+
+- Verify relevant `Open` entries against current code and prune fixed ones.
+- Re-evaluate `Won't Fix` and `Rejected` entries when this review touches their
+  cited code, callers, assumptions, or subsystem. A full audit re-evaluates all.
+- Keep a real but disproportionate issue under `Won't Fix` with a current
+  reason.
+- Put only a recurring/material disproven claim under `Rejected`; it has no
+  severity because it is not a finding. Discard routine refuted candidates.
+- Never add dates or freshness markers.
+
+### Finding format
+
+```text
+[SEVERITY] subsystem: summary
 WHERE: file:line_range
-WHAT: Description of the issue
-WHY: Why this is a problem (reference invariant or pattern from technical-patterns.md)
-FIX: Suggested fix (if clear) or questions to resolve
+TRIGGER: concrete input/order/failure point
+OUTCOME: observable incorrect behavior
+WHY: violated invariant and why existing guards do not prevent it
+FIX: minimal safe direction and regression test
 ```
 
-### Severity Levels
-- **CRITICAL**: Data loss, corruption, undefined behavior, or crash
-- **HIGH**: Incorrect results, resource leak, or performance regression in hot path
-- **MEDIUM**: Edge case bug, error handling gap, or minor performance issue
-- **LOW**: Style, clarity, or non-functional improvement
-- **INFO**: Observation or question, not necessarily a bug
+### Severity
 
-### Quality Gate
-Only report findings where you have **concrete evidence** from the code. Never report:
-- Hypothetical issues without a specific triggering condition
-- Style preferences not related to correctness
-- "Consider" suggestions without a clear downside to the current code
+- **CRITICAL**: data loss/corruption, undefined behavior, exploitable security,
+  or unrecoverable durability violation.
+- **HIGH**: incorrect results, deadlock, realistic crash, resource exhaustion,
+  or material hot-path regression.
+- **MEDIUM**: reachable edge-case bug, error-policy gap, or bounded leak.
+- **LOW**: repository convention, clarity, or documentation defect with a
+  concrete maintenance cost.
 
-Consult `.claude/docs/false-positive-guide.md` before finalizing any finding.
+Observations and questions may appear in the report but never in `## Open`.
+
+## Quality gate
+
+Retain only findings with a concrete trigger and outcome. Refute candidates
+against `.claude/docs/false-positive-guide.md`. Agent agreement, severity
+labels, and pattern-name matching are not substitutes for evidence.

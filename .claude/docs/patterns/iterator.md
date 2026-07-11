@@ -1,12 +1,13 @@
 # Iterator Subsystem Review Patterns
 
 ## Files
-- `src/iterator/db_iter.rs` (~53KB) — user-facing DBIterator
-- `src/iterator/merge.rs` (~25KB) — MergingIterator (heap-based)
-- `src/iterator/source.rs` (~20KB) — IterSource wrapper + SeekableIterator trait (extracted from merge.rs)
-- `src/iterator/level_iter.rs` (~25KB) — lazy two-level iterator for L1+
-- `src/iterator/bidi_iter.rs` (~16KB) — bidirectional support
-- `src/iterator/range_del.rs` (~19KB) — range tombstone tracking
+- `src/iterator/db_iter.rs` — user-facing DBIterator
+- `src/iterator/merge.rs` — MergingIterator (heap-based)
+- `src/iterator/source.rs` — IterSource wrapper + SeekableIterator trait
+- `src/iterator/level_iter.rs` — lazy two-level iterator for L1+
+- `src/iterator/bidi_iter.rs` — bidirectional support
+- `src/iterator/range_del.rs` — range tombstone tracking
+- `src/iterator/mod.rs` — module boundary
 
 ## Architecture
 - DBIterator: deduplication, snapshot filtering, tombstone filtering, prefix bounds
@@ -72,7 +73,7 @@ These patterns exist in the codebase and should be checked during review:
 - **Cross-level tombstone pruning**: A tombstone from level L may only delete keys from level L or deeper (`level > source_level` tombstones are ignored). `FragmentedRangeTombstoneList` tracks per-level tombstone origin to enforce this — a tombstone that has already been compacted *strictly deeper* than the key's own level must never suppress it (this specifically guards the bottommost sequence-zeroing interaction: once a key's sequence is zeroed, a stale, already-deeper tombstone must not be trusted to cover it via a naive seq-only comparison). Same-level and shallower-level tombstones must always be allowed to cover a key — that is ordinary, essential range-delete behavior (e.g. a DeleteRange in the active MemTable must immediately hide matching keys already sitting in deeper, flushed/compacted levels, and must also cover a Put in the very same MemTable).
 - **`posix_fadvise` sequential readahead**: Detects sequential block access patterns and issues `WILLNEED` hints to the OS page cache.
 - **Deferred block read**: SST index stores `first_key` per block; seek positions the iterator without reading data blocks until `next()` is called.
-- **L0 first-block pinning**: Only the first data block (smallest key) of each L0 file is pinned in cache via `insert_pinned()`, so `init_heap`'s first `peek()` is always a cache hit; unpinned when the file is compacted. Index and bloom filter blocks are read directly into `TableReader` fields at open time and never go through `block_cache`.
+- **L0 first-block pinning**: Only the first data block (smallest key) of each L0 file is pinned in cache via `insert_pinned()`, so `init_heap`'s first `peek()` is always a cache hit; it is unpinned when the file leaves L0 (including a trivial move). Index and bloom filter blocks are read directly into `TableReader` fields at open time and never go through `block_cache`.
 - **Atomic L0 counter**: Write-throttle checks use an atomic counter for L0 file count, avoiding mutex contention on the hot write path.
 
 ## Review Checklist

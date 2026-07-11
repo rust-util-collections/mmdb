@@ -89,7 +89,10 @@ Only report performance issues on hot/warm paths. Cold path performance is not a
 - The compaction is not at the bottommost level
 - Any live snapshot has a sequence number <= tombstone's sequence
 - The tombstone covers keys in levels below the output level
-Only report tombstone issues if tombstones are dropped when they SHOULD be retained, or retained at the bottommost level when no snapshots reference them.
+Only report a correctness bug when a tombstone is dropped while still needed.
+Conservative retention at bottommost is at most a space/performance candidate;
+report it only with a concrete, material accumulation scenario, not merely
+because the tombstone was eligible for collection.
 
 ## FP-12: Off-by-One in Half-Open Intervals — Verify First
 
@@ -104,13 +107,26 @@ Only report tombstone issues if tombstones are dropped when they SHOULD be retai
 
 **Pattern**: Seeing an item in `docs/audit.md## Won't Fix` and skipping it without
 re-assessing it against the current code.
-**Rule**: Won't Fix is NOT a permanent exemption. Every audit MUST re-evaluate each
-Won't Fix entry against the latest code. The original deferral decision was based on
-a code snapshot that may have changed. Re-assessment checklist:
+**Rule**: Won't Fix is NOT a permanent exemption. Re-evaluate an entry whenever
+the review touches its cited code, callers, assumptions, or subsystem; a full
+audit re-evaluates every entry. The original decision was based on code that may
+have changed. Re-assessment checklist:
 - Has the surrounding code been refactored or removed?
 - Is the fix now straightforward (e.g., new helper functions, changed APIs)?
 - Was the severity underestimated?
-**When to skip**: Only after explicitly re-verifying that the original reasoning still
-holds against the current code, and noting that re-verification in the audit output.
-**When to report**: If an audit skips Won't Fix entries without re-assessment, that
-omission itself is a finding (severity: LOW, category: process).
+**When to skip**: A narrow review may leave unrelated entries untouched.
+**When to report**: If an in-scope entry is carried forward without checking its
+reason, that omission is a LOW process finding. Never record a re-check date or
+freshness marker in `docs/audit.md`.
+
+## FP-14: Accepted Cache Invalidation Window
+
+**Pattern**: Reporting that `BlockCache::insert()` and its reverse-index update,
+or `detach()` and an in-flight unpinned insert, are not atomic.
+**Rule**: These are documented cutoff-not-barrier tradeoffs. SST file numbers
+and cache member IDs are never reused, so a missed invalidation can retain a
+cold unreachable block until LRU eviction but cannot return another file's or
+member's data.
+**When to report**: Only with evidence of wrong-data visibility, identifier
+reuse, unbounded retention outside LRU capacity, or a new race involving pinned
+entries (which use the member-local mutex).

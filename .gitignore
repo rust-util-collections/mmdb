@@ -7,10 +7,9 @@ Cargo.lock
 
 # Claude Code: track shared configs, ignore personal/runtime files
 .claude/*
-!.claude/commands/
+!.claude/skills/
 !.claude/docs/
 !.claude/settings.json
-!.claude/audit.md
 .copilot
 .aider
 .gemini

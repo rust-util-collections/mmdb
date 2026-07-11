@@ -1,13 +1,17 @@
 # Unsafe Code Audit Patterns
 
 ## Overview
-MMDB contains 66 unsafe blocks/functions across 4 production files:
-- `src/memtable/skiplist_impl.rs` (42) — lock-free skiplist nodes with raw pointers; defines `pub unsafe fn node_kv`/`node_next0` (crate-internal: `mod memtable` is private in lib.rs)
-- `src/memtable/skiplist.rs` (12) — `unsafe impl Send for MemTableCursorIter` plus 11 blocks dereferencing the skiplist raw pointer and calling `node_kv`/`node_next0`
-- `src/db.rs` (11) — `unsafe impl Send/Sync for DB`, one `libc::flock` call, and 8 raw `WriteRequest` pointer derefs in the group-commit path
-- `src/sst/table_reader/mod.rs` (1) — a single `libc::posix_fadvise` call (advisory readahead hint)
+Unsafe code is currently concentrated in:
 
-> **Note**: `src/sst/block.rs`, `src/types.rs`, and `src/sst/format.rs` contain **zero** unsafe blocks (all parsing uses safe `from_le_bytes()`). The "block parsing" category previously associated with these files is safe code — no unsafe audit is needed there.
+- `src/memtable/skiplist_impl.rs` — raw skiplist nodes and manual layout;
+- `src/memtable/skiplist.rs` — cursor dereferences and `Send` contract;
+- `src/db.rs` — DB `Send`/`Sync`, file locking, and group-commit request pointers;
+- `src/sst/table_reader/mod.rs` — advisory `posix_fadvise`.
+
+Derive the live inventory with code search at review time. Do not copy exact
+counts into documentation: additions/removals are themselves the audit signal.
+Safe byte parsing in `block.rs`, `format.rs`, and `types.rs` needs ordinary
+correctness review, not an unsafe audit unless new unsafe code is introduced.
 
 ## Audit Protocol
 
@@ -48,7 +52,10 @@ For changes in `skiplist_impl.rs` or `skiplist.rs`:
 ### Step 4: SST-Level Checks
 For changes in `table_reader/mod.rs` (the only SST file with unsafe code):
 
-- The single unsafe block is a `libc::posix_fadvise` call — an advisory syscall with no memory-safety obligations beyond a valid fd. Verify the `File` is alive (owns the fd) for the duration of the call and that offset/len are derived from validated block handles.
+- The unsafe block is a `libc::posix_fadvise` call. Its memory-safety
+  prerequisite is a live `File` owning the fd. Invalid/overflowed offset or
+  length is still a robustness bug (or debug panic) but not memory unsafety;
+  classify it separately and remember the syscall is advisory.
 - Block data access in the SST layer is entirely safe code (`Arc<Vec<u8>>`-backed, bounds-checked) — do not assume cache-backed pointer casts exist.
 
 > **Note**: `block.rs`, `format.rs`, and `types.rs` contain **zero** unsafe blocks. All integer parsing in these files uses safe `from_le_bytes()` / `from_be_bytes()`. Block iteration is safe code — no unsafe audit is required.
@@ -72,17 +79,17 @@ For any `transmute`, `as *const`, or `as *mut` (note: the codebase currently con
 
 | Location | Risk | Reason |
 |----------|------|--------|
-| skiplist_impl.rs | CRITICAL | Raw pointers, concurrent access, manual memory layout (42 unsafe blocks) |
-| skiplist.rs | HIGH | Raw skiplist pointer derefs + `unsafe impl Send` for cursor iterator (12 unsafe) |
-| db.rs | HIGH | Group-commit `WriteRequest` raw pointer protocol, `unsafe impl Send/Sync for DB`, `libc::flock` (11 unsafe) |
-| table_reader/mod.rs | LOW | Single advisory `posix_fadvise` syscall (1 unsafe) |
+| skiplist_impl.rs | CRITICAL | Raw pointers, concurrent access, manual memory layout |
+| skiplist.rs | HIGH | Raw skiplist pointer dereferences and cursor `Send` contract |
+| db.rs | HIGH | Group-commit pointer protocol, DB `Send`/`Sync`, file locking |
+| table_reader/mod.rs | LOW | Advisory `posix_fadvise` syscall |
 
 ## Red Flags
 Report immediately if you see:
 - `unsafe` block without SAFETY comment
 - `transmute` between types of different sizes
-- Raw pointer dereference without null check
+- Raw pointer dereference without a proven non-null/alignment/lifetime invariant
 - `slice::from_raw_parts` with unchecked length
-- `Relaxed` ordering on pointer stores in concurrent code
+- `Relaxed` pointer publication without another proven synchronization edge
 - `Box::from_raw` on a pointer that might have been freed
-- Any `unsafe` in a public API (external callers can trigger UB)
+- Public unsafe API without an explicit, sufficient `# Safety` contract

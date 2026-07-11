@@ -9,7 +9,7 @@
 - Block-based: records fragmented across fixed-size blocks
 - Record types: Full, First, Middle, Last (for records spanning blocks)
 - CRC32 checksum per record fragment
-- Group commit: leader collects batches → single fsync
+- Group commit: leader collects batches → ordered WAL append → one flush/fsync
 - Recovery: replay WAL to reconstruct MemTable
 
 ## Critical Invariants
@@ -27,16 +27,27 @@ A record larger than block_size must be split into First + Middle* + Last fragme
 **Check**: Verify fragment boundary calculation accounts for the header size within each block.
 
 ### INV-W4: Recovery Completeness
-WAL replay must recover ALL complete records. An incomplete record at the end of the WAL (due to crash mid-write) should be silently skipped, not cause an error.
-**Check**: Verify reader handles truncated final record gracefully.
+WAL replay must recover every complete record without turning arbitrary
+corruption into prefix recovery. `WalReader` surfaces a truncated record as
+corruption; DB recovery may tolerate it only in the highest recoverable WAL
+when every remaining byte is zero padding/a zero-extended tail.
+**Check**: Earlier-WAL corruption, mid-log corruption, or non-zero data after a
+bad record must fail open loudly. Only the active torn tail is truncated.
 
 ### INV-W5: Fsync Semantics
-After fsync, all data written before the fsync call must be durable. Group commit must fsync AFTER writing all batches in the group, not before.
-**Check**: Verify fsync ordering: write(batch_A) → write(batch_B) → fsync() → notify(A, B).
+When any grouped request sets `WriteOptions::sync`, all WAL-enabled records
+appended before the shared sync must be durable before acknowledgement. A group
+with no sync request flushes the userspace buffer but does not promise crash
+durability.
+**Check**: Verify append(A) → append(B) → sync-or-flush → MemTable publication
+→ notify, and that one sync request upgrades the whole group's WAL durability.
 
 ### INV-W6: WAL-MemTable Consistency
-The WAL and MemTable must contain the same data. If a write is in the WAL but not in the MemTable (or vice versa), recovery will diverge from the pre-crash state.
-**Check**: Verify WAL write happens BEFORE MemTable insert (WAL is the source of truth for recovery).
+For WAL-enabled requests, every acknowledged MemTable mutation must have the
+corresponding earlier WAL record. `disable_wal` is an explicit exception whose
+data may disappear after a crash.
+**Check**: Verify WAL append/flush-or-sync happens before MemTable insertion for
+enabled requests and that disabled requests are never advertised as durable.
 
 ## Common Bug Patterns
 
@@ -46,8 +57,10 @@ Process crashes after writing the record header but before writing the payload.
 **Check**: Verify reader validates payload length against header length field.
 
 ### Group Commit Notification Race
-Leader completes fsync and notifies waiters, but a waiter's data hasn't actually been written yet (writer interleaving bug).
-**Check**: Verify leader writes ALL collected batches BEFORE fsync, and the notification is AFTER fsync.
+Leader flushes/syncs and notifies waiters before a request's MemTable entries
+and committed sequence are published.
+**Check**: Verify all assigned entries are inserted and `committed_sequence` is
+published before notification.
 
 ### WAL File Not Deleted After Flush
 Old WAL files accumulate because the deletion condition checks the wrong sequence number.
@@ -57,8 +70,8 @@ Old WAL files accumulate because the deletion condition checks the wrong sequenc
 - [ ] Write ordering matches sequence number ordering
 - [ ] CRC covers type byte + payload
 - [ ] Record fragmentation handles boundary correctly (last bytes of a block)
-- [ ] Recovery handles truncated final record without error
-- [ ] Fsync happens after all batch writes, before notification
+- [ ] Recovery tolerates only the active WAL's zero-padded torn tail
+- [ ] WAL flush/fsync aggregation matches `sync` and `disable_wal` options
 - [ ] WAL write precedes MemTable insert
 - [ ] Old WAL files deleted after successful flush + MANIFEST update
-- [ ] Group commit: all waiters' data is included in the fsync'd write
+- [ ] Group commit notifies only after assigned MemTable entries are published
