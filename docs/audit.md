@@ -44,14 +44,6 @@
 
 ---
 
-### [MEDIUM] manifest: stale edits can regress `last_sequence`
-- **Where**: `src/manifest/version_set.rs:165-176,442-454`
-- **What**: `next_file_number` is advanced with `max`, but `last_sequence` is overwritten directly during both replay and live apply.
-- **Why**: A stale or malformed checksum-valid edit can lower the recovered sequence, causing later writes to reuse lower sequence numbers and lose MVCC precedence to older entries.
-- **Suggested fix**: Keep `last_sequence` monotonic with `max` in both paths and reject values above `MAX_SEQUENCE_NUMBER`. Add a stale-edit regression.
-
----
-
 ### [MEDIUM] SST: entry decoding can consume the restart directory
 - **Where**: `src/sst/block.rs:75-105,379-496`
 - **What**: Entry decoders bound key/value ends against the full block allocation rather than the entry region ending at `restart_offset`.

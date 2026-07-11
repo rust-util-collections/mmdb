@@ -16,7 +16,7 @@ use crate::error::{Error, Result, ResultExt};
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::sst::table_reader::TableReader;
-use crate::types::{SequenceNumber, compare_internal_key};
+use crate::types::{MAX_SEQUENCE_NUMBER, SequenceNumber, compare_internal_key};
 use crate::wal::{WalReader, WalWriter};
 use parking_lot::Mutex;
 
@@ -189,8 +189,19 @@ impl VersionSet {
             if let Some(n) = edit.log_number {
                 log_number = n;
             }
+            // Same forward-only rule: a regressed sequence would make new
+            // writes lose MVCC precedence to already-persisted entries. A
+            // value above the 56-bit packing limit can only come from a
+            // malformed record — fail loudly instead of seeding a counter
+            // that would overflow the internal-key trailer.
             if let Some(s) = edit.last_sequence {
-                last_sequence = s;
+                if s > MAX_SEQUENCE_NUMBER {
+                    return Err(Error::corruption(format!(
+                        "MANIFEST last_sequence {} exceeds maximum {}",
+                        s, MAX_SEQUENCE_NUMBER
+                    )));
+                }
+                last_sequence = last_sequence.max(s);
             }
 
             // Track deletions FIRST — a trivial-move edit deletes from the
@@ -467,8 +478,11 @@ impl VersionSet {
         if let Some(n) = edit.log_number {
             self.log_number = n;
         }
+        // Forward-only for the same reason: a stale lower sequence would let
+        // newly-assigned sequence numbers collide with already-committed
+        // entries and lose MVCC precedence to them.
         if let Some(s) = edit.last_sequence {
-            self.last_sequence = s;
+            self.last_sequence = self.last_sequence.max(s);
         }
 
         self.current = Arc::new(new_version);
@@ -924,6 +938,52 @@ mod tests {
             vs.next_file_number(),
             reserved + 100,
             "stale edit must not regress the allocator"
+        );
+    }
+
+    /// `last_sequence` mirrors the allocator's forward-only rule: a stale
+    /// lower value in a live edit or in a replayed MANIFEST record must not
+    /// regress the counter, and an over-limit value is rejected on replay.
+    #[test]
+    fn test_last_sequence_never_regresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_last_sequence(100);
+        vs.log_and_apply(edit).unwrap();
+        assert_eq!(vs.last_sequence(), 100);
+
+        // Live apply: stale lower value is ignored.
+        let mut stale = VersionEdit::new();
+        stale.set_last_sequence(1);
+        vs.log_and_apply(stale).unwrap();
+        assert_eq!(vs.last_sequence(), 100, "live apply must not regress");
+        drop(vs);
+
+        // Replay: the persisted stale record must not regress either.
+        let recovered = VersionSet::recover(path, 7).unwrap();
+        assert_eq!(recovered.last_sequence(), 100, "replay must not regress");
+        drop(recovered);
+
+        // Replay: a sequence above the 56-bit packing limit is corruption.
+        let over_limit = {
+            let vs = VersionSet::recover(path, 7).unwrap();
+            let mut edit = VersionEdit::new();
+            edit.set_last_sequence(crate::types::MAX_SEQUENCE_NUMBER + 1);
+            let encoded = edit.encode();
+            let mut w = vs.manifest_writer.lock();
+            if let Some(ref mut writer) = *w {
+                writer.add_record(&encoded).unwrap();
+                writer.sync().unwrap();
+            }
+            drop(w);
+            VersionSet::recover(path, 7)
+        };
+        assert!(
+            over_limit.is_err(),
+            "replay must reject an out-of-range last_sequence"
         );
     }
 
