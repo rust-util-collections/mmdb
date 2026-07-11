@@ -36,14 +36,6 @@
 
 ---
 
-### [MEDIUM] manifest: recovery accepts overlapping L1+ files
-- **Where**: `src/manifest/version_set.rs:209-266,321-359`, `src/db.rs:1213-1273`
-- **What**: Recovery and generic edit application sort L1+ files but never validate the non-overlap invariant required by binary-search reads.
-- **Why**: A malformed but checksum-valid MANIFEST can install overlapping files; point lookup may choose the later file by smallest key and miss a key that exists only in the earlier overlapping file.
-- **Suggested fix**: Validate adjacent L1+ user-key ranges after replay and before applying an edit, returning corruption on overlap. Add live-apply and reopen regressions.
-
----
-
 ### [MEDIUM] SST: entry decoding can consume the restart directory
 - **Where**: `src/sst/block.rs:75-105,379-496`
 - **What**: Entry decoders bound key/value ends against the full block allocation rather than the entry region ending at `restart_offset`.
