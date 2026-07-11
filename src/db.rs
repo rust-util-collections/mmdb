@@ -44,61 +44,97 @@ use crate::types::{
 };
 use crate::wal::{WalReader, WalWriter};
 
-const DEAD_KEY_SWEEP_IDLE: u8 = 0;
-const DEAD_KEY_SWEEP_PENDING: u8 = 1;
-const DEAD_KEY_SWEEP_RUNNING: u8 = 2;
-const DEAD_KEY_SWEEP_RUNNING_PENDING: u8 = 3;
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+enum DeadKeySweepState {
+    Idle,
+    Pending,
+    Running,
+    RunningPending,
+}
 
-fn queue_dead_key_sweep(state: &AtomicU8) {
-    let mut current = state.load(Ordering::Acquire);
-    loop {
-        let next = match current {
-            DEAD_KEY_SWEEP_IDLE => DEAD_KEY_SWEEP_PENDING,
-            DEAD_KEY_SWEEP_PENDING | DEAD_KEY_SWEEP_RUNNING_PENDING => return,
-            DEAD_KEY_SWEEP_RUNNING => DEAD_KEY_SWEEP_RUNNING_PENDING,
+impl DeadKeySweepState {
+    fn from_raw(state: u8) -> Self {
+        match state {
+            value if value == Self::Idle as u8 => Self::Idle,
+            value if value == Self::Pending as u8 => Self::Pending,
+            value if value == Self::Running as u8 => Self::Running,
+            value if value == Self::RunningPending as u8 => Self::RunningPending,
             _ => unreachable!("invalid dead-key sweep state"),
-        };
-        match state.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(actual) => current = actual,
         }
     }
 }
 
-fn retry_dead_key_sweep_after_snapshot_release(state: &AtomicU8) -> bool {
-    let mut current = state.load(Ordering::Acquire);
-    loop {
-        match current {
-            DEAD_KEY_SWEEP_IDLE => return false,
-            DEAD_KEY_SWEEP_PENDING | DEAD_KEY_SWEEP_RUNNING_PENDING => return true,
-            DEAD_KEY_SWEEP_RUNNING => match state.compare_exchange_weak(
-                current,
-                DEAD_KEY_SWEEP_RUNNING_PENDING,
+/// Coalesces sweep requests without losing work queued during a running pass.
+struct DeadKeySweepScheduler {
+    state: AtomicU8,
+}
+
+impl DeadKeySweepScheduler {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(DeadKeySweepState::Idle as u8),
+        }
+    }
+
+    fn queue(&self) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                match DeadKeySweepState::from_raw(current) {
+                    DeadKeySweepState::Idle => Some(DeadKeySweepState::Pending as u8),
+                    DeadKeySweepState::Running => Some(DeadKeySweepState::RunningPending as u8),
+                    DeadKeySweepState::Pending | DeadKeySweepState::RunningPending => None,
+                }
+            });
+    }
+
+    fn is_pending(&self) -> bool {
+        DeadKeySweepState::from_raw(self.state.load(Ordering::Acquire))
+            == DeadKeySweepState::Pending
+    }
+
+    fn try_start(&self) -> bool {
+        self.state
+            .compare_exchange(
+                DeadKeySweepState::Pending as u8,
+                DeadKeySweepState::Running as u8,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            },
-            _ => unreachable!("invalid dead-key sweep state"),
+            )
+            .is_ok()
+    }
+
+    fn retry_after_snapshot_release(&self) -> bool {
+        match self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                match DeadKeySweepState::from_raw(current) {
+                    DeadKeySweepState::Running => Some(DeadKeySweepState::RunningPending as u8),
+                    DeadKeySweepState::Idle
+                    | DeadKeySweepState::Pending
+                    | DeadKeySweepState::RunningPending => None,
+                }
+            }) {
+            Ok(_) => true,
+            Err(current) => matches!(
+                DeadKeySweepState::from_raw(current),
+                DeadKeySweepState::Pending | DeadKeySweepState::RunningPending
+            ),
         }
     }
-}
 
-fn finish_dead_key_sweep(state: &AtomicU8, retry: bool) {
-    let mut current = state.load(Ordering::Acquire);
-    loop {
-        let next = match current {
-            DEAD_KEY_SWEEP_RUNNING if retry => DEAD_KEY_SWEEP_PENDING,
-            DEAD_KEY_SWEEP_RUNNING => DEAD_KEY_SWEEP_IDLE,
-            DEAD_KEY_SWEEP_RUNNING_PENDING => DEAD_KEY_SWEEP_PENDING,
-            DEAD_KEY_SWEEP_IDLE | DEAD_KEY_SWEEP_PENDING => return,
-            _ => unreachable!("invalid dead-key sweep state"),
-        };
-        match state.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => return,
-            Err(actual) => current = actual,
-        }
+    fn finish(&self, retry: bool) {
+        let _ = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                match DeadKeySweepState::from_raw(current) {
+                    DeadKeySweepState::Running if retry => Some(DeadKeySweepState::Pending as u8),
+                    DeadKeySweepState::Running => Some(DeadKeySweepState::Idle as u8),
+                    DeadKeySweepState::RunningPending => Some(DeadKeySweepState::Pending as u8),
+                    DeadKeySweepState::Idle | DeadKeySweepState::Pending => None,
+                }
+            });
     }
 }
 
@@ -263,7 +299,7 @@ pub struct DB {
     /// State machine for automatic dead-key sweeping. New unique registrations
     /// at or above the threshold queue another pass; a request arriving during
     /// a pass is retained for the next pass.
-    dead_key_sweep_state: Arc<AtomicU8>,
+    dead_key_sweep: Arc<DeadKeySweepScheduler>,
 }
 
 // SAFETY: the raw `*mut WriteRequest` pointers held in `write_queue` reference
@@ -606,7 +642,7 @@ impl DB {
             };
             options.compaction_filter = Some(Arc::new(lazy_filter));
         }
-        let dead_key_sweep_state = Arc::new(AtomicU8::new(DEAD_KEY_SWEEP_IDLE));
+        let dead_key_sweep = Arc::new(DeadKeySweepScheduler::new());
 
         let (l0_file_count, super_version) = {
             let g = inner.lock();
@@ -640,7 +676,7 @@ impl DB {
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
             let bg_compacting_files = compacting_files.clone();
-            let bg_dead_key_sweep_state = dead_key_sweep_state.clone();
+            let bg_dead_key_sweep = dead_key_sweep.clone();
             let bg_manifest_poisoned = manifest_poisoned.clone();
 
             let handle = thread::Builder::new()
@@ -1009,17 +1045,9 @@ impl DB {
                                 // levels first so removing older copies can make
                                 // shallower copies eligible in the same pass.
                                 loop {
-                                    if bg_dead_key_sweep_state.load(Ordering::Acquire)
-                                        != DEAD_KEY_SWEEP_PENDING
+                                    if !bg_dead_key_sweep.is_pending()
                                         || !bg_snapshot_list.as_sorted_vec().is_empty()
-                                        || bg_dead_key_sweep_state
-                                            .compare_exchange(
-                                                DEAD_KEY_SWEEP_PENDING,
-                                                DEAD_KEY_SWEEP_RUNNING,
-                                                Ordering::AcqRel,
-                                                Ordering::Acquire,
-                                            )
-                                            .is_err()
+                                        || !bg_dead_key_sweep.try_start()
                                     {
                                         break;
                                     }
@@ -1052,10 +1080,7 @@ impl DB {
                                         );
                                         refresh_super_version(&bg_sv, &inner);
                                     }
-                                    finish_dead_key_sweep(
-                                        &bg_dead_key_sweep_state,
-                                        blocked_by_snapshot,
-                                    );
+                                    bg_dead_key_sweep.finish(blocked_by_snapshot);
                                 }
                                 Ok(())
                             },
@@ -1115,7 +1140,7 @@ impl DB {
             snapshot_list,
             lock_file: Mutex::new(lock_file),
             dead_keys,
-            dead_key_sweep_state,
+            dead_key_sweep,
         };
 
         // Kick the background compaction threads once at startup. A DB
@@ -1930,7 +1955,7 @@ impl DB {
     /// Called by `Snapshot::drop`.
     pub(crate) fn release_snapshot(&self, seq: SequenceNumber) {
         self.snapshot_list.release(seq);
-        if retry_dead_key_sweep_after_snapshot_release(&self.dead_key_sweep_state) {
+        if self.dead_key_sweep.retry_after_snapshot_release() {
             self.signal_compaction();
         }
     }
@@ -2356,7 +2381,7 @@ impl DB {
     /// do on a settled store and the registered keys would never be
     /// physically removed.
     fn request_dead_key_sweep(&self) {
-        queue_dead_key_sweep(&self.dead_key_sweep_state);
+        self.dead_key_sweep.queue();
         self.signal_compaction();
     }
 
@@ -3654,6 +3679,42 @@ impl Drop for Snapshot<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_key_sweep_scheduler_preserves_requests_queued_while_running() {
+        let scheduler = DeadKeySweepScheduler::new();
+
+        assert!(!scheduler.try_start());
+        scheduler.queue();
+        assert!(scheduler.is_pending());
+        assert!(scheduler.try_start());
+
+        scheduler.queue();
+        scheduler.finish(false);
+        assert!(scheduler.try_start());
+
+        scheduler.finish(false);
+        assert!(!scheduler.is_pending());
+        assert!(!scheduler.try_start());
+    }
+
+    #[test]
+    fn dead_key_sweep_scheduler_retries_after_snapshot_release() {
+        let scheduler = DeadKeySweepScheduler::new();
+
+        assert!(!scheduler.retry_after_snapshot_release());
+        scheduler.queue();
+        assert!(scheduler.retry_after_snapshot_release());
+        assert!(scheduler.try_start());
+
+        assert!(scheduler.retry_after_snapshot_release());
+        scheduler.finish(false);
+        assert!(scheduler.try_start());
+
+        scheduler.finish(true);
+        assert!(scheduler.try_start());
+        scheduler.finish(false);
+    }
 
     fn open_test_db(dir: &Path) -> DB {
         let opts = DbOptions {

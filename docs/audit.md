@@ -63,16 +63,16 @@
 ## Rejected
 
 ### db: a dead-key sweep error silently kills background compaction
-- **Where**: `src/db.rs:953-1012,2431-2453`
+- **Where**: `src/db.rs:1043-1104,2536-2545`
 - **Claim**: Propagating a sweep error permanently disables compaction without surfacing the failure.
 - **Reason**: The thread records the error through `set_error`, sets `has_bg_error`, and every public entry point then fails through `check_usable()`. This is the engine's deliberate fail-stop-until-reopen policy, not a silent loss of maintenance.
 
 ---
 
 ### db: the L0 dead-key sweep can never apply its filter
-- **Where**: `src/db.rs:953-992`, `src/compaction/leveled.rs:1882-1910`
+- **Where**: `src/db.rs:1043-1084`, `src/compaction/leveled.rs:1882-1915`
 - **Claim**: L0 is never bottommost when the database has multiple configured levels, so its sweep pass is useless.
-- **Reason**: Bottommost status is data-driven. A settled store with no deeper overlap can filter L0; when deeper overlap exists, retaining the L0 entry is required until the deeper data is handled. The actionable defect is the sweep's non-convergent ordering and scheduling, recorded above.
+- **Reason**: Bottommost status is data-driven. A settled store with no deeper overlap can filter L0; when deeper overlap exists, retaining the L0 entry is required until the deeper data is handled. The sweep processes deeper levels first and retains work queued during a pass, so shallower copies are revisited after deeper data is removed.
 
 ---
 
