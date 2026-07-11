@@ -74,6 +74,10 @@ If the invocation changed tracked `.rs` files:
 3. Stage `Cargo.toml` explicitly and inspect the cached diff.
 4. Commit the release metadata as a dedicated final commit. This is the sole
    exception to the one-issue-one-commit rule; never bump once per finding.
+5. Create an annotated git tag matching the new version:
+   `git tag -a "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" -m "v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"`
+   (or construct the version string directly from `Cargo.toml`).
+   The tag must point at the release commit and use the `v` prefix.
 
 `Cargo.lock` is intentionally ignored because MMDB is a library; do not
 force-add it.
