@@ -4,7 +4,8 @@
 //! - **Materialized**: pre-sorted entries for immediate bidirectional access
 //! - **Lazy**: wraps a `DBIterator` for streaming forward iteration.
 //!   First `next_back()` uses `seek_to_last()` (O(log N)).
-//!   Subsequent `next_back()` calls use `db_iter.prev()` for O(1) memory streaming.
+//!   Direction switches re-seek between the consumed front/back keys, and
+//!   subsequent calls stream with O(1) memory.
 
 use std::mem;
 
@@ -43,9 +44,13 @@ enum BidiInner {
         last_back_key: Option<Vec<u8>>,
     },
     /// After calling next() while in LazyBackStarted, the db_iter is re-seeked
-    /// forward with upper_bound set. Streams forward with O(1) memory.
-    /// next_back() returns None (forward-only after direction switch).
-    LazyFwdResumed { db_iter: Box<DBIterator> },
+    /// forward between the consumed front/back keys. Both frontiers are retained
+    /// so a later `next_back()` can re-seek and resume backward streaming.
+    LazyFwdResumed {
+        db_iter: Box<DBIterator>,
+        last_fwd_key: Option<Vec<u8>>,
+        last_back_key: Option<Vec<u8>>,
+    },
 }
 
 impl BidiIterator {
@@ -141,6 +146,12 @@ impl Iterator for BidiIterator {
                     ..
                 } = old
                 {
+                    // Tighten the upper bound before re-seeking so no consumed
+                    // backward entry can be returned from the front.
+                    if let Some(ref back_key) = last_back_key {
+                        db_iter.set_upper_bound(back_key.clone());
+                    }
+
                     // Re-seek forward past the last consumed forward key.
                     match &last_fwd_key {
                         Some(key) => {
@@ -156,19 +167,26 @@ impl Iterator for BidiIterator {
                         }
                     }
 
-                    // Set upper bound to stop before already-returned backward entries.
-                    if let Some(ref back_key) = last_back_key {
-                        db_iter.set_upper_bound(back_key.clone());
-                    }
-
                     // Stream forward — no materialization needed.
-                    self.inner = BidiInner::LazyFwdResumed { db_iter };
+                    self.inner = BidiInner::LazyFwdResumed {
+                        db_iter,
+                        last_fwd_key,
+                        last_back_key,
+                    };
                     self.next()
                 } else {
                     unreachable!()
                 }
             }
-            BidiInner::LazyFwdResumed { db_iter } => db_iter.next(),
+            BidiInner::LazyFwdResumed {
+                db_iter,
+                last_fwd_key,
+                ..
+            } => {
+                let entry = db_iter.next()?;
+                *last_fwd_key = Some(entry.0.clone());
+                Some(entry)
+            }
         }
     }
 
@@ -244,25 +262,55 @@ impl DoubleEndedIterator for BidiIterator {
                 Some((k, v))
             }
             BidiInner::LazyFwdResumed { .. } => {
-                // Need backward access — materialize remaining forward window
-                // (bounded by upper_bound already set on db_iter).
+                // Re-seek to the back frontier instead of materializing the
+                // remaining window. Direction switches stay O(1) in memory.
                 let placeholder = BidiInner::Materialized {
                     entries: Vec::new(),
                     front: 0,
                     back: 0,
                 };
                 let old = mem::replace(&mut self.inner, placeholder);
-                let BidiInner::LazyFwdResumed { mut db_iter } = old else {
+                let BidiInner::LazyFwdResumed {
+                    mut db_iter,
+                    last_fwd_key,
+                    mut last_back_key,
+                } = old
+                else {
                     unreachable!()
                 };
-                let entries: Vec<(Vec<u8>, Vec<u8>)> = db_iter.by_ref().collect();
-                let len = entries.len();
-                self.inner = BidiInner::Materialized {
-                    entries,
-                    front: 0,
-                    back: len,
+
+                if let Some(ref back_key) = last_back_key {
+                    db_iter.set_upper_bound(back_key.clone());
+                }
+                db_iter.seek_to_last();
+                if !db_iter.valid() {
+                    self.inner = BidiInner::LazyBackStarted {
+                        db_iter,
+                        last_fwd_key,
+                        last_back_key,
+                    };
+                    return None;
+                }
+
+                let k = db_iter.key()?.to_vec();
+                if let Some(fwd_key) = last_fwd_key.as_deref()
+                    && k.as_slice() <= fwd_key
+                {
+                    self.inner = BidiInner::LazyBackStarted {
+                        db_iter,
+                        last_fwd_key,
+                        last_back_key,
+                    };
+                    return None;
+                }
+                let v = db_iter.value()?.to_vec();
+                last_back_key = Some(k.clone());
+                self.inner = BidiInner::LazyBackStarted {
+                    db_iter,
+                    last_fwd_key,
+                    last_back_key,
                 };
-                self.next_back()
+                Some((k, v))
             }
             BidiInner::LazyBackStarted {
                 db_iter,
@@ -436,6 +484,29 @@ mod tests {
         assert_eq!(it.next().unwrap().0, b"b");
         assert_eq!(it.next().unwrap().0, b"c");
         assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn test_lazy_repeated_direction_switches_stay_streaming() {
+        let mut it = make_lazy_bidi(&[b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"]);
+
+        assert_eq!(it.next_back().unwrap().0, b"h");
+        assert!(matches!(it.inner, BidiInner::LazyBackStarted { .. }));
+        assert_eq!(it.next().unwrap().0, b"a");
+        assert!(matches!(it.inner, BidiInner::LazyFwdResumed { .. }));
+        assert_eq!(it.next_back().unwrap().0, b"g");
+        assert!(matches!(it.inner, BidiInner::LazyBackStarted { .. }));
+        assert_eq!(it.next().unwrap().0, b"b");
+        assert_eq!(it.next_back().unwrap().0, b"f");
+        assert_eq!(it.next().unwrap().0, b"c");
+        assert_eq!(it.next_back().unwrap().0, b"e");
+        assert_eq!(it.next().unwrap().0, b"d");
+        assert!(it.next_back().is_none());
+        assert!(it.next().is_none());
+        assert!(
+            !matches!(it.inner, BidiInner::Materialized { .. }),
+            "lazy direction switches must never materialize the remaining window"
+        );
     }
 
     #[test]

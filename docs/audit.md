@@ -12,14 +12,6 @@
 
 ## Open
 
-### [HIGH] iterator: lazy bidirectional direction switching materializes an unbounded window
-- **Where**: `src/iterator/bidi_iter.rs:18-49,129-172,246-265`
-- **What**: After backward iteration resumes forward, a later `next_back()` collects every remaining entry into a `Vec`.
-- **Why**: `next_back() -> next() -> next_back()` on a large database can copy a multi-gigabyte remaining range and abort from OOM instead of continuing to stream.
-- **Suggested fix**: Preserve both frontiers in the resumed state and re-seek backward to the last unconsumed back key instead of collecting. Add a mixed-direction regression that asserts the lazy state remains streaming.
-
----
-
 ### [HIGH] manifest: `CURRENT` can escape the database directory
 - **Where**: `src/manifest/version_set.rs:117-136,268-271`
 - **What**: Recovery joins the unvalidated text from `CURRENT` directly onto `db_path` before parsing the manifest number.
