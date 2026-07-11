@@ -963,8 +963,8 @@ impl LeveledCompaction {
     }
 
     /// Pick Ln → Ln+1 compaction. Returns `None` (deferring to another
-    /// priority/level) if the selected input file or any overlapping
-    /// next-level file is already claimed by another in-flight compaction.
+    /// priority/level) if any range-overlapping source or target file is
+    /// already claimed by another in-flight compaction.
     fn pick_level_compaction(
         version: &Version,
         level: usize,
@@ -980,16 +980,21 @@ impl LeveledCompaction {
             .iter()
             .filter(|f| !in_flight.contains(&f.meta.number))
             .max_by_key(|f| f.meta.file_size)?;
-        let input_level = vec![target.clone()];
+        // A range tombstone's end key is not represented by the file's
+        // smallest/largest metadata. Close the source inputs transitively over
+        // real point and tombstone extents so no covering sibling remains
+        // behind while a selected value is moved deeper and sequence-zeroed.
+        let input_level = overlapping_files_for_inputs(files, std::slice::from_ref(target));
+        if input_level
+            .iter()
+            .any(|tf| in_flight.contains(&tf.meta.number))
+        {
+            return None;
+        }
 
-        let (smallest, largest) = Self::total_key_range(&input_level);
         let next_level = level + 1;
         let input_next = if next_level < version.num_levels {
-            if input_level.iter().any(|tf| tf.meta.has_range_deletions) {
-                version.level_files(next_level).to_vec()
-            } else {
-                Self::overlapping_files(version.level_files(next_level), &smallest, &largest)
-            }
+            overlapping_files_for_inputs(version.level_files(next_level), &input_level)
         } else {
             Vec::new()
         };
@@ -1874,14 +1879,15 @@ impl LeveledCompaction {
         (smallest, largest)
     }
 
-    /// Check whether `target_level` is the effective bottommost level for a given
-    /// compaction range. A level is bottommost if no deeper level contains files
-    /// that overlap the compaction's user-key range. This allows tombstones to be
-    /// dropped early instead of being retained until the statically configured
-    /// last level.
+    /// Check whether a compaction range is effectively bottommost.
+    ///
+    /// `first_checked_level` is the source level for a moving compaction and the
+    /// rewritten level for an in-place forced merge. Starting at the source is
+    /// required because an unselected sibling range tombstone can extend beyond
+    /// its file metadata and still cover a selected point entry.
     pub(crate) fn is_bottommost_level(
         version: &Version,
-        target_level: usize,
+        first_checked_level: usize,
         num_levels: usize,
         all_inputs: &[TableFile],
     ) -> bool {
@@ -1896,7 +1902,7 @@ impl LeveledCompaction {
         }
 
         let input_numbers: HashSet<u64> = all_inputs.iter().map(|tf| tf.meta.number).collect();
-        for level in target_level..num_levels {
+        for level in first_checked_level..num_levels {
             for f in version.level_files(level) {
                 if input_numbers.contains(&f.meta.number) {
                     continue;
@@ -2050,6 +2056,81 @@ mod tests {
                 .iter()
                 .all(|tf| tf.meta.number != meta1.number),
             "discarded move must not appear at L2"
+        );
+    }
+
+    #[test]
+    fn test_level_picker_closes_source_range_tombstone_extent() {
+        use std::collections::HashSet;
+
+        use super::LeveledCompaction;
+        use crate::manifest::version_edit::{FileMetaData, VersionEdit};
+        use crate::manifest::version_set::VersionSet;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        fn build_sst(
+            dir: &std::path::Path,
+            number: u64,
+            key: InternalKey,
+            value: &[u8],
+        ) -> FileMetaData {
+            let path = dir.join(format!("{number:06}.sst"));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    internal_keys: true,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            builder.add(key.as_bytes(), value).unwrap();
+            let result = builder.finish().unwrap();
+            FileMetaData {
+                number,
+                file_size: result.file_size,
+                smallest_key: result.smallest_key.unwrap(),
+                largest_key: result.largest_key.unwrap(),
+                has_range_deletions: result.has_range_deletions,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut versions = VersionSet::create(dir.path(), 3).unwrap();
+        let tombstone = build_sst(
+            dir.path(),
+            1,
+            InternalKey::new(b"a", 5, ValueType::RangeDeletion),
+            b"z",
+        );
+        let value = build_sst(
+            dir.path(),
+            2,
+            InternalKey::new(b"m", 10, ValueType::Value),
+            &[7u8; 8192],
+        );
+        assert!(
+            value.file_size > tombstone.file_size,
+            "the value file must be the initial largest-file pick"
+        );
+
+        let mut edit = VersionEdit::new();
+        edit.add_file(1, tombstone.clone());
+        edit.add_file(1, value.clone());
+        versions.log_and_apply(edit).unwrap();
+
+        let version = versions.current();
+        let task = LeveledCompaction::pick_level_compaction(&version, 1, &HashSet::new()).unwrap();
+        let picked: HashSet<u64> = task
+            .input_files_level
+            .iter()
+            .map(|tf| tf.meta.number)
+            .collect();
+        assert_eq!(
+            picked,
+            HashSet::from([tombstone.number, value.number]),
+            "the source-level tombstone covering m must move with the value file"
         );
     }
 

@@ -12,14 +12,6 @@
 
 ## Open
 
-### [HIGH] compaction: source-level range tombstones can be omitted before sequence zeroing
-- **Where**: `src/compaction/leveled.rs:968-1008,1882-1910`, `src/db.rs:1220-1262`
-- **What**: `pick_level_compaction` selects one L1+ source file and expands only into the next level, ignoring sibling files whose range-tombstone end extents overlap the selected source.
-- **Why**: A newer value can be moved deeper and have its sequence zeroed while an older covering tombstone remains in the source level. Reads then trust that shallower tombstone and hide the live value.
-- **Suggested fix**: Close the source-level input set transitively over point and range-tombstone extents before deriving next-level inputs, and include the source level in the bottommost safety check. Add a regression with a tombstone-only sibling covering a selected value file.
-
----
-
 ### [HIGH] iterator: lazy bidirectional direction switching materializes an unbounded window
 - **Where**: `src/iterator/bidi_iter.rs:18-49,129-172,246-265`
 - **What**: After backward iteration resumes forward, a later `next_back()` collects every remaining entry into a `Vec`.

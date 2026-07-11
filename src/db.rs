@@ -651,7 +651,7 @@ impl DB {
                                                     let is_bottom =
                                                         LeveledCompaction::is_bottommost_level(
                                                             &version,
-                                                            task.level + 1,
+                                                            task.level,
                                                             bg_options.num_levels,
                                                             &all_inputs,
                                                         );
@@ -818,7 +818,7 @@ impl DB {
                                                 let is_bottom =
                                                     LeveledCompaction::is_bottommost_level(
                                                         &version,
-                                                        task.level + 1,
+                                                        task.level,
                                                         bg_options.num_levels,
                                                         &all_inputs,
                                                     );
@@ -2077,7 +2077,7 @@ impl DB {
                             .collect();
                         let is_bottom = LeveledCompaction::is_bottommost_level(
                             &version,
-                            task.level + 1,
+                            task.level,
                             self.options.num_levels,
                             &all_inputs,
                         );
@@ -3049,7 +3049,7 @@ impl DB {
                             .collect();
                         let is_bottom = LeveledCompaction::is_bottommost_level(
                             &version,
-                            task.level + 1,
+                            task.level,
                             force_opts.num_levels,
                             &all_inputs,
                         );
