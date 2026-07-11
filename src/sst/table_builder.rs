@@ -23,8 +23,8 @@ use crate::sst::format::*;
 use crate::sst::table_reader::MAX_DECOMPRESSED_BLOCK_SIZE;
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key, user_key};
 
-/// Hard ceiling for the single-block meta structures (index block and
-/// range-del block). The reader rejects any block above
+/// Hard ceiling for single-block metadata (index, range-del, and bloom
+/// filter blocks). The reader rejects any block above
 /// `MAX_DECOMPRESSED_BLOCK_SIZE`; the margin leaves room for the restart
 /// array and block framing. The builder must never finish a table whose
 /// meta blocks exceed this — such an SST could never be opened again.
@@ -186,11 +186,42 @@ impl TableBuilder {
         size
     }
 
-    /// Largest projected single-block meta structure (index or range-del
-    /// block). Callers that can split output across multiple SSTs should cut
-    /// the current file once this reaches `META_BLOCK_SPLIT_THRESHOLD`.
+    fn projected_filter_size(&self) -> usize {
+        if self.options.bloom_bits_per_key == 0 || self.filter_keys.is_empty() {
+            return 0;
+        }
+        BloomFilter::projected_size(self.filter_keys.len(), self.options.bloom_bits_per_key)
+    }
+
+    fn projected_prefix_filter_size(&self) -> usize {
+        if self.options.prefix_len == 0
+            || self.options.bloom_bits_per_key == 0
+            || self.prefix_set.is_empty()
+        {
+            return 0;
+        }
+        BloomFilter::projected_size(self.prefix_set.len(), self.options.bloom_bits_per_key)
+    }
+
+    fn check_filter_block_size(label: &str, key_count: usize, bits_per_key: u32) -> Result<()> {
+        let projected = BloomFilter::projected_size(key_count, bits_per_key);
+        if projected > META_BLOCK_HARD_LIMIT {
+            return Err(Error::invalid_argument(format!(
+                "{label} block size {projected} would exceed maximum readable block size \
+                 {META_BLOCK_HARD_LIMIT}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Largest projected single-block metadata structure. Callers that can
+    /// split output across multiple SSTs should cut the current file once this
+    /// reaches `META_BLOCK_SPLIT_THRESHOLD`.
     pub(crate) fn projected_meta_size(&self) -> usize {
-        self.projected_index_size().max(self.range_del_projected)
+        self.projected_index_size()
+            .max(self.range_del_projected)
+            .max(self.projected_filter_size())
+            .max(self.projected_prefix_filter_size())
     }
 
     /// Add a key-value pair. Must be called in sorted key order.
@@ -275,6 +306,26 @@ impl TableBuilder {
         } else {
             key
         };
+        if self.options.bloom_bits_per_key > 0 {
+            Self::check_filter_block_size(
+                "bloom filter",
+                self.filter_keys.len().saturating_add(1),
+                self.options.bloom_bits_per_key,
+            )?;
+
+            if self.options.prefix_len > 0 && user_key_for_bloom.len() >= self.options.prefix_len {
+                let prefix = &user_key_for_bloom[..self.options.prefix_len];
+                let prefix_count = self
+                    .prefix_set
+                    .len()
+                    .saturating_add(usize::from(!self.prefix_set.contains(prefix)));
+                Self::check_filter_block_size(
+                    "prefix bloom filter",
+                    prefix_count,
+                    self.options.bloom_bits_per_key,
+                )?;
+            }
+        }
         self.filter_keys.push(user_key_for_bloom.to_vec());
 
         // Collect prefix for prefix bloom filter
@@ -439,6 +490,11 @@ impl TableBuilder {
             return Ok(BlockHandle::default());
         }
 
+        Self::check_filter_block_size(
+            "bloom filter",
+            self.filter_keys.len(),
+            self.options.bloom_bits_per_key,
+        )?;
         let bf = BloomFilter::new(self.options.bloom_bits_per_key);
         let key_refs: Vec<&[u8]> = self.filter_keys.iter().map(|k| k.as_slice()).collect();
         let filter_data = bf.create_filter(&key_refs);
@@ -454,6 +510,11 @@ impl TableBuilder {
             return Ok(BlockHandle::default());
         }
 
+        Self::check_filter_block_size(
+            "prefix bloom filter",
+            self.prefix_set.len(),
+            self.options.bloom_bits_per_key,
+        )?;
         let mut prefixes: Vec<&[u8]> = self.prefix_set.iter().map(|p| p.as_slice()).collect();
         prefixes.sort();
 
@@ -545,6 +606,7 @@ pub struct TableBuildResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
     use crate::sst::table_reader::TableReader;
 
     #[test]
@@ -759,5 +821,66 @@ mod tests {
         assert_eq!(tombstones[1].0, b"eee");
         assert_eq!(tombstones[1].1, b"ggg");
         assert_eq!(tombstones[1].2, 7);
+    }
+
+    #[test]
+    fn test_filter_projection_drives_meta_split_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("filter_projection.sst");
+        let bits_per_key = ((META_BLOCK_SPLIT_THRESHOLD - 1) * 8) as u32;
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: bits_per_key,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        builder.add(b"k", b"v").unwrap();
+
+        assert_eq!(builder.projected_filter_size(), META_BLOCK_SPLIT_THRESHOLD);
+        assert!(builder.projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD);
+    }
+
+    #[test]
+    fn test_bloom_filter_hard_limit_is_checked_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_filter.sst");
+        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8) as u32;
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: bits_per_key,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = builder.add(b"k", b"v").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+        assert!(err.message().contains("bloom filter block size"));
+        assert!(builder.filter_keys.is_empty());
+    }
+
+    #[test]
+    fn test_prefix_filter_hard_limit_is_checked_before_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized_prefix_filter.sst");
+        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8) as u32;
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: bits_per_key,
+                prefix_len: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder.prefix_set.insert(b"k".to_vec());
+
+        let err = builder.write_prefix_filter_block().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+        assert!(err.message().contains("prefix bloom filter block size"));
     }
 }

@@ -17,7 +17,12 @@ pub struct DbOptions {
     pub error_if_exists: bool,
     /// Size of a single MemTable in bytes before it is frozen.
     pub write_buffer_size: usize,
-    /// Maximum number of immutable MemTables waiting to be flushed.
+    /// Currently unused compatibility option.
+    ///
+    /// MemTable freezes are flushed synchronously by the write path, so there
+    /// is no immutable-MemTable queue for this value to bound. The field remains
+    /// accepted for configuration compatibility and may be implemented or
+    /// removed in a future major release.
     pub max_immutable_memtables: usize,
     /// Number of L0 files that triggers compaction.
     pub l0_compaction_trigger: usize,

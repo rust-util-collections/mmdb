@@ -3,7 +3,7 @@
 //! Tests that the database behaves as a correct ordered key-value store
 //! under random sequences of operations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -47,18 +47,22 @@ proptest! {
         }, dir.path()).unwrap();
 
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut all_keys = BTreeSet::new();
 
         for op in &ops {
             match op {
                 Op::Put(k, v) => {
+                    all_keys.insert(k.clone());
                     db.put(k, v).unwrap();
                     model.insert(k.clone(), v.clone());
                 }
                 Op::Delete(k) => {
+                    all_keys.insert(k.clone());
                     db.delete(k).unwrap();
                     model.remove(k);
                 }
                 Op::Get(k) => {
+                    all_keys.insert(k.clone());
                     let db_result = db.get(k).unwrap();
                     let model_result = model.get(k).cloned();
                     prop_assert_eq!(
@@ -69,11 +73,12 @@ proptest! {
             }
         }
 
-        // Final consistency check: verify all model entries exist in DB
-        for (k, v) in &model {
-            let db_val = db.get(k).unwrap();
+        // Final consistency check includes keys whose final operation deleted them.
+        for k in &all_keys {
+            let db_result = db.get(k).unwrap();
+            let model_result = model.get(k).cloned();
             prop_assert_eq!(
-                db_val.as_deref(), Some(v.as_slice()),
+                db_result, model_result,
                 "final check failed for key {:?}", k
             );
         }

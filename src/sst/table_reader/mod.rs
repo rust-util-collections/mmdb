@@ -76,6 +76,18 @@ pub struct TableReader {
 }
 
 impl TableReader {
+    fn validate_prefix_filter_metadata(
+        prefix_filter: Option<&[u8]>,
+        prefix_len: Option<usize>,
+    ) -> Result<()> {
+        if prefix_filter.is_some() && prefix_len == Some(0) {
+            return Err(Error::corruption(
+                "prefix filter metadata has zero prefix length".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Open an SST file for reading.
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_all(path, 0, None, None)
@@ -608,6 +620,7 @@ impl TableReader {
         if let Some(e) = iter.error() {
             return Err(e.clone()).ctx();
         }
+        Self::validate_prefix_filter_metadata(prefix.as_deref(), prefix_len).ctx()?;
 
         Ok(MetaIndexData {
             bloom,
@@ -621,7 +634,7 @@ impl TableReader {
     /// Returns `true` if the prefix might be present (or if no prefix bloom exists).
     pub fn prefix_may_match(&self, prefix: &[u8]) -> bool {
         match (self.prefix_filter_data.as_ref(), self.prefix_filter_len) {
-            (Some(filter), Some(prefix_len)) if prefix.len() >= prefix_len => {
+            (Some(filter), Some(prefix_len)) if prefix_len > 0 && prefix.len() >= prefix_len => {
                 BloomFilter::key_may_match(&prefix[..prefix_len], filter)
             }
             _ => true, // Missing/incompatible metadata — conservatively assume present.
@@ -723,5 +736,23 @@ impl TableReader {
     /// Get a file handle for reading. Uses the held file via mutex.
     fn open_file(&self) -> Result<MutexGuard<'_, File>> {
         Ok(self.file.lock())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TableReader;
+
+    #[test]
+    fn test_zero_prefix_filter_length_is_rejected() {
+        assert!(
+            TableReader::validate_prefix_filter_metadata(Some(&[1, 2]), Some(0)).is_err(),
+            "a present filter cannot use the disabled zero-length prefix"
+        );
+        assert!(TableReader::validate_prefix_filter_metadata(Some(&[1, 2]), Some(3)).is_ok());
+        assert!(
+            TableReader::validate_prefix_filter_metadata(Some(&[1, 2]), None).is_ok(),
+            "missing legacy metadata remains a conservative filter bypass"
+        );
     }
 }

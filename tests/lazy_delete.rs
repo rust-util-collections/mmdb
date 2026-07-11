@@ -1,5 +1,13 @@
 use mmdb::{DB, DbOptions};
 
+fn wait_until_removed(db: &DB, key: &[u8], message: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while db.get(key).unwrap().is_some() {
+        assert!(std::time::Instant::now() <= deadline, "{message}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Use a tiny write buffer so each put batch flushes to its own SST,
 /// giving compaction multiple files to merge (avoiding the trivial-move
 /// optimisation that skips the compaction filter).
@@ -333,4 +341,96 @@ fn lazy_delete_sweeps_settled_store() {
             i
         );
     }
+}
+
+#[test]
+fn lazy_delete_sweeps_deepest_level_before_l0() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            l0_compaction_trigger: usize::MAX,
+            lazy_delete_compaction_threshold: 1,
+            num_levels: 3,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    db.put(b"dup", b"old").unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(db.get_property("num-files-at-level1").as_deref(), Some("1"));
+
+    db.put(b"dup", b"new").unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("1"));
+
+    db.lazy_delete(b"dup");
+    wait_until_removed(
+        &db,
+        b"dup",
+        "the newer L0 copy remained after the deeper copy was removed",
+    );
+}
+
+#[test]
+fn lazy_delete_requeues_new_keys_above_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            l0_compaction_trigger: usize::MAX,
+            lazy_delete_compaction_threshold: 1,
+            max_background_compactions: 4,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    db.put(b"a", b"1").unwrap();
+    db.flush().unwrap();
+    db.lazy_delete(b"a");
+    wait_until_removed(&db, b"a", "the first automatic sweep did not finish");
+
+    db.put(b"b", b"2").unwrap();
+    db.flush().unwrap();
+    db.lazy_delete(b"b");
+    wait_until_removed(
+        &db,
+        b"b",
+        "a new key registered above the threshold did not queue another sweep",
+    );
+}
+
+#[test]
+fn lazy_delete_retries_after_snapshot_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            l0_compaction_trigger: usize::MAX,
+            lazy_delete_compaction_threshold: 1,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    db.put(b"k", b"v").unwrap();
+    db.flush().unwrap();
+    let snapshot = db.snapshot();
+    db.lazy_delete(b"k");
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+
+    drop(snapshot);
+    wait_until_removed(
+        &db,
+        b"k",
+        "the queued sweep did not resume after the snapshot was released",
+    );
 }

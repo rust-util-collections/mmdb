@@ -46,9 +46,11 @@ fn main() -> mmdb::Result<()> {
     drop(snap); // releases the snapshot so compaction may reclaim old versions
 
     // --- Prefix iteration (bloom-filter pruned) ---
-    let users: Vec<_> = db
-        .iter_with_prefix(b"user:", &ReadOptions::default())?
-        .collect();
+    let mut user_iter = db.iter_with_prefix(b"user:", &ReadOptions::default())?;
+    let users: Vec<_> = user_iter.by_ref().collect();
+    if let Some(error) = user_iter.error() {
+        return Err(mmdb::Error::io(std::io::Error::other(error)));
+    }
     println!("{} keys under user:", users.len());
 
     // --- Range iteration [acct:1, acct:9) with SST pruning ---
@@ -57,8 +59,12 @@ fn main() -> mmdb::Result<()> {
         fill_cache: false,
         ..Default::default()
     };
-    for (k, v) in db.iter_with_range(&scan_opts, Some(b"acct:1"), Some(b"acct:9"))? {
+    let mut range_iter = db.iter_with_range(&scan_opts, Some(b"acct:1"), Some(b"acct:9"))?;
+    for (k, v) in range_iter.by_ref() {
         println!("{} = {}", String::from_utf8_lossy(&k), v.len());
+    }
+    if let Some(error) = range_iter.error() {
+        return Err(mmdb::Error::io(std::io::Error::other(error)));
     }
 
     // --- Range deletion ---

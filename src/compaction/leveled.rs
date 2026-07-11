@@ -803,7 +803,7 @@ fn execute_sub_compaction_io(
         {
             // Defer the actual file cut to the next user-key boundary (handled at
             // the top of the loop) so a key's versions are never split across files.
-            // The meta-size condition keeps the per-file index / range-del blocks
+            // The meta-size condition keeps each single-block metadata structure
             // well below the reader's hard cap for key-heavy data.
             pending_cut = true;
         }
@@ -854,8 +854,8 @@ fn execute_sub_compaction_io(
 
 impl LeveledCompaction {
     pub(crate) fn max_output_files(task: &CompactionTask, options: &DbOptions) -> u64 {
-        // Output files are also cut when their projected index / range-del
-        // meta block reaches META_BLOCK_SPLIT_THRESHOLD (key-heavy data), so
+        // Output files are also cut when projected single-block metadata
+        // reaches META_BLOCK_SPLIT_THRESHOLD (key-heavy data), so
         // size the reservation for the smaller of the two cut conditions.
         let target_size = options
             .target_file_size_base
@@ -1739,8 +1739,8 @@ impl LeveledCompaction {
                 || builder.as_ref().unwrap().projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD
             {
                 // Defer the actual cut to the next user-key boundary. The
-                // meta-size condition keeps the per-file index / range-del
-                // blocks well below the reader's hard cap for key-heavy data.
+                // meta-size condition keeps each single-block metadata structure
+                // well below the reader's hard cap for key-heavy data.
                 pending_cut = true;
             }
         }

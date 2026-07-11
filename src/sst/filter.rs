@@ -12,6 +12,9 @@ pub struct BloomFilter {
 }
 
 impl BloomFilter {
+    /// Maximum payload size that keeps the probe modulus representable as u32.
+    const MAX_FILTER_BYTES: u64 = (u32::MAX / 8) as u64;
+
     /// Create a new bloom filter policy.
     pub fn new(bits_per_key: u32) -> Self {
         // k = ln(2) * (bits_per_key)
@@ -23,18 +26,11 @@ impl BloomFilter {
     /// Build a filter for the given set of keys.
     /// Returns the filter data.
     pub fn create_filter(&self, keys: &[&[u8]]) -> Vec<u8> {
-        // Compute the bit count in u64 to avoid overflow, then cap the byte
-        // count so that `bytes * 8` always fits in a u32 (the modulus type used
-        // during probing). Without the cap, a pathological bits_per_key/key
-        // count could wrap the bit count to 0 and panic on `h % bits`.
-        const MAX_FILTER_BYTES: u64 = (u32::MAX / 8) as u64;
-        let bits = (keys.len() as u64)
-            .saturating_mul(self.bits_per_key as u64)
-            .max(64);
-        let bytes = bits.div_ceil(8).min(MAX_FILTER_BYTES) as usize;
+        let filter_size = Self::projected_size(keys.len(), self.bits_per_key);
+        let bytes = filter_size - 1;
         let bits = (bytes as u32) * 8;
 
-        let mut filter = vec![0u8; bytes + 1]; // +1 for k at the end
+        let mut filter = vec![0u8; filter_size];
         *filter.last_mut().unwrap() = self.k as u8;
 
         for key in keys {
@@ -49,6 +45,17 @@ impl BloomFilter {
         }
 
         filter
+    }
+
+    /// Project the encoded filter size (payload plus the trailing hash-count
+    /// byte) without allocating.
+    pub(crate) fn projected_size(key_count: usize, bits_per_key: u32) -> usize {
+        let bits = (key_count as u64)
+            .saturating_mul(bits_per_key as u64)
+            .max(64);
+        bits.div_ceil(8)
+            .min(Self::MAX_FILTER_BYTES)
+            .saturating_add(1) as usize
     }
 
     /// Check if a key might be in the filter.
@@ -157,6 +164,19 @@ mod tests {
             "too many false positives: {}",
             false_positives
         );
+    }
+
+    #[test]
+    fn test_projected_size_matches_encoded_filter() {
+        let bf = BloomFilter::new(10);
+        let keys: Vec<Vec<u8>> = (0..100).map(|i| format!("key_{i}").into_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+
+        assert_eq!(
+            BloomFilter::projected_size(key_refs.len(), 10),
+            bf.create_filter(&key_refs).len()
+        );
+        assert_eq!(BloomFilter::projected_size(0, 10), 9);
     }
 
     #[test]

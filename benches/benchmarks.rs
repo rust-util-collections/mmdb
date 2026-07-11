@@ -3,14 +3,15 @@
 //! Run:
 //!   cargo bench                    # all benchmarks
 //!   cargo bench -- "fillseq"       # specific group
-//!   cargo bench -- "cold"          # cold-cache scenarios only
+//!   cargo bench -- "small_cache"   # small block-cache scenarios only
 //!   cargo bench -- "warm"          # warm-cache scenarios only
 //!
-//! Two configurations are tested for I/O-sensitive operations:
+//! Two configurations are tested for cache-sensitive operations:
 //! - **warm**: Large cache (256MB), data fits in memory — measures CPU/algorithm cost
-//! - **cold**: Tiny cache (256KB), data exceeds cache — measures I/O + cache-miss cost
+//! - **small_cache**: Tiny cache (256KB) — measures block-cache-miss + decode cost
 //!
-//! Cold-cache tests use smaller datasets to keep total bench time reasonable.
+//! Small-cache reads still use the same-process OS page cache, so they do not
+//! measure storage latency. These cases use smaller datasets to keep runtime reasonable.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::path::Path;
@@ -47,8 +48,8 @@ fn open_warm(path: &Path) -> mmdb::DB {
     .unwrap()
 }
 
-/// Open DB with cold cache (256KB) — forces disk I/O on reads.
-fn open_cold(path: &Path) -> mmdb::DB {
+/// Open DB with a small block cache (256KB).
+fn open_small_cache(path: &Path) -> mmdb::DB {
     mmdb::DB::open(
         mmdb::DbOptions {
             create_if_missing: true,
@@ -195,7 +196,7 @@ fn bench_overwrite(c: &mut Criterion) {
     group.finish();
 }
 
-// ── readrandom: warm vs cold ────────────────────────────────────────────
+// ── readrandom: warm vs small cache ────────────────────────────────────
 
 fn bench_readrandom(c: &mut Criterion) {
     let mut group = c.benchmark_group("readrandom");
@@ -254,13 +255,14 @@ fn bench_readrandom(c: &mut Criterion) {
         );
     });
 
-    // Cold: SST with tiny cache (cache misses on most reads)
+    // Small cache: SST blocks miss the MMDB cache but remain in the OS page cache.
     // Smaller dataset (2K entries) to keep bench time reasonable
-    group.bench_function("cold/sst_2k", |b| {
+    group.throughput(Throughput::Elements(500));
+    group.bench_function("small_cache/sst_2k", |b| {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let db = open_cold(dir.path());
+                let db = open_small_cache(dir.path());
                 for i in 0..2_000u64 {
                     db.put(&make_key(i), &value).unwrap();
                 }
@@ -280,7 +282,7 @@ fn bench_readrandom(c: &mut Criterion) {
     group.finish();
 }
 
-// ── readseq (scan): warm vs cold ────────────────────────────────────────
+// ── readseq (scan): warm vs small cache ────────────────────────────────
 
 fn bench_readseq(c: &mut Criterion) {
     let mut group = c.benchmark_group("readseq");
@@ -313,17 +315,17 @@ fn bench_readseq(c: &mut Criterion) {
         );
     }
 
-    // Cold: 5K entries (smaller to stay fast), tiny cache, multi-level SST
+    // Small cache: 5K entries (smaller to stay fast), multi-level SST
     for &scan_count in &[100usize, 1_000] {
         group.throughput(Throughput::Elements(scan_count as u64));
         group.bench_with_input(
-            BenchmarkId::new("cold", scan_count),
+            BenchmarkId::new("small_cache", scan_count),
             &scan_count,
             |b, &scan_count| {
                 b.iter_with_setup(
                     || {
                         let dir = tempfile::tempdir().unwrap();
-                        let db = open_cold(dir.path());
+                        let db = open_small_cache(dir.path());
                         for i in 0..5_000u64 {
                             db.put(&make_key(i), &value).unwrap();
                         }
@@ -343,7 +345,7 @@ fn bench_readseq(c: &mut Criterion) {
     group.finish();
 }
 
-// ── prefix scan: warm vs cold ───────────────────────────────────────────
+// ── prefix scan: warm vs small cache ───────────────────────────────────
 
 fn bench_prefix_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefix_scan");
@@ -384,9 +386,9 @@ fn bench_prefix_scan(c: &mut Criterion) {
         );
     });
 
-    // Cold: prefix scan, tiny cache, 3K entries (fast enough)
+    // Small cache: prefix scan over 3K entries
     group.throughput(Throughput::Elements(100));
-    group.bench_function("cold/100", |b| {
+    group.bench_function("small_cache/100", |b| {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
@@ -465,7 +467,6 @@ fn bench_delete(c: &mut Criterion) {
     let count = 10_000u64;
 
     group.throughput(Throughput::Elements(count));
-
     group.bench_function("point_delete_10k", |b| {
         b.iter_with_setup(
             || {
@@ -484,7 +485,8 @@ fn bench_delete(c: &mut Criterion) {
         );
     });
 
-    group.bench_function("range_delete", |b| {
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("range_delete/one_tombstone_5k_span", |b| {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
@@ -586,7 +588,7 @@ fn bench_compression(c: &mut Criterion) {
     group.finish();
 }
 
-// ── large scan: warm vs cold ────────────────────────────────────────────
+// ── large scan: warm vs small cache ────────────────────────────────────
 
 fn bench_scan_large(c: &mut Criterion) {
     let mut group = c.benchmark_group("scan_large");
@@ -619,17 +621,17 @@ fn bench_scan_large(c: &mut Criterion) {
         );
     }
 
-    // Cold: 10K entries (smaller!), tiny cache, multi-level SST
+    // Small cache: 10K entries, multi-level SST
     for &scan_count in &[100usize, 1_000] {
         group.throughput(Throughput::Elements(scan_count as u64));
         group.bench_with_input(
-            BenchmarkId::new("cold", scan_count),
+            BenchmarkId::new("small_cache", scan_count),
             &scan_count,
             |b, &scan_count| {
                 b.iter_with_setup(
                     || {
                         let dir = tempfile::tempdir().unwrap();
-                        let db = open_cold(dir.path());
+                        let db = open_small_cache(dir.path());
                         for i in 0..10_000u64 {
                             db.put(&make_key(i), &value).unwrap();
                         }

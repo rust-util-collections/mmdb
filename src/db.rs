@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar as StdCondvar, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -43,6 +43,64 @@ use crate::types::{
     WriteBatch, WriteBatchWithIndex,
 };
 use crate::wal::{WalReader, WalWriter};
+
+const DEAD_KEY_SWEEP_IDLE: u8 = 0;
+const DEAD_KEY_SWEEP_PENDING: u8 = 1;
+const DEAD_KEY_SWEEP_RUNNING: u8 = 2;
+const DEAD_KEY_SWEEP_RUNNING_PENDING: u8 = 3;
+
+fn queue_dead_key_sweep(state: &AtomicU8) {
+    let mut current = state.load(Ordering::Acquire);
+    loop {
+        let next = match current {
+            DEAD_KEY_SWEEP_IDLE => DEAD_KEY_SWEEP_PENDING,
+            DEAD_KEY_SWEEP_PENDING | DEAD_KEY_SWEEP_RUNNING_PENDING => return,
+            DEAD_KEY_SWEEP_RUNNING => DEAD_KEY_SWEEP_RUNNING_PENDING,
+            _ => unreachable!("invalid dead-key sweep state"),
+        };
+        match state.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn retry_dead_key_sweep_after_snapshot_release(state: &AtomicU8) -> bool {
+    let mut current = state.load(Ordering::Acquire);
+    loop {
+        match current {
+            DEAD_KEY_SWEEP_IDLE => return false,
+            DEAD_KEY_SWEEP_PENDING | DEAD_KEY_SWEEP_RUNNING_PENDING => return true,
+            DEAD_KEY_SWEEP_RUNNING => match state.compare_exchange_weak(
+                current,
+                DEAD_KEY_SWEEP_RUNNING_PENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            },
+            _ => unreachable!("invalid dead-key sweep state"),
+        }
+    }
+}
+
+fn finish_dead_key_sweep(state: &AtomicU8, retry: bool) {
+    let mut current = state.load(Ordering::Acquire);
+    loop {
+        let next = match current {
+            DEAD_KEY_SWEEP_RUNNING if retry => DEAD_KEY_SWEEP_PENDING,
+            DEAD_KEY_SWEEP_RUNNING => DEAD_KEY_SWEEP_IDLE,
+            DEAD_KEY_SWEEP_RUNNING_PENDING => DEAD_KEY_SWEEP_PENDING,
+            DEAD_KEY_SWEEP_IDLE | DEAD_KEY_SWEEP_PENDING => return,
+            _ => unreachable!("invalid dead-key sweep state"),
+        };
+        match state.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Tracks active snapshots so compaction doesn't delete data still needed by readers.
 struct SnapshotList {
@@ -98,7 +156,7 @@ struct FrozenMemtable {
     old_mem: Arc<MemTable>,
     /// Pre-reserved SST file numbers for the flush outputs. The flush may
     /// split the memtable into multiple SSTs (cut at user-key boundaries)
-    /// when projected index / range-del meta blocks grow large; numbers are
+    /// when projected single-block metadata grows large; numbers are
     /// consumed in order and unused ones are simply never materialized.
     sst_numbers: Vec<u64>,
     old_wal_number: u64,
@@ -197,19 +255,15 @@ pub struct DB {
     snapshot_list: Arc<SnapshotList>,
     /// Exclusive directory lock (LOCK file). Prevents concurrent DB access.
     /// The File handle holds the flock; released automatically when dropped.
-    /// Explicitly taken in `simulate_crash()` to allow re-open in tests.
-    /// The field is "read" via Drop (releases flock) — not dead code.
-    _lock_file: Option<fs::File>,
+    /// Interior mutability lets explicit `close()` release it before `DB` drops.
+    lock_file: Mutex<Option<fs::File>>,
     /// Keys registered for lazy deletion. Checked during compaction
     /// and dropped without writing tombstones.
     dead_keys: Arc<RwLock<HashSet<Vec<u8>>>>,
-    /// Set when lazy-delete registrations newly cross
-    /// `lazy_delete_compaction_threshold`; consumed by the background
-    /// compaction thread, which then force-rewrites every populated level
-    /// through the compaction filter. Debt-driven picks alone would never
-    /// revisit an already-settled store (L0 below its trigger, no level
-    /// oversized), leaving registered keys in place forever.
-    dead_key_sweep: Arc<AtomicBool>,
+    /// State machine for automatic dead-key sweeping. New unique registrations
+    /// at or above the threshold queue another pass; a request arriving during
+    /// a pass is retained for the next pass.
+    dead_key_sweep_state: Arc<AtomicU8>,
 }
 
 // SAFETY: the raw `*mut WriteRequest` pointers held in `write_queue` reference
@@ -310,7 +364,7 @@ impl DB {
         }
 
         // Acquire exclusive directory lock to prevent concurrent DB access
-        let _lock_file = {
+        let lock_file = {
             let lock_path = path.join("LOCK");
             let file = OpenOptions::new()
                 .create(true)
@@ -552,7 +606,7 @@ impl DB {
             };
             options.compaction_filter = Some(Arc::new(lazy_filter));
         }
-        let dead_key_sweep = Arc::new(AtomicBool::new(false));
+        let dead_key_sweep_state = Arc::new(AtomicU8::new(DEAD_KEY_SWEEP_IDLE));
 
         let (l0_file_count, super_version) = {
             let g = inner.lock();
@@ -586,7 +640,7 @@ impl DB {
             let bg_has_error = has_bg_error.clone();
             let bg_error_msg = bg_error.clone();
             let bg_compacting_files = compacting_files.clone();
-            let bg_dead_key_sweep = dead_key_sweep.clone();
+            let bg_dead_key_sweep_state = dead_key_sweep_state.clone();
             let bg_manifest_poisoned = manifest_poisoned.clone();
 
             let handle = thread::Builder::new()
@@ -950,22 +1004,31 @@ impl DB {
                                     );
                                 }
 
-                                // Dead-key sweep: lazy_delete[_batch] crossing
-                                // its threshold requests a full filtered
-                                // rewrite. The debt-driven picks above only
-                                // run where compaction is already needed — a
-                                // settled store (e.g. a single L0 or L1 file)
-                                // would never be revisited and the registered
-                                // keys would linger forever. force_merge_level
-                                // rewrites each populated level in place
-                                // (single-file levels included whenever the
-                                // filter is non-noop) and applies the filter
-                                // wherever bottommost-safety allows, exactly
-                                // like the explicit compact() path.
-                                if bg_dead_key_sweep.swap(false, Ordering::AcqRel) {
-                                    for level in 0..bg_options.num_levels {
+                                // A pending sweep stays queued while snapshots
+                                // are active. Once runnable, process deeper
+                                // levels first so removing older copies can make
+                                // shallower copies eligible in the same pass.
+                                loop {
+                                    if bg_dead_key_sweep_state.load(Ordering::Acquire)
+                                        != DEAD_KEY_SWEEP_PENDING
+                                        || !bg_snapshot_list.as_sorted_vec().is_empty()
+                                        || bg_dead_key_sweep_state
+                                            .compare_exchange(
+                                                DEAD_KEY_SWEEP_PENDING,
+                                                DEAD_KEY_SWEEP_RUNNING,
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                            )
+                                            .is_err()
+                                    {
+                                        break;
+                                    }
+
+                                    let mut blocked_by_snapshot = false;
+                                    for level in (0..bg_options.num_levels).rev() {
                                         let mut inner = bg_inner.lock();
                                         let active_snaps = bg_snapshot_list.as_sorted_vec();
+                                        blocked_by_snapshot |= !active_snaps.is_empty();
                                         let ctx = CompactionContext {
                                             db_path: &bg_path,
                                             options: &bg_options,
@@ -989,6 +1052,10 @@ impl DB {
                                         );
                                         refresh_super_version(&bg_sv, &inner);
                                     }
+                                    finish_dead_key_sweep(
+                                        &bg_dead_key_sweep_state,
+                                        blocked_by_snapshot,
+                                    );
                                 }
                                 Ok(())
                             },
@@ -1046,9 +1113,9 @@ impl DB {
             read_compaction_hints,
             read_counter: AtomicU64::new(0),
             snapshot_list,
-            _lock_file,
+            lock_file: Mutex::new(lock_file),
             dead_keys,
-            dead_key_sweep,
+            dead_key_sweep_state,
         };
 
         // Kick the background compaction threads once at startup. A DB
@@ -1863,6 +1930,9 @@ impl DB {
     /// Called by `Snapshot::drop`.
     pub(crate) fn release_snapshot(&self, seq: SequenceNumber) {
         self.snapshot_list.release(seq);
+        if retry_dead_key_sweep_after_snapshot_release(&self.dead_key_sweep_state) {
+            self.signal_compaction();
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -2217,11 +2287,11 @@ impl DB {
     /// during the next compaction that encounters it, without writing a
     /// tombstone. This avoids write amplification for bulk cleanup.
     ///
-    /// If the number of accumulated dead keys newly crosses
+    /// Once the number of accumulated dead keys reaches
     /// `lazy_delete_compaction_threshold` (default: `0`, i.e. disabled —
-    /// this is an opt-in feature), a background sweep is automatically
-    /// scheduled: every populated level is force-rewritten through the
-    /// compaction filter (same behavior as
+    /// this is an opt-in feature), every newly registered unique key queues
+    /// a background sweep: every populated level is force-rewritten through
+    /// the compaction filter (same behavior as
     /// [`lazy_delete_batch`](Self::lazy_delete_batch)), so the keys are
     /// physically removed even when the store has no organic compaction
     /// debt. Removal is subject to the usual bottommost-safety rule: a
@@ -2248,11 +2318,10 @@ impl DB {
     pub fn lazy_delete(&self, key: &[u8]) {
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
-        let prev_len = set.len();
-        set.insert(key.to_vec());
+        let inserted = set.insert(key.to_vec());
         let len = set.len();
         drop(set);
-        if threshold > 0 && len >= threshold && prev_len < threshold {
+        if threshold > 0 && len >= threshold && inserted {
             self.request_dead_key_sweep();
         }
     }
@@ -2262,21 +2331,20 @@ impl DB {
     /// Dead keys are **not** persisted — see [`lazy_delete`](Self::lazy_delete)
     /// for durability caveats.
     ///
-    /// If the number of accumulated dead keys newly crosses
-    /// `lazy_delete_compaction_threshold` (default: `0`, i.e. disabled —
-    /// opt-in only), a background sweep is automatically scheduled — see
-    /// [`lazy_delete`](Self::lazy_delete) for its exact semantics and the
-    /// write-stall tradeoff of opting in.
+    /// At or above `lazy_delete_compaction_threshold` (default: `0`, i.e.
+    /// disabled — opt-in only), a batch containing any newly registered key
+    /// queues a background sweep — see [`lazy_delete`](Self::lazy_delete) for
+    /// its exact semantics and the write-stall tradeoff of opting in.
     pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
-        let prev_len = set.len();
+        let mut any_new = false;
         for k in keys {
-            set.insert(k.as_ref().to_vec());
+            any_new |= set.insert(k.as_ref().to_vec());
         }
         let len = set.len();
         drop(set);
-        if threshold > 0 && len >= threshold && prev_len < threshold {
+        if threshold > 0 && len >= threshold && any_new {
             self.request_dead_key_sweep();
         }
     }
@@ -2288,7 +2356,7 @@ impl DB {
     /// do on a settled store and the registered keys would never be
     /// physically removed.
     fn request_dead_key_sweep(&self) {
-        self.dead_key_sweep.store(true, Ordering::Release);
+        queue_dead_key_sweep(&self.dead_key_sweep_state);
         self.signal_compaction();
     }
 
@@ -2336,11 +2404,9 @@ impl DB {
             first_error = Some(e);
         }
 
-        // Leave the block-cache pool (idempotent; `Drop` also calls it).
-        // Runs regardless of flush/sync errors: the DB is closed either
-        // way, and a shared pool must not keep carrying a closed
-        // member's blocks until LRU pressure notices.
-        self.block_cache.detach();
+        drop(inner);
+        drop(_wg);
+        self.shutdown_background_and_release_resources();
 
         match first_error {
             Some(e) => Err(e),
@@ -2357,6 +2423,20 @@ impl DB {
             *has_work = true;
             cvar.notify_one();
         }
+    }
+
+    fn shutdown_background_and_release_resources(&self) {
+        {
+            let (lock, cvar) = &*self.compaction_notify;
+            let _guard = lock.lock().unwrap();
+            self.compaction_shutdown.store(true, Ordering::Release);
+            cvar.notify_all();
+        }
+        for handle in self.compaction_handles.lock().drain(..) {
+            let _ = handle.join();
+        }
+        self.block_cache.detach();
+        drop(self.lock_file.lock().take());
     }
 
     /// Find the highest sequence number among range tombstones covering `key`
@@ -2882,8 +2962,8 @@ impl DB {
         inner.immutable_memtables.push(old_mem.clone());
 
         // Reserve enough file numbers for the flush to split its output when
-        // projected index / range-del meta blocks grow large (key-heavy
-        // data). Generous over-reservation is harmless: file numbers come
+        // projected single-block metadata grows large (key-heavy data).
+        // Generous over-reservation is harmless: file numbers come
         // from a monotonic u64 counter and unused ones are never reused.
         let reserve =
             2 + (4 * old_mem.approximate_size() as u64) / META_BLOCK_SPLIT_THRESHOLD as u64;
@@ -3428,8 +3508,8 @@ impl DB {
     }
 
     /// Write a memtable to one or more SST files, splitting at user-key
-    /// boundaries whenever the projected single-block index / range-del meta
-    /// structures reach `META_BLOCK_SPLIT_THRESHOLD` (the SST reader rejects
+    /// boundaries whenever projected single-block metadata reaches
+    /// `META_BLOCK_SPLIT_THRESHOLD` (the SST reader rejects
     /// any block above 64 MiB, so a single huge output for key-heavy data
     /// would be unreadable on read-back). Outputs cover disjoint user-key
     /// ranges, so all versions of one user key stay in a single file — this
@@ -3520,23 +3600,9 @@ impl DB {
 impl DB {
     /// Simulate a crash: shut down background threads without flushing memtable.
     /// Useful for testing WAL recovery without zombie compaction threads.
-    pub fn simulate_crash(mut self) {
+    pub fn simulate_crash(self) {
         self.closed.store(true, Ordering::Release);
-        // Hold the condvar's mutex while setting the shutdown flag and
-        // notifying, so a waiter that has just re-checked its condition
-        // cannot miss this wakeup and block forever (lost-wakeup race).
-        {
-            let (lock, cvar) = &*self.compaction_notify;
-            let _guard = lock.lock().unwrap();
-            self.compaction_shutdown.store(true, Ordering::Release);
-            cvar.notify_all();
-        }
-        for handle in self.compaction_handles.lock().drain(..) {
-            let _ = handle.join();
-        }
-        // Release directory lock before forgetting self, so subsequent
-        // DB::open on the same directory will succeed (e.g., in tests).
-        self._lock_file.take();
+        self.shutdown_background_and_release_resources();
         mem::forget(self);
     }
 }
@@ -3551,23 +3617,7 @@ impl Drop for DB {
                 let _ = wal.sync();
             }
         }
-        // Shut down background compaction threads: set shutdown flag, wake all, join.
-        // Hold the condvar's mutex across the flag-set + notify so a waiter
-        // that just re-checked its condition cannot miss this wakeup and
-        // block forever (lost-wakeup race) — mirrors signal_compaction().
-        {
-            let (lock, cvar) = &*self.compaction_notify;
-            let _guard = lock.lock().unwrap();
-            self.compaction_shutdown.store(true, Ordering::Release);
-            cvar.notify_all();
-        }
-        for handle in self.compaction_handles.lock().drain(..) {
-            let _ = handle.join();
-        }
-        // Leave the block-cache pool (idempotent — a preceding `close()`
-        // already detached). After the compaction threads are joined, no
-        // code path of this DB touches the cache again.
-        self.block_cache.detach();
+        self.shutdown_background_and_release_resources();
     }
 }
 
@@ -3696,6 +3746,21 @@ mod tests {
         db.put(b"key", b"val").unwrap();
         db.close().unwrap();
         assert!(db.put(b"key2", b"val2").is_err());
+    }
+
+    #[test]
+    fn test_close_releases_resources_before_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.put(b"key", b"val").unwrap();
+        db.close().unwrap();
+
+        assert!(db.compaction_shutdown.load(Ordering::Acquire));
+        assert!(db.compaction_handles.lock().is_empty());
+        assert!(db.lock_file.lock().is_none());
+
+        let reopened = open_test_db(dir.path());
+        assert_eq!(reopened.get(b"key").unwrap(), Some(b"val".to_vec()));
     }
 
     #[test]

@@ -21,7 +21,7 @@ A pure-Rust LSM-Tree key-value storage engine, purpose-built for
 
 ## Performance
 
-In typical configurations, MMDB's scan throughput and point-read latency are comparable to RocksDB. The engine uses the same core optimizations (bloom filters, block cache, prefix compression, leveled compaction) and is designed to perform well across both warm-cache and cold-cache workloads. Run `make bench` to evaluate performance under your specific hardware and data profile (criterion benchmarks with warm-cache and cold-cache scenarios).
+In typical configurations, MMDB's scan throughput and point-read latency are comparable to RocksDB. The engine uses the same core optimizations (bloom filters, block cache, prefix compression, leveled compaction) and is designed to perform well across both warm-cache and small-block-cache workloads. Run `make bench` to evaluate performance under your specific hardware and data profile.
 
 ---
 
@@ -51,8 +51,10 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | DB properties/statistics (wired to all paths) | Implemented |
 | Typed errors with full propagation traces | Implemented |
 
-Every configuration option is real: knobs that are accepted but not
-implemented do not exist in this API.
+`max_immutable_memtables` is retained as an accepted-but-unused compatibility
+option. MMDB flushes each frozen MemTable synchronously, so there is no
+immutable-MemTable queue for that value to bound; other options are wired to
+their documented behavior.
 
 ---
 
@@ -188,7 +190,13 @@ src/
 
 ---
 
-## Public API
+## Selected Public API
+
+The complete supported API is the set of crate-root re-exports documented on
+[docs.rs/mmdb](https://docs.rs/mmdb). In addition to the selected methods
+below, that includes `BidiIterator`, `WriteBatchWithIndex`, `BlockCache`,
+`BlockCachePool`, `CompressionType`, compaction/property filter traits, and
+the public size-limit constants.
 
 ```rust
 impl DB {
@@ -204,6 +212,8 @@ impl DB {
     pub fn write(&self, batch: WriteBatch) -> Result<()>;
     pub fn write_with_options(&self, options: &WriteOptions, batch: WriteBatch) -> Result<()>;
     pub fn iter(&self) -> Result<DBIterator>;
+    pub fn iter_with_options(&self, options: &ReadOptions) -> Result<DBIterator>;
+    pub fn iter_with_batch(&self, batch: &WriteBatchWithIndex) -> Result<DBIterator>;
 
     /// Prefix-bounded iteration — the fastest option for prefix-scoped queries.
     ///
@@ -242,6 +252,11 @@ impl DB {
     pub fn compact(&self) -> Result<()>;
     pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()>;
     pub fn get_property(&self, name: &str) -> Option<String>;
+    pub fn path(&self) -> &Path;
+    pub fn lazy_delete(&self, key: &[u8]);
+    pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>);
+    pub fn dead_key_count(&self) -> usize;
+    pub fn clear_dead_keys(&self);
     pub fn close(&self) -> Result<()>;
 }
 
@@ -256,6 +271,7 @@ impl DBIterator {
     pub fn seek_to_first(&mut self);
     pub fn seek_to_last(&mut self);
     pub fn prev(&mut self);
+    pub fn next_prefix(&mut self, prefix_len: usize); // O(log N) jump
     pub fn error(&self) -> Option<String>;       // I/O errors swallowed by Iterator::next
 }
 
@@ -378,12 +394,16 @@ v4.0 is a design-level cleanup release. Breaking changes:
 cargo build
 cargo test               # 250+ tests (unit + integration + e2e + proptest)
 make all                 # fmt + lint + check + test
-make bench               # criterion benchmarks (warm + cold cache scenarios)
-cargo bench -- "cold"    # cold-cache benchmarks only
+make bench               # criterion benchmarks (warm + small-cache scenarios)
+cargo bench -- "small_cache" # small block-cache benchmarks only
 cargo bench -- "warm"    # warm-cache benchmarks only
 ```
 
-Benchmarks test both warm-cache (256MB, data in memory) and cold-cache (256KB, I/O-bound) scenarios. Cold-cache tests use smaller datasets to keep runtime reasonable.
+Benchmarks cover warm-cache (256MB block cache, data in memory) and
+small-cache (256KB block cache, block-cache-miss plus decode overhead)
+scenarios. Small-cache reads still use the same-process OS page cache, so they
+do not measure storage latency; those cases use smaller datasets to keep
+runtime reasonable.
 
 ---
 

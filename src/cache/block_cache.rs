@@ -36,7 +36,7 @@ type CacheValue = Arc<Vec<u8>>;
 /// on one lock; sharding bounds that fan-in.
 const FO_SHARDS: usize = 16;
 
-/// Number of internal segments in the pool's LRU store.
+/// Maximum number of internal segments in the pool's LRU store.
 ///
 /// A pool concentrates the hit traffic of every member DB (e.g. 16
 /// engine shards x N reader threads) onto one cache instance; a plain
@@ -46,11 +46,24 @@ const FO_SHARDS: usize = 16;
 /// +14.6% vs private caches unsegmented; +6.8% at 16 segments; noise
 /// at 64 segments, while the skewed-load win stays at -72%/-81%).
 /// `SegmentedCache` partitions by key hash, restoring the parallelism
-/// the private-per-DB layout had; capacity semantics stay pool-global
-/// (each segment holds capacity/64 of a hash-uniform key sample, so a
-/// hot member's working set still spreads across every segment).
-const LRU_SEGMENTS: usize = 64;
+/// the private-per-DB layout had. Small caches use fewer segments so a
+/// normal block that fits the whole cache also fits one segment.
+const MAX_LRU_SEGMENTS: usize = 64;
+/// Preserve at least 1 MiB of admission capacity per segment. This keeps
+/// the benchmarked 64-segment layout unchanged for the default 64 MiB cache.
+const MIN_LRU_SEGMENT_CAPACITY: u64 = 1024 * 1024;
 const _: () = assert!(FO_SHARDS.is_power_of_two());
+
+fn lru_segments(capacity_bytes: u64) -> usize {
+    let raw =
+        (capacity_bytes / MIN_LRU_SEGMENT_CAPACITY).clamp(1, MAX_LRU_SEGMENTS as u64) as usize;
+    let rounded_up = raw.next_power_of_two();
+    if rounded_up == raw {
+        raw
+    } else {
+        rounded_up / 2
+    }
+}
 
 /// One shard of the reverse index: `(member, file_number)` → offsets.
 type FoShard = Mutex<HashMap<(u64, u64), HashSet<u64>>>;
@@ -132,7 +145,9 @@ impl FileOffsetsIndex {
 /// Construct once, wrap in an `Arc`, and hand a
 /// [`attach`](Self::attach)ed view to each DB (via
 /// `DbOptions::block_cache`); DBs given the same pool share capacity,
-/// DBs given none keep a private pool.
+/// DBs given none keep a private pool. The LRU is segmented, so a single
+/// unpinned block must fit the capacity share of its hashed segment; caches
+/// below 1 MiB use one segment, while pools of 64 MiB or more use 64.
 pub struct BlockCachePool {
     inner: moka::sync::SegmentedCache<CacheKey, CacheValue>,
     /// Track which offsets belong to each (member, file) for bulk invalidation.
@@ -151,7 +166,7 @@ impl BlockCachePool {
     pub fn new(capacity_bytes: u64) -> Self {
         let index = Arc::new(FileOffsetsIndex::new());
         let listener_index = index.clone();
-        let inner = moka::sync::SegmentedCache::builder(LRU_SEGMENTS)
+        let inner = moka::sync::SegmentedCache::builder(lru_segments(capacity_bytes))
             .max_capacity(capacity_bytes)
             .weigher(|_key: &CacheKey, value: &CacheValue| -> u32 {
                 value.len().min(u32::MAX as usize) as u32
@@ -446,6 +461,36 @@ impl BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_lru_segments_scale_with_capacity() {
+        assert_eq!(lru_segments(0), 1);
+        assert_eq!(lru_segments(4096), 1);
+        assert_eq!(lru_segments(1024 * 1024), 1);
+        assert_eq!(lru_segments(5 * 1024 * 1024), 4);
+        assert_eq!(lru_segments(8 * 1024 * 1024), 8);
+        assert_eq!(lru_segments(63 * 1024 * 1024), 32);
+        assert_eq!(lru_segments(64 * 1024 * 1024), MAX_LRU_SEGMENTS);
+        assert_eq!(lru_segments(u64::MAX), MAX_LRU_SEGMENTS);
+
+        for capacity in [5, 6, 31, 63].map(|mib| mib * 1024 * 1024) {
+            let segments = lru_segments(capacity);
+            assert!(segments.is_power_of_two());
+            assert!(
+                capacity.div_ceil(segments as u64) >= MIN_LRU_SEGMENT_CAPACITY,
+                "capacity {capacity} across {segments} segments fell below the admission floor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cache_capacity_of_one_block_admits_that_block() {
+        let cache = BlockCache::new(4096);
+        cache.insert(1, 0, vec![0xAB; 4096]);
+        cache.pool.inner.run_pending_tasks();
+
+        assert_eq!(*cache.get(1, 0).unwrap(), vec![0xAB; 4096]);
+    }
 
     #[test]
     fn test_block_cache_basic() {

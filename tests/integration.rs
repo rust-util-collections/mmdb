@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::thread;
 
-use mmdb::{DB, DbOptions, ReadOptions, WriteBatch, WriteOptions};
+use mmdb::{DB, DbOptions, ErrorKind, ReadOptions, WriteBatch, WriteOptions};
 
 fn make_db(dir: &std::path::Path) -> DB {
     DB::open(
@@ -512,11 +512,8 @@ fn test_multi_snapshot_coexistence() {
 fn test_snapshot_before_compaction_and_current_after() {
     // Verifies that:
     // 1. Snapshots work correctly before compaction
-    // 2. Current view shows latest values after compaction
-    // Note: does not verify snapshots survive compaction (known gap).
-    // Note: snapshot reads after compaction may not see old versions because
-    // the current compaction implementation deduplicates without tracking
-    // active snapshots.
+    // 2. Active snapshots retain their original values through compaction
+    // 3. Current view shows latest values after compaction
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions {
         create_if_missing: true,
@@ -559,6 +556,17 @@ fn test_snapshot_before_compaction_and_current_after() {
 
     // Compact
     db.compact().unwrap();
+
+    // The active snapshot must retain the original values after compaction.
+    for i in 0..50 {
+        let key = format!("key_{:04}", i);
+        assert_eq!(
+            db.get_with_options(&r, key.as_bytes()).unwrap(),
+            Some(b"original".to_vec()),
+            "key {} should remain 'original' in the snapshot after compaction",
+            key
+        );
+    }
 
     // Current view should see updated values after compaction
     for i in 0..50 {
@@ -809,10 +817,9 @@ fn test_write_options_no_slowdown() {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions {
         create_if_missing: true,
-        write_buffer_size: 512,
-        l0_compaction_trigger: 2,
+        l0_compaction_trigger: usize::MAX,
         l0_slowdown_trigger: 3,
-        l0_stop_trigger: 5,
+        l0_stop_trigger: usize::MAX,
         ..Default::default()
     };
     let db = DB::open(opts, dir.path()).unwrap();
@@ -826,27 +833,16 @@ fn test_write_options_no_slowdown() {
     db.put_with_options(&wo, b"ns_key", b"ns_val").unwrap();
     assert_eq!(db.get(b"ns_key").unwrap(), Some(b"ns_val".to_vec()));
 
-    // Generate many L0 files to trigger slowdown threshold
-    let mut hit_error = false;
-    for i in 0..100 {
+    // Build the L0 backlog deterministically. Compaction is disabled by the
+    // unreachable trigger, and each explicit flush creates one L0 file.
+    for i in 0..3 {
         let key = format!("flood_{:06}", i);
-        let val = vec![0xABu8; 256];
-        // Use regular put (with slowdown) for flooding
-        let _ = db.put(key.as_bytes(), &val);
-
-        // Periodically try no_slowdown write — it may fail under pressure
-        if i % 20 == 19 {
-            let key = format!("ns_{:04}", i);
-            if db.put_with_options(&wo, key.as_bytes(), b"test").is_err() {
-                hit_error = true;
-                break;
-            }
-        }
+        db.put(key.as_bytes(), b"value").unwrap();
+        db.flush().unwrap();
     }
 
-    // The test verifies the API works. Whether we hit an error depends on
-    // timing and compaction — both outcomes are valid.
-    let _ = hit_error;
+    let err = db.put_with_options(&wo, b"blocked", b"value").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
 }
 
 #[test]

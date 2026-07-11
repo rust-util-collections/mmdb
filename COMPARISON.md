@@ -10,7 +10,7 @@
 | NextPrefix skip | No | Yes | Yes | O(log N) inter-prefix jump |
 | SeekGEWithLimit / IterAtLimit | No | Yes | No | Soft limit for distributed shard scanning |
 | LazyValue / deferred value loading | Partial (BlobDB) | Yes | Yes | Zero-copy within SST blocks, no value alloc on skip path |
-| Iterator object pool | Yes | Yes | Yes | Removed in v4.0 — always-empty global pool added a lock hop per iterator for zero benefit; iterators are flat structs, sources dominate construction cost |
+| Iterator object pool | Yes | Yes | No | Removed in v4.0 — always-empty global pool added a lock hop per iterator for zero benefit; iterators are flat structs, sources dominate construction cost |
 | SetBounds propagation to sub-iterators | Yes | Yes | Yes | upper_bound propagated to TableIterator/LevelIterator |
 | SkipPoint callback | No | Yes | Yes | ReadOptions.skip_point callback filtering |
 | Iterator error propagation | Yes | Yes | Yes | DBIterator::error() exposes I/O errors |

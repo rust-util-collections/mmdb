@@ -53,6 +53,10 @@ jobs:
       - run: cargo test --test e2e_scenarios
       - run: cargo test --test integration
       - run: cargo test --test proptest_db
+      - run: cargo test --test bidi_debug
+      - run: cargo test --test lazy_delete
+      - run: cargo test --test shared_cache
+      # scale_profile is profiling-only and intentionally excluded.
 
   bench-compile:
     name: Bench Compile
