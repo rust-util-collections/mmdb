@@ -923,9 +923,11 @@ impl LeveledCompaction {
     /// Pick L0 → L1 compaction. Returns `None` (deferring to another
     /// priority) if any current L0 file is already claimed by another
     /// in-flight compaction — L0 compaction always includes the *entire*
-    /// current L0 file set, so a partial pick isn't meaningful here; the
-    /// caller's next loop iteration retries once the other compaction
-    /// installs or is discarded and clears its claim.
+    /// current L0 file set, so a partial pick isn't meaningful here.
+    /// Opportunistic callers treat that as nothing-to-do (the in-flight
+    /// compaction is already draining L0), while the explicit full-compaction
+    /// path waits for the claim to clear and re-picks (`DB::drain_l0` with
+    /// `wait_for_inflight`).
     fn pick_l0_compaction(version: &Version, in_flight: &HashSet<u64>) -> Option<CompactionTask> {
         let l0_files = version.level_files(0);
         if l0_files.is_empty()

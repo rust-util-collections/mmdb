@@ -1,4 +1,10 @@
-use mmdb::{DB, DbOptions};
+use std::{
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::Duration,
+};
+
+use mmdb::{CompactionFilter, CompactionFilterDecision, DB, DbOptions};
 
 fn wait_until_removed(db: &DB, key: &[u8], message: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -433,4 +439,88 @@ fn lazy_delete_retries_after_snapshot_release() {
         b"k",
         "the queued sweep did not resume after the snapshot was released",
     );
+}
+
+/// A user compaction filter that parks its first invocation until released,
+/// modeling a slow in-flight background merge. `is_noop()` is `false`, so
+/// no-op shortcuts (trivial move, single-file skip) never bypass it.
+struct GateFilter {
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl CompactionFilter for GateFilter {
+    fn filter(&self, _level: usize, _key: &[u8], _value: &[u8]) -> CompactionFilterDecision {
+        // Park only the first invocation: report entry, then wait for release.
+        if let Some(release) = self.release.lock().unwrap().take() {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let _ = release.recv_timeout(Duration::from_secs(10));
+        }
+        CompactionFilterDecision::Keep
+    }
+
+    fn is_noop(&self) -> bool {
+        false
+    }
+}
+
+/// Regression: a key registered while a background compaction is mid-merge
+/// must still be removed by an explicit full compaction. The background merge
+/// checked the key against the dead-keys set before the registration, so
+/// `compact_range(None, None)` must wait for that in-flight compaction to
+/// settle (and then rewrite its installed output) instead of skipping the
+/// claimed L0 files and returning early.
+#[test]
+fn compact_waits_for_inflight_compaction_and_removes_dead_keys() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 1024,
+            compaction_filter: Some(Arc::new(GateFilter {
+                entered: Mutex::new(Some(entered_tx)),
+                release: Mutex::new(Some(release_rx)),
+            })),
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    // Reach `l0_compaction_trigger` (default 4) so the background thread
+    // picks the whole L0 set and parks inside the filter on the smallest
+    // key (key 0), which has already passed the dead-key check by then.
+    for i in 0u32..20 {
+        db.put(&i.to_be_bytes(), &[i as u8; 64]).unwrap();
+    }
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("background compaction never reached the filter");
+
+    // Register key 0 while the background merge output is still uninstalled.
+    db.lazy_delete(&0u32.to_be_bytes());
+
+    thread::scope(|s| {
+        let compact = s.spawn(|| db.compact_range(None::<&[u8]>, None::<&[u8]>));
+        // Let compact_range observe the in-flight claim before the gate opens.
+        thread::sleep(Duration::from_millis(200));
+        let _ = release_tx.send(());
+        compact.join().unwrap().unwrap();
+    });
+
+    assert!(
+        db.get(&0u32.to_be_bytes()).unwrap().is_none(),
+        "dead key registered during an in-flight compaction must not survive compact_range"
+    );
+    for i in 1u32..20 {
+        assert!(
+            db.get(&i.to_be_bytes()).unwrap().is_some(),
+            "key {} should survive",
+            i
+        );
+    }
 }

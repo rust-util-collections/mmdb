@@ -15,7 +15,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
@@ -210,6 +210,51 @@ fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
     }));
 }
 
+/// File numbers claimed by in-flight compaction picks, paired with a condvar
+/// so the explicit full-compaction path can wait for in-flight picks to
+/// install or discard instead of silently skipping their input files.
+struct CompactionClaims {
+    files: Mutex<HashSet<u64>>,
+    released: Condvar,
+}
+
+impl CompactionClaims {
+    fn new() -> Self {
+        Self {
+            files: Mutex::new(HashSet::new()),
+            released: Condvar::new(),
+        }
+    }
+
+    /// Lock the claimed-file set. Pick phases insert claims while holding
+    /// this guard, atomically with the pick itself.
+    fn lock(&self) -> MutexGuard<'_, HashSet<u64>> {
+        self.files.lock()
+    }
+
+    /// Release claimed numbers and wake every waiter observing the set.
+    fn release(&self, numbers: &[u64]) {
+        let mut files = self.files.lock();
+        for num in numbers {
+            files.remove(num);
+        }
+        drop(files);
+        self.released.notify_all();
+    }
+
+    /// Block until no compaction pick holds any claim. Callers must not hold
+    /// `DB::inner` (claims are released only after install/discard, which
+    /// needs that lock). Claims are RAII-released on every exit path — even a
+    /// panicking compaction thread drops its `CompactionClaim` — so this
+    /// terminates once in-flight work settles.
+    fn wait_until_empty(&self) {
+        let mut files = self.files.lock();
+        while !files.is_empty() {
+            self.released.wait(&mut files);
+        }
+    }
+}
+
 /// RAII release for file numbers claimed in `DB::compacting_files` while a
 /// compaction pick is in flight (between `pick_compaction` and
 /// `install_compaction`/discard). The numbers are inserted under the pick
@@ -218,18 +263,16 @@ fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
 /// error, install error — releases the claim. A leaked claim would
 /// permanently exclude those files from all future picks
 /// (`pick_l0_compaction` refuses to run while any current L0 file is
-/// claimed), silently disabling L0 compaction for the life of the process.
+/// claimed), silently disabling L0 compaction for the life of the process
+/// and hanging `CompactionClaims::wait_until_empty` forever.
 struct CompactionClaim {
-    claims: Arc<Mutex<HashSet<u64>>>,
+    claims: Arc<CompactionClaims>,
     numbers: Vec<u64>,
 }
 
 impl Drop for CompactionClaim {
     fn drop(&mut self) {
-        let mut claimed = self.claims.lock();
-        for num in &self.numbers {
-            claimed.remove(num);
-        }
+        self.claims.release(&self.numbers);
     }
 }
 
@@ -274,8 +317,9 @@ pub struct DB {
     /// doing unlocked I/O. `install_compaction`'s stale-input check already
     /// makes this safe on its own (the loser's output is discarded, never
     /// installed) — this only avoids wasting the loser's merge/compress/
-    /// write work and rate-limiter budget.
-    compacting_files: Arc<Mutex<HashSet<u64>>>,
+    /// write work and rate-limiter budget. The paired condvar lets
+    /// `force_compact_all` wait for in-flight picks to settle.
+    compacting_files: Arc<CompactionClaims>,
     /// Cached L0 file count for fast write-throttle checks.
     /// Updated after flush/compaction. Avoids locking `inner` on every write.
     l0_file_count: Arc<AtomicUsize>,
@@ -631,7 +675,7 @@ impl DB {
         let compaction_notify = Arc::new((StdMutex::new(false), StdCondvar::new()));
         let has_bg_error = Arc::new(AtomicBool::new(false));
         let bg_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let compacting_files: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+        let compacting_files = Arc::new(CompactionClaims::new());
 
         // Wrap the user's compaction filter with lazy-delete support.
         let dead_keys = Arc::new(RwLock::new(HashSet::new()));
@@ -2089,7 +2133,7 @@ impl DB {
         let old_wal = frozen.old_wal_number;
         self.post_flush_cleanup(old_wal).ctx()?;
         if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger
-            && let Err(e) = self.drain_l0()
+            && let Err(e) = self.drain_l0(false)
         {
             // Fatal states: a background error was recorded (e.g. a failed
             // MANIFEST sync inside drain_l0) or the MANIFEST writer is
@@ -2111,9 +2155,12 @@ impl DB {
     /// Run compaction if needed: drains L0, then force-merges every level
     /// (L1..Ln) down to as few files as possible — a full, deliberate
     /// compaction of the whole database, similar in spirit to calling
-    /// `compact_range(None, None)`. For light, incremental L0 relief only
-    /// (e.g. from application code reacting to write throttling), prefer
-    /// relying on background compaction instead of calling this directly.
+    /// `compact_range(None, None)`. Waits for any in-flight background
+    /// compaction to settle first, so entries it filtered before this call
+    /// are still rewritten by this pass. For light, incremental L0 relief
+    /// only (e.g. from application code reacting to write throttling),
+    /// prefer relying on background compaction instead of calling this
+    /// directly.
     pub fn compact(&self) -> Result<()> {
         self.check_usable().ctx()?;
         let _wg = self.write_queue.lock();
@@ -2587,7 +2634,7 @@ impl DB {
             // multi-level database compaction — and does not hold db_mutex
             // for the duration of the merge I/O (drain_l0 follows the
             // standard short-lock pick/install pattern).
-            if let Err(e) = self.drain_l0() {
+            if let Err(e) = self.drain_l0(false) {
                 // The stop trigger is the last line of defense against
                 // unbounded L0 growth. If compaction is failing, admitting
                 // the write would silently disable the stall exactly when it
@@ -3121,15 +3168,24 @@ impl DB {
     /// calls) for the duration of the merge I/O — unlike the previous
     /// `do_compaction`, which held the lock for its entire run. Used by the
     /// inline write-throttle path and by `flush()`'s post-flush trigger,
-    /// neither of which should pay for a full-database compaction.
-    fn drain_l0(&self) -> Result<()> {
+    /// neither of which should pay for a full-database compaction, and by
+    /// `force_compact_all`.
+    ///
+    /// When a pick is blocked because another in-flight compaction has
+    /// claimed the current L0 files, `wait_for_inflight` selects the policy:
+    /// `false` returns immediately (opportunistic callers — the in-flight
+    /// compaction is already doing the work), while `true` waits for the
+    /// claim to settle and re-picks so L0 is genuinely drained on return
+    /// (required by `force_compact_all`, whose level passes would otherwise
+    /// run before L0 data reached them).
+    fn drain_l0(&self, wait_for_inflight: bool) -> Result<()> {
         let force_opts = DbOptions {
             l0_compaction_trigger: 1,
             ..self.options.clone()
         };
         loop {
             // Phase 1: pick + pre-allocate (short lock)
-            let pick = {
+            let (pick, l0_blocked) = {
                 let mut inner = self.inner.lock();
                 let version = inner.versions.current();
                 let mut claimed = self.compacting_files.lock();
@@ -3164,17 +3220,23 @@ impl DB {
                         // Capture the snapshot list under the DB lock,
                         // consistent with the inputs just picked.
                         let active_snaps = self.snapshot_list.as_sorted_vec();
-                        Some((
-                            task,
-                            file_start,
-                            file_limit,
-                            l0_inputs,
-                            is_bottom,
-                            active_snaps,
-                            claimed_numbers,
-                        ))
+                        (
+                            Some((
+                                task,
+                                file_start,
+                                file_limit,
+                                l0_inputs,
+                                is_bottom,
+                                active_snaps,
+                                claimed_numbers,
+                            )),
+                            false,
+                        )
                     }
-                    None => None,
+                    // With `l0_compaction_trigger: 1`, a `None` pick while L0
+                    // is non-empty means every candidate was excluded by an
+                    // in-flight claim — not that L0 is drained.
+                    None => (None, version.l0_file_count() > 0),
                 }
             }; // lock released
             let Some((
@@ -3187,6 +3249,13 @@ impl DB {
                 claimed_numbers,
             )) = pick
             else {
+                if wait_for_inflight && l0_blocked {
+                    // Wait (without holding `inner`) for the in-flight
+                    // compaction to install or discard, then re-pick.
+                    // Breaking here instead would return with L0 undrained.
+                    self.compacting_files.wait_until_empty();
+                    continue;
+                }
                 break;
             };
             // Claim released on every exit (success or `?`) via Drop —
@@ -3283,7 +3352,14 @@ impl DB {
     /// acceptable here since this path is administrative, not the write hot
     /// path that `drain_l0` was split out to protect.
     fn force_compact_all(&self) -> Result<()> {
-        self.drain_l0()?;
+        // Settle in-flight background compactions first. Their merge streams
+        // were filtered when they were picked, so decisions may predate
+        // dead-key registrations (or other filter-state changes) made before
+        // this call. Waiting lets them install — their outputs are then
+        // rewritten by the passes below — or discard, instead of installing
+        // stale-filtered data after this full pass has returned.
+        self.compacting_files.wait_until_empty();
+        self.drain_l0(true)?;
         let force_opts = DbOptions {
             l0_compaction_trigger: 1,
             ..self.options.clone()
