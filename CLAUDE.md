@@ -67,3 +67,4 @@ Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` a
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
 - Unsafe code is concentrated in the skiplist, group-commit/file-lock paths, and the SST readahead syscall; derive the live inventory and follow `.claude/docs/patterns/unsafe-audit.md`
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes
+- **No Co-Authored-By in commits** — never add `Co-Authored-By:` or similar trailers to commit messages; project commits are authored only by the human contributor
