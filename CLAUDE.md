@@ -48,7 +48,7 @@ Supporting documentation in `.claude/docs/`:
 - `technical-patterns.md` — cataloged bug patterns for LSM-Tree/Rust
 - `review-core.md` — systematic review methodology + canonical Subsystem Map (file → subsystem → pattern guide)
 - `false-positive-guide.md` — rules for filtering spurious findings
-- `commit-protocol.md` — canonical atomic validate → commit → final version procedure
+- `commit-protocol.md` — canonical atomic validate → commit → final version + release tag procedure
 - `patterns/` — per-subsystem review guides (compaction, iterator, WAL, SST, memtable, manifest, cache, concurrency, unsafe-audit)
 
 Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` and `/x-fix`; it separates actionable Open findings, accepted Won't Fix risks, and disproven Rejected claims.

@@ -50,16 +50,16 @@ The goal is not a cosmetic zero count at any cost. Correctness wins over an
 over-eager architectural change; every remaining non-open entry must have
 current, concrete reasoning.
 
-## Phase 3: Final gate and version
+## Phase 3: Final gate, version, and tag
 
 Run the commit protocol's final repository gate. Fix any regression in a new
 focused commit. If Rust source changed, bump the patch version exactly once for
-the whole pipeline and commit that release metadata separately as directed by
-the protocol.
+the whole pipeline, commit that release metadata separately, and create the
+annotated release tag as directed by the protocol.
 
-If nothing changed, do not create an empty commit or version bump.
+If nothing changed, do not create an empty commit, version bump, or tag.
 
 ## Output
 
 Report coverage, finding dispositions, validations, every commit hash/subject,
-the version result, and any baseline changes left untouched.
+the version and release-tag result, and any baseline changes left untouched.

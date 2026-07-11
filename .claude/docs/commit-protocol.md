@@ -62,7 +62,7 @@ Run this gate once per unchanged final code state. If it exposes a regression,
 fix that root cause in a new atomic commit and repeat the gate. Documentation-
 only workflows skip Rust validation.
 
-## Single version bump
+## Single version bump and release tag
 
 If the invocation changed tracked `.rs` files:
 
@@ -82,7 +82,7 @@ If the invocation changed tracked `.rs` files:
 `Cargo.lock` is intentionally ignored because MMDB is a library; do not
 force-add it.
 
-Skip the bump when no Rust source changed. Do not create an empty commit.
+Skip the bump and tag when no Rust source changed. Do not create an empty commit.
 
 ## Final state
 

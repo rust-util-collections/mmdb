@@ -65,11 +65,11 @@ After processing the initial backlog:
 3. Stop on no-progress validation loops or unsafe overlap with baseline
    changes; do not stash, reset, or rewrite prior commits.
 
-### 4. Final gate and version
+### 4. Final gate, version, and tag
 
 Run the commit protocol's final repository gate. If any Rust source changed,
-apply its single version-bump policy once for the entire invocation, not once
-per finding.
+apply its single version-bump-and-release-tag policy once for the entire
+invocation, not once per finding.
 
 `docs/audit.md` must finish with no unresolved `## Open` entry unless execution
 is blocked and the blocker is reported. Never add dates or freshness markers.
@@ -77,5 +77,5 @@ is blocked and the blocker is reported. Never add dates or freshness markers.
 ## Output
 
 Report the initial disposition count, fixes, rejected and deferred entries,
-validations, every commit hash/subject, the version result, and untouched
-baseline changes.
+validations, every commit hash/subject, the version and release-tag result, and
+untouched baseline changes.

@@ -62,14 +62,14 @@ Apply the per-unit procedure in `.claude/docs/commit-protocol.md`: format,
 lint, run targeted tests, stage exact paths/hunks, inspect the cached diff, and
 create one new commit. Never amend an earlier commit.
 
-### 4. Final gate and version
+### 4. Final gate, version, and tag
 
 After all behavior commits, execute the commit protocol's final repository gate
-and single version-bump policy. Any regression found after a commit is fixed in
-a new focused commit, never by rewriting history.
+and single version-bump-and-release-tag policy. Any regression found after a
+commit is fixed in a new focused commit, never by rewriting history.
 
 ## Output
 
 Report reviewed files/subsystems, findings fixed, validations run, every commit
-hash/subject, the version result, and any baseline changes intentionally left
-untouched.
+hash/subject, the version and release-tag result, and any baseline changes
+intentionally left untouched.
