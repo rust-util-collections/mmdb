@@ -12,57 +12,235 @@
 
 ## Open
 
-*(none)*
+### [CRITICAL] WAL: zeroed mid-log fragments are accepted as padding
+- **Where**: `src/wal/reader.rs:175-245`, `src/db.rs:396-452`
+- **What**: An all-zero physical-record header is skipped wherever it appears, without proving that the remaining WAL bytes are zero padding.
+- **Why**: If corruption zeros one complete fragment while a later record remains, alignment can be preserved and recovery silently omits the missing acknowledged batch, replays later batches, then deletes the WAL.
+- **Suggested fix**: Treat an all-zero header as terminal padding only when every remaining byte is zero; otherwise return corruption. Add a crash-recovery test with a zeroed middle fragment followed by a valid record.
+
+---
+
+### [HIGH] compaction: source-level range tombstones can be omitted before sequence zeroing
+- **Where**: `src/compaction/leveled.rs:968-1008,1882-1910`, `src/db.rs:1220-1262`
+- **What**: `pick_level_compaction` selects one L1+ source file and expands only into the next level, ignoring sibling files whose range-tombstone end extents overlap the selected source.
+- **Why**: A newer value can be moved deeper and have its sequence zeroed while an older covering tombstone remains in the source level. Reads then trust that shallower tombstone and hide the live value.
+- **Suggested fix**: Close the source-level input set transitively over point and range-tombstone extents before deriving next-level inputs, and include the source level in the bottommost safety check. Add a regression with a tombstone-only sibling covering a selected value file.
+
+---
+
+### [HIGH] iterator: lazy bidirectional direction switching materializes an unbounded window
+- **Where**: `src/iterator/bidi_iter.rs:18-49,129-172,246-265`
+- **What**: After backward iteration resumes forward, a later `next_back()` collects every remaining entry into a `Vec`.
+- **Why**: `next_back() -> next() -> next_back()` on a large database can copy a multi-gigabyte remaining range and abort from OOM instead of continuing to stream.
+- **Suggested fix**: Preserve both frontiers in the resumed state and re-seek backward to the last unconsumed back key instead of collecting. Add a mixed-direction regression that asserts the lazy state remains streaming.
+
+---
+
+### [HIGH] manifest: `CURRENT` can escape the database directory
+- **Where**: `src/manifest/version_set.rs:117-136,268-271`
+- **What**: Recovery joins the unvalidated text from `CURRENT` directly onto `db_path` before parsing the manifest number.
+- **Why**: A crafted or corrupted `CURRENT` containing an absolute path or `..` component can make open read and later truncate a WAL-shaped file outside the database directory.
+- **Suggested fix**: Require an exact `MANIFEST-<u64>` basename, construct the path from the parsed number, and reject every other value before opening it. Test that a traversal value cannot touch a sibling file.
+
+---
+
+### [MEDIUM] cache: fixed segmentation makes valid blocks permanently uncacheable
+- **Where**: `src/cache/block_cache.rs:39-52,129-170,239-289`
+- **What**: The pool always uses 64 Moka segments, each limited to `ceil(total_capacity / 64)`, so an entry larger than one segment's share is rejected even when it fits the total configured capacity.
+- **Why**: A 4 KiB cache cannot retain one normal 4 KiB block, and the default 64 MiB cache permanently misses any valid block larger than 1 MiB. This contradicts the documented pool-global and historical private-cache semantics.
+- **Suggested fix**: Choose the segment count adaptively for small capacities, document the per-segment admission bound for larger blocks, and add regressions for a cache whose capacity equals one normal block.
+
+---
+
+### [MEDIUM] db: explicit `close()` does not quiesce background threads or release the directory lock
+- **Where**: `src/db.rs:142-213,2311-2349,3544-3571`
+- **What**: `close()` marks the handle closed and flushes it, but compaction shutdown, thread joins, and the `LOCK` file release occur only in `Drop`.
+- **Why**: Retaining a closed handle keeps worker threads and the directory flock alive indefinitely, and an in-flight compaction may continue after `close()` reports completion.
+- **Suggested fix**: Share an idempotent shutdown/join helper between `close()` and `Drop`, make the lock file interior-mutable so `close()` can release it, and test reopening while the closed handle is still alive.
+
+---
+
+### [MEDIUM] db: automatic dead-key sweeping is non-convergent
+- **Where**: `src/db.rs:953-992,1843-1866,2216-2293`, `src/compaction/leveled.rs:1473-1506`
+- **What**: The sweep runs one ascending level pass after a one-shot threshold crossing, consumes its flag even when snapshots prevent filtering, and never re-arms for later registrations once the set is already above threshold.
+- **Why**: A newest L0 copy can remain after deeper copies are removed, subsequent dead keys never trigger another sweep, and a snapshot-blocked sweep is permanently lost.
+- **Suggested fix**: Sweep deepest-to-shallowest, request work for every new unique key while above threshold, and retain/re-arm pending work until a snapshot-free pass can apply the filter. Cover multi-level, repeated-registration, and snapshot-release cases.
+
+---
+
+### [MEDIUM] manifest: recovery accepts overlapping L1+ files
+- **Where**: `src/manifest/version_set.rs:209-266,321-359`, `src/db.rs:1213-1273`
+- **What**: Recovery and generic edit application sort L1+ files but never validate the non-overlap invariant required by binary-search reads.
+- **Why**: A malformed but checksum-valid MANIFEST can install overlapping files; point lookup may choose the later file by smallest key and miss a key that exists only in the earlier overlapping file.
+- **Suggested fix**: Validate adjacent L1+ user-key ranges after replay and before applying an edit, returning corruption on overlap. Add live-apply and reopen regressions.
+
+---
+
+### [MEDIUM] manifest: stale edits can regress `last_sequence`
+- **Where**: `src/manifest/version_set.rs:165-176,442-454`
+- **What**: `next_file_number` is advanced with `max`, but `last_sequence` is overwritten directly during both replay and live apply.
+- **Why**: A stale or malformed checksum-valid edit can lower the recovered sequence, causing later writes to reuse lower sequence numbers and lose MVCC precedence to older entries.
+- **Suggested fix**: Keep `last_sequence` monotonic with `max` in both paths and reject values above `MAX_SEQUENCE_NUMBER`. Add a stale-edit regression.
+
+---
+
+### [MEDIUM] SST: entry decoding can consume the restart directory
+- **Where**: `src/sst/block.rs:75-105,379-496`
+- **What**: Entry decoders bound key/value ends against the full block allocation rather than the entry region ending at `restart_offset`.
+- **Why**: A malformed checksum-valid length can make an entry swallow restart offsets and the restart count, returning fabricated value bytes instead of corruption.
+- **Suggested fix**: Pass the entry-region limit into both decode helpers and reject any decoded end beyond it. Add iterator and seek regressions for trailer overrun.
+
+---
+
+### [MEDIUM] SST: zero prefix-filter length can create false negatives
+- **Where**: `src/sst/table_reader/mod.rs:560-629`, `src/sst/table_builder.rs:449-464`
+- **What**: The reader accepts a prefix-filter block paired with `prefix_len == 0`, a combination the writer never emits.
+- **Why**: Every query then probes the filter with the empty prefix; if that bit is absent, the SST is skipped even though it contains matching keys.
+- **Suggested fix**: Reject inconsistent prefix-filter metadata during table open, or conservatively bypass the filter. Add a malformed-metaindex regression.
+
+---
+
+### [MEDIUM] SST: bloom filters can exceed the reader's block-size limit
+- **Where**: `src/sst/filter.rs:23-38`, `src/sst/table_builder.rs:180-194,272-284,436-464`, `src/sst/table_reader/mod.rs:450-473`
+- **What**: Builder size projections and hard checks cover data, index, and range-deletion blocks but omit whole-key and prefix bloom blocks.
+- **Why**: Public option combinations with many small keys or very high `bloom_bits_per_key` can write a filter above 64 MiB; `TableBuilder::finish()` succeeds but `TableReader::open()` rejects the resulting SST.
+- **Suggested fix**: Include projected filter sizes in split decisions and enforce the reader-compatible hard limit before writing either filter block. Add builder-level boundary regressions.
+
+---
+
+### [LOW] CI: tracked correctness suites are not executed
+- **Where**: `.github/workflows/ci.yml:44-55`, `tests/bidi_debug.rs:1-31`, `tests/lazy_delete.rs:1-260`, `tests/shared_cache.rs:1-103`
+- **What**: CI enumerates selected integration targets and omits bidirectional, lazy-delete, and shared-cache tests.
+- **Why**: Regressions in mixed-direction iteration, automatic deletion, or cross-DB cache isolation can merge while every CI job passes.
+- **Suggested fix**: Run the complete debug test set while explicitly skipping only the profiling-only scale test.
+
+---
+
+### [LOW] options: `max_immutable_memtables` is a public no-op
+- **Where**: `src/options.rs:18-21,112-153`, `README.md:54-55`
+- **What**: The option is exposed, defaulted, and printed but never read by the database.
+- **Why**: Callers can tune it without any behavioral effect despite the public claim that accepted configuration knobs are implemented.
+- **Suggested fix**: Document the compatibility no-op and its synchronous-flush reason now, then either remove it in the next major release or implement a real bounded immutable-memtable queue.
+
+---
+
+### [LOW] benchmarks: group-level metadata misstates heterogeneous workloads
+- **Where**: `benches/benchmarks.rs:198-206,257-278,461-501`, `README.md:375-386`
+- **What**: The cold random-read case executes 500 gets while reporting 1,000 elements, range delete reports 10,000 operations for one tombstone write, and same-process page-cache data is described as I/O-bound cold cache.
+- **Why**: Criterion throughput and the README overstate measured work and can mislead performance comparisons.
+- **Suggested fix**: Set throughput per benchmark case, define range-delete units explicitly, rename the small-block-cache cases, and align the README methodology.
+
+---
+
+### [LOW] example: canonical iteration ignores deferred errors
+- **Where**: `examples/basic.rs:48-62`, `src/iterator/db_iter.rs:247-251,927-932`
+- **What**: The example collects or consumes iterators without checking `DBIterator::error()` afterward.
+- **Why**: A deferred SST read failure produces partial output while the canonical example still exits successfully, teaching callers to miss the API's error channel.
+- **Suggested fix**: Retain each iterator, check `error()` after exhaustion, and keep the example compile-tested.
+
+---
+
+### [LOW] docs: comparison table claims the removed iterator pool still exists
+- **Where**: `COMPARISON.md:5-16`, `README.md:364-366`
+- **What**: The MMDB column says "Yes" for an iterator object pool while the same row and migration guide say it was removed.
+- **Why**: The feature matrix gives callers contradictory API and performance expectations.
+- **Suggested fix**: Mark the feature as absent and retain the removal rationale.
+
+---
+
+### [LOW] docs: README presents an incomplete public API inventory
+- **Where**: `README.md:191-282`, `src/lib.rs:24-36`
+- **What**: The section is titled "Public API" and presents `impl DB`, but omits exported methods and types, including `iter_with_options()` even while recommending it in the same block.
+- **Why**: Callers relying on the repository documentation cannot discover supported iteration, batch-overlay, lazy-delete, path, and prefix-step surfaces.
+- **Suggested fix**: Either make the inventory complete or label it as selected API and link prominently to docs.rs, with compile-checked snippets for the recommended omitted paths.
+
+---
+
+### [LOW] tests: `no_slowdown` coverage accepts a broken implementation
+- **Where**: `tests/integration.rs:807-850`
+- **What**: The test records whether a pressured `no_slowdown` write fails, then discards the result and accepts both outcomes.
+- **Why**: An implementation that never rejects stalled writes passes the named regression.
+- **Suggested fix**: Disable background compaction for the setup, deterministically build L0 above the slowdown threshold, and require `InvalidArgument`.
+
+---
+
+### [LOW] tests: property model does not verify final deletions
+- **Where**: `tests/proptest_db.rs:13-80`
+- **What**: The final consistency pass checks only keys still present in the model.
+- **Why**: A deleted key that is never chosen by a later random `Get` can remain visible without failing the property test.
+- **Suggested fix**: Track every generated key and compare the final database result with `model.get()` for both present and absent keys.
+
+---
+
+### [LOW] tests: snapshot-compaction regression omits the snapshot assertion
+- **Where**: `tests/integration.rs:511-580`
+- **What**: The test keeps a snapshot alive across compaction but checks it only before compaction, and its comments still claim snapshots are not tracked.
+- **Why**: A regression that drops versions needed by an active snapshot passes while the test documents obsolete behavior.
+- **Suggested fix**: Assert the snapshot's original values after compaction and update the comments to the current snapshot-retention contract.
 
 ---
 
 ## Won't Fix
 
-### [LOW] rate_limiter: `request()` f64 subtraction is a no-op for values ≳ 2.5e17, theoretical infinite loop
-- **Where**: `src/rate_limiter.rs` (`request`, the `remaining -= chunk` convergence loop)
-- **What**: For a single request of ~hundreds of petabytes, `chunk` can fall below `ULP(remaining)/2`, making the f64 subtraction a no-op and the loop non-terminating. Mathematically confirmed.
-- **Reason**: Not practically reachable. Every call site passes single-entry sizes (internal key + value bytes, bounded by allocatable memory); triggering the loop requires first materializing a ~2.5e17-byte entry in RAM. The module is private, so no external caller can inject an arbitrary value. Guarding would add cost/complexity to a hot path for an input that cannot occur. Revisit if `request()` is ever exposed to sizes not backed by in-memory buffers.
+### [MEDIUM] iterator: seek paths do not overlap cross-source I/O prefetch
+- **Where**: `src/iterator/merge.rs:293-305`, `src/iterator/source.rs:370-382`
+- **What**: Seek entry points synchronously position and decode each source before heap initialization can issue cross-source prefetch hints.
+- **Reason**: A targeted pre-seek hint hook is possible, but `posix_fadvise` is advisory and no controlled cold-cache multi-source benchmark demonstrates a material latency regression. Changing the seek protocol without that evidence would add cross-implementation complexity for an unquantified optimization.
 
 ---
 
-### [LOW] compaction: Near-duplicate merge-loop logic between `execute_sub_compaction_io` and `force_merge_level`
-- **Where**: `src/compaction/leveled.rs` — the tombstone/sequence/snapshot-dedup/filter merge logic (~150 lines) is duplicated nearly verbatim between the two functions.
-- **What**: Both implementations were independently verified correct and mutually consistent (same snapshot-retention algorithm, same sequence-zeroing condition, same filter gating). No functional bug today.
-- **Reason**: Merging two independently-verified, invariant-critical ~150-line blocks (INV-C2, INV-C2a, INV-C3, INV-C6 all converge here) for a maintainability-only, non-functional finding carries disproportionate regression risk relative to its severity. Revisit if a correctness fix is ever needed in one of the two functions — apply the same fix to both, independently re-verified, at that time.
+### [LOW] manifest: file-number arithmetic can overflow at `u64::MAX`
+- **Where**: `src/manifest/version_set.rs:497-509,581-584`
+- **What**: File allocation, reservations, and MANIFEST rotation increment `u64` counters without checked arithmetic.
+- **Reason**: Reaching exhaustion through production allocation requires roughly 1.8e19 file numbers; all reservation counts are bounded by in-memory workload sizes. The failure is mathematically real but not practically reachable. Revisit if identifiers become externally supplied or allocation jumps by unbounded amounts.
 
 ---
 
-### [LOW] SST: Unvalidated `BlockHandle` offset/size flow into readahead arithmetic and the `posix_fadvise` unsafe call
-- **Where**: `src/sst/table_reader/iterator.rs` (`maybe_readahead`, `prefetch_first_block`); consumed by `src/sst/table_reader/mod.rs` (`advise_willneed`)
-- **What**: `maybe_readahead()` computes `len` via unchecked `u64` addition on index-derived `BlockHandle` values before the normal bounds check (which only runs when the block is actually read later). The result is cast `as i64` for the FFI call, which could go negative on a corrupted index, contradicting the SAFETY comment's claim.
-- **Reason**: `posix_fadvise` is a pure advisory hint — its return value is discarded, and a nonsensical offset/length cannot cause memory unsafety; the real bounds check still gates actual reads. Only concrete downside is a possible debug-build overflow panic on a corrupted index block. Low enough risk/impact to defer; revisit if the readahead logic is touched for other reasons.
+### [LOW] rate_limiter: `request()` f64 subtraction can stop converging for enormous values
+- **Where**: `src/rate_limiter.rs:92-124`
+- **What**: For a single request around hundreds of petabytes, `chunk` can fall below half an ULP of `remaining`, making `remaining -= chunk` a no-op and the loop non-terminating.
+- **Reason**: Every production call passes one entry's encoded size, bounded by the 64 MiB write-entry limit and allocatable memory. The private API cannot receive the theoretical trigger.
 
 ---
 
-### [LOW] SST: `Block::new()` restart-count validation can overflow `usize` on 32-bit targets
-- **Where**: `src/sst/block.rs` (restart-count validation in `Block::new()`)
-- **What**: `(num_restarts as usize) * 4 + 4` can overflow a 32-bit `usize` for large corrupted `num_restarts` values, potentially causing an out-of-bounds panic instead of a clean `Error::corruption`.
-- **Reason**: CI only targets `ubuntu-latest` (64-bit x86_64) and `Cargo.toml` has no 32-bit target support; on any 64-bit target this cannot overflow for any `u32` value. Purely a latent portability gap on unsupported targets — revisit if 32-bit target support is ever added.
+### [LOW] compaction: near-duplicate merge-loop logic
+- **Where**: `src/compaction/leveled.rs:657-808,1595-1740`
+- **What**: Normal and forced compaction independently implement closely related tombstone, snapshot, deduplication, filter, and sequence-zeroing logic.
+- **Reason**: Both paths are currently consistent, while extracting one shared state machine across their different sub-range and streaming protocols would carry disproportionate regression risk. Revisit when a correctness change must touch either loop.
 
 ---
 
-### [MEDIUM] iterator: `MergingIterator` seek path (`seek`/`seek_to_first`/`seek_for_prev`) still defeats cross-source I/O-overlap prefetch
-- **Where**: `src/iterator/merge.rs` (`seek`, `seek_to_first`, `seek_for_prev`), `src/iterator/source.rs` (`seek_to`/`seek_for_prev_to`/`seek_to_first_impl`, each combining position+decode into one synchronous call)
-- **What**: Every seek-based entry point (the mechanism `db.rs`'s `iter_with_prefix()` uses internally, and the pattern most of the test suite exercises via `iter.seek(...)`) positions each source sequentially and synchronously decodes its entry before `init_heap()`'s prefetch phase runs, eliminating I/O-overlap for the hot seek path. `LevelIterator::prefetch_first_block()` has been added (fixing the cold-start/no-seek case), but the seek path itself is unchanged.
-- **Reason**: `SeekableIterator`'s trait contract (in `src/iterator/source.rs`) has no split "position-only" phase — every seek implementation combines positioning and decoding into one call. Cleanly separating these would require changing the trait's method signatures/semantics across every implementor (`TableIterator`, `LevelIterator`, `MemTableCursorIter`, boxed/Vec sources), a cross-cutting, moderately invasive change with real regression risk to defer for a dedicated, focused effort rather than bundle into this audit cycle. The immediate, common-case win (cold-start prefetch for `LevelIterator`) has been captured; this residual gap only affects warm I/O-overlap opportunity, not correctness.
+### [LOW] SST: readahead trusts unvalidated `BlockHandle` arithmetic
+- **Where**: `src/sst/table_reader/iterator.rs:701-716,892-900`, `src/sst/table_reader/mod.rs:697-714`
+- **What**: Readahead computes unchecked ranges and casts them to signed syscall arguments before the normal block-read bounds check.
+- **Reason**: `posix_fadvise` is advisory and the actual read remains checked, so the concrete impact is limited to a possible debug overflow panic on corrupted index metadata. Revisit when readahead is otherwise changed.
+
+---
+
+### [LOW] SST: restart-count validation can overflow `usize` on 32-bit targets
+- **Where**: `src/sst/block.rs:75-85`
+- **What**: `(num_restarts as usize) * 4 + 4` can overflow on a 32-bit target for corrupted input.
+- **Reason**: The supported and CI target is 64-bit Linux; no 32-bit support is declared. Revisit if 32-bit targets are added.
 
 ---
 
 ## Rejected
 
-### db: Dead-key sweep `?` on `force_merge_level` error "permanently kills the background compaction thread"
-- **Where**: `src/db.rs` (dead-key sweep block in the background compaction loop)
-- **Claim**: A transient sweep error breaks the thread's main loop, silently and permanently disabling all future compaction.
-- **Reason**: The error path calls `set_error`, which sets `has_bg_error`; from then on every public entry point fails loudly via `check_usable()`. This is the engine's deliberate fail-stop-until-reopen policy, identical to every other background error path (debt-driven picks, hint compactions, flush). Nothing is silent, and "no further compaction" is the intended fail-stop behavior.
+### db: a dead-key sweep error silently kills background compaction
+- **Where**: `src/db.rs:953-1012,2431-2453`
+- **Claim**: Propagating a sweep error permanently disables compaction without surfacing the failure.
+- **Reason**: The thread records the error through `set_error`, sets `has_bg_error`, and every public entry point then fails through `check_usable()`. This is the engine's deliberate fail-stop-until-reopen policy, not a silent loss of maintenance.
 
 ---
 
-### db: Dead-key sweep's L0 pass "never fires the filter because L0 is never bottommost"
-- **Where**: `src/db.rs` (sweep loop starting at level 0), `src/compaction/leveled.rs` (`is_bottommost_level`)
-- **Claim**: `is_bottommost` is always false for L0 when `num_levels > 1`, making the L0 sweep pass useless.
-- **Reason**: `is_bottommost_level` is data-driven, not level-count-driven: it checks whether any deeper level contains files overlapping the inputs. On a settled store whose data sits only in L0 (the scenario the sweep exists for), it returns true and the filter fires at L0. When deeper overlapping data exists, skipping the filter at L0 is required for MVCC correctness. Residual single-file no-op rewrites are separately eliminated by the `force_merge_level` early return.
+### db: the L0 dead-key sweep can never apply its filter
+- **Where**: `src/db.rs:953-992`, `src/compaction/leveled.rs:1882-1910`
+- **Claim**: L0 is never bottommost when the database has multiple configured levels, so its sweep pass is useless.
+- **Reason**: Bottommost status is data-driven. A settled store with no deeper overlap can filter L0; when deeper overlap exists, retaining the L0 entry is required until the deeper data is handled. The actionable defect is the sweep's non-convergent ordering and scheduling, recorded above.
+
+---
+
+### manifest: additions-before-deletions diverge from recovery for production edits
+- **Where**: `src/manifest/version_set.rs:178-232,321-399`, `src/compaction/leveled.rs:1078-1102,1255-1284`
+- **Claim**: A current edit can delete and re-add the same file number at the same level, causing live apply and replay to produce different versions.
+- **Reason**: Every production edit either moves a file to a different level, allocates fresh output numbers, adds flush files only, or writes a full snapshot without deletions. No caller can produce the same-level collision required by the claim.
