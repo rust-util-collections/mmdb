@@ -12,14 +12,6 @@
 
 ## Open
 
-### [HIGH] manifest: `CURRENT` can escape the database directory
-- **Where**: `src/manifest/version_set.rs:117-136,268-271`
-- **What**: Recovery joins the unvalidated text from `CURRENT` directly onto `db_path` before parsing the manifest number.
-- **Why**: A crafted or corrupted `CURRENT` containing an absolute path or `..` component can make open read and later truncate a WAL-shaped file outside the database directory.
-- **Suggested fix**: Require an exact `MANIFEST-<u64>` basename, construct the path from the parsed number, and reject every other value before opening it. Test that a traversal value cannot touch a sibling file.
-
----
-
 ### [MEDIUM] cache: fixed segmentation makes valid blocks permanently uncacheable
 - **Where**: `src/cache/block_cache.rs:39-52,129-170,239-289`
 - **What**: The pool always uses 64 Moka segments, each limited to `ceil(total_capacity / 64)`, so an entry larger than one segment's share is rejected even when it fits the total configured capacity.

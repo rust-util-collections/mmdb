@@ -59,6 +59,29 @@ pub struct VersionSet {
 }
 
 impl VersionSet {
+    fn parse_manifest_number(manifest_name: &str) -> Result<u64> {
+        let digits = manifest_name
+            .strip_prefix("MANIFEST-")
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or_else(|| {
+                Error::corruption(format!(
+                    "CURRENT contains invalid MANIFEST name: {manifest_name:?}"
+                ))
+            })?;
+        let manifest_number = digits.parse::<u64>().map_err(|_| {
+            Error::corruption(format!(
+                "CURRENT MANIFEST number is out of range: {manifest_name:?}"
+            ))
+        })?;
+        let canonical_name = format!("MANIFEST-{manifest_number:06}");
+        if manifest_name != canonical_name {
+            return Err(Error::corruption(format!(
+                "CURRENT contains non-canonical MANIFEST name: {manifest_name:?}"
+            )));
+        }
+        Ok(manifest_number)
+    }
+
     /// Create a new VersionSet (for a fresh database). Test-only wrapper.
     #[cfg(test)]
     pub(crate) fn create(db_path: &Path, num_levels: usize) -> Result<Self> {
@@ -119,14 +142,9 @@ impl VersionSet {
         let manifest_name = fs::read_to_string(&current_path)
             .map_err(|e| Error::corruption(format!("cannot read CURRENT: {}", e)))
             .ctx()?;
-        let manifest_name = manifest_name.trim();
-        let manifest_path = db_path.join(manifest_name);
-
-        // Parse manifest number from name
-        let manifest_number = manifest_name
-            .strip_prefix("MANIFEST-")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(1);
+        let manifest_name = manifest_name.trim_end_matches(['\r', '\n']);
+        let manifest_number = Self::parse_manifest_number(manifest_name).ctx()?;
+        let manifest_path = db_path.join(format!("MANIFEST-{manifest_number:06}"));
 
         // Replay MANIFEST records in two passes:
         // Pass 1: Collect all edits to determine the final file set.
@@ -769,6 +787,39 @@ mod tests {
         // Recovery should succeed for a clean (empty) DB
         let vs = VersionSet::recover(path, 7).unwrap();
         assert_eq!(vs.current().total_files(), 0);
+    }
+
+    #[test]
+    fn test_recovery_rejects_invalid_current_name_without_modifying_other_file() {
+        use std::io::Write;
+
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("db");
+        fs::create_dir(&db_path).unwrap();
+        drop(VersionSet::create(&db_path, 7).unwrap());
+
+        let source_manifest = db_path.join("MANIFEST-000001");
+        let other_file = root.path().join("other-file");
+        let mut other_bytes = fs::read(source_manifest).unwrap();
+        other_bytes.extend_from_slice(b"torn");
+        let mut file = fs::File::create(&other_file).unwrap();
+        file.write_all(&other_bytes).unwrap();
+        file.sync_all().unwrap();
+
+        fs::write(db_path.join("CURRENT"), "../other-file\n").unwrap();
+        let err = match VersionSet::recover(&db_path, 7) {
+            Ok(_) => panic!("recovery should reject an invalid CURRENT name"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("invalid MANIFEST name"),
+            "unexpected recovery error: {err}"
+        );
+        assert_eq!(
+            fs::read(&other_file).unwrap(),
+            other_bytes,
+            "an invalid CURRENT name must not modify an unrelated file"
+        );
     }
 
     #[test]
