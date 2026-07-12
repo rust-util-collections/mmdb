@@ -12,44 +12,57 @@
 
 ## Open
 
-*(none)*
+### [MEDIUM] db: `close()` can hide a recorded fail-stop error
+- **Where**: `src/db.rs:2451-2486,2583-2605,2898-2955`
+- **What**: `close()` reports only failures from its own flush and WAL sync, without consulting the background-error or poisoned-MANIFEST state.
+- **Why**: An inline auto-flush can fail after rotating the active memtable, record a fail-stop error, and still return success for the already-committed write. A subsequent `close()` then sees an empty active memtable, syncs the new WAL, and returns `Ok(())`, so explicit shutdown loses the only error signal for the unresolved immutable memtable.
+- **Suggested fix**: After shutdown work completes, return the existing fail-stop error when no direct close error took precedence; share the lookup with `check_usable()` and cover background-error and MANIFEST-poison cases.
+
+---
+
+### [LOW] SST: readahead arithmetic trusts malformed block handles
+- **Where**: `src/sst/table_reader/iterator.rs:705-721,901-909`, `src/sst/table_reader/mod.rs:708-725`
+- **What**: Readahead computes block ranges with unchecked `u64` addition/subtraction and casts them to signed syscall arguments before the normal block-read bounds check.
+- **Why**: A malformed index handle can overflow or reverse the advisory range, causing a debug-build panic before the checked read path reports corruption. Release builds wrap the advisory arguments, but the hint is optional and its syscall result is discarded.
+- **Suggested fix**: Use checked range arithmetic and checked signed conversions, skip invalid hints, and add focused malformed-handle tests.
+
+---
+
+### [LOW] docs: `make all` is documented as running `check`
+- **Where**: `README.md:391-400`, `Makefile:1-17`
+- **What**: The README says `make all` runs `fmt + lint + check + test`, while the target depends only on `fmt`, `lint`, and `test`.
+- **Why**: Contributors relying on the documented aggregate command may assume `cargo check` and `cargo check --tests` ran when they did not.
+- **Suggested fix**: Remove `check` from the README description so it matches the Makefile and `CLAUDE.md`.
 
 ---
 
 ## Won't Fix
 
 ### [MEDIUM] iterator: seek paths do not overlap cross-source I/O prefetch
-- **Where**: `src/iterator/merge.rs:293-305`, `src/iterator/source.rs:370-382`
-- **What**: Seek entry points synchronously position and decode each source before heap initialization can issue cross-source prefetch hints.
-- **Reason**: A targeted pre-seek hint hook is possible, but `posix_fadvise` is advisory and no controlled cold-cache multi-source benchmark demonstrates a material latency regression. Changing the seek protocol without that evidence would add cross-implementation complexity for an unquantified optimization.
+- **Where**: `src/iterator/merge.rs:243-305`, `src/iterator/source.rs:370-382`
+- **What**: Explicit seeks and bidirectional direction switches synchronously position and decode each source before heap initialization can issue cross-source prefetch hints.
+- **Reason**: SST index entries are already memory-resident, so a targeted pre-seek hint phase is feasible, and direction switches make the path warmer than explicit seeks alone. However, `posix_fadvise` is advisory and no controlled cold-cache multi-source benchmark demonstrates a material latency regression; changing the protocol without that evidence remains disproportionate.
 
 ---
 
 ### [LOW] manifest: file-number arithmetic can overflow at `u64::MAX`
-- **Where**: `src/manifest/version_set.rs:497-509,581-584`
+- **Where**: `src/manifest/version_set.rs:565-577,641-651`
 - **What**: File allocation, reservations, and MANIFEST rotation increment `u64` counters without checked arithmetic.
 - **Reason**: Reaching exhaustion through production allocation requires roughly 1.8e19 file numbers; all reservation counts are bounded by in-memory workload sizes. The failure is mathematically real but not practically reachable. Revisit if identifiers become externally supplied or allocation jumps by unbounded amounts.
 
 ---
 
 ### [LOW] rate_limiter: `request()` f64 subtraction can stop converging for enormous values
-- **Where**: `src/rate_limiter.rs:92-124`
+- **Where**: `src/rate_limiter.rs:78-107,145-178`
 - **What**: For a single request around hundreds of petabytes, `chunk` can fall below half an ULP of `remaining`, making `remaining -= chunk` a no-op and the loop non-terminating.
 - **Reason**: Every production call passes one entry's encoded size, bounded by the 64 MiB write-entry limit and allocatable memory. The private API cannot receive the theoretical trigger.
 
 ---
 
 ### [LOW] compaction: near-duplicate merge-loop logic
-- **Where**: `src/compaction/leveled.rs:657-808,1595-1740`
+- **Where**: `src/compaction/leveled.rs:610-853,1563-1830`
 - **What**: Normal and forced compaction independently implement closely related tombstone, snapshot, deduplication, filter, and sequence-zeroing logic.
 - **Reason**: Both paths are currently consistent, while extracting one shared state machine across their different sub-range and streaming protocols would carry disproportionate regression risk. Revisit when a correctness change must touch either loop.
-
----
-
-### [LOW] SST: readahead trusts unvalidated `BlockHandle` arithmetic
-- **Where**: `src/sst/table_reader/iterator.rs:701-716,892-900`, `src/sst/table_reader/mod.rs:697-714`
-- **What**: Readahead computes unchecked ranges and casts them to signed syscall arguments before the normal block-read bounds check.
-- **Reason**: `posix_fadvise` is advisory and the actual read remains checked, so the concrete impact is limited to a possible debug overflow panic on corrupted index metadata. Revisit when readahead is otherwise changed.
 
 ---
 
