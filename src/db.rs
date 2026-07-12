@@ -2449,6 +2449,9 @@ impl DB {
     }
 
     /// Close the database.
+    ///
+    /// Resources are released even when this returns a flush, sync, or
+    /// previously recorded fail-stop error.
     pub fn close(&self) -> Result<()> {
         if self
             .closed
@@ -2479,6 +2482,10 @@ impl DB {
         drop(inner);
         drop(_wg);
         self.shutdown_background_and_release_resources();
+
+        if first_error.is_none() {
+            first_error = self.fail_stop_error();
+        }
 
         match first_error {
             Some(e) => Err(e),
@@ -2556,6 +2563,22 @@ impl DB {
         self.has_bg_error.store(true, Ordering::Release);
     }
 
+    fn fail_stop_error(&self) -> Option<Error> {
+        if self.has_bg_error.load(Ordering::Acquire)
+            && let Some(ref msg) = *self.bg_error.lock()
+        {
+            return Some(Error::background(msg.clone()));
+        }
+        if self.manifest_poisoned.load(Ordering::Acquire) {
+            return Some(Error::corruption(
+                "MANIFEST writer poisoned by an earlier write failure; \
+                 reopen the database to recover"
+                    .to_string(),
+            ));
+        }
+        None
+    }
+
     /// Periodically check read-level samples and generate compaction hints.
     /// Called every 1024 reads from get_with_options.
     fn maybe_check_read_compaction(&self) {
@@ -2584,23 +2607,8 @@ impl DB {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::db_closed());
         }
-        // Fast path: only lock if the error flag is set.
-        if self.has_bg_error.load(Ordering::Acquire)
-            && let Some(ref msg) = *self.bg_error.lock()
-        {
-            return Err(Error::background(msg.clone()));
-        }
-        // A poisoned MANIFEST writer is a fail-stop condition even when no
-        // background error was recorded (e.g. a rotation's directory fsync
-        // failed inside `maybe_compact_manifest`, which must not surface an
-        // error to its caller). Checked after `bg_error` so the richer
-        // message wins when both are set.
-        if self.manifest_poisoned.load(Ordering::Acquire) {
-            return Err(Error::corruption(
-                "MANIFEST writer poisoned by an earlier write failure; \
-                 reopen the database to recover"
-                    .to_string(),
-            ));
+        if let Some(error) = self.fail_stop_error() {
+            return Err(error);
         }
         Ok(())
     }
@@ -3755,6 +3763,7 @@ impl Drop for Snapshot<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ErrorKind;
 
     #[test]
     fn dead_key_sweep_scheduler_preserves_requests_queued_while_running() {
@@ -3898,6 +3907,32 @@ mod tests {
 
         let reopened = open_test_db(dir.path());
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"val".to_vec()));
+    }
+
+    #[test]
+    fn test_close_reports_existing_background_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.set_bg_error("simulated auto-flush failure".to_string());
+
+        let err = db.close().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Background);
+        assert_eq!(err.message(), "simulated auto-flush failure");
+        assert!(db.compaction_handles.lock().is_empty());
+        assert!(db.lock_file.lock().is_none());
+    }
+
+    #[test]
+    fn test_close_reports_poisoned_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.manifest_poisoned.store(true, Ordering::Release);
+
+        let err = db.close().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err.message().contains("MANIFEST writer poisoned"));
+        assert!(db.compaction_handles.lock().is_empty());
+        assert!(db.lock_file.lock().is_none());
     }
 
     #[test]

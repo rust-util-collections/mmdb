@@ -12,14 +12,6 @@
 
 ## Open
 
-### [MEDIUM] db: `close()` can hide a recorded fail-stop error
-- **Where**: `src/db.rs:2451-2486,2583-2605,2898-2955`
-- **What**: `close()` reports only failures from its own flush and WAL sync, without consulting the background-error or poisoned-MANIFEST state.
-- **Why**: An inline auto-flush can fail after rotating the active memtable, record a fail-stop error, and still return success for the already-committed write. A subsequent `close()` then sees an empty active memtable, syncs the new WAL, and returns `Ok(())`, so explicit shutdown loses the only error signal for the unresolved immutable memtable.
-- **Suggested fix**: After shutdown work completes, return the existing fail-stop error when no direct close error took precedence; share the lookup with `check_usable()` and cover background-error and MANIFEST-poison cases.
-
----
-
 ### [LOW] SST: readahead arithmetic trusts malformed block handles
 - **Where**: `src/sst/table_reader/iterator.rs:705-721,901-909`, `src/sst/table_reader/mod.rs:708-725`
 - **What**: Readahead computes block ranges with unchecked `u64` addition/subtraction and casts them to signed syscall arguments before the normal block-read bounds check.
