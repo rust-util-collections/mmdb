@@ -12,14 +12,6 @@
 
 ## Open
 
-### [LOW] SST: readahead arithmetic trusts malformed block handles
-- **Where**: `src/sst/table_reader/iterator.rs:705-721,901-909`, `src/sst/table_reader/mod.rs:708-725`
-- **What**: Readahead computes block ranges with unchecked `u64` addition/subtraction and casts them to signed syscall arguments before the normal block-read bounds check.
-- **Why**: A malformed index handle can overflow or reverse the advisory range, causing a debug-build panic before the checked read path reports corruption. Release builds wrap the advisory arguments, but the hint is optional and its syscall result is discarded.
-- **Suggested fix**: Use checked range arithmetic and checked signed conversions, skip invalid hints, and add focused malformed-handle tests.
-
----
-
 ### [LOW] docs: `make all` is documented as running `check`
 - **Where**: `README.md:391-400`, `Makefile:1-17`
 - **What**: The README says `make all` runs `fmt + lint + check + test`, while the target depends only on `fmt`, `lint`, and `test`.

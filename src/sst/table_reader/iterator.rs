@@ -2,11 +2,26 @@ use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::Result;
 use crate::sst::block::{Block, decode_entry_reuse};
+use crate::sst::format::BlockHandle;
 use crate::types::{LazyValue, compare_internal_key, user_key};
 
 pub use crate::sst::format::BLOCK_TRAILER_SIZE;
 
 use super::{IndexEntries, IndexEntry, TableReader};
+
+fn checked_readahead_range(
+    first_handle: BlockHandle,
+    last_handle: BlockHandle,
+) -> Option<(u64, u64)> {
+    if last_handle.offset < first_handle.offset {
+        return None;
+    }
+    let end = last_handle
+        .offset
+        .checked_add(last_handle.size)?
+        .checked_add(BLOCK_TRAILER_SIZE as u64)?;
+    Some((first_handle.offset, end.checked_sub(first_handle.offset)?))
+}
 
 pub struct TableIterator {
     reader: Arc<TableReader>,
@@ -715,10 +730,9 @@ impl TableIterator {
         // Compute the file range covering the upcoming blocks
         let first_handle = index_entries[start].handle;
         let last_handle = index_entries[end - 1].handle;
-        let offset = first_handle.offset;
-        let len = (last_handle.offset + last_handle.size + BLOCK_TRAILER_SIZE as u64) - offset;
-
-        self.reader.advise_willneed(offset, len);
+        if let Some((offset, len)) = checked_readahead_range(first_handle, last_handle) {
+            self.reader.advise_willneed(offset, len);
+        }
     }
 }
 
@@ -902,11 +916,9 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.ensure_index();
         if let Some(index) = self.index_entries.as_ref()
             && let Some(entry) = index.first()
+            && let Some((offset, len)) = checked_readahead_range(entry.handle, entry.handle)
         {
-            self.reader.advise_willneed(
-                entry.handle.offset,
-                entry.handle.size + BLOCK_TRAILER_SIZE as u64,
-            );
+            self.reader.advise_willneed(offset, len);
         }
     }
 
@@ -1010,6 +1022,19 @@ mod tests {
         }
         builder.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn test_checked_readahead_range_rejects_malformed_handles() {
+        let first = BlockHandle::new(100, 10);
+        let last = BlockHandle::new(120, 20);
+        assert_eq!(checked_readahead_range(first, last), Some((100, 45)));
+
+        let reversed = BlockHandle::new(90, 20);
+        assert_eq!(checked_readahead_range(first, reversed), None);
+
+        let overflowing = BlockHandle::new(120, u64::MAX);
+        assert_eq!(checked_readahead_range(first, overflowing), None);
     }
 
     #[test]

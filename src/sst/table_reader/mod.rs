@@ -711,19 +711,17 @@ impl TableReader {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
+            let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
+                return;
+            };
             if let Ok(file) = self.open_file() {
                 // SAFETY: `posix_fadvise` is an advisory hint with no safety
                 // invariants beyond a valid fd. The fd is obtained from a live
                 // `File` via `AsRawFd` and remains valid for the `MutexGuard`
-                // lifetime. The offset and length are derived from SST block
-                // handles and cannot be negative.
+                // lifetime. Checked conversions keep offset and length
+                // non-negative in the platform `off_t` representation.
                 unsafe {
-                    libc::posix_fadvise(
-                        file.as_raw_fd(),
-                        offset as i64,
-                        len as i64,
-                        libc::POSIX_FADV_WILLNEED,
-                    );
+                    libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED);
                 }
             }
         }
