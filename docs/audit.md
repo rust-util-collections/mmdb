@@ -12,11 +12,7 @@
 
 ## Open
 
-### [LOW] docs: `make all` is documented as running `check`
-- **Where**: `README.md:391-400`, `Makefile:1-17`
-- **What**: The README says `make all` runs `fmt + lint + check + test`, while the target depends only on `fmt`, `lint`, and `test`.
-- **Why**: Contributors relying on the documented aggregate command may assume `cargo check` and `cargo check --tests` ran when they did not.
-- **Suggested fix**: Remove `check` from the README description so it matches the Makefile and `CLAUDE.md`.
+*(none)*
 
 ---
 

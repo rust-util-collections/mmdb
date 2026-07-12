@@ -393,7 +393,7 @@ v4.0 is a design-level cleanup release. Breaking changes:
 ```bash
 cargo build
 cargo test               # 250+ tests (unit + integration + e2e + proptest)
-make all                 # fmt + lint + check + test
+make all                 # fmt + lint + test
 make bench               # criterion benchmarks (warm + small-cache scenarios)
 cargo bench -- "small_cache" # small block-cache benchmarks only
 cargo bench -- "warm"    # warm-cache benchmarks only
