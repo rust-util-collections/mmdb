@@ -357,37 +357,6 @@ See [COMPARISON.md](COMPARISON.md) for a detailed feature-by-feature comparison 
 
 ---
 
-## Migrating 3.x → 4.0
-
-v4.0 is a design-level cleanup release. Breaking changes:
-
-1. **Typed errors replace `ruc` chains.** `Result<T>` is now
-   `Result<T, mmdb::Error>`; match on `err.kind()` (`ErrorKind`). Errors still
-   carry a full per-hop `file:line:column` propagation trace (rendered by
-   `Display`/`Debug`), plus `std::error::Error::source()`, `Clone`, and `Sync`
-   — a strict superset of the old `Box<dyn RucError>` payload. Code that only
-   propagates/prints errors (incl. `ruc`'s `.c(d!())` on the caller side)
-   keeps working since `Error: Display + Debug + Send + Sync`.
-2. **Internal modules are private.** Import everything from the crate root
-   (e.g. `mmdb::CompressionType`, not `mmdb::sst::format::CompressionType`).
-3. **No-op "compatibility" options removed** from `DbOptions`
-   (`cache_index_and_filter_blocks`, `max_write_buffer_number`,
-   `level_compaction_dynamic_level_bytes`, `allow_concurrent_memtable_write`,
-   `memtable_prefix_bloom_ratio`), `ReadOptions` (`verify_checksums`,
-   `readahead_size`, `total_order_seek`, `pin_data`) and `WriteOptions`
-   (`low_pri`). Delete them from struct literals. `ReadOptions::fill_cache`
-   remains and is now **actually implemented** (checksums are always
-   verified).
-4. **Iterator pool removed.** `pool_return()` and `PooledIterator` are gone —
-   just drop iterators.
-5. **RAII-only snapshots.** `snapshot_seq()`/`release_snapshot()` are private;
-   use `let snap = db.snapshot();` and `snap.read_options()` /
-   `snap.sequence()`.
-6. **`write_with_options(&WriteOptions, WriteBatch)`** — options now come
-   first, consistent with every other `*_with_options` method.
-
----
-
 ## Build & Test
 
 ```bash
