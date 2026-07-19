@@ -453,6 +453,18 @@ impl DB {
             )));
         }
 
+        // The slowdown window must precede the stop trigger. With
+        // slowdown > stop, normal writes block at the stop trigger before
+        // any slowdown delay can engage, so the configured window is
+        // unreachable — reject the misconfiguration loudly instead of
+        // silently reinterpreting it at write time.
+        if options.l0_slowdown_trigger > options.l0_stop_trigger {
+            return Err(Error::invalid_argument(format!(
+                "l0_slowdown_trigger ({}) must be <= l0_stop_trigger ({})",
+                options.l0_slowdown_trigger, options.l0_stop_trigger
+            )));
+        }
+
         if options.create_if_missing {
             fs::create_dir_all(&path).ctx()?;
         } else if !path.exists() {
@@ -2882,17 +2894,13 @@ impl DB {
         }
 
         if write_options.no_slowdown {
-            // A no_slowdown write must fail fast whenever a blocking path
-            // would engage: the slowdown delay *or* the stop-trigger drain.
-            // Checking only the slowdown trigger would let these writes
-            // bypass the L0 stop entirely when the store is configured with
-            // l0_slowdown_trigger > l0_stop_trigger.
+            // A no_slowdown write fails fast whenever a blocking path would
+            // engage. Open-time validation guarantees
+            // l0_slowdown_trigger <= l0_stop_trigger, so the slowdown
+            // trigger is the first threshold at which either blocking path
+            // (the slowdown delay or the stop-trigger drain) can activate.
             let l0_count = self.l0_file_count.load(Ordering::Relaxed);
-            let throttle_floor = self
-                .options
-                .l0_slowdown_trigger
-                .min(self.options.l0_stop_trigger);
-            if l0_count >= throttle_floor {
+            if l0_count >= self.options.l0_slowdown_trigger {
                 return Err(Error::invalid_argument(
                     "write stalled: no_slowdown is set".to_string(),
                 ));

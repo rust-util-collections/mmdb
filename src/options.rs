@@ -48,8 +48,10 @@ pub struct DbOptions {
     /// Live Versions and iterators can pin additional readers.
     pub max_open_files: u64,
     /// Number of L0 files that triggers write slowdown.
+    /// Must be <= `l0_stop_trigger` (validated at [`crate::DB::open`]).
     pub l0_slowdown_trigger: usize,
     /// Number of L0 files that stops writes until compaction completes.
+    /// Must be >= `l0_slowdown_trigger` (validated at [`crate::DB::open`]).
     pub l0_stop_trigger: usize,
     /// Optional rate limiter for compaction writes (bytes/sec). 0 = no limit.
     pub rate_limiter_bytes_per_sec: u64,
