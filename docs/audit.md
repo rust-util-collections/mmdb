@@ -50,3 +50,68 @@
 - **Where**: `src/sst/block.rs:75-85`
 - **What**: `(num_restarts as usize) * 4 + 4` can overflow on a 32-bit target for corrupted input.
 - **Reason**: The supported and CI target is 64-bit Linux; no 32-bit support is declared. Revisit if 32-bit targets are added.
+
+---
+
+### [VERY LOW] memtable: skiplist node destructors skipped if `all_nodes.push` unwinds after `ptr::write`
+- **Where**: `src/memtable/skiplist_impl.rs:225-243`
+- **What**: If the `all_nodes` bookkeeping push unwound between `ptr::write` initializing a node and the push completing, the node's key/value heap allocations would never be dropped.
+- **Reason**: `Vec::push` aborts via `handle_alloc_error` on allocation failure, and its capacity-overflow panic requires `len > isize::MAX`; no unwinding path reaches the window on supported targets. Reordering the unsafe insert protocol to close an unreachable leak carries more regression risk than value.
+
+---
+
+### [MEDIUM] API: `WriteBatch` has no entry-count or aggregate-size cap
+- **Where**: `src/types.rs` (WriteBatch), `src/db.rs` (`write_batch_inner`)
+- **What**: A caller can assemble arbitrarily large batches; the write path encodes the whole batch as one WAL record and applies it under the write lock.
+- **Reason**: Batch memory is allocated by the caller before `write()` is ever reached, so an engine-side cap cannot protect the process — it only adds config surface. Engine invariants are protected by the per-entry caps (`MAX_USER_KEY_SIZE`, `MAX_WRITE_ENTRY_SIZE`) and the WAL u32 entry-count guard; the transient WAL-encode duplication is bounded by the caller's own batch size.
+
+---
+
+### [MEDIUM] API: snapshots and iterators are uncapped pinning resources
+- **Where**: `src/db.rs` (`SnapshotList`, iterator constructors)
+- **What**: Every live snapshot/iterator pins a SuperVersion (memtables, SST readers); nothing limits how many a caller may hold.
+- **Reason**: These are caller-owned RAII handles — the standard LSM engine contract (RocksDB likewise imposes no cap). An engine-side limit would turn application handle leaks into spurious engine errors instead of a diagnosable application defect.
+
+---
+
+### [MEDIUM] options: no global memory budget across subsystems
+- **Where**: `src/options.rs` (`DbOptions`)
+- **What**: There is no `max_total_memory`-style option enforcing one budget across memtables, caches, iterators, and compaction.
+- **Reason**: Cross-subsystem budget accounting is a feature request, not a defect; each subsystem is individually bounded and documented (`write_buffer_size`, `block_cache_capacity`, `max_open_files`, rate limiter). Revisit if a hosting environment requires hard aggregate limits.
+
+---
+
+### [LOW] options: `num_levels` accepts arbitrarily large values
+- **Where**: `src/options.rs:36`, `src/db.rs` (open-time validation)
+- **What**: Only `num_levels >= 2` is validated; a huge value allocates per-level `Vec` headers in every `Version` and one merge source per level in every iterator.
+- **Reason**: The cost is linear, small, and entirely self-inflicted configuration; introducing an upper bound now could refuse to open stores created with larger values. Revisit if per-level state stops being O(1).
+
+---
+
+## Rejected
+
+### [MEDIUM] WAL: `WalWriter` needs a `Drop` impl to avoid losing buffered records
+- **Where**: `src/wal/writer.rs:11-15`
+- **What**: Claim: `BufWriter` discards its buffer on drop, so a `WalWriter` dropped without an explicit flush silently loses up to one buffer of records.
+- **Reason**: The premise is false — `std::io::BufWriter`'s `Drop` flushes the buffer (only errors are ignored, per its documentation). Independently, every commit path flushes or syncs the WAL before acknowledging a write, so drop-time behavior only concerns unacknowledged data on panic unwind.
+
+---
+
+### [HIGH] WAL: unbounded growth without rotation
+- **Where**: `src/wal/writer.rs`, `src/db.rs` (`freeze_memtable_sync`)
+- **What**: Claim: nothing rotates the active WAL, so it can grow until the disk fills.
+- **Reason**: The WAL is rotated at every memtable freeze (`freeze_memtable_sync` creates the next WAL), and the write path freezes synchronously once `approximate_size() >= write_buffer_size` — writers block during the flush, so the active WAL is bounded by roughly `write_buffer_size` plus one batch. Retired WALs are deleted in `post_flush_cleanup`.
+
+---
+
+### [MEDIUM] memtable: range tombstones evade `approximate_size` accounting
+- **Where**: `src/memtable/mod.rs:72-76`
+- **What**: Claim: `delete_range` entries are nearly free in `approximate_size()`, so unbounded range-deletion volume never triggers a flush.
+- **Reason**: `MemTable::put` already accounts the duplicated begin/end keys plus `MemRangeTombstone` struct overhead for every `RangeDeletion` entry, in addition to the skiplist entry itself; sustained `delete_range` traffic advances the flush threshold like any other write.
+
+---
+
+### [MEDIUM] write path: group-commit queue depth is unbounded
+- **Where**: `src/db.rs` (`WriteQueueState`)
+- **What**: Claim: the `VecDeque<*mut WriteRequest>` grows without limit, allowing unbounded memory growth under write pressure.
+- **Reason**: Each queue entry is a raw pointer to a *blocked* caller's stack frame; a thread enqueues at most one request and then waits on the condvar until the leader completes it. Queue depth therefore equals the number of concurrently blocked writer threads — the caller's thread budget — and cannot accumulate beyond it.
