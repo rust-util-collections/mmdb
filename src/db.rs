@@ -45,8 +45,10 @@ use crate::types::{
 use crate::wal::{WalReader, WalWriter};
 
 /// Maximum number of dead-key registrations probed for auto-pruning after
-/// each flush. Bounds the extra read work the flush path performs; explicit
-/// `compact()` / `compact_range()` calls prune without a cap.
+/// each flush. Bounds the extra read work per pass; the probes run off the
+/// writer-serializing paths (explicit `flush()` prunes after releasing the
+/// write-queue lock; an auto-flush leader prunes after waking its waiters).
+/// Explicit `compact()` / `compact_range()` calls prune without a cap.
 const DEAD_KEY_PRUNE_PER_FLUSH: usize = 1024;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2186,33 +2188,38 @@ impl DB {
     /// L0 stop trigger and the background thread's fail-stop policy.
     pub fn flush(&self) -> Result<()> {
         self.check_usable().ctx()?;
-        let _wg = self.write_queue.lock(); // serialize with writers
-        let mut inner = self.inner.lock();
-        if inner.active_memtable.is_empty() {
-            return Ok(());
-        }
-        let frozen = self.freeze_memtable_sync(&mut inner).ctx()?;
-        drop(inner); // release lock during SST write
-        self.flush_and_install_frozen(&frozen).ctx()?;
-        let old_wal = frozen.old_wal_number;
-        self.post_flush_cleanup(old_wal).ctx()?;
-        if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger
-            && let Err(e) = self.drain_l0(false)
         {
-            // Fatal states: a background error was recorded (e.g. a failed
-            // MANIFEST sync inside drain_l0) or the MANIFEST writer is
-            // poisoned. Both mean the engine must fail-stop, so propagate.
-            let fatal = self.has_bg_error.load(Ordering::Acquire)
-                || self.manifest_poisoned.load(Ordering::Acquire);
-            if fatal {
-                return Err(e).ctx();
+            let _wg = self.write_queue.lock(); // serialize with writers
+            let mut inner = self.inner.lock();
+            if inner.active_memtable.is_empty() {
+                return Ok(());
             }
-            // Non-fatal: the failed step was rejected wholesale before
-            // anything was persisted (log_and_apply's error contract) and
-            // its output files were already cleaned up. The flush itself —
-            // the caller's durability request — has fully succeeded.
-            tracing::warn!("post-flush L0 drain failed (will retry): {}", e);
+            let frozen = self.freeze_memtable_sync(&mut inner).ctx()?;
+            drop(inner); // release lock during SST write
+            self.flush_and_install_frozen(&frozen).ctx()?;
+            let old_wal = frozen.old_wal_number;
+            self.post_flush_cleanup(old_wal).ctx()?;
+            if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger
+                && let Err(e) = self.drain_l0(false)
+            {
+                // Fatal states: a background error was recorded (e.g. a failed
+                // MANIFEST sync inside drain_l0) or the MANIFEST writer is
+                // poisoned. Both mean the engine must fail-stop, so propagate.
+                let fatal = self.has_bg_error.load(Ordering::Acquire)
+                    || self.manifest_poisoned.load(Ordering::Acquire);
+                if fatal {
+                    return Err(e).ctx();
+                }
+                // Non-fatal: the failed step was rejected wholesale before
+                // anything was persisted (log_and_apply's error contract) and
+                // its output files were already cleaned up. The flush itself —
+                // the caller's durability request — has fully succeeded.
+                tracing::warn!("post-flush L0 drain failed (will retry): {}", e);
+            }
         }
+        // Off the writer-serializing lock: harvest dead-key registrations
+        // that compactions since the previous flush have fully applied.
+        self.prune_settled_dead_keys(Some(DEAD_KEY_PRUNE_PER_FLUSH), None, None);
         Ok(())
     }
 
@@ -2232,7 +2239,7 @@ impl DB {
             self.force_compact_all().ctx()?;
         }
         // Full pass done — every settled registration is now prunable.
-        self.prune_settled_dead_keys(None);
+        self.prune_settled_dead_keys(None, None, None);
         Ok(())
     }
 
@@ -2423,9 +2430,10 @@ impl DB {
         }
 
         drop(_wg);
-        // Registrations inside [begin, end) that the pass fully applied are
-        // settled; the probe keeps any key still visible elsewhere.
-        self.prune_settled_dead_keys(None);
+        // A range-scoped pass can only newly settle registrations inside
+        // [begin, end): only those are probed. Out-of-range settled keys are
+        // harvested by later capped flush passes or a full compact().
+        self.prune_settled_dead_keys(None, begin, end);
         Ok(())
     }
 
@@ -2526,12 +2534,24 @@ impl DB {
     /// the tombstone itself guarantees the remnants are dropped by normal
     /// compaction GC.
     ///
-    /// `max_checks` bounds how many registrations are probed (the flush path
-    /// passes a cap so the group-commit leader never stalls on an unbounded
-    /// scan); `None` probes every registration. A rotating cursor makes
-    /// successive capped passes cover the whole set. Lookup errors (e.g.
-    /// fail-stop) conservatively keep the registration.
-    fn prune_settled_dead_keys(&self, max_checks: Option<usize>) {
+    /// `max_checks` bounds how many registrations are probed (flush-driven
+    /// passes are capped so no caller stalls on an unbounded scan); `None`
+    /// probes every candidate. A rotating cursor makes successive capped
+    /// passes cover the whole set. `lower`/`upper` restrict the candidates
+    /// to the half-open window `[lower, upper)` — a range-scoped compaction
+    /// can only newly settle keys inside its own range, so probing the rest
+    /// would be wasted reads. Lookup errors (e.g. fail-stop) conservatively
+    /// keep the registration.
+    fn prune_settled_dead_keys(
+        &self,
+        max_checks: Option<usize>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) {
+        let in_window = |key: &Vec<u8>| {
+            lower.is_none_or(|lo| key.as_slice() >= lo)
+                && upper.is_none_or(|hi| key.as_slice() < hi)
+        };
         let candidates: Vec<Vec<u8>> = {
             let set = self.dead_keys.read();
             if set.is_empty() {
@@ -2543,14 +2563,19 @@ impl DB {
                         .dead_key_prune_cursor
                         .fetch_add(limit, Ordering::Relaxed)
                         % set.len();
+                    // `take(set.len())` bounds the rotation to one full lap:
+                    // without it, a window matching no key would make
+                    // `cycle` + `filter` spin forever.
                     set.iter()
                         .cycle()
                         .skip(start)
+                        .take(set.len())
+                        .filter(|key| in_window(key))
                         .take(limit)
                         .cloned()
                         .collect()
                 }
-                _ => set.iter().cloned().collect(),
+                _ => set.iter().filter(|key| in_window(key)).cloned().collect(),
             }
         };
         // One-shot probes: don't let them evict hot blocks from the cache.
@@ -2905,11 +2930,13 @@ impl DB {
         debug_assert!(!wq.leader_active);
         wq.leader_active = true;
 
+        let mut group_flushed = false;
         loop {
             let batch_group: Vec<*mut WriteRequest> = wq.queue.drain(..).collect();
             drop(wq); // release queue lock while doing I/O
 
             let result = self.write_batch_group(&batch_group);
+            group_flushed |= matches!(result, Ok(true));
 
             // Signal everyone in this batch
             let mut wq_inner = self.write_queue.lock();
@@ -2921,7 +2948,7 @@ impl DB {
                     // Error is Clone: every follower receives the leader's
                     // full typed error chain, not a stringified copy.
                     r.result = match &result {
-                        Ok(()) => Some(Ok(())),
+                        Ok(_) => Some(Ok(())),
                         Err(e) => Some(Err(e.clone())),
                     };
                 }
@@ -2940,11 +2967,21 @@ impl DB {
             wq = wq_inner;
         }
 
+        // Leadership released and every waiter woken: harvest dead-key
+        // registrations settled by compactions since the previous flush.
+        // Runs on the leader's own time so queued writers never pay for it.
+        if group_flushed {
+            self.prune_settled_dead_keys(Some(DEAD_KEY_PRUNE_PER_FLUSH), None, None);
+        }
+
         req.result.take().unwrap_or(Ok(()))
     }
 
     /// Process a batch group: assign sequences, write+flush WAL, then publish to MemTable.
-    fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<()> {
+    /// Returns `true` when the group's writes triggered a memtable flush, so
+    /// the leader can harvest settled dead-key registrations after it has
+    /// woken the group's waiters.
+    fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<bool> {
         self.check_usable()?;
         let mut need_sync = false;
         let mut inner = self.inner.lock();
@@ -2958,7 +2995,7 @@ impl DB {
             })
             .sum();
         if total_ops == 0 {
-            return Ok(());
+            return Ok(false);
         }
 
         let first_group_seq = self.sequence.load(Ordering::Acquire);
@@ -3064,7 +3101,7 @@ impl DB {
                     rr.result = Some(Err(Error::io(io::Error::other(msg.clone()))));
                 }
             }
-            return Ok(());
+            return Ok(false);
         }
 
         // Check memtable size threshold — release lock during SST I/O
@@ -3124,7 +3161,7 @@ impl DB {
             self.signal_compaction();
         }
 
-        Ok(())
+        Ok(flush_wal.is_some())
     }
 
     /// Freeze+flush in one call (holds lock throughout).
@@ -3329,10 +3366,6 @@ impl DB {
         if let Err(e) = fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
         }
-        // Harvest dead-key registrations that compactions since the previous
-        // flush have fully applied. Capped so the flush path (including the
-        // group-commit leader) pays only bounded extra read work.
-        self.prune_settled_dead_keys(Some(DEAD_KEY_PRUNE_PER_FLUSH));
         Ok(())
     }
 

@@ -517,6 +517,49 @@ fn lazy_delete_unknown_key_pruned_on_flush() {
     );
 }
 
+/// A range-scoped compact_range must prune only registrations inside its
+/// range: out-of-range settled keys stay registered (probing them would be
+/// wasted reads) until a capped flush pass or a full compact() harvests them.
+#[test]
+fn compact_range_prunes_only_in_range_registrations() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    for k in [b"c1" as &[u8], b"c2", b"c3", b"x1"] {
+        db.put(k, b"v").unwrap();
+    }
+    // Settle the memtable into L0 before registering, so the capped
+    // post-flush prune cannot fire after registration.
+    db.flush().unwrap();
+
+    db.lazy_delete(b"c2"); // inside the compacted range, physically removable
+    db.lazy_delete(b"zz_ghost"); // outside the range, already settled (never existed)
+    assert_eq!(db.dead_key_count(), 2);
+
+    db.compact_range(Some(b"c"), Some(b"d")).unwrap();
+
+    assert!(
+        db.get(b"c2").unwrap().is_none(),
+        "c2 must be compacted away"
+    );
+    assert_eq!(
+        db.dead_key_count(),
+        1,
+        "only the in-range settled registration may be pruned by a range-scoped pass"
+    );
+
+    // A full compaction probes everything: the out-of-range ghost goes too.
+    db.compact().unwrap();
+    assert_eq!(db.dead_key_count(), 0);
+}
+
 /// A user compaction filter that parks its first invocation until released,
 /// modeling a slow in-flight background merge. `is_noop()` is `false`, so
 /// no-op shortcuts (trivial move, single-file skip) never bypass it.
