@@ -418,6 +418,21 @@ impl CompactionFilter for LazyDeleteFilter {
     }
 }
 
+/// Whether the half-open range tombstone `[begin, end)` can cover any key
+/// inside an iterator's enforced bounds (`lower` inclusive, `upper`
+/// exclusive). A tombstone entirely outside the bounds can never affect a
+/// yielded key, so iterator construction need not retain it. File-level
+/// pruning cannot use a lower bound (a tombstone may extend past its file's
+/// largest key), but the tombstone's own extent is exact.
+fn tombstone_overlaps_bounds(
+    begin: &[u8],
+    end: &[u8],
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> bool {
+    lower.is_none_or(|lo| end > lo) && upper.is_none_or(|hi| begin < hi)
+}
+
 impl DB {
     /// Open or create a database.
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
@@ -1589,14 +1604,15 @@ impl DB {
             (None, Some(param_hi)) => Some(param_hi.to_vec()),
             (None, None) => None,
         };
-        if effective_lower.is_some() || effective_upper.is_some() {
-            db_iter.set_bounds(effective_lower, effective_upper);
-        }
-
         // Collect all range tombstones upfront from per-source caches.
         // This enables O(log T) binary search for any key in any direction,
         // replacing the old inline-collection + full-scan preload approach.
+        // Tombstones that cannot cover any key within the effective bounds
+        // are dropped here, so the retained set scales with the scan range
+        // rather than with every range deletion in the database.
         if any_range_deletions {
+            let bounds_lo = effective_lower.as_deref();
+            let bounds_hi = effective_upper.as_deref();
             // Collect tombstones with level info for cross-level pruning.
             // A tombstone from level L may cover keys at level L or deeper;
             // one strictly deeper than a key's source level never covers it.
@@ -1604,13 +1620,17 @@ impl DB {
             // Memtable tombstones are at level 0 (highest priority).
             if active_mem.has_range_deletions() {
                 for (b, e, s) in active_mem.get_range_tombstones() {
-                    all_tombstones.push((b, e, s, 0));
+                    if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                        all_tombstones.push((b, e, s, 0));
+                    }
                 }
             }
             for imm in imm_mems {
                 if imm.has_range_deletions() {
                     for (b, e, s) in imm.get_range_tombstones() {
-                        all_tombstones.push((b, e, s, 0));
+                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                            all_tombstones.push((b, e, s, 0));
+                        }
                     }
                 }
             }
@@ -1619,7 +1639,9 @@ impl DB {
                 if tf.meta.has_range_deletions {
                     let ts = tf.reader.get_range_tombstones().ctx()?;
                     for (b, e, s) in ts {
-                        all_tombstones.push((b, e, s, 0));
+                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                            all_tombstones.push((b, e, s, 0));
+                        }
                     }
                 }
             }
@@ -1637,7 +1659,9 @@ impl DB {
                         }
                         let ts = tf.reader.get_range_tombstones().ctx()?;
                         for (b, e, s) in ts {
-                            all_tombstones.push((b, e, s, level));
+                            if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                                all_tombstones.push((b, e, s, level));
+                            }
                         }
                     }
                 }
@@ -1645,6 +1669,9 @@ impl DB {
             if !all_tombstones.is_empty() {
                 db_iter.set_range_tombstones_with_levels(all_tombstones);
             }
+        }
+        if effective_lower.is_some() || effective_upper.is_some() {
+            db_iter.set_bounds(effective_lower, effective_upper);
         }
         if let Some(ref sp) = options.skip_point {
             db_iter.set_skip_point(Arc::clone(sp));
@@ -1790,17 +1817,25 @@ impl DB {
         let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix_owned.to_vec());
 
         // Collect all range tombstones with level info for cross-level pruning.
+        // The iterator only yields keys within [prefix, prefix_upper), so
+        // tombstones that cannot cover that range are dropped here.
         if any_range_deletions {
+            let bounds_lo = Some(prefix);
+            let bounds_hi = prefix_upper.as_deref();
             let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
             if active_mem.has_range_deletions() {
                 for (b, e, s) in active_mem.get_range_tombstones() {
-                    all_tombstones.push((b, e, s, 0));
+                    if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                        all_tombstones.push((b, e, s, 0));
+                    }
                 }
             }
             for imm in imm_mems {
                 if imm.has_range_deletions() {
                     for (b, e, s) in imm.get_range_tombstones() {
-                        all_tombstones.push((b, e, s, 0));
+                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                            all_tombstones.push((b, e, s, 0));
+                        }
                     }
                 }
             }
@@ -1808,7 +1843,9 @@ impl DB {
                 if tf.meta.has_range_deletions {
                     let ts = tf.reader.get_range_tombstones().ctx()?;
                     for (b, e, s) in ts {
-                        all_tombstones.push((b, e, s, 0));
+                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                            all_tombstones.push((b, e, s, 0));
+                        }
                     }
                 }
             }
@@ -1826,7 +1863,9 @@ impl DB {
                         }
                         let ts = tf.reader.get_range_tombstones().ctx()?;
                         for (b, e, s) in ts {
-                            all_tombstones.push((b, e, s, level));
+                            if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
+                                all_tombstones.push((b, e, s, level));
+                            }
                         }
                     }
                 }

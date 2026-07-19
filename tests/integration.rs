@@ -1713,6 +1713,91 @@ fn test_sst_range_tombstone_cross_l0_files() {
     );
 }
 
+/// Bounded iterators drop range tombstones that cannot overlap their bounds
+/// at construction time. A tombstone that merely *straddles* a bound must
+/// still be applied to the keys inside the bounds, from every source
+/// (memtable and SST).
+#[test]
+fn test_bounded_iter_applies_tombstones_straddling_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 64 * 1024 * 1024,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    for k in [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"] {
+        db.put(k, b"v").unwrap();
+    }
+    // Straddles the lower bound c: [a, d) hides a..c inside and outside.
+    db.delete_range(b"a", b"d").unwrap();
+    // Straddles the upper bound g: [f, i) hides f..h.
+    db.delete_range(b"f", b"i").unwrap();
+    db.flush().unwrap(); // exercise the SST tombstone collection path
+
+    let collect = |db: &DB| -> Vec<Vec<u8>> {
+        db.iter_with_range(&ReadOptions::default(), Some(b"c"), Some(b"g"))
+            .unwrap()
+            .map(|(k, _)| k)
+            .collect()
+    };
+    assert_eq!(
+        collect(&db),
+        vec![b"d".to_vec(), b"e".to_vec()],
+        "straddling tombstones must still hide c (lower straddle) and f (upper straddle)"
+    );
+
+    // Same shape through the memtable path: newer puts + memtable tombstones.
+    for k in [b"c", b"f"] {
+        db.put(k, b"v2").unwrap();
+    }
+    db.delete_range(b"a", b"d").unwrap();
+    db.delete_range(b"f", b"i").unwrap();
+    assert_eq!(
+        collect(&db),
+        vec![b"d".to_vec(), b"e".to_vec()],
+        "memtable straddling tombstones must be applied within the bounds"
+    );
+
+    // A tombstone fully outside the bounds must not disturb in-bound keys.
+    db.delete_range(b"x", b"z").unwrap();
+    assert_eq!(collect(&db), vec![b"d".to_vec(), b"e".to_vec()]);
+}
+
+/// Prefix iterators must keep applying a range tombstone that starts before
+/// the prefix but extends into it.
+#[test]
+fn test_prefix_iter_applies_tombstone_starting_before_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 64 * 1024 * 1024,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    db.put(b"p:1", b"v").unwrap();
+    db.put(b"p:2", b"v").unwrap();
+    db.put(b"p:3", b"v").unwrap();
+    // Starts before the "p:" prefix range and covers p:1..p:3.
+    db.delete_range(b"a", b"p:3").unwrap();
+    db.flush().unwrap();
+
+    let keys: Vec<Vec<u8>> = db
+        .iter_with_prefix(b"p:", &ReadOptions::default())
+        .unwrap()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        keys,
+        vec![b"p:3".to_vec()],
+        "a tombstone starting before the prefix must still hide covered prefixed keys"
+    );
+}
+
 // ---- Step 4: compact_range with range filtering ----
 
 #[test]
