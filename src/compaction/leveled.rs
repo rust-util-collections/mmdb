@@ -549,10 +549,12 @@ fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<RawTombstone>> {
 
 /// Execute a single sub-compaction covering [lower_bound, upper_bound).
 /// File numbers are allocated from a shared atomic counter to avoid collisions.
-/// `all_range_del_entries` contains range tombstone merge entries from ALL input files.
-/// `all_raw_tombstones` contains raw (begin, end, seq) triples to pre-populate
-/// the RangeTombstoneTracker, ensuring tombstones whose start key is before
-/// this sub-task's lower_bound are still applied.
+/// `all_range_del_entries` contains range tombstone merge entries from ALL
+/// input files; only those starting inside this sub-task's range are injected
+/// into its merge stream. `all_raw_tombstones` contains raw (begin, end, seq)
+/// triples to pre-populate the RangeTombstoneTracker; every tombstone
+/// overlapping the sub-task's range is applied, so tombstones whose start key
+/// is before `lower_bound` still take effect.
 fn execute_sub_compaction_io(
     ctx: &CompactionContext<'_>,
     sub: &SubCompactionTask,
@@ -573,9 +575,31 @@ fn execute_sub_compaction_io(
         sources.push(IterSource::from_boxed(Box::new(iter)));
     }
 
-    // Inject ALL range tombstones into merge stream
+    // Inject the range tombstones relevant to this sub-task into the merge
+    // stream. A tombstone entry is keyed at its start key, and the merge
+    // loop only consumes entries whose start lies in [lower_bound,
+    // upper_bound) — the seek skips earlier starts and the upper-bound
+    // check breaks before later ones — so entries outside that window are
+    // dead weight in this sub-task and need not be cloned.
     if !params.all_range_del_entries.is_empty() {
-        sources.push(IterSource::new(params.all_range_del_entries.to_vec()));
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = params
+            .all_range_del_entries
+            .iter()
+            .filter(|(ikey, _)| {
+                let start = user_key(ikey);
+                sub.lower_bound
+                    .as_ref()
+                    .is_none_or(|lo| start >= lo.as_slice())
+                    && sub
+                        .upper_bound
+                        .as_ref()
+                        .is_none_or(|hi| start < hi.as_slice())
+            })
+            .cloned()
+            .collect();
+        if !entries.is_empty() {
+            sources.push(IterSource::new(entries));
+        }
     }
 
     let mut merger = MergingIterator::new(sources, compare_internal_key);
@@ -600,10 +624,24 @@ fn execute_sub_compaction_io(
     let mut last_written_seq: SequenceNumber = 0;
     let mut snapshot_idx: usize = ctx.active_snapshots.len();
     let mut range_tombstones = RangeTombstoneTracker::new();
-    // Pre-populate tracker with ALL tombstones so that tombstones whose
-    // start key is before this sub-task's lower_bound still take effect.
+    // Pre-populate the tracker with every tombstone that can cover a key in
+    // this sub-task's range — in particular straddlers whose start key is
+    // before lower_bound must still take effect. Tombstones entirely outside
+    // [lower_bound, upper_bound) can never cover a processed key (the merge
+    // loop only queries the tracker for keys inside that window), so they
+    // are skipped instead of cloned.
     for (begin, end, seq) in params.all_raw_tombstones {
-        range_tombstones.add(begin.clone(), end.clone(), *seq);
+        let covers_sub_range = sub
+            .lower_bound
+            .as_ref()
+            .is_none_or(|lo| end.as_slice() > lo.as_slice())
+            && sub
+                .upper_bound
+                .as_ref()
+                .is_none_or(|hi| begin.as_slice() < hi.as_slice());
+        if covers_sub_range {
+            range_tombstones.add(begin.clone(), end.clone(), *seq);
+        }
     }
     range_tombstones.reset();
 
@@ -1156,9 +1194,10 @@ impl LeveledCompaction {
         // Range deletions do NOT require serializing to a single sub-task:
         // `all_range_del_entries`/`all_raw_tombstones` below are collected
         // once from ALL input files and shared (by reference) with every
-        // sub-task's `SubCompactionParams`, so each sub-compaction already
-        // gets full, complete tombstone visibility regardless of its own
-        // key range — the cross-sub-task sharing this data structure exists
+        // sub-task's `SubCompactionParams`; each sub-compaction then applies
+        // exactly the subset overlapping its own key range (straddlers
+        // included), so tombstone visibility stays complete for every key it
+        // processes — the cross-sub-task sharing this data structure exists
         // for (INV-C2a) works correctly with `actual_subs > 1`.
         let max_subs = if task.level == 0 {
             1
