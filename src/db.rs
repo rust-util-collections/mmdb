@@ -418,6 +418,24 @@ impl CompactionFilter for LazyDeleteFilter {
     }
 }
 
+/// Append the `(begin, end, seq)` tombstones that can cover a key inside the
+/// `[lower, upper)` window to `dst`, tagged with their source `level`.
+/// Shared by every bounded iterator constructor so a future tombstone source
+/// cannot miss the bounds filter.
+fn collect_tombstones_overlapping_bounds(
+    dst: &mut Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
+    src: impl IntoIterator<Item = (Vec<u8>, Vec<u8>, SequenceNumber)>,
+    level: usize,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) {
+    for (b, e, s) in src {
+        if tombstone_overlaps_bounds(&b, &e, lower, upper) {
+            dst.push((b, e, s, level));
+        }
+    }
+}
+
 impl DB {
     /// Open or create a database.
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
@@ -1604,30 +1622,35 @@ impl DB {
             let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
             // Memtable tombstones are at level 0 (highest priority).
             if active_mem.has_range_deletions() {
-                for (b, e, s) in active_mem.get_range_tombstones() {
-                    if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                        all_tombstones.push((b, e, s, 0));
-                    }
-                }
+                collect_tombstones_overlapping_bounds(
+                    &mut all_tombstones,
+                    active_mem.get_range_tombstones(),
+                    0,
+                    bounds_lo,
+                    bounds_hi,
+                );
             }
             for imm in imm_mems {
                 if imm.has_range_deletions() {
-                    for (b, e, s) in imm.get_range_tombstones() {
-                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                            all_tombstones.push((b, e, s, 0));
-                        }
-                    }
+                    collect_tombstones_overlapping_bounds(
+                        &mut all_tombstones,
+                        imm.get_range_tombstones(),
+                        0,
+                        bounds_lo,
+                        bounds_hi,
+                    );
                 }
             }
             // L0 files are also at level 0.
             for tf in version.level_files(0) {
                 if tf.meta.has_range_deletions {
-                    let ts = tf.reader.get_range_tombstones().ctx()?;
-                    for (b, e, s) in ts {
-                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                            all_tombstones.push((b, e, s, 0));
-                        }
-                    }
+                    collect_tombstones_overlapping_bounds(
+                        &mut all_tombstones,
+                        tf.reader.get_range_tombstones().ctx()?,
+                        0,
+                        bounds_lo,
+                        bounds_hi,
+                    );
                 }
             }
             for level in 1..version.num_levels {
@@ -1642,12 +1665,13 @@ impl DB {
                         {
                             continue;
                         }
-                        let ts = tf.reader.get_range_tombstones().ctx()?;
-                        for (b, e, s) in ts {
-                            if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                                all_tombstones.push((b, e, s, level));
-                            }
-                        }
+                        collect_tombstones_overlapping_bounds(
+                            &mut all_tombstones,
+                            tf.reader.get_range_tombstones().ctx()?,
+                            level,
+                            bounds_lo,
+                            bounds_hi,
+                        );
                     }
                 }
             }
@@ -1809,29 +1833,34 @@ impl DB {
             let bounds_hi = prefix_upper.as_deref();
             let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
             if active_mem.has_range_deletions() {
-                for (b, e, s) in active_mem.get_range_tombstones() {
-                    if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                        all_tombstones.push((b, e, s, 0));
-                    }
-                }
+                collect_tombstones_overlapping_bounds(
+                    &mut all_tombstones,
+                    active_mem.get_range_tombstones(),
+                    0,
+                    bounds_lo,
+                    bounds_hi,
+                );
             }
             for imm in imm_mems {
                 if imm.has_range_deletions() {
-                    for (b, e, s) in imm.get_range_tombstones() {
-                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                            all_tombstones.push((b, e, s, 0));
-                        }
-                    }
+                    collect_tombstones_overlapping_bounds(
+                        &mut all_tombstones,
+                        imm.get_range_tombstones(),
+                        0,
+                        bounds_lo,
+                        bounds_hi,
+                    );
                 }
             }
             for tf in version.level_files(0) {
                 if tf.meta.has_range_deletions {
-                    let ts = tf.reader.get_range_tombstones().ctx()?;
-                    for (b, e, s) in ts {
-                        if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                            all_tombstones.push((b, e, s, 0));
-                        }
-                    }
+                    collect_tombstones_overlapping_bounds(
+                        &mut all_tombstones,
+                        tf.reader.get_range_tombstones().ctx()?,
+                        0,
+                        bounds_lo,
+                        bounds_hi,
+                    );
                 }
             }
             for level in 1..version.num_levels {
@@ -1846,12 +1875,13 @@ impl DB {
                         {
                             continue;
                         }
-                        let ts = tf.reader.get_range_tombstones().ctx()?;
-                        for (b, e, s) in ts {
-                            if tombstone_overlaps_bounds(&b, &e, bounds_lo, bounds_hi) {
-                                all_tombstones.push((b, e, s, level));
-                            }
-                        }
+                        collect_tombstones_overlapping_bounds(
+                            &mut all_tombstones,
+                            tf.reader.get_range_tombstones().ctx()?,
+                            level,
+                            bounds_lo,
+                            bounds_hi,
+                        );
                     }
                 }
             }
