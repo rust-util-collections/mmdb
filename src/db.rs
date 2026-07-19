@@ -2809,6 +2809,18 @@ impl DB {
     }
 
     fn write_batch_inner(&self, batch: WriteBatch, write_options: &WriteOptions) -> Result<()> {
+        // The WAL record format stores the batch entry count as a u32
+        // (encode_wal_record); a larger batch would silently truncate the
+        // count and drop entries on recovery. Not reachable with realistic
+        // memory budgets, but the encoding invariant is validated explicitly
+        // so a malformed batch fails the write instead of corrupting replay.
+        if batch.entries.len() > u32::MAX as usize {
+            return Err(Error::invalid_argument(format!(
+                "write batch entry count {} exceeds the WAL record maximum {}",
+                batch.entries.len(),
+                u32::MAX
+            )));
+        }
         // Validate entry sizes up front. Oversized keys/values would be
         // accepted into the WAL and memtable but could never be flushed into
         // a readable SST (the reader caps blocks at 64 MiB and the index
