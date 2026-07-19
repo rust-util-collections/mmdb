@@ -18,7 +18,10 @@ use std::{
 
 use crate::error::{Error, Result, ResultExt};
 use crate::sst::{
-    META_BLOCK_HARD_LIMIT, block_builder::BlockBuilder, filter::BloomFilter, format::*,
+    META_BLOCK_HARD_LIMIT,
+    block_builder::BlockBuilder,
+    filter::{BloomFilter, bloom_hash},
+    format::*,
     table_reader::MAX_DECOMPRESSED_BLOCK_SIZE,
 };
 use crate::types::{InternalKeyRef, ValueType, compare_internal_key, user_key};
@@ -107,8 +110,9 @@ pub struct TableBuilder {
     index_entries: Vec<PendingIndexEntry>,
     // First key of the current (not-yet-flushed) data block
     pending_first_key: Option<Vec<u8>>,
-    // Keys for bloom filter
-    filter_keys: Vec<Vec<u8>>,
+    // Precomputed bloom_hash of every key added, for bloom filter
+    // construction. 4 bytes per key instead of a full key copy.
+    filter_key_hashes: Vec<u32>,
 
     // Current file offset
     offset: u64,
@@ -152,7 +156,7 @@ impl TableBuilder {
             options,
             index_entries: Vec::new(),
             pending_first_key: None,
-            filter_keys: Vec::new(),
+            filter_key_hashes: Vec::new(),
             offset: 0,
             last_key: Vec::new(),
             smallest_key: None,
@@ -180,10 +184,13 @@ impl TableBuilder {
     }
 
     fn projected_filter_size(&self) -> usize {
-        if self.options.bloom_bits_per_key == 0 || self.filter_keys.is_empty() {
+        if self.options.bloom_bits_per_key == 0 || self.filter_key_hashes.is_empty() {
             return 0;
         }
-        BloomFilter::projected_size(self.filter_keys.len(), self.options.bloom_bits_per_key)
+        BloomFilter::projected_size(
+            self.filter_key_hashes.len(),
+            self.options.bloom_bits_per_key,
+        )
     }
 
     fn projected_prefix_filter_size(&self) -> usize {
@@ -291,7 +298,7 @@ impl TableBuilder {
         if self.options.bloom_bits_per_key > 0 {
             BloomFilter::checked_size(
                 "bloom filter",
-                self.filter_keys.len().saturating_add(1),
+                self.filter_key_hashes.len().saturating_add(1),
                 self.options.bloom_bits_per_key,
             )?;
 
@@ -307,8 +314,8 @@ impl TableBuilder {
                     self.options.bloom_bits_per_key,
                 )?;
             }
+            self.filter_key_hashes.push(bloom_hash(user_key_for_bloom));
         }
-        self.filter_keys.push(user_key_for_bloom.to_vec());
 
         // Collect prefix for prefix bloom filter
         if self.options.prefix_len > 0 && user_key_for_bloom.len() >= self.options.prefix_len {
@@ -467,14 +474,15 @@ impl TableBuilder {
     }
 
     fn write_filter_block(&mut self) -> Result<BlockHandle> {
-        if self.options.bloom_bits_per_key == 0 || self.filter_keys.is_empty() {
+        if self.options.bloom_bits_per_key == 0 || self.filter_key_hashes.is_empty() {
             // No filter
             return Ok(BlockHandle::default());
         }
 
         let bf = BloomFilter::new(self.options.bloom_bits_per_key);
-        let key_refs: Vec<&[u8]> = self.filter_keys.iter().map(|k| k.as_slice()).collect();
-        let filter_data = bf.create_filter(&key_refs).ctx()?;
+        let filter_data = bf
+            .create_filter_from_hashes(&self.filter_key_hashes)
+            .ctx()?;
 
         self.write_raw_block(&filter_data).ctx()
     }
@@ -837,7 +845,7 @@ mod tests {
         let err = builder.add(b"k", b"v").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidArgument);
         assert!(err.message().contains("bloom filter block size"));
-        assert!(builder.filter_keys.is_empty());
+        assert!(builder.filter_key_hashes.is_empty());
     }
 
     #[test]

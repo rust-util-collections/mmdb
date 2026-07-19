@@ -31,17 +31,26 @@ impl BloomFilter {
     /// Returns an error before allocation if the encoded filter would exceed
     /// the SST reader's metadata-block limit.
     pub fn create_filter(&self, keys: &[&[u8]]) -> Result<Vec<u8>> {
-        let filter_size = Self::checked_size("bloom filter", keys.len(), self.bits_per_key)?;
+        let hashes: Vec<u32> = keys.iter().map(|k| bloom_hash(k)).collect();
+        self.create_filter_from_hashes(&hashes)
+    }
+
+    /// Build a filter from precomputed [`bloom_hash`] values.
+    ///
+    /// Produces byte-identical output to [`create_filter`](Self::create_filter)
+    /// on the corresponding keys; lets long-running builders retain a 4-byte
+    /// hash per key instead of a full key copy.
+    pub fn create_filter_from_hashes(&self, hashes: &[u32]) -> Result<Vec<u8>> {
+        let filter_size = Self::checked_size("bloom filter", hashes.len(), self.bits_per_key)?;
         let bytes = filter_size - 1;
         let bits = (bytes as u32) * 8;
 
         let mut filter = vec![0u8; filter_size];
         *filter.last_mut().unwrap() = self.k as u8;
 
-        for key in keys {
-            let h = bloom_hash(key);
-            let delta = h.rotate_left(15); // rotate_left(15) == rotate_right(17)
-            let mut h = h;
+        for &hash in hashes {
+            let delta = hash.rotate_left(15); // rotate_left(15) == rotate_right(17)
+            let mut h = hash;
             for _ in 0..self.k {
                 let bit_pos = h % bits;
                 filter[(bit_pos / 8) as usize] |= 1 << (bit_pos % 8);
@@ -104,7 +113,7 @@ impl BloomFilter {
 
 /// Hash function for bloom filter based on MurmurHash2.
 /// Matches LevelDB/RocksDB's BloomHash for compatibility and quality.
-fn bloom_hash(key: &[u8]) -> u32 {
+pub(crate) fn bloom_hash(key: &[u8]) -> u32 {
     let seed: u32 = 0xbc9f1d34;
     let m: u32 = 0x5bd1e995;
     let r: u32 = 24;
@@ -207,6 +216,20 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::InvalidArgument);
         assert!(err.message().contains("bloom filter block size"));
+    }
+
+    #[test]
+    fn test_create_filter_from_hashes_matches_create_filter() {
+        let bf = BloomFilter::new(10);
+        let keys: Vec<Vec<u8>> = (0..500).map(|i| format!("key_{i}").into_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let hashes: Vec<u32> = key_refs.iter().map(|k| bloom_hash(k)).collect();
+
+        assert_eq!(
+            bf.create_filter(&key_refs).unwrap(),
+            bf.create_filter_from_hashes(&hashes).unwrap(),
+            "hash-based construction must be byte-identical to key-based construction"
+        );
     }
 
     #[test]
