@@ -2254,17 +2254,14 @@ impl DB {
             }
         }
 
+        // No range specified: delegate to compact() so the full-compaction
+        // behavior (force_compact_all + dead-key prune) has a single home.
+        if begin.is_none() && end.is_none() {
+            return self.compact();
+        }
+
         // Compact files overlapping the specified range
         let _wg = self.write_queue.lock();
-
-        // If no range specified, fall back to full compaction
-        if begin.is_none() && end.is_none() {
-            self.force_compact_all().ctx()?;
-            drop(_wg);
-            // Full pass done — every settled registration is now prunable.
-            self.prune_settled_dead_keys(None);
-            return Ok(());
-        }
 
         // Range-filtered compaction: compact files overlapping [begin, end)
         loop {
