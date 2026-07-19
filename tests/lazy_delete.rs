@@ -441,6 +441,82 @@ fn lazy_delete_retries_after_snapshot_release() {
     );
 }
 
+/// Fully applied registrations must be pruned automatically: once a full
+/// compaction has physically removed a registered key, keeping its
+/// registration would only leak memory and keep the internal lazy-delete
+/// filter active (blocking the trivial-move optimization) forever.
+#[test]
+fn lazy_delete_registrations_pruned_after_full_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+
+    for i in 0u32..20 {
+        db.put(&i.to_be_bytes(), &[i as u8; 64]).unwrap();
+    }
+    let dead: Vec<Vec<u8>> = (0u32..5).map(|i| i.to_be_bytes().to_vec()).collect();
+    db.lazy_delete_batch(&dead);
+    assert_eq!(db.dead_key_count(), 5);
+
+    db.compact_range(None::<&[u8]>, None::<&[u8]>).unwrap();
+
+    for i in 0u32..5 {
+        assert!(db.get(&i.to_be_bytes()).unwrap().is_none());
+    }
+    assert_eq!(
+        db.dead_key_count(),
+        0,
+        "fully applied registrations must be pruned after a full compaction"
+    );
+}
+
+/// A registration whose key is still visible must survive pruning — the
+/// lazy deletion has not been applied yet.
+#[test]
+fn lazy_delete_registration_kept_while_key_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    db.put(b"live", b"v").unwrap();
+    db.lazy_delete(b"live");
+    // The post-flush prune probes the key; it is still visible at L0, so
+    // the registration must be kept.
+    db.flush().unwrap();
+    assert_eq!(db.dead_key_count(), 1);
+    assert!(db.get(b"live").unwrap().is_some());
+}
+
+/// A registration for a key that never existed is settled from the start:
+/// the next post-flush prune must drop it.
+#[test]
+fn lazy_delete_unknown_key_pruned_on_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            create_if_missing: true,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+
+    db.lazy_delete(b"ghost");
+    assert_eq!(db.dead_key_count(), 1);
+    db.put(b"data", b"v").unwrap();
+    db.flush().unwrap();
+    assert_eq!(
+        db.dead_key_count(),
+        0,
+        "a never-visible registration must be pruned by the post-flush pass"
+    );
+}
+
 /// A user compaction filter that parks its first invocation until released,
 /// modeling a slow in-flight background merge. `is_noop()` is `false`, so
 /// no-op shortcuts (trivial move, single-file skip) never bypass it.

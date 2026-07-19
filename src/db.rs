@@ -44,6 +44,11 @@ use crate::types::{
 };
 use crate::wal::{WalReader, WalWriter};
 
+/// Maximum number of dead-key registrations probed for auto-pruning after
+/// each flush. Bounds the extra read work the flush path performs; explicit
+/// `compact()` / `compact_range()` calls prune without a cap.
+const DEAD_KEY_PRUNE_PER_FLUSH: usize = 1024;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 enum DeadKeySweepState {
@@ -344,6 +349,10 @@ pub struct DB {
     /// at or above the threshold queue another pass; a request arriving during
     /// a pass is retained for the next pass.
     dead_key_sweep: Arc<DeadKeySweepScheduler>,
+    /// Rotating start offset for the capped post-flush dead-key prune, so
+    /// successive capped passes cover the whole set instead of repeatedly
+    /// probing the same iteration prefix.
+    dead_key_prune_cursor: AtomicUsize,
 }
 
 // SAFETY: the raw `*mut WriteRequest` pointers held in `write_queue` reference
@@ -1185,6 +1194,7 @@ impl DB {
             lock_file: Mutex::new(lock_file),
             dead_keys,
             dead_key_sweep,
+            dead_key_prune_cursor: AtomicUsize::new(0),
         };
 
         // Kick the background compaction threads once at startup. A DB
@@ -2163,8 +2173,13 @@ impl DB {
     /// directly.
     pub fn compact(&self) -> Result<()> {
         self.check_usable().ctx()?;
-        let _wg = self.write_queue.lock();
-        self.force_compact_all()
+        {
+            let _wg = self.write_queue.lock();
+            self.force_compact_all().ctx()?;
+        }
+        // Full pass done — every settled registration is now prunable.
+        self.prune_settled_dead_keys(None);
+        Ok(())
     }
 
     /// Compact all keys in the given range across all levels.
@@ -2190,7 +2205,11 @@ impl DB {
 
         // If no range specified, fall back to full compaction
         if begin.is_none() && end.is_none() {
-            return self.force_compact_all();
+            self.force_compact_all().ctx()?;
+            drop(_wg);
+            // Full pass done — every settled registration is now prunable.
+            self.prune_settled_dead_keys(None);
+            return Ok(());
         }
 
         // Range-filtered compaction: compact files overlapping [begin, end)
@@ -2352,6 +2371,10 @@ impl DB {
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
         }
 
+        drop(_wg);
+        // Registrations inside [begin, end) that the pass fully applied are
+        // settled; the probe keeps any key still visible elsewhere.
+        self.prune_settled_dead_keys(None);
         Ok(())
     }
 
@@ -2387,6 +2410,16 @@ impl DB {
     /// before compaction removes them, the registrations are lost and
     /// the keys will remain in the database permanently unless
     /// re-registered.
+    ///
+    /// A registration is pruned automatically once no visible version of
+    /// the key remains (checked after flushes and after explicit
+    /// [`compact`](Self::compact) / [`compact_range`](Self::compact_range)
+    /// calls), so a fully applied lazy deletion stops consuming memory. A
+    /// key written *after* its registration was pruned is a normal live
+    /// key; a key re-written *while* its registration is still active is
+    /// removed by a later compaction like any other registered key — do
+    /// not reuse a key until its lazy deletion has completed or
+    /// [`clear_dead_keys`](Self::clear_dead_keys) has been called.
     pub fn lazy_delete(&self, key: &[u8]) {
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
@@ -2432,12 +2465,71 @@ impl DB {
         self.signal_compaction();
     }
 
+    /// Remove dead-key registrations that have been fully applied.
+    ///
+    /// Once no visible version of a registered key remains, compaction can
+    /// never encounter that key again: keeping the registration only wastes
+    /// memory and keeps the internal lazy-delete filter non-noop, which
+    /// permanently disables the trivial-move optimization. A key that is
+    /// merely shadowed by a newer point/range tombstone is also settled —
+    /// the tombstone itself guarantees the remnants are dropped by normal
+    /// compaction GC.
+    ///
+    /// `max_checks` bounds how many registrations are probed (the flush path
+    /// passes a cap so the group-commit leader never stalls on an unbounded
+    /// scan); `None` probes every registration. A rotating cursor makes
+    /// successive capped passes cover the whole set. Lookup errors (e.g.
+    /// fail-stop) conservatively keep the registration.
+    fn prune_settled_dead_keys(&self, max_checks: Option<usize>) {
+        let candidates: Vec<Vec<u8>> = {
+            let set = self.dead_keys.read();
+            if set.is_empty() {
+                return;
+            }
+            match max_checks {
+                Some(limit) if limit < set.len() => {
+                    let start = self
+                        .dead_key_prune_cursor
+                        .fetch_add(limit, Ordering::Relaxed)
+                        % set.len();
+                    set.iter()
+                        .cycle()
+                        .skip(start)
+                        .take(limit)
+                        .cloned()
+                        .collect()
+                }
+                _ => set.iter().cloned().collect(),
+            }
+        };
+        // One-shot probes: don't let them evict hot blocks from the cache.
+        let read_options = ReadOptions {
+            fill_cache: false,
+            ..ReadOptions::default()
+        };
+        let settled: Vec<Vec<u8>> = candidates
+            .into_iter()
+            .filter(|key| matches!(self.get_with_options(&read_options, key), Ok(None)))
+            .collect();
+        if settled.is_empty() {
+            return;
+        }
+        let mut set = self.dead_keys.write();
+        for key in &settled {
+            set.remove(key);
+        }
+    }
+
     /// Returns the current number of keys registered for lazy deletion.
     pub fn dead_key_count(&self) -> usize {
         self.dead_keys.read().len()
     }
 
     /// Clear all dead keys to reclaim memory used by the dead-keys set.
+    ///
+    /// Fully applied registrations are already pruned automatically (see
+    /// [`lazy_delete`](Self::lazy_delete)); this exists to abandon
+    /// registrations that are still pending.
     ///
     /// **Caution:** Only call this after a full compaction
     /// ([`compact_range(None, None)`](Self::compact_range)) has
@@ -3165,6 +3257,10 @@ impl DB {
         if let Err(e) = fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
         }
+        // Harvest dead-key registrations that compactions since the previous
+        // flush have fully applied. Capped so the flush path (including the
+        // group-commit leader) pays only bounded extra read work.
+        self.prune_settled_dead_keys(Some(DEAD_KEY_PRUNE_PER_FLUSH));
         Ok(())
     }
 
