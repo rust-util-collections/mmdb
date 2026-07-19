@@ -2833,8 +2833,17 @@ impl DB {
         }
 
         if write_options.no_slowdown {
+            // A no_slowdown write must fail fast whenever a blocking path
+            // would engage: the slowdown delay *or* the stop-trigger drain.
+            // Checking only the slowdown trigger would let these writes
+            // bypass the L0 stop entirely when the store is configured with
+            // l0_slowdown_trigger > l0_stop_trigger.
             let l0_count = self.l0_file_count.load(Ordering::Relaxed);
-            if l0_count >= self.options.l0_slowdown_trigger {
+            let throttle_floor = self
+                .options
+                .l0_slowdown_trigger
+                .min(self.options.l0_stop_trigger);
+            if l0_count >= throttle_floor {
                 return Err(Error::invalid_argument(
                     "write stalled: no_slowdown is set".to_string(),
                 ));

@@ -845,6 +845,38 @@ fn test_write_options_no_slowdown() {
     assert_eq!(err.kind(), ErrorKind::InvalidArgument);
 }
 
+/// no_slowdown must also fail fast at the L0 stop trigger. With a
+/// configuration where l0_stop_trigger < l0_slowdown_trigger, a
+/// slowdown-only check would let no_slowdown writes bypass the stop
+/// entirely and keep growing L0 unboundedly.
+#[test]
+fn test_write_options_no_slowdown_respects_stop_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        l0_compaction_trigger: usize::MAX,
+        l0_slowdown_trigger: usize::MAX,
+        l0_stop_trigger: 3,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    let wo = WriteOptions {
+        no_slowdown: true,
+        ..Default::default()
+    };
+    db.put_with_options(&wo, b"ok", b"v").unwrap();
+
+    for i in 0..3 {
+        let key = format!("flood_{:06}", i);
+        db.put(key.as_bytes(), b"value").unwrap();
+        db.flush().unwrap();
+    }
+
+    let err = db.put_with_options(&wo, b"blocked", b"value").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+}
+
 #[test]
 fn test_db_reopen_cycle() {
     let dir = tempfile::tempdir().unwrap();
