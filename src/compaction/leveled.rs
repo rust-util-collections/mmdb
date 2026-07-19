@@ -33,7 +33,7 @@ use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator};
 use crate::stats::DbStats;
 use crate::types::{
     InternalKey, InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType,
-    compare_internal_key, user_key,
+    compare_internal_key, tombstone_overlaps_bounds, user_key,
 };
 
 /// Test-only instrumentation: incremented each time `execute_compaction_io`
@@ -138,17 +138,6 @@ fn file_metadata_overlaps_bounds(
     let file_largest = user_key(&tf.meta.largest_key);
     let above_lower = lower.is_none_or(|lo| file_largest >= lo);
     let below_upper = upper.is_none_or(|hi| file_smallest < hi);
-    above_lower && below_upper
-}
-
-fn tombstone_overlaps_bounds(
-    begin: &[u8],
-    end: &[u8],
-    lower: Option<&[u8]>,
-    upper: Option<&[u8]>,
-) -> bool {
-    let above_lower = lower.is_none_or(|lo| end > lo);
-    let below_upper = upper.is_none_or(|hi| begin < hi);
     above_lower && below_upper
 }
 
@@ -631,15 +620,12 @@ fn execute_sub_compaction_io(
     // loop only queries the tracker for keys inside that window), so they
     // are skipped instead of cloned.
     for (begin, end, seq) in params.all_raw_tombstones {
-        let covers_sub_range = sub
-            .lower_bound
-            .as_ref()
-            .is_none_or(|lo| end.as_slice() > lo.as_slice())
-            && sub
-                .upper_bound
-                .as_ref()
-                .is_none_or(|hi| begin.as_slice() < hi.as_slice());
-        if covers_sub_range {
+        if tombstone_overlaps_bounds(
+            begin,
+            end,
+            sub.lower_bound.as_deref(),
+            sub.upper_bound.as_deref(),
+        ) {
             range_tombstones.add(begin.clone(), end.clone(), *seq);
         }
     }

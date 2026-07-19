@@ -242,6 +242,26 @@ pub fn user_key(internal_key: &[u8]) -> &[u8] {
     }
 }
 
+/// Whether the half-open range tombstone `[begin, end)` can cover any user
+/// key inside the half-open window `[lower, upper)` (`None` = unbounded).
+///
+/// Shared by iterator construction (tombstones outside the iterator's
+/// enforced bounds can never affect a yielded key), compact_range file
+/// picking, and sub-compaction tombstone scoping, so the boundary semantics
+/// cannot drift between compaction and iteration. Note that file-level
+/// pruning cannot use a lower bound (a tombstone may extend past its file's
+/// largest key) — this predicate is exact only for the tombstone's own
+/// extent.
+#[inline]
+pub fn tombstone_overlaps_bounds(
+    begin: &[u8],
+    end: &[u8],
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> bool {
+    lower.is_none_or(|lo| end > lo) && upper.is_none_or(|hi| begin < hi)
+}
+
 /// A write batch groups multiple mutations to be applied atomically.
 pub struct WriteBatch {
     pub(crate) entries: Vec<WriteBatchEntry>,

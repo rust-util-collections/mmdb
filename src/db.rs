@@ -40,7 +40,7 @@ use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
 use crate::types::{
     self, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, ValueType,
-    WriteBatch, WriteBatchWithIndex,
+    WriteBatch, WriteBatchWithIndex, tombstone_overlaps_bounds,
 };
 use crate::wal::{WalReader, WalWriter};
 
@@ -416,21 +416,6 @@ impl CompactionFilter for LazyDeleteFilter {
         // the relocated file, so allowing the move here is safe.
         self.user_filter.as_ref().is_none_or(|f| f.is_noop()) && self.dead_keys.read().is_empty()
     }
-}
-
-/// Whether the half-open range tombstone `[begin, end)` can cover any key
-/// inside an iterator's enforced bounds (`lower` inclusive, `upper`
-/// exclusive). A tombstone entirely outside the bounds can never affect a
-/// yielded key, so iterator construction need not retain it. File-level
-/// pruning cannot use a lower bound (a tombstone may extend past its file's
-/// largest key), but the tombstone's own extent is exact.
-fn tombstone_overlaps_bounds(
-    begin: &[u8],
-    end: &[u8],
-    lower: Option<&[u8]>,
-    upper: Option<&[u8]>,
-) -> bool {
-    lower.is_none_or(|lo| end > lo) && upper.is_none_or(|hi| begin < hi)
 }
 
 impl DB {
