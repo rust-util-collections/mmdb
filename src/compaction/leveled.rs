@@ -32,8 +32,8 @@ use crate::sst::table_builder::{META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, T
 use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator};
 use crate::stats::DbStats;
 use crate::types::{
-    InternalKey, InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType,
-    compare_internal_key, tombstone_overlaps_bounds, user_key,
+    InternalKey, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
+    decode_internal_key, tombstone_overlaps_bounds, user_key,
 };
 
 /// Test-only instrumentation: incremented each time `execute_compaction_io`
@@ -634,11 +634,17 @@ fn execute_sub_compaction_io(
     range_tombstones.reset();
 
     while let Some((ikey, value)) = merger.next_entry() {
-        if ikey.len() < 8 {
-            continue;
-        }
-        let ikr = InternalKeyRef::new(&ikey);
-        let user_key = ikr.user_key();
+        let (user_key, entry_seq, vt) = match decode_internal_key(&ikey) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                cleanup_output_files(
+                    ctx.db_path,
+                    &new_files,
+                    builder.as_ref().map(|_| current_file_number),
+                );
+                return Err(e).ctx();
+            }
+        };
 
         // Check upper bound: stop if user_key >= upper_bound
         if let Some(ref hi) = sub.upper_bound
@@ -680,7 +686,7 @@ fn execute_sub_compaction_io(
             pending_cut = false;
         }
 
-        if ikr.value_type() == ValueType::RangeDeletion {
+        if vt == ValueType::RangeDeletion {
             // Not re-added to `range_tombstones` here: `all_raw_tombstones`
             // already pre-populated the tracker with every tombstone in the
             // input set (including this one) before the loop started, so
@@ -692,7 +698,7 @@ fn execute_sub_compaction_io(
                 continue;
             }
             last_range_del_key = Some(ikey.clone());
-            if params.is_bottommost && ikr.sequence() < params.oldest_snapshot_seq {
+            if params.is_bottommost && entry_seq < params.oldest_snapshot_seq {
                 continue;
             }
         } else if let Some(ref last) = last_point_key
@@ -701,21 +707,17 @@ fn execute_sub_compaction_io(
             while snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= last_written_seq {
                 snapshot_idx -= 1;
             }
-            if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
-                last_written_seq = ikr.sequence();
+            if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= entry_seq {
+                last_written_seq = entry_seq;
                 // A retained older version that is shadowed by a range tombstone
                 // below the oldest snapshot must still be dropped. Otherwise, if
                 // that tombstone is itself dropped at the bottommost level, the
                 // value would resurrect for the snapshot that retained it. (The
                 // newest-version branch below already applies this check; retained
                 // versions need it too.)
-                if ikr.value_type() == ValueType::Value
+                if vt == ValueType::Value
                     && !range_tombstones.is_empty()
-                    && range_tombstones.is_deleted(
-                        user_key,
-                        ikr.sequence(),
-                        params.oldest_snapshot_seq,
-                    )
+                    && range_tombstones.is_deleted(user_key, entry_seq, params.oldest_snapshot_seq)
                 {
                     continue;
                 }
@@ -724,26 +726,24 @@ fn execute_sub_compaction_io(
             }
         } else {
             last_point_key = Some(user_key.to_vec());
-            last_written_seq = ikr.sequence();
+            last_written_seq = entry_seq;
             snapshot_idx = ctx.active_snapshots.len();
 
             // Only a genuine Deletion may be dropped here, and only at the
-            // bottommost level below the oldest snapshot — use the strict
-            // decode so a corrupted trailer byte fails the compaction loudly
-            // instead of being silently misread as Deletion and permanently
-            // destroyed (the original input files are untouched on error).
+            // bottommost level below the oldest snapshot. Type was validated
+            // by `decode_internal_key` above.
             if params.is_bottommost
-                && ikr.sequence() < params.oldest_snapshot_seq
-                && ikr.value_type_checked().ctx()? == ValueType::Deletion
+                && entry_seq < params.oldest_snapshot_seq
+                && vt == ValueType::Deletion
             {
                 continue;
             }
 
-            if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
-                let entry_seq = ikr.sequence();
-                if range_tombstones.is_deleted(user_key, entry_seq, params.oldest_snapshot_seq) {
-                    continue;
-                }
+            if vt == ValueType::Value
+                && !range_tombstones.is_empty()
+                && range_tombstones.is_deleted(user_key, entry_seq, params.oldest_snapshot_seq)
+            {
+                continue;
             }
         }
 
@@ -752,7 +752,7 @@ fn execute_sub_compaction_io(
         if params.is_bottommost
             && ctx.active_snapshots.is_empty()
             && let Some(ref filter) = ctx.options.compaction_filter
-            && ikr.value_type() == ValueType::Value
+            && vt == ValueType::Value
         {
             match filter.filter(params.target_level, user_key, final_value.as_slice()) {
                 CompactionFilterDecision::Keep => {}
@@ -792,13 +792,11 @@ fn execute_sub_compaction_io(
 
         let final_ikey;
         let ikey_ref = if params.is_bottommost
-            && ikr.sequence() > 0
-            && ikr.sequence() < params.oldest_snapshot_seq
-            && ikr.value_type() == ValueType::Value
+            && entry_seq > 0
+            && entry_seq < params.oldest_snapshot_seq
+            && vt == ValueType::Value
         {
-            final_ikey = InternalKey::new(user_key, 0, ikr.value_type())
-                .as_bytes()
-                .to_vec();
+            final_ikey = InternalKey::new(user_key, 0, vt).as_bytes().to_vec();
             &final_ikey
         } else {
             &ikey
@@ -1590,11 +1588,17 @@ impl LeveledCompaction {
         let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
-            if ikey.len() < 8 {
-                continue;
-            }
-            let ikr = InternalKeyRef::new(&ikey);
-            let user_key = ikr.user_key();
+            let (user_key, entry_seq, vt) = match decode_internal_key(&ikey) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    cleanup_output_files(
+                        ctx.db_path,
+                        &edit.new_files,
+                        builder.as_ref().map(|_| current_file_number),
+                    );
+                    return Err(e).ctx();
+                }
+            };
 
             // Defer size-triggered file cuts to user-key boundaries so a key's
             // versions are never split across files (which would create overlapping
@@ -1628,8 +1632,8 @@ impl LeveledCompaction {
                 pending_cut = false;
             }
 
-            if ikr.value_type() == ValueType::RangeDeletion {
-                range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), ikr.sequence());
+            if vt == ValueType::RangeDeletion {
+                range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), entry_seq);
                 range_tombstones.reset();
                 if let Some(ref last) = last_range_del_key
                     && last.as_slice() == ikey.as_slice()
@@ -1637,7 +1641,7 @@ impl LeveledCompaction {
                     continue;
                 }
                 last_range_del_key = Some(ikey.clone());
-                if is_bottommost && ikr.sequence() < oldest_snapshot_seq {
+                if is_bottommost && entry_seq < oldest_snapshot_seq {
                     continue;
                 }
             } else if let Some(ref last) = last_point_key
@@ -1648,18 +1652,14 @@ impl LeveledCompaction {
                 {
                     snapshot_idx -= 1;
                 }
-                if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= ikr.sequence() {
-                    last_written_seq = ikr.sequence();
+                if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= entry_seq {
+                    last_written_seq = entry_seq;
                     // A retained older version shadowed by a range tombstone below
                     // the oldest snapshot must still be dropped, or it would
                     // resurrect if that tombstone is dropped at the bottommost level.
-                    if ikr.value_type() == ValueType::Value
+                    if vt == ValueType::Value
                         && !range_tombstones.is_empty()
-                        && range_tombstones.is_deleted(
-                            user_key,
-                            ikr.sequence(),
-                            oldest_snapshot_seq,
-                        )
+                        && range_tombstones.is_deleted(user_key, entry_seq, oldest_snapshot_seq)
                     {
                         continue;
                     }
@@ -1668,24 +1668,19 @@ impl LeveledCompaction {
                 }
             } else {
                 last_point_key = Some(user_key.to_vec());
-                last_written_seq = ikr.sequence();
+                last_written_seq = entry_seq;
                 snapshot_idx = ctx.active_snapshots.len();
 
-                // See execute_sub_compaction_io: strict decode so a corrupted
-                // trailer byte fails loudly instead of being silently
-                // misread as Deletion and permanently destroyed.
-                if is_bottommost
-                    && ikr.sequence() < oldest_snapshot_seq
-                    && ikr.value_type_checked().ctx()? == ValueType::Deletion
-                {
+                // Type was validated by `decode_internal_key` above.
+                if is_bottommost && entry_seq < oldest_snapshot_seq && vt == ValueType::Deletion {
                     continue;
                 }
 
-                if ikr.value_type() == ValueType::Value && !range_tombstones.is_empty() {
-                    let entry_seq = ikr.sequence();
-                    if range_tombstones.is_deleted(user_key, entry_seq, oldest_snapshot_seq) {
-                        continue;
-                    }
+                if vt == ValueType::Value
+                    && !range_tombstones.is_empty()
+                    && range_tombstones.is_deleted(user_key, entry_seq, oldest_snapshot_seq)
+                {
+                    continue;
                 }
             }
 
@@ -1694,7 +1689,7 @@ impl LeveledCompaction {
             if is_bottommost
                 && ctx.active_snapshots.is_empty()
                 && let Some(ref filter) = ctx.options.compaction_filter
-                && ikr.value_type() == ValueType::Value
+                && vt == ValueType::Value
             {
                 match filter.filter(level, user_key, final_value.as_slice()) {
                     CompactionFilterDecision::Keep => {}
@@ -1733,13 +1728,11 @@ impl LeveledCompaction {
             // sequence falls below the minimum active snapshot, zero it out.
             let final_ikey;
             let ikey_ref = if is_bottommost
-                && ikr.sequence() > 0
-                && ikr.sequence() < oldest_snapshot_seq
-                && ikr.value_type() == ValueType::Value
+                && entry_seq > 0
+                && entry_seq < oldest_snapshot_seq
+                && vt == ValueType::Value
             {
-                final_ikey = InternalKey::new(user_key, 0, ikr.value_type())
-                    .as_bytes()
-                    .to_vec();
+                final_ikey = InternalKey::new(user_key, 0, vt).as_bytes().to_vec();
                 &final_ikey
             } else {
                 &ikey

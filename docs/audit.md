@@ -12,12 +12,6 @@
 
 ## Open
 
-### [CRITICAL] SST/compaction: malformed internal keys are silently skipped or reinterpreted
-- **Where**: `src/types.rs`, `src/sst/table_builder.rs`, `src/sst/table_reader/mod.rs`, `src/iterator/db_iter.rs`, `src/compaction/leveled.rs`
-- **What**: CRC-valid keys shorter than the eight-byte trailer are skipped, while unknown value-type bytes are coerced to point deletions. Point reads and iterators can report false absence; both compaction loops can install output that omitted malformed entries and then delete the source SST.
-- **Why**: Persisted-key semantic boundaries use infallible decoding or `continue`, and the existing checked type decoder is confined to one bottommost-deletion branch.
-- **Suggested fix**: Add one fallible length/sequence/type decoder and use it at every persisted internal-key boundary, surface iterator corruption through `error()`, reject malformed builder input, and regress reads plus normal/forced compaction with CRC-valid malformed entries.
-
 ### [HIGH] compaction: range-scoped picking can move tombstones below covered source keys
 - **Where**: `src/compaction/leveled.rs` (`pick_compaction_for_range`)
 - **What**: A narrow range compaction selects source files by their point-key metadata but does not close the selection over overlapping same-level siblings. It can move a range tombstone to L1 while a covered point remains in L0, after which level-aware iteration ignores the deeper tombstone and resurrects the point.

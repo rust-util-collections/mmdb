@@ -24,7 +24,7 @@ use crate::sst::{
     format::*,
     table_reader::MAX_DECOMPRESSED_BLOCK_SIZE,
 };
-use crate::types::{InternalKeyRef, ValueType, compare_internal_key, user_key};
+use crate::types::{ValueType, compare_internal_key, decode_internal_key, user_key};
 
 /// Soft threshold at which callers that can split their output across
 /// multiple SST files (flush, compaction) should cut the current file, so
@@ -216,18 +216,23 @@ impl TableBuilder {
     /// Add a key-value pair. Must be called in sorted key order.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         assert!(!self.finished);
-        if self.options.internal_keys {
+        let internal_vt = if self.options.internal_keys {
+            // Reject short keys / unknown type bytes before committing them
+            // to a CRC-valid SST that would later misread as deletions/absence.
+            let (_, _, vt) = decode_internal_key(key).ctx()?;
             assert!(
                 self.last_key.is_empty()
                     || compare_internal_key(key, &self.last_key) == Ordering::Greater,
                 "keys must be added in order"
             );
+            Some(vt)
         } else {
             assert!(
                 self.last_key.is_empty() || key > self.last_key.as_slice(),
                 "keys must be added in order"
             );
-        }
+            None
+        };
 
         if self.smallest_key.is_none() {
             self.smallest_key = Some(key.to_vec());
@@ -250,26 +255,23 @@ impl TableBuilder {
         }
 
         // Buffer range deletions into a separate block
-        if self.options.internal_keys && key.len() >= 8 {
-            let ikr = InternalKeyRef::new(key);
-            if ikr.value_type() == ValueType::RangeDeletion {
-                // All range tombstones share one block; it must stay readable.
-                let projected = self
-                    .range_del_projected
-                    .saturating_add(entry_size)
-                    .saturating_add(META_ENTRY_OVERHEAD);
-                if projected > META_BLOCK_HARD_LIMIT {
-                    return Err(Error::invalid_argument(format!(
-                        "range-del block size {} would exceed maximum readable block size {}",
-                        projected, META_BLOCK_HARD_LIMIT
-                    )));
-                }
-                self.range_del_projected = projected;
-                self.has_range_deletions = true;
-                self.range_del_entries.push((key.to_vec(), value.to_vec()));
-                self.last_key = key.to_vec();
-                return Ok(());
+        if internal_vt == Some(ValueType::RangeDeletion) {
+            // All range tombstones share one block; it must stay readable.
+            let projected = self
+                .range_del_projected
+                .saturating_add(entry_size)
+                .saturating_add(META_ENTRY_OVERHEAD);
+            if projected > META_BLOCK_HARD_LIMIT {
+                return Err(Error::invalid_argument(format!(
+                    "range-del block size {} would exceed maximum readable block size {}",
+                    projected, META_BLOCK_HARD_LIMIT
+                )));
             }
+            self.range_del_projected = projected;
+            self.has_range_deletions = true;
+            self.range_del_entries.push((key.to_vec(), value.to_vec()));
+            self.last_key = key.to_vec();
+            return Ok(());
         }
 
         // The index block stores each data block's last key AND first key, in
@@ -290,8 +292,8 @@ impl TableBuilder {
         }
 
         // Collect key for bloom filter (use user key if internal_keys mode)
-        let user_key_for_bloom = if self.options.internal_keys && key.len() >= 8 {
-            &key[..key.len() - 8]
+        let user_key_for_bloom = if self.options.internal_keys {
+            user_key(key)
         } else {
             key
         };
@@ -730,7 +732,7 @@ mod tests {
     #[test]
     fn test_range_del_block_separate_storage() {
         use crate::sst::table_reader::TableReader;
-        use crate::types::{InternalKey, ValueType};
+        use crate::types::{InternalKey, InternalKeyRef, ValueType};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("range_del.sst");
@@ -826,6 +828,29 @@ mod tests {
 
         assert_eq!(builder.projected_filter_size(), META_BLOCK_SPLIT_THRESHOLD);
         assert!(builder.projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD);
+    }
+
+    #[test]
+    fn test_internal_keys_reject_malformed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad_ikey.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let err = builder.add(b"short", b"v").unwrap_err();
+        assert!(err.to_string().contains("too short"));
+
+        let packed = (1u64 << 8) | 0xAB;
+        let mut bad = b"k".to_vec();
+        bad.extend_from_slice(&(!packed).to_be_bytes());
+        let err = builder.add(&bad, b"v").unwrap_err();
+        assert!(err.to_string().contains("invalid value_type"));
     }
 
     #[test]

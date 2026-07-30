@@ -182,27 +182,39 @@ impl<'a> InternalKeyRef<'a> {
         ValueType::from_u8((trailer & 0xFF) as u8).unwrap_or(ValueType::Deletion)
     }
 
-    /// Like [`value_type`](Self::value_type), but returns `Error::corruption`
-    /// instead of silently coercing an unrecognized trailer byte to
-    /// `Deletion`. Use this at decision points where mistaking a corrupted
-    /// `Value`/`RangeDeletion` entry for a `Deletion` would cause the entry
-    /// to be permanently and silently dropped (e.g. compaction's bottommost
-    /// tombstone/deletion-drop logic) — bit-rot surviving a checksum, or a
-    /// future on-disk variant, must fail loudly there rather than destroy
-    /// data irrecoverably.
-    #[inline]
-    pub fn value_type_checked(&self) -> Result<ValueType> {
-        let trailer = self.trailer();
-        let raw = (trailer & 0xFF) as u8;
-        ValueType::from_u8(raw)
-            .ok_or_else(|| Error::corruption(format!("invalid value_type byte {} in trailer", raw)))
-    }
-
     #[inline]
     fn trailer(&self) -> u64 {
         let offset = self.encoded.len() - 8;
         !u64::from_be_bytes(self.encoded[offset..].try_into().unwrap())
     }
+}
+
+/// Decode a persisted internal key's length, sequence, and type.
+///
+/// Every on-disk / compaction / iterator boundary that treats bytes as an
+/// internal key must use this (or the infallible accessors only after a
+/// successful call). Keys shorter than the 8-byte trailer and trailers with
+/// unknown value-type bytes fail as corruption — never skip or coerce.
+#[inline]
+pub fn decode_internal_key(encoded: &[u8]) -> Result<(&[u8], SequenceNumber, ValueType)> {
+    if encoded.len() < 8 {
+        return Err(Error::corruption(format!(
+            "internal key too short: {} bytes (need at least 8)",
+            encoded.len()
+        )));
+    }
+    let ikr = InternalKeyRef::new(encoded);
+    let vt = decode_trailer_type(ikr.trailer())?;
+    let seq = ikr.sequence();
+    let uk_len = ikr.user_key().len();
+    Ok((&encoded[..uk_len], seq, vt))
+}
+
+#[inline]
+fn decode_trailer_type(packed_trailer: u64) -> Result<ValueType> {
+    let raw = (packed_trailer & 0xFF) as u8;
+    ValueType::from_u8(raw)
+        .ok_or_else(|| Error::corruption(format!("invalid value_type byte {} in trailer", raw)))
 }
 
 /// Compare two internal keys:
@@ -526,6 +538,24 @@ mod tests {
         assert_eq!(ik.sequence(), 100);
         assert_eq!(ik.value_type(), ValueType::Value);
         assert_eq!(ik.encoded_len(), 5 + 8);
+
+        let (uk, seq, vt) = decode_internal_key(ik.as_bytes()).unwrap();
+        assert_eq!(uk, b"hello");
+        assert_eq!(seq, 100);
+        assert_eq!(vt, ValueType::Value);
+    }
+
+    #[test]
+    fn test_decode_internal_key_rejects_short_and_unknown_type() {
+        assert!(decode_internal_key(b"short").is_err());
+        assert!(decode_internal_key(&[]).is_err());
+
+        // Valid length, unknown type byte in trailer.
+        let packed = (42u64 << 8) | 0xFF;
+        let mut key = b"key".to_vec();
+        key.extend_from_slice(&(!packed).to_be_bytes());
+        let err = decode_internal_key(&key).unwrap_err();
+        assert!(err.to_string().contains("invalid value_type"));
     }
 
     #[test]

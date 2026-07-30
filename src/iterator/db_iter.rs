@@ -6,7 +6,8 @@ use std::cmp::Ordering;
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::types::{
-    InternalKeyRef, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
+    LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
+    decode_internal_key,
 };
 
 type IKeyCompareFn = fn(&[u8], &[u8]) -> Ordering;
@@ -65,6 +66,10 @@ pub struct DBIterator {
     /// Fast path: true when no range tombstones and no skip_point callback.
     /// Enables next_visible_clean() which skips tombstone checks.
     clean_read: bool,
+    /// Semantic corruption while decoding an internal key (short trailer /
+    /// unknown type). Surfaced via [`Self::error`] so callers do not treat it
+    /// as normal exhaustion.
+    key_decode_error: Option<String>,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> Ordering {
@@ -97,6 +102,7 @@ impl DBIterator {
             skip_point: None,
             last_seek_key: None,
             clean_read: true,
+            key_decode_error: None,
         }
     }
 
@@ -121,6 +127,7 @@ impl DBIterator {
             skip_point: None,
             last_seek_key: None,
             clean_read: true,
+            key_decode_error: None,
         }
     }
 
@@ -150,6 +157,7 @@ impl DBIterator {
             skip_point: None,
             last_seek_key: None,
             clean_read: true,
+            key_decode_error: None,
         }
     }
 
@@ -244,11 +252,14 @@ impl DBIterator {
         self.prev_overshoot = None;
     }
 
-    /// Return the first error from any underlying source iterator.
+    /// Return the first error from any underlying source iterator, or a
+    /// key-decode corruption observed while filtering entries.
     /// Use after iteration returns `None` to distinguish normal exhaustion
-    /// from I/O failures.
+    /// from I/O or semantic corruption failures.
     pub fn error(&self) -> Option<String> {
-        self.merger.error()
+        self.key_decode_error
+            .clone()
+            .or_else(|| self.merger.error())
     }
 
     /// Set a skip-point callback. During iteration, any user key for which
@@ -336,65 +347,65 @@ impl DBIterator {
         loop {
             let action = {
                 let (ikey_ref, _value_ref) = self.merger.peek_entry()?;
-                if ikey_ref.len() < 8 {
-                    Action::Skip
-                } else {
-                    let ikr = InternalKeyRef::new(ikey_ref);
-                    let seq = ikr.sequence();
-                    let vt = ikr.value_type();
-
-                    if !(seq <= snapshot || batch_floor.is_some_and(|floor| seq >= floor)) {
-                        Action::Skip
-                    } else {
-                        let uk_len = ikey_ref.len() - 8;
-
-                        // Lower bound check
-                        if let Some(ref lb) = self.iterate_lower_bound
-                            && ikey_ref[..uk_len] < **lb
-                        {
-                            Action::Skip
-                        }
-                        // Prefix boundary check
-                        else if let Some(ref pfx) = self.prefix
-                            && !ikey_ref[..uk_len].starts_with(pfx)
-                        {
-                            if &ikey_ref[..uk_len] < pfx.as_slice() {
-                                Action::Skip
-                            } else {
-                                return None;
-                            }
-                        }
-                        // Upper bound check
-                        else if let Some(ref ub) = self.iterate_upper_bound
-                            && ikey_ref[..uk_len] >= **ub
-                        {
-                            return None;
-                        } else if vt == ValueType::RangeDeletion {
-                            // Skip RangeDeletion entries — tombstones are pre-loaded.
-                            // Do NOT update last_user_key: RangeDeletion is not a point
-                            // mutation for this user key. Updating it would suppress a
-                            // same-key Value via dedup instead of the proper range
-                            // tombstone coverage check (which uses strict >).
-                            Action::Skip
-                        } else if self.has_last_key
-                            && self.last_user_key.as_slice() == &ikey_ref[..uk_len]
-                        {
-                            // Duplicate user key — already saw newest version
+                match decode_internal_key(ikey_ref) {
+                    Err(e) => {
+                        self.key_decode_error = Some(e.to_string());
+                        return None;
+                    }
+                    Ok((_, seq, vt)) => {
+                        if !(seq <= snapshot || batch_floor.is_some_and(|floor| seq >= floor)) {
                             Action::Skip
                         } else {
-                            // New user key — update dedup state
-                            self.last_user_key.clear();
-                            self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
-                            self.has_last_key = true;
+                            let uk_len = ikey_ref.len() - 8;
 
-                            if vt == ValueType::Deletion {
+                            // Lower bound check
+                            if let Some(ref lb) = self.iterate_lower_bound
+                                && ikey_ref[..uk_len] < **lb
+                            {
                                 Action::Skip
-                            } else if self.range_tombstones.is_empty() {
-                                Action::Take { uk_len }
+                            }
+                            // Prefix boundary check
+                            else if let Some(ref pfx) = self.prefix
+                                && !ikey_ref[..uk_len].starts_with(pfx)
+                            {
+                                if &ikey_ref[..uk_len] < pfx.as_slice() {
+                                    Action::Skip
+                                } else {
+                                    return None;
+                                }
+                            }
+                            // Upper bound check
+                            else if let Some(ref ub) = self.iterate_upper_bound
+                                && ikey_ref[..uk_len] >= **ub
+                            {
+                                return None;
+                            } else if vt == ValueType::RangeDeletion {
+                                // Skip RangeDeletion entries — tombstones are pre-loaded.
+                                // Do NOT update last_user_key: RangeDeletion is not a point
+                                // mutation for this user key. Updating it would suppress a
+                                // same-key Value via-dedup instead of the proper range
+                                // tombstone coverage check (which uses strict >).
+                                Action::Skip
+                            } else if self.has_last_key
+                                && self.last_user_key.as_slice() == &ikey_ref[..uk_len]
+                            {
+                                // Duplicate user key — already saw newest version
+                                Action::Skip
                             } else {
-                                // Defer tombstone check until after peek_entry
-                                // borrow ends so we can call peek_source_level().
-                                Action::TakeCheckTombstone { uk_len, seq }
+                                // New user key — update dedup state
+                                self.last_user_key.clear();
+                                self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
+                                self.has_last_key = true;
+
+                                if vt == ValueType::Deletion {
+                                    Action::Skip
+                                } else if self.range_tombstones.is_empty() {
+                                    Action::Take { uk_len }
+                                } else {
+                                    // Defer tombstone check until after peek_entry
+                                    // borrow ends so we can call peek_source_level().
+                                    Action::TakeCheckTombstone { uk_len, seq }
+                                }
                             }
                         }
                     }
@@ -467,14 +478,14 @@ impl DBIterator {
         let batch_floor = self.batch_seq_floor;
         loop {
             let (ikey_ref, _) = self.merger.peek_entry()?;
-            if ikey_ref.len() < 8 {
-                self.merger.advance_entry();
-                continue;
-            }
+            let (seq, vt) = match decode_internal_key(ikey_ref) {
+                Err(e) => {
+                    self.key_decode_error = Some(e.to_string());
+                    return None;
+                }
+                Ok((_, seq, vt)) => (seq, vt),
+            };
             let uk_len = ikey_ref.len() - 8;
-            let ikr = InternalKeyRef::new(ikey_ref);
-            let seq = ikr.sequence();
-            let vt = ikr.value_type();
 
             if !(seq <= snapshot || batch_floor.is_some_and(|floor| seq >= floor)) {
                 self.merger.advance_entry();
@@ -707,13 +718,16 @@ impl DBIterator {
             let mut iter_entry = first_entry;
 
             while let Some((ikey, value, level)) = iter_entry.take() {
-                if ikey.len() < 8 {
-                    iter_entry = self.prev_entry_with_level();
-                    continue;
-                }
-
-                let uk_len = ikey.len() - 8;
-                let uk = &ikey[..uk_len];
+                let (uk_owned, seq, vt) = match decode_internal_key(&ikey) {
+                    Err(e) => {
+                        self.key_decode_error = Some(e.to_string());
+                        self.current = None;
+                        return;
+                    }
+                    Ok((uk, seq, vt)) => (uk.to_vec(), seq, vt),
+                };
+                let uk = uk_owned.as_slice();
+                let uk_len = uk.len();
 
                 // Prefix guard
                 if let Some(ref pfx) = self.prefix
@@ -736,10 +750,6 @@ impl DBIterator {
                     iter_entry = self.prev_entry_with_level();
                     continue;
                 }
-
-                let ikr = InternalKeyRef::new(&ikey);
-                let seq = ikr.sequence();
-                let vt = ikr.value_type();
 
                 match &candidate_uk {
                     None => {
@@ -1615,5 +1625,25 @@ mod tests {
 
         iter.prev();
         assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_malformed_internal_key_surfaces_error() {
+        // Short key must stop iteration and set error().
+        let sources = vec![vec![(b"short".to_vec(), b"v".to_vec())]];
+        let mut iter = DBIterator::new(sources, 100);
+        assert!(iter.next().is_none());
+        let err = iter.error().expect("decode error");
+        assert!(err.contains("too short"), "got {err}");
+
+        // Unknown type byte must not be coerced to Deletion (false absence).
+        let packed = (5u64 << 8) | 0xEE;
+        let mut bad = b"k".to_vec();
+        bad.extend_from_slice(&(!packed).to_be_bytes());
+        let sources = vec![vec![(bad, b"v".to_vec())]];
+        let mut iter = DBIterator::new(sources, 100);
+        assert!(iter.next().is_none());
+        let err = iter.error().expect("type error");
+        assert!(err.contains("invalid value_type"), "got {err}");
     }
 }

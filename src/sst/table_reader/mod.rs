@@ -21,7 +21,7 @@ use crate::sst::format::{
     RANGE_DEL_BLOCK_NAME, decode_footer, decode_index_value_with_props,
 };
 use crate::stats::DbStats;
-use crate::types::{InternalKeyRef, SequenceNumber, ValueType, compare_internal_key};
+use crate::types::{SequenceNumber, ValueType, compare_internal_key, decode_internal_key};
 
 /// A range tombstone: (begin_key, end_key, sequence_number).
 type RangeTombstoneEntry = (Vec<u8>, Vec<u8>, SequenceNumber);
@@ -268,17 +268,17 @@ impl TableReader {
             .seek_by(seek_key.as_bytes(), compare_internal_key)
             .ctx()?
         {
-            Some((encoded_ikey, value)) if encoded_ikey.len() >= 8 => {
-                let ik = InternalKeyRef::new(&encoded_ikey);
-                if ik.user_key() == user_key {
-                    return Ok(Some(match ik.value_type() {
+            Some((encoded_ikey, value)) => {
+                let (uk, _, vt) = decode_internal_key(&encoded_ikey).ctx()?;
+                if uk == user_key {
+                    return Ok(Some(match vt {
                         ValueType::Value => Some(value),
                         ValueType::Deletion | ValueType::RangeDeletion => None,
                     }));
                 }
                 Ok(None)
             }
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -318,12 +318,11 @@ impl TableReader {
             .seek_by(seek_key.as_bytes(), compare_internal_key)
             .ctx()?
         {
-            Some((encoded_ikey, value)) if encoded_ikey.len() >= 8 => {
-                let ik = InternalKeyRef::new(&encoded_ikey);
-                if ik.user_key() == user_key {
-                    let entry_seq = ik.sequence();
+            Some((encoded_ikey, value)) => {
+                let (uk, entry_seq, vt) = decode_internal_key(&encoded_ikey).ctx()?;
+                if uk == user_key {
                     return Ok(Some((
-                        match ik.value_type() {
+                        match vt {
                             ValueType::Value => Some(value),
                             ValueType::Deletion | ValueType::RangeDeletion => None,
                         },
@@ -332,7 +331,7 @@ impl TableReader {
                 }
                 Ok(None)
             }
-            _ => Ok(None),
+            None => Ok(None),
         }
     }
 
@@ -372,12 +371,9 @@ impl TableReader {
             let block = Block::new(block_data).ctx()?;
             let mut iter = block.iter();
             for (k, v) in &mut iter {
-                if k.len() < 8 {
-                    continue;
-                }
-                let ikr = InternalKeyRef::new(&k);
-                if ikr.value_type() == ValueType::RangeDeletion {
-                    triples.push((ikr.user_key().to_vec(), v, ikr.sequence()));
+                let (uk, seq, vt) = decode_internal_key(&k).ctx()?;
+                if vt == ValueType::RangeDeletion {
+                    triples.push((uk.to_vec(), v, seq));
                 }
             }
             if let Some(e) = iter.error() {
@@ -393,14 +389,10 @@ impl TableReader {
 
                 let mut iter = block.iter();
                 for (k, v) in &mut iter {
-                    if k.len() < 8 {
-                        continue;
+                    let (uk, seq, vt) = decode_internal_key(&k).ctx()?;
+                    if vt == ValueType::RangeDeletion {
+                        triples.push((uk.to_vec(), v, seq));
                     }
-                    let ikr = InternalKeyRef::new(&k);
-                    if ikr.value_type() != ValueType::RangeDeletion {
-                        continue;
-                    }
-                    triples.push((ikr.user_key().to_vec(), v, ikr.sequence()));
                 }
                 if let Some(e) = iter.error() {
                     return Err(e.clone()).ctx();
