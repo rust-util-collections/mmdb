@@ -489,6 +489,25 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// Test-only seam for `DB::open`'s compaction-worker spawn loop: forces the
+// spawn at this 0-based worker index to be reported as failed, so a test
+// can exercise partial-startup cleanup without needing real OS thread
+// exhaustion. Thread-local for the same cross-test-isolation reason as
+// `PRUNE_SETTLED_RACE_HOOK` above.
+#[cfg(test)]
+thread_local! {
+    static FAIL_COMPACTION_SPAWN_AT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// `DB::open` deposits its `compaction_shutdown` flag here on every
+    /// call. Every worker thread — including one whose spawn is forced to
+    /// fail above, since its (detached) real thread still shares this same
+    /// `Arc` — holds a clone for its entire life, so a test can poll
+    /// `Arc::strong_count` back down to the sink's own reference to confirm
+    /// every worker actually exited instead of leaking.
+    static LAST_COMPACTION_SHUTDOWN_FLAG: std::cell::RefCell<Option<Arc<AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl DB {
     /// Open or create a database.
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
@@ -775,6 +794,9 @@ impl DB {
         // Spawn background compaction threads
         let compaction_shutdown = Arc::new(AtomicBool::new(false));
         let compaction_notify = Arc::new((StdMutex::new(false), StdCondvar::new()));
+        #[cfg(test)]
+        LAST_COMPACTION_SHUTDOWN_FLAG
+            .with(|sink| *sink.borrow_mut() = Some(compaction_shutdown.clone()));
         let has_bg_error = Arc::new(AtomicBool::new(false));
         let bg_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let compacting_files = Arc::new(CompactionClaims::new());
@@ -1237,9 +1259,43 @@ impl DB {
                             }
                         }
                     }
-                })
-                .with_ctx(|| "failed to spawn compaction thread")?;
-            compaction_handles.push(handle);
+                });
+            // Test-only: force this iteration to be reported as a failed
+            // spawn. Any real handle just created above is dropped
+            // (detached) rather than tracked — its thread still shares
+            // `compaction_shutdown`/`compaction_notify` with every other
+            // worker, so it exits once the `Err` branch below signals
+            // shutdown, same as the genuinely-prior workers.
+            #[cfg(test)]
+            let handle = if FAIL_COMPACTION_SPAWN_AT.with(|f| f.get()) == Some(i) {
+                Err(io::Error::other(
+                    "test-injected compaction thread spawn failure",
+                ))
+            } else {
+                handle
+            };
+            match handle {
+                Ok(handle) => compaction_handles.push(handle),
+                Err(e) => {
+                    // Partial startup failure: workers 0..i already spawned
+                    // are running and blocked on `compaction_notify`, each
+                    // holding Arc clones of `inner`/`super_version`/etc.
+                    // Returning here without unwinding them would leak both
+                    // the threads and everything they keep alive for the
+                    // rest of the process — signal and wake them, then join
+                    // before propagating the spawn error.
+                    {
+                        let (lock, cvar) = &*compaction_notify;
+                        let _guard = lock.lock().unwrap();
+                        compaction_shutdown.store(true, Ordering::Release);
+                        cvar.notify_all();
+                    }
+                    for h in compaction_handles.drain(..) {
+                        let _ = h.join();
+                    }
+                    return Err(e).with_ctx(|| "failed to spawn compaction thread");
+                }
+            }
         }
 
         let db = Self {
@@ -4209,6 +4265,54 @@ mod tests {
              deletion was active"
         );
         assert_eq!(db.dead_key_count(), 0);
+    }
+
+    /// Regression: if a later worker's spawn fails during `DB::open`, the
+    /// workers spawned before it must not be left running forever. Force
+    /// worker 2 (of 5) to fail via `FAIL_COMPACTION_SPAWN_AT` and confirm
+    /// every worker — including workers 0 and 1, which `DB::open` must
+    /// signal and join before returning the error — actually exits, via
+    /// `Arc::strong_count` on the shared shutdown flag dropping back to
+    /// just this test's own reference.
+    #[test]
+    fn db_open_partial_compaction_spawn_failure_joins_prior_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions {
+            create_if_missing: true,
+            max_background_compactions: 5,
+            ..Default::default()
+        };
+
+        FAIL_COMPACTION_SPAWN_AT.with(|f| f.set(Some(2)));
+        let result = DB::open(opts, dir.path());
+        FAIL_COMPACTION_SPAWN_AT.with(|f| f.set(None));
+
+        assert!(
+            result.is_err(),
+            "the injected spawn failure must propagate from DB::open"
+        );
+
+        let shutdown_flag = LAST_COMPACTION_SHUTDOWN_FLAG
+            .with(|sink| sink.borrow_mut().take())
+            .expect("DB::open must deposit its compaction_shutdown flag");
+
+        // Workers 0 and 1 must already be joined by the time `DB::open`
+        // returns; worker 2's real (detached) thread only needs to notice
+        // the same shutdown signal and exit, which the poll below allows a
+        // short bounded time for.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let count = Arc::strong_count(&shutdown_flag);
+            if count == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "compaction workers spawned before the injected failure were \
+                 not joined/exited (Arc::strong_count = {count})"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn open_test_db(dir: &Path) -> DB {

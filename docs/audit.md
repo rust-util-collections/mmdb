@@ -11,12 +11,6 @@
 > changes.
 
 ## Open
-### [MEDIUM] open: partial compaction-thread spawn failure leaks earlier workers
-- **Where**: `src/db.rs` (background compaction thread startup)
-- **What**: If a later worker spawn fails, `DB::open` returns immediately while already spawned workers retain shared state and wait indefinitely.
-- **Why**: The error path neither signals shutdown nor joins the handles accumulated before the failed spawn.
-- **Suggested fix**: On partial startup failure, signal and notify shutdown, then join all prior workers before returning the spawn error. Regress with an injectable failure on worker N.
-
 ### [MEDIUM] iterator: `BidiIterator` hides underlying lazy-iteration failures
 - **Where**: `src/iterator/bidi_iter.rs`
 - **What**: SST I/O or corruption can make a lazy bidirectional iterator return `None`, but it exposes no `error()` accessor. The initial reverse transition also replaces the underlying state before all early returns, risking loss of the source error.
