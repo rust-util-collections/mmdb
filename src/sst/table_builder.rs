@@ -900,7 +900,7 @@ mod tests {
     #[test]
     fn test_prefix_set_empty_when_bloom_disabled() {
         let dir = tempfile::tempdir().unwrap();
-        let path= dir.path().join("no_bloom_prefix.sst");
+        let path = dir.path().join("no_bloom_prefix.sst");
         let mut builder = TableBuilder::new(
             &path,
             TableBuildOptions {
@@ -918,5 +918,4 @@ mod tests {
         );
         builder.finish().unwrap();
     }
-
 }
