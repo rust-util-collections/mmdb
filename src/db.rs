@@ -477,6 +477,18 @@ fn collect_tombstones_overlapping_bounds(
     }
 }
 
+// Test-only seam for deterministically racing a concurrent write against
+// `prune_settled_dead_keys`'s window between its unlocked absence probe and
+// its locked re-verify-and-remove step. Thread-local (not a `DB` field) so
+// it cannot leak across concurrently-running tests on other threads, and
+// `#[cfg(test)]`-only so it never compiles into `test-utils` or release
+// builds. Unused outside that one regression test.
+#[cfg(test)]
+thread_local! {
+    static PRUNE_SETTLED_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl DB {
     /// Open or create a database.
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
@@ -2599,6 +2611,12 @@ impl DB {
     /// can only newly settle keys inside its own range, so probing the rest
     /// would be wasted reads. Lookup errors (e.g. fail-stop) conservatively
     /// keep the registration.
+    ///
+    /// The bulk absence probe runs unlocked so a large candidate set never
+    /// stalls writers, then the (normally much smaller) settled subset is
+    /// re-verified and removed under `write_queue` so a concurrent write
+    /// cannot land in the gap between "observed absent" and "registration
+    /// removed" — see `write_queue`'s use below.
     fn prune_settled_dead_keys(
         &self,
         max_checks: Option<usize>,
@@ -2647,8 +2665,38 @@ impl DB {
         if settled.is_empty() {
             return;
         }
+
+        // Test-only: let a regression test deterministically run a
+        // concurrent write right here — after the absence probe above but
+        // before the re-verify-and-remove step below.
+        #[cfg(test)]
+        if let Some(hook) = PRUNE_SETTLED_RACE_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+
+        // The probe above is a lock-free, unlocked scan so a large candidate
+        // set never stalls writers — but that leaves a check-then-act gap: a
+        // concurrent put/write_batch can commit a new version of a key we
+        // just saw absent before we remove its registration below, and the
+        // removal would then permanently hide a rewrite that raced the
+        // pruning decision from any future compaction filter. Re-verify the
+        // (already filtered, normally much smaller) `settled` list while
+        // holding `write_queue` after any in-flight leader finishes: no
+        // writer can even enqueue past that lock (`write()` takes the same
+        // mutex before joining or becoming leader), so nothing can commit
+        // between this second check and the removal — the same
+        // serialization `compact`/`compact_range`/`close` already rely on.
+        let mut wq = self.write_queue.lock();
+        self.wait_for_write_leader_idle(&mut wq);
+        let reconfirmed: Vec<Vec<u8>> = settled
+            .into_iter()
+            .filter(|key| matches!(self.get_with_options(&read_options, key), Ok(None)))
+            .collect();
+        if reconfirmed.is_empty() {
+            return;
+        }
         let mut set = self.dead_keys.write();
-        for key in &settled {
+        for key in &reconfirmed {
             set.remove(key);
         }
     }
@@ -4089,6 +4137,78 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: `prune_settled_dead_keys`'s absence probe is an unlocked
+    /// scan, so a concurrent write can commit a new version of a key
+    /// between "observed absent" and "registration removed". Deterministically
+    /// land a write to a registered dead key inside exactly that window (via
+    /// `PRUNE_SETTLED_RACE_HOOK`, which fires once the probe has already
+    /// decided the key is settled) and confirm the registration survives —
+    /// so a later compaction still enforces the documented "reused while
+    /// still registered" contract instead of the race silently exempting
+    /// the rewrite from ever being checked again.
+    #[test]
+    fn prune_settled_dead_keys_reverifies_under_write_queue_before_removing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+
+        // Registered while genuinely absent (never written), so the probe's
+        // very first pass finds it settled.
+        db.lazy_delete(b"race_key");
+        assert_eq!(db.dead_key_count(), 1);
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (written_tx, written_rx) = std::sync::mpsc::channel::<()>();
+
+        // Arm the hook: it fires once, exactly between the probe (which will
+        // have already decided "race_key" is settled) and the
+        // re-verify-and-remove step. It wakes the writer below and then
+        // blocks until that write has fully committed, deterministically
+        // placing the concurrent rewrite inside the race window under test.
+        PRUNE_SETTLED_RACE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                started_tx.send(()).unwrap();
+                written_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+        });
+
+        thread::scope(|scope| {
+            let writer_db = &db;
+            scope.spawn(move || {
+                started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                writer_db
+                    .put(b"race_key", b"rewritten-while-active")
+                    .unwrap();
+                written_tx.send(()).unwrap();
+            });
+
+            db.prune_settled_dead_keys(None, None, None);
+        });
+
+        assert_eq!(
+            db.dead_key_count(),
+            1,
+            "a write racing the absence probe must keep the registration active"
+        );
+        assert_eq!(
+            db.get(b"race_key").unwrap(),
+            Some(b"rewritten-while-active".to_vec()),
+            "the concurrent write itself must not be lost"
+        );
+
+        // Per the documented contract, a value written while its
+        // registration was still active is removed by a later compaction.
+        // `compact()` only rewrites SST files, so flush the memtable first.
+        db.flush().unwrap();
+        db.compact().unwrap();
+        assert_eq!(
+            db.get(b"race_key").unwrap(),
+            None,
+            "a later compaction must still remove a value written while lazy \
+             deletion was active"
+        );
+        assert_eq!(db.dead_key_count(), 0);
     }
 
     fn open_test_db(dir: &Path) -> DB {

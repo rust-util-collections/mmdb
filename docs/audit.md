@@ -11,12 +11,6 @@
 > changes.
 
 ## Open
-### [HIGH] API: lazy-delete pruning can forget a concurrent rewrite
-- **Where**: `src/db.rs` (`prune_settled_dead_keys`, write path)
-- **What**: Pruning observes an absent key without holding writer serialization, then removes its registration after a concurrent put commits the same key. Future compaction preserves that rewrite even though it occurred while lazy deletion was active.
-- **Why**: The absence probe and registration removal are a check-then-act sequence with no generation or write-order validation.
-- **Suggested fix**: Make final validation/removal atomic with relevant writes, or use equivalent registration generations. Add a deterministic race between the absence probe and removal.
-
 ### [MEDIUM] open: partial compaction-thread spawn failure leaks earlier workers
 - **Where**: `src/db.rs` (background compaction thread startup)
 - **What**: If a later worker spawn fails, `DB::open` returns immediately while already spawned workers retain shared state and wait indefinitely.
