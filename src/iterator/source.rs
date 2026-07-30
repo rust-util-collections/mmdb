@@ -28,6 +28,9 @@ enum IterSourceInner {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         pos: usize,
     },
+    /// Test-only generic box; production uses typed Sst/Level/Memtable arms so
+    /// `iter_error` can surface. Kept for unit tests of Merkel ports.
+    #[cfg(test)]
     Boxed(Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>),
     /// Direct (non-boxed) memtable cursor — zero vtable dispatch.
     Memtable {
@@ -38,9 +41,7 @@ enum IterSourceInner {
         iter: crate::sst::table_reader::TableIterator,
     },
     /// Direct (non-boxed) level iterator — zero vtable dispatch.
-    Level {
-        iter: LevelIterator,
-    },
+    Level { iter: LevelIterator },
 }
 
 /// Trait for iterators that support seeking and bidirectional traversal.
@@ -134,6 +135,7 @@ impl IterSource {
         }
     }
 
+    #[cfg(test)]
     pub fn from_boxed(iter: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>) -> Self {
         Self {
             inner: IterSourceInner::Boxed(iter),
@@ -229,6 +231,7 @@ impl IterSource {
                     false
                 }
             }
+            #[cfg(test)]
             IterSourceInner::Boxed(iter) => match iter.next() {
                 Some((k, v)) => {
                     self.peeked_key = k;
@@ -278,6 +281,7 @@ impl IterSource {
                     false
                 }
             }
+            #[cfg(test)]
             IterSourceInner::Boxed(_) => false,
             IterSourceInner::Memtable { iter } => {
                 let mut tmp_val = Vec::new();
@@ -355,6 +359,7 @@ impl IterSource {
                     *pos += 1;
                 }
             }
+            #[cfg(test)]
             IterSourceInner::Boxed(_) => {
                 self.seek(target, compare);
             }
@@ -385,6 +390,8 @@ impl IterSource {
     }
 
     /// Seek forward until the current key >= target according to `compare`.
+    /// Used by the test-only boxed source arm.
+    #[cfg(test)]
     pub fn seek<F: Fn(&[u8], &[u8]) -> Ordering>(&mut self, target: &[u8], compare: &F) {
         // Discard peeked if < target
         loop {
@@ -446,6 +453,7 @@ impl IterSource {
                     self.has_peeked = true;
                 }
             }
+            #[cfg(test)]
             IterSourceInner::Boxed(_) => {}
         }
     }
@@ -489,6 +497,7 @@ impl IterSource {
                     self.has_peeked = true;
                 }
             }
+            #[cfg(test)]
             IterSourceInner::Boxed(_) => {}
         }
     }
@@ -532,6 +541,7 @@ impl IterSource {
                     self.has_peeked = true;
                 }
             }
+            #[cfg(test)]
             IterSourceInner::Boxed(_) => {
                 // Cannot seek to last on plain iterator
             }

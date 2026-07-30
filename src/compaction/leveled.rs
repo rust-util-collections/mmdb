@@ -555,13 +555,15 @@ fn execute_sub_compaction_io(
         // Compaction scans every input block exactly once; filling the
         // block cache would evict hot point-read blocks for no benefit.
         let iter = TableIterator::new(tf.reader.clone()).with_fill_cache(false);
-        sources.push(IterSource::from_boxed(Box::new(iter)));
+        // from_table_iter (not from_boxed): surfaces iter_error so a mid-block
+        // decode/CRC failure fails the job instead of looking like clean EOF.
+        sources.push(IterSource::from_table_iter(iter));
     }
     for tf in &sub.input_files_next {
         // Compaction scans every input block exactly once; filling the
         // block cache would evict hot point-read blocks for no benefit.
         let iter = TableIterator::new(tf.reader.clone()).with_fill_cache(false);
-        sources.push(IterSource::from_boxed(Box::new(iter)));
+        sources.push(IterSource::from_table_iter(iter));
     }
 
     // Inject the range tombstones relevant to this sub-task into the merge
@@ -1543,7 +1545,9 @@ impl LeveledCompaction {
             // Compaction scans every input block exactly once; filling the
             // block cache would evict hot point-read blocks for no benefit.
             let iter = TableIterator::new(tf.reader.clone()).with_fill_cache(false);
-            sources.push(IterSource::from_boxed(Box::new(iter)));
+            // from_table_iter (not from_boxed): surfaces iter_error so a mid-block
+            // decode/CRC failure fails the job instead of looking like clean EOF.
+            sources.push(IterSource::from_table_iter(iter));
         }
 
         // Inject range tombstones from new-format SSTs into the merge stream

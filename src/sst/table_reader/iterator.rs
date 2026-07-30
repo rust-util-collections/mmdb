@@ -755,10 +755,18 @@ impl Iterator for TableIterator {
                 if let Some(entry) = self.cursor_next() {
                     return Some(entry);
                 }
+                // cursor_next sets err on mid-block decode failure and returns
+                // None; must not fall through to load_next_block (silent key loss).
+                if self.err.is_some() {
+                    return None;
+                }
             }
             // Try cursor-based path first (forward iteration)
             if let Some(entry) = self.cursor_next() {
                 return Some(entry);
+            }
+            if self.err.is_some() {
+                return None;
             }
             // Try materialized entries (backward iteration positioned us here)
             if self.block_pos < self.current_block_entries.len() {
@@ -1668,6 +1676,95 @@ mod tests {
             "scan over a corrupt index must set iter_error(), got {} entries \
              with no error",
             yielded
+        );
+    }
+
+    /// Mid-block entry decode failure must stop `Iterator::next` before loading
+    /// later blocks. Falling through to `load_next_block` after setting `err`
+    /// used to silently yield post-corruption keys (and, via boxed compaction
+    /// sources that ignore `iter_error`, install truncated outputs).
+    #[test]
+    fn test_mid_block_entry_decode_error_stops_iterator_next() {
+        use crate::iterator::merge::{IterSource, MergingIterator, SeekableIterator};
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mid_block_corrupt.sst");
+
+        // Small blocks + restart every entry so we can corrupt entry #1 of a
+        // multi-entry early block and still have later blocks intact.
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 64,
+                block_restart_interval: 1,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        const COUNT: usize = 40;
+        for i in 0..COUNT {
+            let ik = InternalKey::new(
+                format!("key_{:06}", i).as_bytes(),
+                (COUNT - i) as u64,
+                ValueType::Value,
+            );
+            builder
+                .add(ik.as_bytes(), format!("value_{i}").as_bytes())
+                .unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        let entries = reader.cached_index_entries().unwrap();
+        assert!(
+            entries.len() >= 2,
+            "fixture needs multiple data blocks, got {}",
+            entries.len()
+        );
+
+        // Corrupt entry #1 (second restart) inside the first data block and
+        // re-seal the CRC so only entry decode (not whole-block CRC) fails.
+        let first = &entries[0];
+        let rel = restart_entry_offset(&path, first.handle.offset, first.handle.size, 1);
+        corrupt_block_byte_recompute_crc(&path, first.handle.offset, first.handle.size, rel);
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let mut iter = TableIterator::new(Arc::clone(&reader));
+        iter.seek_to_first();
+        let mut yielded = 0usize;
+        while iter.next().is_some() {
+            yielded += 1;
+            assert!(
+                yielded < COUNT,
+                "Iterator::next must not scan past a mid-block decode error"
+            );
+        }
+        assert!(
+            iter.iter_error().is_some(),
+            "mid-block decode must set iter_error after stop, yielded {yielded}"
+        );
+        // First restart entry can still be produced before the corrupt one.
+        assert!(yielded < COUNT, "must not yield every key in the file");
+
+        // Compaction-shaped path: from_table_iter must surface the same error
+        // through MergingIterator::error (from_boxed cannot).
+        let mut mi = MergingIterator::new(
+            vec![IterSource::from_table_iter(
+                TableIterator::new(reader).with_fill_cache(false),
+            )],
+            crate::types::compare_internal_key,
+        );
+        let mut merge_yielded = 0usize;
+        while mi.next_entry().is_some() {
+            merge_yielded += 1;
+        }
+        assert!(
+            mi.error().is_some(),
+            "merging from_table_iter must report mid-block decode via error(), \
+             yielded {merge_yielded}"
         );
     }
 

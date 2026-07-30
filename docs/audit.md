@@ -12,12 +12,6 @@
 
 ## Open
 
-### [HIGH] sst/compaction: mid-block decode error can look like EOF and lose keys
-- **Where**: `src/sst/table_reader/iterator.rs` (`Iterator::next`); `src/compaction/leveled.rs` (`from_boxed(Box::new(TableIterator))`); `src/iterator/source.rs` (`from_boxed` / `iter_error`)
-- **What**: After `cursor_next` sets `err` and returns `None`, `Iterator::next` still loads later blocks and keeps yielding. Compaction builds sources via `from_boxed`, which cannot surface `iter_error`, so `merger.error()` stays `None` and the job can install truncated outputs then delete inputs.
-- **Why**: Stop-on-error is required once `err` is set; user paths (`next_lazy` / `next_into` / `from_table_iter`) already stop, but compaction uses plain `Iterator::next` through a boxed source.
-- **Suggested fix**: Re-check `err` after every `cursor_next`/`None` in `Iterator::next` before `load_next_block`. Wire compaction through `IterSource::from_table_iter`. Regression: multi-block SST with resealed mid-entry corruption; assert plain next stops with `iter_error` and compaction aborts.
-
 ### [HIGH] manifest: rotation poison does not fail post-apply sync before input/WAL unlink
 - **Where**: `src/manifest/version_set.rs` (`log_and_apply` / `maybe_compact_manifest` / `sync_manifest`); `src/db.rs` (`post_flush_cleanup`, compaction phase-4 handle syncs)
 - **What**: When MANIFEST rotation fails old-writer `sync`, the writer is poisoned but `log_and_apply` still returns `Ok`. Callers then run a second MANIFEST sync via `sync_manifest` or `manifest_sync_handle`; neither fail-fasts on the existing poison flag, so a later "successful" sync (fsyncgate) authorizes input-SST / old-WAL unlink.
