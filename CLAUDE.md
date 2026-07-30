@@ -41,15 +41,16 @@ user-invocable only.
 - `/x-review` — deep regression analysis of recent changes
 - `/x-fix` — fix audit backlog: resolve `docs/audit.md` → self-review → commit
 - `/x-commit` — self-reviewing commit: review uncommitted changes → fix → commit
-- `/x-overhaul` — full codebase overhaul: review all → fix → commit
+- `/x-overhaul` — audit-fix-commit pipeline (full repo or scoped like `/x-review`)
 
-Supporting documentation in `.claude/docs/`:
-- `workflow-policy.md` — shared worktree safety and one-issue-one-commit policy
-- `technical-patterns.md` — cataloged bug patterns for LSM-Tree/Rust
-- `review-core.md` — systematic review methodology + canonical Subsystem Map (file → subsystem → pattern guide)
-- `false-positive-guide.md` — rules for filtering spurious findings
-- `commit-protocol.md` — canonical atomic validate → commit → final version + release tag procedure
-- `patterns/` — per-subsystem review guides (compaction, iterator, WAL, SST, memtable, manifest, cache, concurrency, unsafe-audit)
+Supporting docs (`.claude/docs/`):
+- `workflow-policy.md` — worktree safety, one-issue-one-commit
+- `pragmatic-engineering.md` — root goal, low variance
+- `technical-patterns.md` / `design-patterns.md` — LSM bugs + D-\* design lens
+- `review-core.md` — evidence standard + Subsystem Map
+- `false-positive-guide.md` — suppress noise
+- `commit-protocol.md` — validate → commit → version/tag
+- `patterns/*` — per-subsystem checklists
 
 Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` and `/x-fix`; it separates actionable Open findings, accepted Won't Fix risks, and disproven Rejected claims.
 

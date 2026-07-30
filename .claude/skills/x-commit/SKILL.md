@@ -6,70 +6,46 @@ disable-model-invocation: true
 
 # Self-Reviewing Commit for MMDB
 
-Review all intended worktree changes, fix confirmed defects, validate them, and
-create local commits. Never push.
+Review owned worktree changes → fix confirmed defects → validate → local commits.
+Never push. User-invoked only. New commits only (no amend/rebase/force-push).
 
 ## Setup
 
-1. Read `.claude/docs/workflow-policy.md`.
-2. Read `.claude/docs/commit-protocol.md`.
-3. Read `.claude/docs/review-core.md`,
-   `.claude/docs/technical-patterns.md`, and
-   `.claude/docs/false-positive-guide.md`.
-4. Run the workflow-policy preflight and record the invocation ledger required
-   by the commit protocol.
+Read `workflow-policy.md`, `commit-protocol.md`, `pragmatic-engineering.md`,
+`review-core.md`, `technical-patterns.md`, `false-positive-guide.md`;
+design-shaped → `design-patterns.md`. Preflight + ledger (incl. **frozen paths**).
 
 ## Protocol
 
-### 1. Establish scope
+### 1. Scope
 
-1. Read `git status --short`, staged and unstaged diffs, and every intended
-   untracked file. `git diff HEAD` alone is insufficient because it omits
-   untracked files.
-2. If no intended changes exist, report "nothing to commit" and stop.
-3. Separate the worktree into coherent commit units before editing:
-   - one independent issue, root cause, or behavior change per unit;
-   - required tests, docs, and audit-registry updates stay with that unit;
-   - preserve pre-staged boundaries unless the user explicitly asks to change
-     them.
-4. If unrelated changes overlap the same hunk and cannot be separated safely,
-   stop rather than stash, revert, or absorb them.
-5. When several pre-existing units coexist, do not claim that a validation run
-   against the combined worktree proves each commit independently. Use the
-   disposable-worktree procedure in `workflow-policy.md` when isolation matters.
+1. `git status --short`, full diffs, intended untracked (`git diff HEAD` misses untracked).
+2. Nothing intended → “nothing to commit”, stop.
+3. Freeze owned paths before edit; later stage freeze + this-invocation fix/format only.
+4. Split coherent units: one issue/root cause/behavior each; tests/docs/audit stay with unit;
+   keep pre-staged boundaries unless user changes them.
+5. Unrelated same-hunk overlap → stop (no stash/revert/absorb).
+6. Multi-unit tree: combined validation ≠ per-unit proof — disposable worktree when isolation matters.
 
-### 2. Review and fix
+### 2. Review and fix (per unit)
 
-For each unit:
+Map guides → full functions/callers/errors/tests → invariants, crash, concurrency,
+unsafe, quantified hot-path perf, design (if any), placeholders, public API →
+refute via FP guide → fix completely + regression → re-review until clean. No-progress
+loop → stop and report.
 
-1. Map changed files through the Subsystem Map and load the relevant guides.
-2. Read complete functions, callers, error paths, and tests.
-3. Check invariants, boundaries, crash safety, concurrency, unsafe contracts,
-   performance hot paths, and public API compatibility.
-4. Refute candidates using the false-positive guide; retain only concrete
-   defects.
-5. Fix every retained defect completely and add focused regression coverage.
-6. Re-review the resulting unit until no confirmed finding remains. If the same
-   failure repeats without new evidence or progress, stop and report the
-   blocker instead of looping.
+Investigate parallel OK; edit/commit sequential.
 
-Read-only investigation may run in parallel. All edits and commits are
-sequential.
+### 3. Validate and commit
 
-### 3. Validate and commit each unit
+`commit-protocol.md` per unit: format, lint, targeted tests, exact stage, inspect
+cached diff, one new commit. Never amend.
 
-Apply the per-unit procedure in `.claude/docs/commit-protocol.md`: format,
-lint, run targeted tests, stage exact paths/hunks, inspect the cached diff, and
-create one new commit. Never amend an earlier commit.
+### 4. Final gate, version, tag
 
-### 4. Final gate, version, and tag
-
-After all behavior commits, execute the commit protocol's final repository gate
-and single version-bump-and-release-tag policy. Any regression found after a
-commit is fixed in a new focused commit, never by rewriting history.
+After behavior commits: full gate + single version-bump-and-tag policy. Post-commit
+regression → new focused commit, no history rewrite.
 
 ## Output
 
-Report reviewed files/subsystems, findings fixed, validations run, every commit
-hash/subject, the version and release-tag result, and any baseline changes
-intentionally left untouched.
+Files/subsystems, fixes, validations, hashes/subjects, version/tag, untouched baseline.

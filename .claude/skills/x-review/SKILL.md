@@ -7,156 +7,108 @@ disable-model-invocation: true
 
 # Deep Regression Review for MMDB
 
-Review MMDB changes with high-signal, evidence-based analysis. Source code stays
-read-only unless the user supplied `--fix`; the normal workflow may update only
-`docs/audit.md`. It never commits or pushes.
+High-signal review. Code read-only unless `--fix`; may update only
+`docs/audit.md`. Never commit or push. User-invoked only.
 
 ## Setup
 
-1. Read `.claude/docs/workflow-policy.md`.
-2. Read `.claude/docs/technical-patterns.md`.
-3. Read `.claude/docs/review-core.md` and use its Subsystem Map as the canonical
-   file-to-guide mapping.
-4. Read `.claude/docs/false-positive-guide.md`.
+Read: `workflow-policy.md`, `pragmatic-engineering.md`, `technical-patterns.md`,
+`review-core.md` (Subsystem Map), `false-positive-guide.md`. Design-shaped /
+multi-subsystem → also `design-patterns.md`.
 
 ## Input
 
-Arguments: `$ARGUMENTS`
-
-Accept exactly one optional scope plus an optional `--fix`:
+`$ARGUMENTS` — one optional scope + optional `--fix`:
 
 | Input | Scope |
 |-------|-------|
 | *(empty)* | Latest commit |
-| `N` | Last N commits; N must be a positive integer |
-| `staged` | Staged changes (`git diff --cached`) |
-| `worktree` | All staged, unstaged, and untracked worktree changes |
-| `all` | Full repository audit |
+| `N` | Last N commits (positive int) |
+| `staged` | `git diff --cached` |
+| `worktree` | Staged + unstaged + untracked |
+| `all` | Full repo |
 | `<hash>` | One commit |
-| `<hash1>..<hash2>` | Exact commit range |
+| `<hash1>..<hash2>` | Range |
 
-Validate revisions with Git before reviewing. Reject unknown, ambiguous, or
-extra arguments with the usage string; never guess the intended range.
-
-`--fix` means apply confirmed fixes to the current worktree after reporting.
-For historical scopes, first verify that each candidate still exists at the
-current `HEAD`; never apply or register a bug that is already fixed.
+Validate revs with Git. Reject bad args; never guess. `--fix`: apply confirmed
+fixes after report. Historical scope: only still-present HEAD defects.
 
 ## Protocol
 
-### Phase 1: Scope and coverage
+### Phase 1 — Scope
 
-1. Record the pre-existing worktree baseline required by
-   `workflow-policy.md`.
-2. Build the changed-file list and read the complete diff plus surrounding
-   implementation, callers, and relevant tests.
-   - For `worktree`, include untracked files from `git status --short`; Git
-     diffs do not show them.
-   - For `all`, build a tracked-file ledger from `src/`, `tests/`, `benches/`,
-     build/CI configuration, public documentation, and `.claude/`.
-3. Map every code file to the Subsystem Map and load every mapped pattern
-   guide. Apply cross-cutting concurrency and unsafe guides where relevant.
-4. Mark generated, vendored, ignored, or explicitly out-of-scope files in the
-   ledger instead of silently omitting them.
+1. Worktree baseline (`workflow-policy.md`).
+2. Changed files + full diff + callers/tests. `worktree` includes untracked
+   (`git status --short`). `all` → ledger: `src/`, `tests/`, `benches/`,
+   build/CI, public docs, `.claude/`.
+3. Map via Subsystem Map; load guides (concurrency/unsafe when relevant).
+4. Mark generated/vendored/out-of-scope in the ledger — do not silent-drop.
 
-### Phase 2: Evidence collection
+### Phase 2 — Evidence
 
-For a small, single-subsystem diff, review directly. Use agents only when
-separate context materially improves coverage:
+Small single-subsystem → review direct. Agents only if context split helps
+(read-only; exact scope + guides + high-signal rule).
 
-- Agents are read-only and receive an exact scope, relevant guides, and the
-  high-signal rule.
-- For a non-trivial diff, use no more dimensions than needed: correctness and
-  invariants; crash/concurrency/unsafe; API/performance/error paths.
-- For `all`, partition the depth pass into disjoint subsystem batches. Every
-  tracked Rust source file must have one owner. Run a later cross-subsystem pass
-  only for interactions that a file-local pass cannot establish.
-- Do not delegate compiler, formatter, or Clippy diagnostics to LLM agents.
-  Deterministic tools own those checks.
+Non-trivial dimensions (minimum sufficient):
 
-Every candidate finding must include:
+- correctness / invariants
+- crash / concurrency / unsafe
+- design shape if locks/resources/bounds/install/failure/API (`design-patterns.md`)
+- API / quantified perf / placeholders (`review-core.md`)
 
-1. exact location and affected invariant;
-2. a concrete, realistic trigger;
-3. the incorrect observable outcome;
-4. the existing guard or protocol that was checked and why it is insufficient;
-5. a minimal fix direction and appropriate regression test.
+`all`: disjoint subsystem batches (each Rust file one owner); cross-subsystem +
+design only for gaps. fmt/compile/clippy → tools, not agents.
 
-Discard style preferences, unsupported speculation, and findings already
-covered by `.claude/docs/false-positive-guide.md`.
+Each candidate: location + invariant · realistic trigger · wrong outcome · why
+guards fail · minimal fix + test. Drop style, speculation, FP hits.
 
-### Phase 3: Critical verification
+### Phase 3 — Verify
 
-The orchestrator re-reads every candidate with full context and actively tries
-to refute it. Use one independent read-only verifier only when the control flow
-or invariant remains genuinely ambiguous; agent majority voting is not proof.
+Orchestrator re-reads and tries to **refute**. One independent verifier only if
+still ambiguous. Voting ≠ proof. Keep only code-demonstrable items; merge same
+root cause.
 
-A finding survives only when its trigger and outcome can be demonstrated from
-the current code. Deduplicate multiple symptoms with one root cause.
+### Phase 4 — Completeness
 
-### Phase 4: Completeness
+Diff: every changed file, public contract, failure path, relevant test.
+`all`: ledger vs depth results; critic only uncovered files/invariants. No rework.
 
-For diff scopes, account for every changed file, changed public contract,
-failure path, and relevant test. For `all`, reconcile the file ledger against
-the depth-pass results and run a focused completeness critic over uncovered
-files or invariants only. Do not repeat already-owned review work.
+### Phase 5 — Audit registry
 
-### Phase 5: Audit registry
+Update `docs/audit.md` from current code:
 
-Update `docs/audit.md` from current-code evidence:
-
-1. Prune fixed or obsolete `## Open` entries in scope.
-2. Add confirmed actionable findings to `## Open`, deduplicated and sorted
-   CRITICAL → HIGH → MEDIUM → LOW.
-3. Re-evaluate `## Won't Fix` entries whose files, callers, assumptions, or
-   subsystem intersect this review. In `all` mode, re-evaluate every entry.
-4. Keep disproportional but real findings under `## Won't Fix` with a concrete
-   `**Reason**`.
-5. Put disproven claims under `## Rejected`; these are not findings and have no
-   severity. Record only an existing or plausibly recurring claim with useful
-   counter-evidence; discard routine refuted candidates instead of bloating the
-   registry. Re-check recorded claims only when their cited code or invariant
-   changed.
-6. Never add dates, timestamps, "last reviewed", or similar freshness markers.
-
-Use this shape:
+1. Prune fixed/obsolete in-scope Open.
+2. Add confirmed Open, dedupe, CRITICAL→LOW.
+3. Re-check intersecting Won't Fix (`all` → all).
+4. Disproportionate real → Won't Fix + Reason.
+5. Material disproven → Rejected (no severity); drop routine noise; re-check only
+   if cited code/invariant changed.
+6. No dates/freshness markers.
 
 ```markdown
 ## Open
-
 ### [SEVERITY] subsystem: summary
 - **Where**: file:line_range
-- **What**: concrete defect
-- **Why**: trigger, outcome, and violated invariant
-- **Suggested fix**: minimal safe direction
+- **What**: defect
+- **Why**: trigger, outcome, invariant
+- **Suggested fix**: direction
 
 ## Won't Fix
-
 ### [SEVERITY] subsystem: summary
-- **Where**: file:line_range
-- **What**: concrete defect
-- **Reason**: why fixing it is currently disproportionate or unsafe
+- **Where** / **What** / **Reason**
 
 ## Rejected
-
-### subsystem: rejected claim
-- **Where**: file:line_range
-- **Claim**: what was alleged
-- **Reason**: evidence showing why it is not a bug
+### subsystem: claim
+- **Where** / **Claim** / **Reason**
 ```
 
-### Phase 6: Report
+### Phase 6 — Report
 
-Report scope, covered subsystems/invariants, and confirmed findings. For each
-finding, include severity, location, trigger, outcome, and fix direction. If
-none survive, state that plainly and list the meaningful coverage performed.
+Scope, coverage, findings (severity, loc, trigger, outcome, fix). Zero → say so
++ what was covered.
 
-### Phase 7: Fix (`--fix` only)
+### Phase 7 — `--fix` only
 
-1. Apply confirmed fixes sequentially; never run mutating agents in parallel.
-2. Preserve baseline changes and stop on unsafe overlap.
-3. Add focused regression coverage and run the smallest relevant validation
-   after each fix.
-4. Re-review the changed code and update `docs/audit.md`.
-5. Do not bump the version, commit, amend, or push. The user can invoke
-   `/x-commit` after inspecting the resulting worktree.
+Sequential fixes; preserve baseline; stop on unsafe overlap. Regression tests +
+smallest validate per fix; re-review; update audit. No version/commit/push —
+user runs `/x-commit` after inspect.

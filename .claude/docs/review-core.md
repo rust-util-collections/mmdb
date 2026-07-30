@@ -1,146 +1,114 @@
-# MMDB Review Core Methodology
+# MMDB Review Core
 
-This document defines the evidence standard and canonical subsystem mapping for
-MMDB reviews.
+Evidence standard and subsystem map. Apply `pragmatic-engineering.md`: only
+findings/process that remove a concrete failure mode.
 
-## 1. Context and coverage
+## 1. Context
 
-Before analyzing a change:
+1. Full diff + surrounding functions.
+2. Map each changed code file via Subsystem Map; load guides, callers, tests.
+3. Design-shaped / multi-subsystem diffs → also `design-patterns.md`.
+4. Full audit → tracked-file ledger first (no static/size guesses).
 
-1. Read the complete diff and surrounding functions.
-2. Map every changed code file through the Subsystem Map.
-3. Read all mapped guides, callers, and directly relevant tests.
-4. For a full audit, build a tracked-file ledger first; do not rely on a static
-   list or approximate file sizes.
+### Subsystem Map
 
-### Subsystem Map (canonical)
+One primary row per Rust file. Concurrency/unsafe are overlays.
 
-Every Rust source file has one primary row. Concurrency and unsafe guides are
-cross-cutting overlays, not substitutes for the primary guide.
+| Subsystem | Files | Guides |
+|-----------|-------|--------|
+| write/read | `src/db.rs`, `options.rs`, `error.rs`, `stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `unsafe-audit.md` (`db.rs`) |
+| memtable | `src/memtable/**` | `patterns/memtable.md`, `unsafe-audit.md` |
+| WAL | `src/wal/**` | `patterns/wal.md` |
+| SST | `src/sst/**` | `patterns/sst.md`, `unsafe-audit.md` if `unsafe` |
+| iterator | `src/iterator/**` | `patterns/iterator.md` |
+| compaction | `src/compaction/**` | `patterns/compaction.md` |
+| manifest | `src/manifest/**` | `patterns/manifest.md`, `concurrency.md` |
+| cache | `src/cache/**` | `patterns/cache.md`, `concurrency.md` |
+| types/API | `types.rs`, `lib.rs`, `rate_limiter.rs` | `technical-patterns.md` |
 
-| Subsystem | File patterns | Pattern guide(s) |
-|-----------|---------------|------------------|
-| write/read path | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/unsafe-audit.md` for `db.rs` |
-| memtable | `src/memtable/**/*.rs` | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
-| WAL | `src/wal/**/*.rs` | `patterns/wal.md` |
-| SST | `src/sst/**/*.rs` | `patterns/sst.md`, `patterns/unsafe-audit.md` for files containing `unsafe` |
-| iterator | `src/iterator/**/*.rs` | `patterns/iterator.md` |
-| compaction | `src/compaction/**/*.rs` | `patterns/compaction.md` |
-| manifest | `src/manifest/**/*.rs` | `patterns/manifest.md`, `patterns/concurrency.md` |
-| cache | `src/cache/**/*.rs` | `patterns/cache.md`, `patterns/concurrency.md` |
-| types and public API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` |
+Guides under `.claude/docs/patterns/`. Tests/benches/CI/docs/`.claude` → map to
+the subsystem they cover; check alignment.
 
-Pattern guides live in `.claude/docs/patterns/`. Tests, benches, Cargo/CI
-configuration, public docs, and `.claude/` are supporting surfaces: map them to
-the subsystem whose behavior they specify, then check consistency.
+## 2. Risk (effort, not a finding)
 
-## 2. Risk classification
+| Class | Examples | Default |
+|-------|----------|---------|
+| Conc/unsafe | atomics, raw ptr, lock order, threads | CRITICAL |
+| Durability | WAL, MANIFEST, SST, checksums | HIGH |
+| Control/resource | branches, open/close, cleanup | HIGH |
+| API/behavior | exports, defaults, iterator | HIGH |
+| Errors | propagate, fail-stop, retry | MEDIUM |
+| Perf | hot/warm complexity, locks, I/O | context |
+| Tests/docs/config | coverage/alignment | LOW unless wrong |
 
-| Category | Examples | Default risk |
-|----------|----------|--------------|
-| Concurrency/unsafe | atomics, raw pointers, lock order, thread lifecycle | CRITICAL |
-| Durability/encoding | WAL, MANIFEST, SST format, checksums | HIGH |
-| Control/resource flow | branches, loops, open/close, cleanup | HIGH |
-| API/behavior | public types, defaults, iterator semantics | HIGH |
-| Error handling | propagation, fail-stop policy, retry semantics | MEDIUM |
-| Performance | complexity, allocation, lock or I/O on hot path | context-dependent |
-| Tests/docs/config | coverage or contract alignment | LOW unless behavior is wrong |
-
-Classification prioritizes review effort; it is not itself a finding.
-
-## 3. Evidence protocol
+## 3. Evidence
 
 For each risky change:
 
-1. **State the invariant** from the mapped guide.
-2. **Construct a trigger** using realistic input, ordering, crash point, or
-   corruption boundary.
-3. **Trace the full path**, including callers, cleanup, and existing guards.
-4. **State the observable outcome**: wrong value, data loss, corruption, panic,
-   leak, deadlock, or quantified hot-path regression.
-5. **Check regression coverage** and identify the smallest test that would fail
-   before the fix.
+1. Name the invariant (mapped guide).
+2. Build a realistic trigger (input, order, crash, corrupt boundary).
+3. Trace full path (callers, cleanup, existing guards).
+4. State outcome: wrong value, loss, corruption, panic, leak, deadlock, or **quantified** hot-path cost.
+5. Note smallest regression test that would fail pre-fix.
 
-### Boundary conditions
+**Boundaries:** empty/single entry, first/last block keys, restarts, L0 limits,
+snapshots, malformed disk data, max sizes, partial I/O errors.
 
-Consider empty/single-entry state, first/last block keys, restart boundaries,
-L0 thresholds, snapshot cutoffs, malformed persisted data, maximum supported
-sizes, and error paths after partial I/O.
+**Concurrency:** Build lock/atomic protocol from code. Cycles, guard lifetime,
+publication, wait predicates, shutdown. `Relaxed` OK for counter/hints; Acquire/Release only when a happens-before edge is required.
 
-### Concurrency
+**Crash:** Crash points on write/sync/dir-sync/MANIFEST/CURRENT/delete.
+MANIFEST append ≠ CURRENT replace (`patterns/manifest.md`).
 
-Build the actual lock/atomic protocol from current code. Check lock cycles,
-guard lifetimes, publication order, wait predicates, and thread shutdown.
-`Relaxed` is valid for counters or hints that carry no publication guarantee;
-require Acquire/Release only where a happens-before edge is needed.
+**Perf:** Hot/warm only; quantify cost and path class. Cold micro-opts are not findings.
 
-### Crash safety
+**Design:** Locks, ownership, queues/fan-out, multi-step install, degrade, exports
+→ applicable D-\* in `design-patterns.md`; skip empty families.
 
-Enumerate crash points around file writes, file sync, directory sync, MANIFEST
-append/sync, CURRENT publication, and file deletion. Use
-`patterns/manifest.md` for the exact persistence ordering; MANIFEST append and
-CURRENT replacement are different protocols.
+**Placeholder (CRITICAL in non-test prod when it ships behavior):**
+`todo!` / `unimplemented!` / stand-in `unreachable!`; dummy returns where real
+work is required; `// TODO|FIXME|HACK` for unfinished required behavior;
+`if false` / `#[cfg(any())]` around incomplete required paths. Grep before
+calling dead code. Cleanup-only → LOW/skip.
 
-### Performance
+**API:** Only `src/lib.rs` re-exports are public. Align behavior, defaults,
+errors, docs, tests when they change.
 
-Require hot/warm-path evidence and quantify the added work. Cold-path
-micro-optimizations are not findings.
+## 4. Deterministic / style
 
-### API contract
+fmt / compile / clippy → tools, not agents. Still LOW if tools miss:
 
-Only curated re-exports in `src/lib.rs` are public API. Check behavior,
-defaults, error semantics, and corresponding docs/tests when those exports
-change.
+- no `#[allow(...)]`
+- import repeated paths; group prefixes
+- public docs + `CLAUDE.md` + this map + guides stay aligned
+- every unsafe has accurate `// SAFETY:`
 
-## 4. Deterministic and style checks
+## 5. Audit (`docs/audit.md`)
 
-Formatting, compilation, and Clippy diagnostics belong to deterministic tools,
-not speculative review agents. Repository-specific conventions that tools do
-not enforce are still LOW findings:
-
-- no `#[allow(...)]`;
-- import repeated inline paths and group common prefixes;
-- keep public API docs, `CLAUDE.md`, this map, and pattern guides aligned;
-- every unsafe operation has an accurate `// SAFETY:` contract.
-
-## 5. Audit registry
-
-Consult `docs/audit.md` before final reporting:
-
-- Verify relevant `Open` entries against current code and prune fixed ones.
-- Re-evaluate `Won't Fix` and `Rejected` entries when this review touches their
-  cited code, callers, assumptions, or subsystem. A full audit re-evaluates all.
-- Keep a real but disproportionate issue under `Won't Fix` with a current
-  reason.
-- Put only a recurring/material disproven claim under `Rejected`; it has no
-  severity because it is not a finding. Discard routine refuted candidates.
-- Never add dates or freshness markers.
-
-### Finding format
+- Prune fixed in-scope `Open`.
+- Re-check `Won't Fix` / `Rejected` when cited code/callers/assumptions/subsystem
+  touched; full audit → all entries.
+- Real but disproportionate → `Won't Fix` + current reason.
+- Material disproven → `Rejected` (no severity). Drop routine noise.
+- No dates/freshness markers.
 
 ```text
 [SEVERITY] subsystem: summary
 WHERE: file:line_range
-TRIGGER: concrete input/order/failure point
-OUTCOME: observable incorrect behavior
-WHY: violated invariant and why existing guards do not prevent it
-FIX: minimal safe direction and regression test
+TRIGGER: input/order/failure
+OUTCOME: observable wrong behavior
+WHY: invariant + why guards fail
+FIX: minimal direction + regression test
 ```
 
-### Severity
+- **CRITICAL**: loss/corruption, UB, memory safety, unrecoverable durability
+- **HIGH**: wrong results, deadlock, realistic crash, exhaustion, material hot-path hit
+- **MEDIUM**: edge bug, error-policy gap, bounded leak
+- **LOW**: convention/docs with real maintenance cost
 
-- **CRITICAL**: data loss/corruption, undefined behavior, memory safety violation,
-  or unrecoverable durability violation.
-- **HIGH**: incorrect results, deadlock, realistic crash, resource exhaustion,
-  or material hot-path regression.
-- **MEDIUM**: reachable edge-case bug, error-policy gap, or bounded leak.
-- **LOW**: repository convention, clarity, or documentation defect with a
-  concrete maintenance cost.
-
-Observations and questions may appear in the report but never in `## Open`.
+Observations ≠ `## Open`.
 
 ## Quality gate
 
-Retain only findings with a concrete trigger and outcome. Refute candidates
-against `.claude/docs/false-positive-guide.md`. Agent agreement, severity
-labels, and pattern-name matching are not substitutes for evidence.
+Concrete trigger + outcome only. Refute via `false-positive-guide.md`. Agent
+agreement and pattern IDs are not proof.

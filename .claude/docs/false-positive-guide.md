@@ -1,132 +1,88 @@
 # MMDB False Positive Guide
 
-Before reporting any finding, check it against this guide. If a finding matches a false positive pattern below, either suppress it or explicitly note why it does NOT apply.
+Match before reporting. Suppress, or say why the rule does not apply.
 
----
+## FP-1: Safe Rust ownership
 
-## FP-1: Rust Ownership System Already Prevents It
+**Skip:** UAF/double-free/dangling in safe Rust (no `unsafe`/raw ptr).
+**Keep:** Logical UAF (e.g. index into Vec after mutation).
 
-**Pattern**: Reporting a use-after-free, double-free, or dangling reference in safe Rust code.
-**Rule**: If the code is safe Rust (no `unsafe` block), the borrow checker prevents these at compile time. Only report memory safety issues inside `unsafe` blocks or when raw pointers are involved.
-**Exception**: Logical use-after-free (e.g., using an index into a Vec after the Vec has been modified) is still valid even in safe code.
+## FP-2: Continuous lock
 
-## FP-2: Lock Held Across Entire Operation
+**Skip:** Check-then-act while the protecting guard spans the whole sequence.
+Trace `MutexGuard`/`RwLockGuard` to end of scope or `drop`.
 
-**Pattern**: Reporting a check-then-act race when the relevant Mutex is held for the entire check-then-act sequence.
-**Rule**: If you see a potential race condition, FIRST verify that the lock protecting the shared state is held continuously from the check to the act. If it is, the race is impossible.
-**How to verify**: Trace the `MutexGuard` or `RwLockGuard` lifetime — it lives until the end of the scope or explicit `drop()`.
+## FP-3: ArcSwap snapshot staleness
 
-## FP-3: ArcSwap Load is Intentionally Point-in-Time
+**Skip:** `super_version.load()` lagging a concurrent flush/compact — by design.
+Pin/seq makes snapshot reads correct; non-snapshot may see any version current during the call.
+**Keep:** SuperVersion used for a latest-state decision (e.g. compact inputs).
 
-**Pattern**: Reporting that `super_version.load()` might return stale data after a concurrent flush/compaction.
-**Rule**: This is by design for the lock-free read path. The loaded SuperVersion is a consistent snapshot at the time of load. Staleness is acceptable because:
-- Snapshot-based reads use a pinned sequence number that guarantees correctness
-- Non-snapshot reads return any version that was current at some point during the call
-**When to report**: Only if the loaded SuperVersion is used to make a decision that requires seeing the LATEST state (e.g., picking compaction inputs).
+## FP-4: unwrap/expect on proven state
 
-## FP-4: Unwrap/Expect on Known-Valid State
+**Skip** unless a production path can fail it. Check same-scope population,
+caller guards, and tests (panics OK).
 
-**Pattern**: Reporting `unwrap()` or `expect()` as potential panics.
-**Rule**: Many `unwrap()` calls are on states that are guaranteed by prior logic. Before reporting:
-1. Check if the Option/Result is populated by a prior operation in the same scope
-2. Check if the calling condition guarantees the value (e.g., `if vec.is_empty() { return; } vec[0].unwrap()`)
-3. Check if it's in test code (panics are acceptable in tests)
-**When to report**: Only if you can construct a concrete scenario where the unwrap WILL fail in production.
+## FP-5: Clippy already enforces
 
-## FP-5: Clippy Would Catch It
+CI is `-D warnings`. Skip unused vars, needless clones, redundant closures, etc.
+Focus on semantics clippy cannot see.
 
-**Pattern**: Reporting a lint that `cargo clippy -D warnings` already enforces.
-**Rule**: The CI runs clippy with deny-all-warnings. Do not duplicate clippy's work. Focus on semantic correctness that clippy cannot detect.
-**Examples of what NOT to report**: unused variables, unnecessary clones, redundant closures, missing `Default` impl.
+## FP-6: Advice without downside
 
-## FP-6: "Consider" Without Concrete Downside
+No pure “consider”. Need wrong result, crash, or leak scenario.
+Bad: “add bounds check”. Good: “corrupt SST prefix_len > key.len() panics on slice”.
 
-**Pattern**: Suggesting a refactor, adding error handling, or "defensive" code without identifying a specific failure scenario.
-**Rule**: Do not report findings that are purely advisory. Every finding must have a concrete scenario where the current code produces a wrong result, crashes, or leaks resources.
-**Bad**: "Consider adding bounds checking here"
-**Good**: "When `prefix_len > key.len()`, this will panic at `key[..prefix_len]` — this can happen when a corrupted SST has an invalid prefix length"
+## FP-7: Test code standards
 
-## FP-7: Test-Only Code Held to Production Standards
+Tests may unwrap, Drop cleanup, block, hardcode.
+**Keep:** wrong tests, or `test-utils` issues that can reach production.
 
-**Pattern**: Reporting error handling, performance, or resource management issues in test code.
-**Rule**: Test code has different standards. Acceptable in tests:
-- `unwrap()` and `expect()` liberally
-- Temporary directory cleanup via `Drop` (no need for explicit checks)
-- Blocking operations without timeouts
-- Hardcoded constants
-**When to report**: Only if the test itself is incorrect (testing the wrong thing) or if test-utils code (`#[cfg(feature = "test-utils")]`) has safety issues that could leak into production.
+## FP-8: Documented unsafe
 
-## FP-8: Intentional Unsafe with Safety Comment
+Read `// SAFETY:`. Skip if prereqs hold.
+**Keep:** broken prereqs, invalidated assumptions, missing/vague comment.
 
-**Pattern**: Reporting an `unsafe` block that has a `// SAFETY:` comment explaining why it's sound.
-**Rule**: Read the safety comment first. If the justification is sound and the prerequisites are maintained by the surrounding code, do not report it. Only report if:
-1. The safety comment's prerequisites are NOT actually guaranteed
-2. A subsequent change has invalidated the safety comment's assumptions
-3. The safety comment is missing or vague ("// SAFETY: this is fine")
+## FP-9: Perf off hot path
 
-## FP-9: Performance Issue Without Hot Path Evidence
+**Hot:** get, iter next/prev, block decode, bloom. **Warm:** flush, compact loop.
+**Cold:** open/close, options, error format, WAL recovery.
+Report perf only on hot/warm with path evidence.
 
-**Pattern**: Reporting an allocation, clone, or lock acquisition as a performance issue without evidence it's on a hot path.
-**Rule**: MMDB has clear hot paths and cold paths:
-- **Hot**: get(), iterator next()/prev(), block decode, bloom filter probe
-- **Warm**: flush, compaction inner loop
-- **Cold**: open(), close(), option parsing, error formatting, WAL recovery
-Only report performance issues on hot/warm paths. Cold path performance is not a concern.
+## FP-10: Incomplete lock analysis
 
-## FP-10: Incomplete Concurrency Analysis
+Before races: all locks (`Mutex`/`RwLock`/`ArcSwap`), order, higher serializer
+locks, and that parking_lot is non-reentrant.
 
-**Pattern**: Reporting a race condition based on reading only the code under review, without checking the full locking protocol.
-**Rule**: Before reporting any concurrency bug:
-1. Identify ALL locks involved (grep for `Mutex`, `RwLock`, `ArcSwap`)
-2. Trace the lock acquisition order for the reported scenario
-3. Check if a higher-level lock serializes the operation
-4. Verify that the `parking_lot` lock semantics match your assumption (parking_lot Mutexes are NOT reentrant)
+## FP-11: Tombstone retention by design
 
-## FP-11: Compaction Tombstone Retained by Design
+Non-bottommost / snapshot-covered / covering lower levels → must keep.
+Drop only when still needed → correctness. Bottommost conservative keep → only
+with material accumulation, not mere eligibility.
 
-**Pattern**: Reporting that compaction is not dropping tombstones "efficiently".
-**Rule**: Tombstone retention in non-bottommost compactions is correct and intentional. Tombstones must be written to the output file if:
-- The compaction is not at the bottommost level
-- Any live snapshot has a sequence number <= tombstone's sequence
-- The tombstone covers keys in levels below the output level
-Only report a correctness bug when a tombstone is dropped while still needed.
-Conservative retention at bottommost is at most a space/performance candidate;
-report it only with a concrete, material accumulation scenario, not merely
-because the tombstone was eligible for collection.
+## FP-12: Half-open ranges
 
-## FP-12: Off-by-One in Half-Open Intervals — Verify First
+MMDB is `[start, end)`. Verify use-site ops (`key < end`, not `<=`) and a concrete
+mis-included/excluded key before filing.
 
-**Pattern**: Reporting a range boundary error in `[start, end)` intervals.
-**Rule**: MMDB consistently uses half-open intervals `[start, end)`. Before reporting:
-1. Verify the actual semantics at the point of use (not just the variable names)
-2. Check the comparison operator: `<` is correct for end, `<=` is wrong
-3. Check the iterator: `seek(start)` + `while key < end` is correct
-**When to report**: Only when you can demonstrate a concrete key that is incorrectly included or excluded.
+## FP-13: Won't Fix without re-check
 
-## FP-13: Won't Fix → Skip Without Re-evaluation
+Not permanent. Re-check when review touches cited code/callers/assumptions/
+subsystem; full audit → every entry. Carry-forward without check → LOW process.
+No freshness dates in `audit.md`.
 
-**Pattern**: Seeing an item in `docs/audit.md## Won't Fix` and skipping it without
-re-assessing it against the current code.
-**Rule**: Won't Fix is NOT a permanent exemption. Re-evaluate an entry whenever
-the review touches its cited code, callers, assumptions, or subsystem; a full
-audit re-evaluates every entry. The original decision was based on code that may
-have changed. Re-assessment checklist:
-- Has the surrounding code been refactored or removed?
-- Is the fix now straightforward (e.g., new helper functions, changed APIs)?
-- Was the severity underestimated?
-**When to skip**: A narrow review may leave unrelated entries untouched.
-**When to report**: If an in-scope entry is carried forward without checking its
-reason, that omission is a LOW process finding. Never record a re-check date or
-freshness marker in `docs/audit.md`.
+## FP-14: Legitimate no-ops
 
-## FP-14: Accepted Cache Invalidation Window
+`Ok(())` / `None` / empty vec often correct. Placeholder only if contract requires
+work and body is stub (`todo!`, unfinished TODO, temp dummy).
 
-**Pattern**: Reporting that `BlockCache::insert()` and its reverse-index update,
-or `detach()` and an in-flight unpinned insert, are not atomic.
-**Rule**: These are documented cutoff-not-barrier tradeoffs. SST file numbers
-and cache member IDs are never reused, so a missed invalidation can retain a
-cold unreachable block until LRU eviction but cannot return another file's or
-member's data.
-**When to report**: Only with evidence of wrong-data visibility, identifier
-reuse, unbounded retention outside LRU capacity, or a new race involving pinned
-entries (which use the member-local mutex).
+## FP-15: Design ID is not a finding
+
+D-\* labels need trigger + outcome. Prefer LSM protocol guides when they already
+catalog the bug.
+
+## FP-16: Cache invalidation window
+
+`insert`/reverse-index and detach vs unpinned insert are cutoff-not-barrier.
+IDs never reuse → wrong data cannot swap; cold unreachable until LRU.
+**Keep:** wrong-data visibility, ID reuse, unbounded retain, pin-path races.

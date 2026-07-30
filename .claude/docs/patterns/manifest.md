@@ -1,96 +1,38 @@
-# MANIFEST and VersionSet Review Patterns
+# MANIFEST / VersionSet Review Patterns
 
-## Files
+**Files:** `version_set`, `version_edit`, `version`, `mod`; tests: `crash_recovery`.
 
-- `src/manifest/version_set.rs` — edit validation, persistence, recovery, rotation
-- `src/manifest/version_edit.rs` — durable tagged encoding
-- `src/manifest/version.rs` — immutable live file-set snapshots
-- `src/manifest/mod.rs` — module boundary
-- `tests/crash_recovery.rs` — durability and orphan-cleanup coverage
+**Arch:** VersionEdit in WAL-framed MANIFEST; CURRENT names active MANIFEST;
+replay → immutable Version; rotation = full snapshot + atomic CURRENT swap.
 
-## Architecture
+## Invariants
 
-`VersionEdit` records file additions/deletions and monotonic counters in a
-WAL-framed MANIFEST. `CURRENT` names the active MANIFEST. Recovery replays edits
-into an immutable `Version`; periodic rotation writes a full snapshot to a new
-MANIFEST and atomically publishes it through `CURRENT`.
+**MAN1 Reject = not applied** — `log_and_apply` Err ⇒ no append/install (callers may delete new SSTs).
+Validate before append; after install, rotation deferred/poison — never ambiguous Err.
 
-## Critical invariants
+**MAN2 New-SST durability order** — SST finish+sync → DB dir sync → edit append → MANIFEST sync before durable OK. Never unlink inputs before durable installed edit.
 
-### INV-MAN1: Rejection contract
+**MAN3 Fail-stop poison** — failed MANIFEST append/sync, new-SST dir sync, or post-CURRENT dir sync → poison until reopen where documented. Shared poison; public ops observe it.
 
-`VersionSet::log_and_apply()` returning `Err` means the edit was not appended or
-installed. Callers rely on this to delete newly-built output SSTs safely.
+**MAN4 Recovery ≡ live apply** — same file set/counters. Exact-level deletes; delete-before-add for trivial move; reject dups/level mismatch/missing SST; torn zero-pad tail only. Open only files live after full replay.
 
-**Check**: Open/validate every new SST, level, and exact-level deletion before
-appending. After append/install, maintenance such as rotation must defer or
-poison rather than surface an ambiguous `Err`.
+**MAN5 IDs monotonic** — file# / seq never reuse or regress. Max-forward apply; `ensure_file_number_at_least` for parallel reserve.
 
-### INV-MAN2: New-SST durability ordering
+**MAN6 CURRENT publish** — both old writer and new snapshot hold all edits →
+`CURRENT.tmp.<n>` write+sync → rename CURRENT → install writer → dir sync.
+Uncertain post-publish durability ⇒ keep old MANIFEST. Pre-publish fail discard/defer;
+post dir-sync fail poison (no switch-back / divergence).
 
-Before a MANIFEST record that references a new SST can become durable:
+**MAN7 Encoding** — tags append-only; never reinterpret old tags. Bounds-check lengths.
 
-1. SST contents are finished and synced;
-2. the DB directory is synced so the SST directory entry is durable;
-3. the edit is appended;
-4. the MANIFEST is synced before the operation reports durable completion.
+## Checklist
 
-**Check**: Never delete input files before the installed edit is durably synced.
-
-### INV-MAN3: Fail-stop poisoning
-
-A failed MANIFEST append, MANIFEST sync, new-SST directory sync, or
-post-CURRENT-publish directory sync can make later success ambiguous. The
-writer must poison and reject further edits until reopen where documented.
-
-**Check**: All sync handles share the same poison flag and public DB operations
-observe it.
-
-### INV-MAN4: Recovery equivalence
-
-Recovery must reconstruct the same final file set and counters as in-process
-application.
-
-**Check**: Replay deletions at the exact recorded level, process delete-before-
-add for trivial moves, reject duplicate/live-level mismatches and missing SSTs,
-and tolerate corruption only at a torn zero-padded tail. Open only files live
-after the full replay.
-
-### INV-MAN5: Monotonic identifiers
-
-File numbers and sequence numbers must never regress or be reused.
-
-**Check**: Apply/recovery take the maximum forward file allocator value;
-parallel reservations are reconciled with `ensure_file_number_at_least()`.
-
-### INV-MAN6: CURRENT publication
-
-The new MANIFEST snapshot and old writer must both contain all applied edits
-before publication. Write and sync a unique `CURRENT.tmp.<manifest_number>`,
-rename it to `CURRENT`, install the matching writer in-process, then sync the
-directory. Retain the old MANIFEST if post-publish durability is uncertain.
-
-**Check**: Pre-publish failures discard/defer the new snapshot. Post-publish
-directory-sync failure poisons further edits instead of switching back or
-letting old/new MANIFESTs diverge.
-
-### INV-MAN7: Durable encoding compatibility
-
-`VersionEdit` tag meanings are persisted format. Existing tags must never be
-reinterpreted; new fields use new tags and old tags retain their decode
-semantics.
-
-**Check**: Bounds-check every length before slicing and preserve legacy tag
-decoding.
-
-## Review checklist
-
-- [ ] `Err` from `log_and_apply` still means no edit applied
-- [ ] New SST and directory durability precede MANIFEST durability
-- [ ] Every ambiguous write/sync failure poisons consistently
-- [ ] Recovery and live apply enforce the same level/file invariants
-- [ ] Torn-tail tolerance cannot hide valid later records
-- [ ] File allocator and last-sequence bookkeeping never regress
-- [ ] CURRENT temp write, sync, rename, install, and directory sync are ordered
-- [ ] Old MANIFEST deletion occurs only after durable CURRENT publication
-- [ ] Persisted tags remain append-only and backward compatible
+- [ ] Err ⇒ nothing applied
+- [ ] SST+dir before MANIFEST durability
+- [ ] Ambiguous write/sync → consistent poison
+- [ ] Recovery = live invariants
+- [ ] Torn-tail cannot hide later valid records
+- [ ] Allocators/last-seq never regress
+- [ ] CURRENT tmp/sync/rename/install/dir order
+- [ ] Old MANIFEST delete only after durable CURRENT
+- [ ] Tags backward compatible
