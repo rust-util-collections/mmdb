@@ -90,6 +90,13 @@ fn confirm_manifest_durable(
 /// Explicit `compact()` / `compact_range()` calls prune without a cap.
 const DEAD_KEY_PRUNE_PER_FLUSH: usize = 1024;
 
+/// How many settled dead keys `prune_settled_dead_keys` re-verifies per
+/// `write_queue` acquisition. Only each key's own re-verify-and-remove pair
+/// needs to be atomic against concurrent writes, so the locked phase is
+/// chunked: writers wait at most one chunk of lookups instead of the whole
+/// (uncapped, for explicit `compact`/`compact_range`) settled list.
+const DEAD_KEY_RECONFIRM_CHUNK: usize = 64;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[repr(u8)]
 enum DeadKeySweepState {
@@ -487,6 +494,11 @@ fn collect_tombstones_overlapping_bounds(
 thread_local! {
     static PRUNE_SETTLED_RACE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Counts `write_queue` acquisitions made by `prune_settled_dead_keys`'s
+    /// re-verify phase, so a test can prove that phase is chunked instead of
+    /// holding the writer barrier across every settled key. Thread-local for
+    /// the same cross-test-isolation reason as the hook above.
+    static PRUNE_SETTLED_LOCK_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // Test-only seam for `DB::open`'s compaction-worker spawn loop: forces the
@@ -2669,10 +2681,12 @@ impl DB {
     /// keep the registration.
     ///
     /// The bulk absence probe runs unlocked so a large candidate set never
-    /// stalls writers, then the (normally much smaller) settled subset is
-    /// re-verified and removed under `write_queue` so a concurrent write
-    /// cannot land in the gap between "observed absent" and "registration
-    /// removed" — see `write_queue`'s use below.
+    /// stalls writers, then the settled subset is re-verified and removed
+    /// under `write_queue` so a concurrent write cannot land in the gap
+    /// between "observed absent" and "registration removed". That locked
+    /// phase is chunked (`DEAD_KEY_RECONFIRM_CHUNK`) because only each key's
+    /// own check-and-remove pair must be atomic — see `write_queue`'s use
+    /// below.
     fn prune_settled_dead_keys(
         &self,
         max_checks: Option<usize>,
@@ -2735,25 +2749,37 @@ impl DB {
         // concurrent put/write_batch can commit a new version of a key we
         // just saw absent before we remove its registration below, and the
         // removal would then permanently hide a rewrite that raced the
-        // pruning decision from any future compaction filter. Re-verify the
-        // (already filtered, normally much smaller) `settled` list while
-        // holding `write_queue` after any in-flight leader finishes: no
-        // writer can even enqueue past that lock (`write()` takes the same
-        // mutex before joining or becoming leader), so nothing can commit
-        // between this second check and the removal — the same
+        // pruning decision from any future compaction filter. Re-verify each
+        // key while holding `write_queue` after any in-flight leader
+        // finishes: no writer can even enqueue past that lock (`write()`
+        // takes the same mutex before joining or becoming leader), so nothing
+        // can commit between a key's second check and its removal — the same
         // serialization `compact`/`compact_range`/`close` already rely on.
-        let mut wq = self.write_queue.lock();
-        self.wait_for_write_leader_idle(&mut wq);
-        let reconfirmed: Vec<Vec<u8>> = settled
-            .into_iter()
-            .filter(|key| matches!(self.get_with_options(&read_options, key), Ok(None)))
-            .collect();
-        if reconfirmed.is_empty() {
-            return;
-        }
-        let mut set = self.dead_keys.write();
-        for key in &reconfirmed {
-            set.remove(key);
+        //
+        // Only each key's own re-verify-and-remove pair has to be atomic with
+        // respect to writes, so the pass is chunked and the lock is released
+        // between chunks. Holding it across the whole `settled` list would
+        // make every writer wait out that many lookups; each one is a real
+        // read (memtables + every L0 file + one file per lower level, with
+        // Bloom unable to help once a rewritten key is present), so a large
+        // registration set turns an unlocked scan into a proportional write
+        // stall.
+        for chunk in settled.chunks(DEAD_KEY_RECONFIRM_CHUNK) {
+            let mut wq = self.write_queue.lock();
+            #[cfg(test)]
+            PRUNE_SETTLED_LOCK_COUNT.with(|c| c.set(c.get() + 1));
+            self.wait_for_write_leader_idle(&mut wq);
+            let reconfirmed: Vec<&Vec<u8>> = chunk
+                .iter()
+                .filter(|key| matches!(self.get_with_options(&read_options, key), Ok(None)))
+                .collect();
+            if reconfirmed.is_empty() {
+                continue;
+            }
+            let mut set = self.dead_keys.write();
+            for key in reconfirmed {
+                set.remove(key);
+            }
         }
     }
 
@@ -4312,6 +4338,46 @@ mod tests {
              deletion was active"
         );
         assert_eq!(db.dead_key_count(), 0);
+    }
+
+    /// Regression: the re-verify phase must not hold `write_queue` across
+    /// every settled key. Each re-verify is a real lookup (memtables + every
+    /// L0 file + one file per lower level), so a single critical section over
+    /// an uncapped settled list — which explicit `compact`/`compact_range`
+    /// produce — blocks every writer for that whole scan. Assert the locked
+    /// phase is chunked, and that chunking did not weaken the removal
+    /// contract for keys that stayed absent.
+    #[test]
+    fn prune_settled_dead_keys_chunks_the_write_queue_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+
+        // Enough settled keys to require several chunks.
+        let count = DEAD_KEY_RECONFIRM_CHUNK * 4 + 7;
+        for i in 0..count {
+            db.lazy_delete(format!("gone{i:06}").as_bytes());
+        }
+        assert_eq!(db.dead_key_count(), count);
+
+        PRUNE_SETTLED_LOCK_COUNT.with(|c| c.set(0));
+        db.prune_settled_dead_keys(None, None, None);
+        let locks = PRUNE_SETTLED_LOCK_COUNT.with(|c| c.get());
+
+        let expected = count.div_ceil(DEAD_KEY_RECONFIRM_CHUNK);
+        assert_eq!(
+            locks, expected,
+            "re-verify must take write_queue once per chunk of \
+             {DEAD_KEY_RECONFIRM_CHUNK}, not once for all {count} keys"
+        );
+        assert!(
+            locks > 1,
+            "a single acquisition would hold the writer barrier across every key"
+        );
+        assert_eq!(
+            db.dead_key_count(),
+            0,
+            "every still-absent registration must still be pruned"
+        );
     }
 
     /// Regression: if a later worker's spawn fails during `DB::open`, the
