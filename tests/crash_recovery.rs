@@ -466,6 +466,71 @@ fn test_crash_zeroed_midlog_wal_fragment_fails_open() {
 }
 
 #[test]
+fn test_enlarged_middle_wal_length_fails_open() {
+    // Three synced same-block records whose middle physical length is enlarged
+    // through the third. Without classification, recovery would treat the
+    // post-read EOF as a torn active tail and drop the third committed record.
+    const WAL_HEADER_SIZE: usize = 7;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    {
+        let db = DB::open(make_opts(), &path).unwrap();
+        for i in 0..3 {
+            db.put_with_options(
+                &WriteOptions {
+                    sync: true,
+                    ..Default::default()
+                },
+                format!("len_key{i}").as_bytes(),
+                format!("len_value{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        db.simulate_crash();
+    }
+
+    let wal_path = {
+        let mut wal_files: Vec<_> = fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        wal_files.sort();
+        wal_files.into_iter().next().unwrap()
+    };
+
+    let mut bytes = fs::read(&wal_path).unwrap();
+    let physical_len = |offset: usize| {
+        WAL_HEADER_SIZE + u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]) as usize
+    };
+    let first_len = physical_len(0);
+    let second_offset = first_len;
+    let second_len = physical_len(second_offset);
+    let third_offset = second_offset + second_len;
+    let third_len = physical_len(third_offset);
+    assert!(
+        third_offset + third_len <= bytes.len(),
+        "expected three complete same-block WAL records"
+    );
+    let enlarged = (third_offset + third_len - second_offset - WAL_HEADER_SIZE) as u16;
+    bytes[second_offset + 4..second_offset + 6].copy_from_slice(&enlarged.to_le_bytes());
+    fs::write(&wal_path, bytes).unwrap();
+
+    let result = DB::open(make_opts(), &path);
+    assert!(
+        result.is_err(),
+        "open must fail closed when a corrupt length swallows a later valid record"
+    );
+    assert!(
+        wal_path.exists(),
+        "corrupt WAL must be preserved after failed recovery"
+    );
+}
+
+#[test]
 fn test_earlier_wal_corrupt_tail_fails_open_when_newer_wal_exists() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();

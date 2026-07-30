@@ -193,11 +193,15 @@ impl VersionSet {
             let data = match reader.read_record() {
                 Ok(Some(data)) => data,
                 Ok(None) => break,
-                // Tolerate a corrupt record only when nothing but zero padding
-                // follows it (torn tail); `open_append_truncated` below then
-                // discards the tail. Corruption followed by real data would
-                // silently drop later edits — fail the open instead.
-                Err(e) if reader.rest_is_zero_padding().unwrap_or(false) => {
+                // Tolerate only structural short-reads when nothing but zero
+                // padding follows (torn tail); `open_append_truncated` below
+                // then discards the tail. Checksum/type failure after a full
+                // untrusted length read can already have skipped later edits —
+                // fail the open instead of treating a zero suffix as proof.
+                Err(e)
+                    if reader.last_error_is_truncation()
+                        && reader.rest_is_zero_padding().unwrap_or(false) =>
+                {
                     tracing::warn!("MANIFEST {} has corrupt tail: {}", manifest_name, e);
                     break;
                 }

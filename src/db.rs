@@ -645,7 +645,14 @@ impl DB {
                     // post-recovery cleanup would then delete the WAL. Fail the
                     // open loudly instead and preserve the file for inspection.
                     Err(e) => {
+                        // Only structural short-reads (partial header/payload/
+                        // trailer / zero-extended tip) may be a torn active
+                        // tail. Checksum, type, and other semantic failures fail
+                        // closed: an untrusted length can already have skipped
+                        // later valid records, so zero bytes past the advanced
+                        // position are not proof of a safe prefix.
                         if Some(*wal_num) == recoverable_tail_wal_num
+                            && reader.last_error_is_truncation()
                             && reader.rest_is_zero_padding().unwrap_or(false)
                         {
                             tracing::warn!(

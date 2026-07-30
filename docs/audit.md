@@ -12,12 +12,6 @@
 
 ## Open
 
-### [CRITICAL] WAL: corrupt length can hide later valid records during tail recovery
-- **Where**: `src/wal/reader.rs` (`read_physical_record`, `rest_is_zero_padding`), `src/db.rs` (WAL recovery)
-- **What**: A corrupted physical-record length can make the reader consume later valid records before reporting a checksum mismatch. Recovery then checks only the bytes after that untrusted length, sees EOF or zero padding, and accepts the prefix as a torn active-WAL tail.
-- **Why**: Tail recovery treats every read error alike and starts its causal-hole check from the reader's advanced position. A length field that survived neither checksum nor semantic validation must not define where the corruption ends.
-- **Suggested fix**: Classify WAL read failures and tolerate only structurally truncated active tails; checksum, type, and invalid-length failures must fail closed. Regress with three same-block records whose middle length is enlarged through the third record.
-
 ### [CRITICAL] close: pre-leader maintenance can install files after resources are released
 - **Where**: `src/db.rs` (`write_batch_inner`, `maybe_throttle_writes`, `drain_l0`, bounded `compact_range`, `close`)
 - **What**: A writer can be inside stop-trigger compaction before it enqueues and marks a group leader, while bounded `compact_range` has a similar gap between write-queue guards. Concurrent `close()` can observe no leader, release `LOCK` and caches, and let either operation later install SST/MANIFEST state.

@@ -18,6 +18,12 @@ pub struct WalReader {
     /// After iterating all records, this is the safe truncation point for
     /// append-after-crash (any bytes beyond this are corrupt/partial).
     last_valid_offset: u64,
+    /// Set when the most recent `read_record` failure is a structural short
+    /// read (partial header/payload/trailer, Zero header, multi-fragment EOF).
+    /// Checksum, type, and other semantic failures clear it — those must not
+    /// be treated as torn tails even if the remaining file bytes are zero,
+    /// because an untrusted length can already have consumed later records.
+    last_error_is_truncation: bool,
 }
 
 impl WalReader {
@@ -29,6 +35,7 @@ impl WalReader {
             block_offset: 0,
             eof: false,
             last_valid_offset: 0,
+            last_error_is_truncation: false,
         })
     }
 
@@ -38,14 +45,26 @@ impl WalReader {
         self.last_valid_offset
     }
 
+    /// True when the previous `read_record` error is a structural short-read
+    /// that recovery may treat as a torn active log tail (subject to
+    /// [`Self::rest_is_zero_padding`]). Checksum, type, and other semantic
+    /// failures return false.
+    pub fn last_error_is_truncation(&self) -> bool {
+        self.last_error_is_truncation
+    }
+
     /// True if every byte from the current read position to EOF is zero.
     ///
-    /// After `read_record()` fails, this distinguishes a torn tail from
-    /// mid-log corruption: a record torn by a crash is the last thing in the
-    /// file, followed at most by block padding or a filesystem zero-extended
-    /// tail. Non-zero bytes after the failed record mean data was written
-    /// after it, so the failure is real corruption and the log suffix would
-    /// be silently lost by prefix recovery.
+    /// After a **structural truncation** from `read_record()`, this
+    /// distinguishes a torn tail from mid-log corruption: a record torn by a
+    /// crash is the last thing in the file, followed at most by block padding
+    /// or a filesystem zero-extended tail. Non-zero bytes after the failed
+    /// record mean data was written after it, so the failure is real
+    /// corruption and the log suffix would be silently lost by prefix recovery.
+    ///
+    /// Must not be used alone after checksum/type/length simulation of a full
+    /// physical record: an untrusted length may already have skipped later
+    /// valid records. Map that case with [`Self::last_error_is_truncation`].
     ///
     /// Consumes the remaining bytes; the reader is not usable for further
     /// record reads afterwards (`last_valid_offset` is unaffected).
@@ -63,6 +82,16 @@ impl WalReader {
                 Err(e) => return Err(e).ctx(),
             }
         }
+    }
+
+    fn fail_truncation<T>(&mut self, msg: impl Into<String>) -> Result<T> {
+        self.last_error_is_truncation = true;
+        Err(Error::corruption(msg.into()))
+    }
+
+    fn fail_corruption<T>(&mut self, msg: impl Into<String>) -> Result<T> {
+        self.last_error_is_truncation = false;
+        Err(Error::corruption(msg.into()))
     }
 
     /// Return an iterator over all records in the WAL.
@@ -88,42 +117,34 @@ impl WalReader {
                     self.eof = true;
                     if in_fragmented_record {
                         tracing::warn!("WAL: partial record without end (truncated)");
-                        return Err(Error::corruption(
-                            "partial WAL record without end".to_string(),
-                        ));
+                        return self.fail_truncation("partial WAL record without end");
                     }
                     return Ok(None);
                 }
                 Some((record_type, data)) => match record_type {
                     RecordType::Full => {
                         if in_fragmented_record {
-                            return Err(Error::corruption(
-                                "full record inside fragment".to_string(),
-                            ));
+                            return self.fail_corruption("full record inside fragment");
                         }
                         self.last_valid_offset = self.reader.stream_position().ctx()?;
                         return Ok(Some(data));
                     }
                     RecordType::First => {
                         if in_fragmented_record {
-                            return Err(Error::corruption(
-                                "first record inside fragment".to_string(),
-                            ));
+                            return self.fail_corruption("first record inside fragment");
                         }
                         in_fragmented_record = true;
                         result = data;
                     }
                     RecordType::Middle => {
                         if !in_fragmented_record {
-                            return Err(Error::corruption(
-                                "middle record without first".to_string(),
-                            ));
+                            return self.fail_corruption("middle record without first");
                         }
                         result.extend_from_slice(&data);
                     }
                     RecordType::Last => {
                         if !in_fragmented_record {
-                            return Err(Error::corruption("last record without first".to_string()));
+                            return self.fail_corruption("last record without first");
                         }
                         result.extend_from_slice(&data);
                         self.last_valid_offset = self.reader.stream_position().ctx()?;
@@ -153,9 +174,7 @@ impl WalReader {
                         match self.reader.read(&mut skip[skipped..leftover]) {
                             Ok(0) if skipped == 0 => return Ok(None),
                             Ok(0) => {
-                                return Err(Error::corruption(
-                                    "truncated WAL block trailer".to_string(),
-                                ));
+                                return self.fail_truncation("truncated WAL block trailer");
                             }
                             Ok(n) => skipped += n,
                             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -176,7 +195,7 @@ impl WalReader {
                 match self.reader.read(&mut header_buf[header_read..]) {
                     Ok(0) if header_read == 0 => return Ok(None),
                     Ok(0) => {
-                        return Err(Error::corruption("truncated WAL record header".to_string()));
+                        return self.fail_truncation("truncated WAL record header");
                     }
                     Ok(n) => header_read += n,
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -185,33 +204,31 @@ impl WalReader {
             }
 
             // A full zero header is only valid in a zero-extended tail. Surface
-            // it as corruption so recovery can accept it only after proving
+            // it as truncation so recovery can accept it only after proving
             // that every remaining byte is also zero.
             if header_buf == [0u8; HEADER_SIZE] {
-                return Err(Error::corruption(
-                    "zero WAL record before proven zero tail".to_string(),
-                ));
+                return self.fail_truncation("zero WAL record before proven zero tail");
             }
 
             let (checksum, length, record_type) = decode_header(&header_buf);
             let record_type = match record_type {
                 Some(rt) => rt,
                 None => {
-                    return Err(Error::corruption(format!(
-                        "unknown WAL record type: {}",
-                        header_buf[6]
-                    )));
+                    return self
+                        .fail_corruption(format!("unknown WAL record type: {}", header_buf[6]));
                 }
             };
             let length = length as usize;
 
             // Validate that the record payload fits within the current block.
+            // An invalid length must fail closed: it is semantic corruption,
+            // not a short read of a real physical record.
             let remaining = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
             if length > remaining {
-                return Err(Error::corruption(format!(
+                return self.fail_corruption(format!(
                     "WAL record length {} exceeds remaining block space {}",
                     length, remaining
-                )));
+                ));
             }
 
             // Read the data
@@ -219,9 +236,7 @@ impl WalReader {
             match self.reader.read_exact(&mut data) {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    return Err(Error::corruption(
-                        "truncated WAL record payload".to_string(),
-                    ));
+                    return self.fail_truncation("truncated WAL record payload");
                 }
                 Err(e) => return Err(e).ctx(),
             }
@@ -229,20 +244,23 @@ impl WalReader {
             self.block_offset += HEADER_SIZE + length;
 
             if matches!(record_type, RecordType::Zero) {
-                return Err(Error::corruption("non-padding WAL zero record".to_string()));
+                return self.fail_corruption("non-padding WAL zero record");
             }
 
-            // Verify checksum
+            // Verify checksum. A mismatch after a full payload read must fail
+            // closed: an untrusted length may already have swallowed later
+            // records, so zero-padding after the reader's advanced position
+            // does not prove a torn active tail.
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&[record_type as u8]);
             hasher.update(&data);
             let expected_checksum = hasher.finalize();
 
             if checksum != expected_checksum {
-                return Err(Error::corruption(format!(
+                return self.fail_corruption(format!(
                     "WAL checksum mismatch: expected {:#x}, got {:#x}",
                     expected_checksum, checksum
-                )));
+                ));
             }
 
             return Ok(Some((record_type, data)));
@@ -347,5 +365,78 @@ mod tests {
         let mut reader = WalReader::new(&path).unwrap();
         assert_eq!(reader.read_record().unwrap().unwrap(), payload);
         assert!(reader.read_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_enlarged_length_through_later_records_is_not_truncation() {
+        // Three same-block records. Inflating the middle length through the
+        // third consumes later payload bytes before the checksum fails; that
+        // must be semantic corruption, not a torn-tail candidate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("enlarged_len.wal");
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"rec-a").unwrap();
+            writer.add_record(b"rec-b").unwrap();
+            writer.add_record(b"rec-c").unwrap();
+            writer.sync().unwrap();
+        }
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let physical_len = |offset: usize| {
+            HEADER_SIZE + u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]) as usize
+        };
+        let a_len = physical_len(0);
+        let b_off = a_len;
+        let b_len = physical_len(b_off);
+        let c_off = b_off + b_len;
+        let c_len = physical_len(c_off);
+        assert!(
+            c_off + c_len <= bytes.len(),
+            "expected three complete same-block records"
+        );
+
+        // Length of B is enlarged so the declared payload covers through C.
+        let enlarged = (c_off + c_len - b_off - HEADER_SIZE) as u16;
+        bytes[b_off + 4..b_off + 6].copy_from_slice(&enlarged.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), b"rec-a");
+        let err = reader.read_record().unwrap_err();
+        assert!(
+            err.to_string().contains("checksum mismatch"),
+            "enlarged length should fail at checksum, got: {err}"
+        );
+        assert!(
+            !reader.last_error_is_truncation(),
+            "checksum after full untrusted-length read must not be a torn tail"
+        );
+        // With the pre-fix policy, rest_is_zero_padding alone would return
+        // true (EOF after swallowing C) and hide the third record.
+        assert!(reader.rest_is_zero_padding().unwrap());
+    }
+
+    #[test]
+    fn test_truncated_payload_is_truncation_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torn_payload.wal");
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"complete").unwrap();
+            writer.add_record(b"will-be-torn").unwrap();
+            writer.sync().unwrap();
+        }
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(len > 4);
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(len - 4).unwrap();
+        drop(file);
+
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), b"complete");
+        assert!(reader.read_record().is_err());
+        assert!(reader.last_error_is_truncation());
+        assert!(reader.rest_is_zero_padding().unwrap());
     }
 }
