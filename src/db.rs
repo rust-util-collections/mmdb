@@ -506,9 +506,12 @@ impl DB {
 
         if options.create_if_missing {
             fs::create_dir_all(&path).ctx()?;
-        } else if !path.exists() {
+        } else if !path.join("CURRENT").exists() {
+            // Match RocksDB/LevelDB: existence means a DB marker (`CURRENT`),
+            // not merely a directory path. An empty dir must not be initialized
+            // when creation is disabled (and must not create LOCK either).
             return Err(Error::invalid_argument(format!(
-                "DB path does not exist: {}",
+                "DB does not exist: {}",
                 path.display()
             )));
         }
@@ -4092,6 +4095,38 @@ mod tests {
         let db = open_test_db(dir.path());
         assert!(db.path().exists());
         assert!(dir.path().join("CURRENT").exists());
+    }
+
+    #[test]
+    fn test_open_create_if_missing_false_rejects_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        assert!(path.exists());
+        assert!(!path.join("CURRENT").exists());
+
+        let err = match DB::open(
+            DbOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
+            path,
+        ) {
+            Ok(_) => panic!("empty dir must not create a DB when create_if_missing is false"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
+        assert!(
+            !path.join("CURRENT").exists(),
+            "must not create CURRENT when create_if_missing is false"
+        );
+        assert!(
+            !path.join("LOCK").exists(),
+            "must not create LOCK when open fails before initialization"
+        );
+        assert!(
+            std::fs::read_dir(path).unwrap().next().is_none(),
+            "empty dir must stay without DB files"
+        );
     }
 
     #[test]

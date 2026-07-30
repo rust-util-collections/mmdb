@@ -11,9 +11,13 @@ pub type SkipPointFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 /// Database-level options.
 #[derive(Clone)]
 pub struct DbOptions {
-    /// Create the database directory if it does not exist.
+    /// Create the database if it does not already exist.
+    ///
+    /// Existence is defined by the `CURRENT` marker (same as
+    /// [`Self::error_if_exists`]), not by the path merely being a directory.
+    /// When false, opening an empty directory fails without creating files.
     pub create_if_missing: bool,
-    /// Return an error if the database already exists.
+    /// Return an error if the database already exists (`CURRENT` is present).
     pub error_if_exists: bool,
     /// Size of a single MemTable in bytes before it is frozen.
     pub write_buffer_size: usize,

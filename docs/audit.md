@@ -30,12 +30,6 @@
 - **Why**: Range normalization occurs only after WAL encoding and sequence assignment; the rotation trigger observes only accounted memtable bytes.
 - **Suggested fix**: Elide invalid/no-op range entries before sequence assignment and WAL encoding, including inside `WriteBatch`. Regress repeated no-op ranges under a tiny write buffer.
 
-### [HIGH] API: `create_if_missing = false` creates a DB in an empty directory
-- **Where**: `src/db.rs` (`DB::open`)
-- **What**: An existing empty directory passes the path-existence check, then `VersionSet::open_with_cache` takes its missing-`CURRENT` creation path and writes a new database despite creation being disabled.
-- **Why**: The option checks directory existence rather than the database marker that distinguishes an existing DB.
-- **Suggested fix**: Require `CURRENT` before taking the lock or creating files when creation is disabled. Regress an empty temporary directory and assert it stays uninitialized.
-
 ### [HIGH] API: lazy-delete pruning can forget a concurrent rewrite
 - **Where**: `src/db.rs` (`prune_settled_dead_keys`, write path)
 - **What**: Pruning observes an absent key without holding writer serialization, then removes its registration after a concurrent put commits the same key. Future compaction preserves that rewrite even though it occurred while lazy deletion was active.
