@@ -106,6 +106,25 @@ impl BidiIterator {
             _ => false,
         }
     }
+
+    /// Return the first error from the underlying source iterator, or a
+    /// key-decode corruption observed while filtering entries. Always
+    /// `None` for a materialized iterator (built from an already-collected
+    /// `Vec`, so there is no further I/O that can fail).
+    ///
+    /// Call after `next()`/`next_back()` returns `None` to distinguish
+    /// normal exhaustion from an I/O or corruption failure that stopped
+    /// iteration early — the lazy variants otherwise look identical to a
+    /// cleanly exhausted range, mirroring [`DBIterator::error`].
+    pub fn error(&self) -> Option<String> {
+        match &self.inner {
+            BidiInner::Materialized { .. } => None,
+            BidiInner::Lazy { db_iter, .. } => db_iter.error(),
+            BidiInner::LazyBackStarted(state) | BidiInner::LazyFwdResumed(state) => {
+                state.db_iter.error()
+            }
+        }
+    }
 }
 
 impl Iterator for BidiIterator {
@@ -223,10 +242,32 @@ impl DoubleEndedIterator for BidiIterator {
                 let last_fwd_key = db_iter.last_user_key().map(|k| k.to_vec());
 
                 db_iter.seek_to_last();
+                // Every path below restores `db_iter` into `LazyBackStarted`
+                // before returning — including exhaustion/error and the
+                // defensive key()/value() mismatch — so a later `error()`
+                // call can still report an I/O or corruption failure that
+                // stopped the seek early, instead of that failure looking
+                // identical to a legitimately empty range (which losing
+                // `db_iter` via an early `?` return would otherwise do).
                 if !db_iter.valid() {
+                    self.inner = BidiInner::LazyBackStarted(LazyBidiState {
+                        db_iter,
+                        last_fwd_key,
+                        last_back_key: None,
+                    });
                     return None;
                 }
-                let k = db_iter.key()?.to_vec();
+                let Some(k) = db_iter.key().map(|k| k.to_vec()) else {
+                    // valid() == true should always mean key() is Some;
+                    // treat any inconsistency as no data instead of losing
+                    // `db_iter`.
+                    self.inner = BidiInner::LazyBackStarted(LazyBidiState {
+                        db_iter,
+                        last_fwd_key,
+                        last_back_key: None,
+                    });
+                    return None;
+                };
                 // If forward iteration already consumed this key (or past it),
                 // there is nothing left to yield from the back; otherwise we would
                 // re-yield a key already returned by next(). Mirrors the frontier
@@ -241,7 +282,14 @@ impl DoubleEndedIterator for BidiIterator {
                     });
                     return None;
                 }
-                let v = db_iter.value()?.to_vec();
+                let Some(v) = db_iter.value().map(|v| v.to_vec()) else {
+                    self.inner = BidiInner::LazyBackStarted(LazyBidiState {
+                        db_iter,
+                        last_fwd_key,
+                        last_back_key: Some(k),
+                    });
+                    return None;
+                };
                 self.inner = BidiInner::LazyBackStarted(LazyBidiState {
                     db_iter,
                     last_fwd_key,
@@ -267,19 +315,29 @@ impl DoubleEndedIterator for BidiIterator {
                     state.db_iter.set_upper_bound(back_key.clone());
                 }
                 state.db_iter.seek_to_last();
+                // As in the `Lazy` branch above, every path below restores
+                // `state` (and its `db_iter`) into `LazyBackStarted` before
+                // returning, so `error()` can still see a failure that
+                // stopped this seek early.
                 if !state.db_iter.valid() {
                     self.inner = BidiInner::LazyBackStarted(state);
                     return None;
                 }
 
-                let k = state.db_iter.key()?.to_vec();
+                let Some(k) = state.db_iter.key().map(|k| k.to_vec()) else {
+                    self.inner = BidiInner::LazyBackStarted(state);
+                    return None;
+                };
                 if let Some(fwd_key) = state.last_fwd_key.as_deref()
                     && k.as_slice() <= fwd_key
                 {
                     self.inner = BidiInner::LazyBackStarted(state);
                     return None;
                 }
-                let v = state.db_iter.value()?.to_vec();
+                let Some(v) = state.db_iter.value().map(|v| v.to_vec()) else {
+                    self.inner = BidiInner::LazyBackStarted(state);
+                    return None;
+                };
                 state.last_back_key = Some(k.clone());
                 self.inner = BidiInner::LazyBackStarted(state);
                 Some((k, v))
@@ -488,5 +546,97 @@ mod tests {
         // Now forward should get b, then stop (upper bound is c)
         assert_eq!(it.next().unwrap().0, b"b");
         assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn test_error_none_for_materialized() {
+        let it = BidiIterator::new(make_entries(&[b"a", b"b"]));
+        assert!(it.error().is_none());
+    }
+
+    #[test]
+    fn test_error_none_after_clean_lazy_exhaustion() {
+        // Forward and backward exhaustion with no underlying failure must
+        // both report no error.
+        let mut it = make_lazy_bidi(&[b"a", b"b"]);
+        while it.next().is_some() {}
+        assert!(it.error().is_none());
+
+        let mut it = make_lazy_bidi(&[b"a", b"b"]);
+        while it.next_back().is_some() {}
+        assert!(it.error().is_none());
+    }
+
+    /// Regression: a key too short to decode as an `InternalKey` must not
+    /// look like a legitimately empty range. `next_back()`'s first call
+    /// extracts the underlying `DBIterator` via `mem::replace` before
+    /// calling `seek_to_last()`; every path out of that transition —
+    /// including the `!valid()` early return exercised here — must
+    /// restore it so `error()` can still report what stopped iteration.
+    #[test]
+    fn test_lazy_next_back_first_call_surfaces_decode_error() {
+        let sources = vec![vec![(b"short".to_vec(), b"v".to_vec())]];
+        let db_iter = DBIterator::new(sources, 100);
+        let mut it = BidiIterator::lazy(db_iter);
+
+        assert!(it.error().is_none(), "no error before any iteration");
+        assert!(it.next_back().is_none());
+        let err = it
+            .error()
+            .expect("the decode error must survive the reverse transition");
+        assert!(err.contains("too short"), "got {err}");
+    }
+
+    /// Same bug, hit on the second `next_back()` after a direction switch
+    /// (`LazyFwdResumed` -> `LazyBackStarted`), which re-seeks via the same
+    /// extract-then-early-return-prone pattern as the first-call transition
+    /// above, at a different call site.
+    #[test]
+    fn test_lazy_next_back_after_direction_switch_surfaces_decode_error() {
+        use crate::types::{InternalKey, ValueType};
+
+        // "a", "n", "z" are valid; "m" has a well-formed length but an
+        // unrecognized value_type byte, so it sorts normally by its user
+        // key instead of the "too-short" shortcut that always sorts first
+        // (see `compare_internal_key`). Resolving a backward entry decodes
+        // whichever entry immediately precedes it (to confirm there is no
+        // further same-user-key version) — placing "m" directly before
+        // "n" means resolving "z" (peeks "n") and forward-resolving "a"
+        // both stay clean, and only the *second* next_back(), which lands
+        // on "n", is the one that peeks "m" and hits the decode error.
+        let a = InternalKey::new(b"a", 10, ValueType::Value).into_bytes();
+        let n = InternalKey::new(b"n", 8, ValueType::Value).into_bytes();
+        let z = InternalKey::new(b"z", 5, ValueType::Value).into_bytes();
+        let packed = (7u64 << 8) | 0xEE;
+        let mut bad = b"m".to_vec();
+        bad.extend_from_slice(&(!packed).to_be_bytes());
+        let sources = vec![vec![
+            (a, b"va".to_vec()),
+            (bad, b"vm".to_vec()),
+            (n, b"vn".to_vec()),
+            (z, b"vz".to_vec()),
+        ]];
+        let db_iter = DBIterator::new(sources, 100);
+        let mut it = BidiIterator::lazy(db_iter);
+
+        // 1st next_back(): seek_to_last() lands on "z" — decodes fine.
+        assert_eq!(it.next_back().unwrap().0, b"z");
+        assert!(matches!(it.inner, BidiInner::LazyBackStarted(_)));
+        assert!(it.error().is_none());
+
+        // next(): re-seeks forward below "z", lands on "a" — decodes fine,
+        // transitions to LazyFwdResumed.
+        assert_eq!(it.next().unwrap().0, b"a");
+        assert!(matches!(it.inner, BidiInner::LazyFwdResumed(_)));
+        assert!(it.error().is_none());
+
+        // 2nd next_back(): LazyFwdResumed's handler re-seeks to the largest
+        // key below "z", which is "n" — resolving it decodes the
+        // immediately preceding malformed "m" entry.
+        assert!(it.next_back().is_none());
+        let err = it
+            .error()
+            .expect("the decode error must survive the second next_back()'s reverse transition");
+        assert!(err.contains("invalid value_type"), "got {err}");
     }
 }

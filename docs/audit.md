@@ -11,12 +11,6 @@
 > changes.
 
 ## Open
-### [MEDIUM] iterator: `BidiIterator` hides underlying lazy-iteration failures
-- **Where**: `src/iterator/bidi_iter.rs`
-- **What**: SST I/O or corruption can make a lazy bidirectional iterator return `None`, but it exposes no `error()` accessor. The initial reverse transition also replaces the underlying state before all early returns, risking loss of the source error.
-- **Why**: The wrapper preserves the item-only `Iterator` surface but omits `DBIterator`'s separate error channel.
-- **Suggested fix**: Forward the underlying error for every lazy state and preserve state across reverse initialization. Regress forward and reverse failures.
-
 ### [MEDIUM] SST: L0 first-block pinning performs large reads under the DB mutex
 - **Where**: `src/db.rs` (`install_flush`), `src/sst/table_reader/mod.rs` (`pin_metadata_in_cache`)
 - **What**: Default L0 pinning can synchronously read, checksum, allocate, and decompress a legal first data block of up to 64 MiB during locked flush installation, convoying writers and admin paths.
