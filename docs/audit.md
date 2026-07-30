@@ -11,12 +11,6 @@
 > changes.
 
 ## Open
-### [HIGH] iterator: overlapping range tombstones have quadratic construction and storage
-- **Where**: `src/iterator/range_del.rs` (`FragmentedRangeTombstoneList`), `src/sst/table_reader/mod.rs`
-- **What**: Every endpoint fragment clones and sorts every active `(sequence, level)` pair. Nested tombstones therefore require quadratic work and memory; per-table caching then expands the fragments and aggregate iterators fragment them again.
-- **Why**: The representation materializes the fragment-by-active-tombstone product instead of retaining each raw interval once or sharing active state.
-- **Suggested fix**: Preserve an O(T) canonical form and use an O(T)-space query representation or bounded fallback for high overlap. Regress nested N/2N inputs with cardinality and coverage assertions.
-
 ### [HIGH] API: lazy-delete pruning can forget a concurrent rewrite
 - **Where**: `src/db.rs` (`prune_settled_dead_keys`, write path)
 - **What**: Pruning observes an absent key without holding writer serialization, then removes its registration after a concurrent put commits the same key. Future compaction preserves that rewrite even though it occurred while lazy deletion was active.

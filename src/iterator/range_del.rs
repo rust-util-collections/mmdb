@@ -121,40 +121,162 @@ impl RangeTombstoneTracker {
 // ---------------------------------------------------------------------------
 // FragmentedRangeTombstoneList — immutable, O(log T) binary-search index
 // ---------------------------------------------------------------------------
+//
+// Query index construction, illustrated for two raw tombstones [a,z)@seq5
+// and [d,f)@seq8:
+//
+//   boundaries         a    d    f    z
+//   elementary ivals   [a,d) [d,f) [f,z)     <- leaves of the tree, 0..3
+//
+//   segment-tree assignment (range-update style):
+//     seq5/lvl0  covers leaves [0,3): assigned to as few canonical
+//                ancestor nodes as needed (O(log N) of them), NOT
+//                cloned into each of the 3 leaves individually.
+//     seq8/lvl0  covers leaf [1,2) only: assigned directly to that leaf.
+//
+// A point query for a key inside leaf 1 (`[d,f)`) walks root -> leaf,
+// visiting the O(log N) ancestor nodes on that path and checking each one's
+// (small) list for the best entry passing the caller's snapshot/level
+// filters — it never scans a per-leaf list that duplicated every tombstone
+// active there.
 
-/// A non-overlapping tombstone fragment: keys in [begin, end) are covered
-/// by tombstones at the listed sequence numbers.
-struct TombstoneFragment {
-    begin: Vec<u8>,
-    end: Vec<u8>,
-    /// `(sequence_number, source_level)` pairs covering this interval,
-    /// stored in **descending seq** order for efficient max-visible-seq lookup.
-    /// The level enables cross-level pruning: a tombstone from level L can only
-    /// delete keys from levels > L.
-    seq_levels: Vec<(SequenceNumber, usize)>,
+/// Elementary-interval boundaries for the query index: `bounds[i]` is the
+/// begin key of interval `i`; `bounds[i + 1]` is its (exclusive) end.
+/// Derived from every raw begin/end key, sorted and deduplicated. Some
+/// intervals may have zero covering tombstones (gaps between tombstones);
+/// queries landing there correctly see no coverage.
+type Bounds = Vec<Vec<u8>>;
+
+/// Segment tree over the elementary intervals in `Bounds`. Node `i`'s
+/// children are `2*i` and `2*i+1` (1-indexed, root at `1`); node `1` spans
+/// the whole `[0, num_intervals)` range. Each raw tombstone is inserted into
+/// the O(log N) canonical nodes covering the interval range it spans — this
+/// is what keeps total node-list size O(T log T) rather than the O(T^2) that
+/// results from attaching a copy of every tombstone active at each
+/// elementary interval to that interval directly.
+type Tree = Vec<Vec<(SequenceNumber, usize)>>;
+
+/// A safe upper bound on node count for a recursive 1-indexed segment tree
+/// over `n` leaves, split via `mid = lo + (hi - lo) / 2`. Standard bound.
+fn tree_node_capacity(num_intervals: usize) -> usize {
+    if num_intervals == 0 {
+        0
+    } else {
+        4 * num_intervals
+    }
+}
+
+/// Insert `val` into every canonical node covering `[lo, hi)`.
+fn tree_insert(
+    tree: &mut Tree,
+    num_intervals: usize,
+    lo: usize,
+    hi: usize,
+    val: (SequenceNumber, usize),
+) {
+    if lo >= hi {
+        return; // empty/invalid range: no coverage
+    }
+    tree_insert_rec(tree, 1, 0, num_intervals, lo, hi, val);
+}
+
+fn tree_insert_rec(
+    tree: &mut Tree,
+    node: usize,
+    node_lo: usize,
+    node_hi: usize,
+    lo: usize,
+    hi: usize,
+    val: (SequenceNumber, usize),
+) {
+    if hi <= node_lo || node_hi <= lo {
+        return; // disjoint
+    }
+    if lo <= node_lo && node_hi <= hi {
+        tree[node].push(val); // this node is a canonical piece of [lo, hi)
+        return;
+    }
+    // A unit-length node can never reach here: for integer bounds, any
+    // interval overlapping [node_lo, node_lo + 1) must fully contain it
+    // (lo <= node_lo and node_hi <= hi both hold), which the branch above
+    // already caught. So `node_hi - node_lo >= 2` and `mid` strictly splits.
+    let mid = node_lo + (node_hi - node_lo) / 2;
+    tree_insert_rec(tree, 2 * node, node_lo, mid, lo, hi, val);
+    tree_insert_rec(tree, 2 * node + 1, mid, node_hi, lo, hi, val);
+}
+
+/// Walk root -> `leaf`, returning the max seq among ancestor-node entries
+/// passing the snapshot/level filters.
+fn tree_query(
+    tree: &Tree,
+    num_intervals: usize,
+    leaf: usize,
+    snapshot: SequenceNumber,
+    source_level: Option<usize>,
+) -> SequenceNumber {
+    let mut node = 1usize;
+    let mut node_lo = 0usize;
+    let mut node_hi = num_intervals;
+    let mut best: SequenceNumber = 0;
+    loop {
+        // Entries are sorted (seq desc, level asc): the first one passing
+        // both filters is this node's own best contribution.
+        for &(seq, level) in &tree[node] {
+            if seq > snapshot {
+                continue;
+            }
+            if let Some(src_lvl) = source_level
+                && level > src_lvl
+            {
+                continue;
+            }
+            if seq > best {
+                best = seq;
+            }
+            break;
+        }
+        if node_hi - node_lo <= 1 {
+            break;
+        }
+        let mid = node_lo + (node_hi - node_lo) / 2;
+        if leaf < mid {
+            node_hi = mid;
+            node *= 2;
+        } else {
+            node_lo = mid;
+            node = 2 * node + 1;
+        }
+    }
+    best
 }
 
 /// Pre-fragmented, immutable range tombstone index.
 ///
-/// Overlapping raw tombstones are split at overlap points into non-overlapping
-/// fragments sorted by `begin`. This enables O(log T) binary search for any
-/// user key in any direction (forward or backward), replacing both the
-/// sweep-line tracker and the linear-scan fallback.
+/// Supports O(log T)-ish binary search + ancestor-walk lookup for any user
+/// key, replacing both the sweep-line tracker and a linear-scan fallback,
+/// without materializing the full active-tombstone set at every elementary
+/// interval (which would be O(T) per interval and O(T^2) overall for deeply
+/// nested/overlapping input — see the module-level diagram above).
 ///
 /// Constructed once at iterator creation time from all sources' cached
 /// tombstones; never mutated afterwards.
 pub(crate) struct FragmentedRangeTombstoneList {
-    /// Non-overlapping fragments sorted by `begin`. Guaranteed:
-    /// - `fragments[i].end <= fragments[i+1].begin` (no overlap)
-    /// - Each fragment has at least one seq in `seqs`
-    fragments: Vec<TombstoneFragment>,
+    /// Original `(begin, end, seq, level)` tuples exactly as supplied to the
+    /// constructor. Source of truth for `tombstones()`; also lets `is_empty`
+    /// answer without touching the query index.
+    raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
+    /// Query index (empty when `raw` is empty).
+    bounds: Bounds,
+    tree: Tree,
 }
 
 impl FragmentedRangeTombstoneList {
     /// Create an empty list (no tombstones).
     pub fn empty() -> Self {
         Self {
-            fragments: Vec::new(),
+            raw: Vec::new(),
+            bounds: Vec::new(),
+            tree: Vec::new(),
         }
     }
 
@@ -166,70 +288,52 @@ impl FragmentedRangeTombstoneList {
     }
 
     /// Build from raw tombstones with level info: `(begin, end, seq, level)`.
-    ///
-    /// Algorithm (RocksDB-style boundary sweep):
-    /// 1. Collect all unique boundary points (begin and end keys), sort & dedup.
-    /// 2. For each consecutive boundary pair `[b_i, b_{i+1})`, find all
-    ///    tombstones that cover this interval and record their `(seq, level)`.
-    /// 3. Skip intervals with no covering tombstones.
-    pub fn new_with_levels(mut raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>) -> Self {
+    pub fn new_with_levels(raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>) -> Self {
         if raw.is_empty() {
             return Self::empty();
         }
 
-        // Collect and sort unique boundary points.
-        let mut boundaries: Vec<Vec<u8>> = Vec::with_capacity(raw.len() * 2);
+        // Elementary-interval boundaries: every distinct begin/end key.
+        let mut bounds: Bounds = Vec::with_capacity(raw.len() * 2);
         for (begin, end, _, _) in &raw {
-            boundaries.push(begin.clone());
-            boundaries.push(end.clone());
+            bounds.push(begin.clone());
+            bounds.push(end.clone());
         }
-        boundaries.sort();
-        boundaries.dedup();
+        bounds.sort();
+        bounds.dedup();
 
-        // Sort tombstones by (begin ASC) for sweep efficiency.
-        raw.sort_by(|a, b| a.0.cmp(&b.0));
+        let num_intervals = bounds.len() - 1;
+        let mut tree: Tree = vec![Vec::new(); tree_node_capacity(num_intervals)];
 
-        // Sweep boundaries left-to-right, tracking active tombstones.
-        let mut fragments = Vec::new();
-        let mut tomb_idx = 0;
-        let mut active: Vec<usize> = Vec::new();
-
-        for w in boundaries.windows(2) {
-            let b_start = &w[0];
-            let b_end = &w[1];
-
-            // Activate tombstones whose begin <= b_start.
-            while tomb_idx < raw.len() && raw[tomb_idx].0.as_slice() <= b_start.as_slice() {
-                active.push(tomb_idx);
-                tomb_idx += 1;
+        for (begin, end, seq, level) in &raw {
+            if begin >= end {
+                continue; // empty/invalid range contributes no coverage
             }
-
-            // Prune expired tombstones (end <= b_start).
-            active.retain(|&idx| raw[idx].1.as_slice() > b_start.as_slice());
-
-            if active.is_empty() {
-                continue;
-            }
-
-            // Collect (seq, level) pairs from active tombstones, sorted by seq descending.
-            let mut seq_levels: Vec<(SequenceNumber, usize)> =
-                active.iter().map(|&idx| (raw[idx].2, raw[idx].3)).collect();
-            seq_levels.sort_unstable_by_key(|sl| std::cmp::Reverse(sl.0));
-            seq_levels.dedup_by_key(|sl| sl.0);
-
-            fragments.push(TombstoneFragment {
-                begin: b_start.clone(),
-                end: b_end.clone(),
-                seq_levels,
-            });
+            // `bounds` contains this tombstone's begin/end exactly (both were
+            // pushed above), so these binary searches always hit.
+            let lo = bounds
+                .binary_search(begin)
+                .expect("begin was pushed into bounds above");
+            let hi = bounds
+                .binary_search(end)
+                .expect("end was pushed into bounds above");
+            tree_insert(&mut tree, num_intervals, lo, hi, (*seq, *level));
         }
 
-        Self { fragments }
+        for node in &mut tree {
+            // Descending seq so the first entry passing the caller's
+            // snapshot/level filters is the answer. Level ascending breaks
+            // ties among equal seqs (possible once compaction zeroes several
+            // bottommost tombstones' sequence numbers together), trying the
+            // most permissive (shallowest) level first.
+            node.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        }
+
+        Self { raw, bounds, tree }
     }
 
     /// Find the highest-seq tombstone covering `user_key` visible at `snapshot`.
     /// Returns 0 if no covering tombstone exists.
-    /// O(log T) via binary search on non-overlapping fragments.
     pub fn max_covering_tombstone_seq(
         &self,
         user_key: &[u8],
@@ -257,57 +361,40 @@ impl FragmentedRangeTombstoneList {
         snapshot: SequenceNumber,
         source_level: Option<usize>,
     ) -> SequenceNumber {
-        if self.fragments.is_empty() {
-            return 0;
-        }
+        let num_intervals = match self.bounds.len().checked_sub(1) {
+            Some(0) | None => return 0,
+            Some(n) => n,
+        };
 
-        // Binary search: find the last fragment whose begin <= user_key.
-        let idx = self
-            .fragments
-            .partition_point(|f| f.begin.as_slice() <= user_key);
+        // Binary search: find the last interval whose begin <= user_key.
+        let idx = self.bounds[..num_intervals].partition_point(|b| b.as_slice() <= user_key);
         if idx == 0 {
             return 0;
         }
-        let frag = &self.fragments[idx - 1];
+        let leaf = idx - 1;
 
         // Check user_key is within [begin, end).
-        if user_key >= frag.end.as_slice() {
+        if user_key >= self.bounds[leaf + 1].as_slice() {
             return 0;
         }
 
-        // seq_levels are sorted by seq descending; find max visible seq,
-        // optionally filtering by level.
-        for &(seq, level) in &frag.seq_levels {
-            if seq > snapshot {
-                continue;
-            }
-            // Only tombstones strictly deeper than the key are excluded;
-            // same-level and shallower tombstones may always cover it.
-            if let Some(src_lvl) = source_level
-                && level > src_lvl
-            {
-                continue;
-            }
-            return seq;
-        }
-        0
+        tree_query(&self.tree, num_intervals, leaf, snapshot, source_level)
     }
 
     /// Whether the list contains any tombstones.
     pub fn is_empty(&self) -> bool {
-        self.fragments.is_empty()
+        self.raw.is_empty()
     }
 
-    /// Export tombstones as `(begin, end, seq)` triples.
-    /// Each fragment may produce multiple triples (one per seq).
+    /// Export tombstones as `(begin, end, seq)` triples — exactly the raw
+    /// input, one triple per original tombstone (never re-expanded through
+    /// the fragmented query index, which could otherwise multiply out an
+    /// aggregate re-fragmentation downstream).
     pub fn tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
-        let mut result = Vec::new();
-        for frag in &self.fragments {
-            for &(seq, _level) in &frag.seq_levels {
-                result.push((frag.begin.clone(), frag.end.clone(), seq));
-            }
-        }
-        result
+        self.raw
+            .iter()
+            .map(|(b, e, s, _)| (b.clone(), e.clone(), *s))
+            .collect()
     }
 }
 
@@ -527,5 +614,122 @@ mod tests {
         assert_eq!(list.max_covering_tombstone_seq(b"b", 10), 5);
         assert_eq!(list.max_covering_tombstone_seq(b"c", 10), 5);
         assert_eq!(list.max_covering_tombstone_seq(b"e", 10), 5);
+    }
+
+    /// N tombstones nested inside one another (tombstone `i` covers
+    /// `[i, 2N-i)` at seq `i+1`) is the adversarial case that made the old
+    /// per-fragment representation clone and sort every active tombstone
+    /// into every one of the ~2N elementary intervals it overlapped —
+    /// O(N) work and memory attached to each of O(N) intervals, O(N^2)
+    /// overall. The segment-tree index instead assigns each tombstone to
+    /// O(log N) canonical nodes, so total stored entries stay near O(N log N).
+    #[test]
+    fn test_fragmented_nested_bounded_storage() {
+        let n: usize = 2000;
+        let raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> = (0..n)
+            .map(|i| {
+                let begin = format!("{i:06}").into_bytes();
+                let end = format!("{:06}", 2 * n - i).into_bytes();
+                (begin, end, (i + 1) as SequenceNumber)
+            })
+            .collect();
+
+        let list = FragmentedRangeTombstoneList::new(raw);
+
+        // Cardinality: total entries stored across the whole segment tree
+        // must stay near O(n log n), nowhere close to the O(n^2) a
+        // per-fragment clone would produce (>= n^2/4 = 1,000,000 for
+        // n=2000, since at least half the elementary intervals are covered
+        // by at least n/2 tombstones simultaneously).
+        let total_entries: usize = list.tree.iter().map(|node| node.len()).sum();
+        assert!(
+            total_entries < n * 40,
+            "expected roughly O(n log n) (n*40 = {}) but stored {total_entries} \
+             entries for n={n} fully-nested tombstones",
+            n * 40
+        );
+        assert!(
+            total_entries < n * n / 4,
+            "storage did not avoid the O(n^2) blowup: {total_entries} entries for n={n}"
+        );
+
+        // Coverage: the innermost point is covered by every tombstone
+        // (highest seq wins); the outermost point only by the outermost
+        // (seq=1) tombstone.
+        let center = format!("{n:06}").into_bytes();
+        assert_eq!(
+            list.max_covering_tombstone_seq(&center, n as SequenceNumber),
+            n as SequenceNumber,
+            "innermost key must see the highest (innermost) seq"
+        );
+        assert_eq!(
+            list.max_covering_tombstone_seq(b"000000", n as SequenceNumber),
+            1,
+            "outermost key is covered only by the outermost (seq=1) tombstone"
+        );
+        // A snapshot older than every seq must see no coverage at all.
+        assert_eq!(list.max_covering_tombstone_seq(&center, 0), 0);
+    }
+
+    /// Exhaustive differential check against a brute-force oracle over a
+    /// deliberately messy mix: full nesting, partial overlap, exact
+    /// adjacency, identical ranges at different levels/seqs, and duplicate
+    /// seqs at different levels (which compaction's bottommost seq-zeroing
+    /// can legitimately produce — see `test_same_seq_not_deleted`-style
+    /// scenarios at scale). Covers every requested key/snapshot/level
+    /// combination, not just a few hand-picked points.
+    #[test]
+    fn test_fragmented_matches_brute_force_oracle() {
+        fn brute_force(
+            raw: &[(Vec<u8>, Vec<u8>, SequenceNumber, usize)],
+            key: &[u8],
+            snapshot: SequenceNumber,
+            source_level: Option<usize>,
+        ) -> SequenceNumber {
+            let mut best = 0;
+            for (b, e, s, l) in raw {
+                let level_ok = source_level.is_none_or(|sl| *l <= sl);
+                if *s <= snapshot
+                    && key >= b.as_slice()
+                    && key < e.as_slice()
+                    && level_ok
+                    && *s > best
+                {
+                    best = *s;
+                }
+            }
+            best
+        }
+
+        let raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)> = vec![
+            (vec![0], vec![100], 1, 0),
+            (vec![10], vec![90], 5, 1),
+            (vec![20], vec![80], 3, 0),
+            (vec![20], vec![80], 9, 2),
+            (vec![30], vec![40], 20, 3),
+            (vec![40], vec![50], 21, 0),
+            (vec![60], vec![70], 2, 2),
+            (vec![0], vec![5], 0, 0),
+            (vec![0], vec![5], 0, 1),
+            (vec![95], vec![100], 30, 5),
+            (vec![100], vec![110], 31, 0),
+        ];
+
+        let list = FragmentedRangeTombstoneList::new_with_levels(raw.clone());
+
+        for key_byte in 0u8..=120 {
+            let key = [key_byte];
+            for snapshot in [0u64, 1, 2, 5, 9, 20, 21, 30, 31, u64::MAX] {
+                for source_level in [None, Some(0usize), Some(1), Some(2), Some(3), Some(5)] {
+                    let expected = brute_force(&raw, &key, snapshot, source_level);
+                    let actual =
+                        list.max_covering_tombstone_seq_for_level(&key, snapshot, source_level);
+                    assert_eq!(
+                        actual, expected,
+                        "key={key_byte} snapshot={snapshot} source_level={source_level:?}"
+                    );
+                }
+            }
+        }
     }
 }

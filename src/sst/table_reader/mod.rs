@@ -338,8 +338,9 @@ impl TableReader {
     /// Find the highest-seq range tombstone covering `user_key` with seq <= `read_seq`.
     /// Returns 0 if none found. Only meaningful for SSTs that contain range deletions.
     ///
-    /// Range tombstones are cached per-SST on first access, so subsequent calls
-    /// are O(T) in the number of tombstones rather than O(blocks * entries).
+    /// Range tombstones are indexed per-SST on first access (O(T log T) for
+    /// `T` tombstones); subsequent calls are a segment-tree ancestor walk,
+    /// not a full rescan.
     pub fn max_covering_tombstone_seq(
         &self,
         user_key: &[u8],
@@ -349,15 +350,20 @@ impl TableReader {
         Ok(tombstones.max_covering_tombstone_seq(user_key, read_seq))
     }
 
-    /// Return all range tombstones as (begin, end, seq) triples.
+    /// Return all range tombstones as (begin, end, seq) triples — exactly
+    /// the `T` raw tombstones this table holds, one triple each (never
+    /// re-expanded through the cached query index, which would otherwise
+    /// multiply out when an aggregate multi-source iterator re-fragments
+    /// the combined result).
     /// Delegates to `cached_range_tombstones()` — no extra I/O after first call.
     pub fn get_range_tombstones(&self) -> Result<Vec<RangeTombstoneEntry>> {
         let cached = self.cached_range_tombstones().ctx()?;
         Ok(cached.tombstones())
     }
 
-    /// Get cached range tombstones as a pre-fragmented index (O(log T) lookup).
-    /// Populated once on first access.
+    /// Get cached range tombstones as a pre-indexed structure (O(log T)-ish
+    /// point lookup via a segment tree over elementary key intervals — see
+    /// `FragmentedRangeTombstoneList`). Populated once on first access.
     fn cached_range_tombstones(&self) -> Result<Arc<FragmentedRangeTombstoneList>> {
         if let Some(cached) = self.range_tombstone_cache.get() {
             return Ok(cached.clone());
