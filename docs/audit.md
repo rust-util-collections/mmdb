@@ -12,11 +12,7 @@
 
 ## Open
 
-### [HIGH] manifest: rotation poison does not fail post-apply sync before input/WAL unlink
-- **Where**: `src/manifest/version_set.rs` (`log_and_apply` / `maybe_compact_manifest` / `sync_manifest`); `src/db.rs` (`post_flush_cleanup`, compaction phase-4 handle syncs)
-- **What**: When MANIFEST rotation fails old-writer `sync`, the writer is poisoned but `log_and_apply` still returns `Ok`. Callers then run a second MANIFEST sync via `sync_manifest` or `manifest_sync_handle`; neither fail-fasts on the existing poison flag, so a later "successful" sync (fsyncgate) authorizes input-SST / old-WAL unlink.
-- **Why**: MAN3: ambiguous MANIFEST durability must block side effects that assume durability. Poison exists because a later sync can lie; it currently only blocks *future* applies, not the current call's cleanup.
-- **Suggested fix**: `sync_manifest` and every handle-based sync site must return corruption/fail-stop when already poisoned before treating success as permission to unlink. Keep `log_and_apply` Ok-after-apply so callers do not delete *outputs*. Regression: forced rotation + injected old-writer sync fail → poison → post-sync fails closed and does not delete inputs/WAL.
+*(none)*
 
 ---
 

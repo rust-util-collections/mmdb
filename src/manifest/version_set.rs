@@ -540,6 +540,18 @@ impl VersionSet {
     /// `log_and_apply` (before the referencing MANIFEST record), so this only
     /// needs to fsync the MANIFEST writer itself.
     pub fn sync_manifest(&self) -> Result<()> {
+        // Already-poisoned writers must not be treated as /successfully
+        // synced/ — e.g. rotation may have failed its old-writer sync and
+        // set the flag while log_and_apply still returned Ok. A later sync
+        // can falsely report durability (fsyncgate); fail closed so callers
+        // skip input/WAL unlink.
+        if self.is_poisoned() {
+            return Err(Error::corruption(
+                "MANIFEST writer poisoned by an earlier write failure; \
+                 reopen the database to recover"
+                    .to_string(),
+            ));
+        }
         let mut w = self.manifest_writer.lock();
         if let Some(ref mut writer) = *w
             && let Err(e) = writer.sync()
@@ -952,6 +964,30 @@ mod tests {
         let recovered = VersionSet::recover(path, 7).unwrap();
         assert_eq!(recovered.current().total_files(), 0);
         assert_eq!(recovered.last_sequence(), 7);
+    }
+
+    /// Already-poisoned writers must fail-closed on `sync_manifest` so
+    /// post-apply cleanup cannot treat a later-sync success as permission
+    /// to unlink inputs or WALs.
+    #[test]
+    fn test_sync_manifest_fails_closed_when_poisoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vs = VersionSet::create(dir.path(), 7).unwrap();
+
+        let mut edit = VersionEdit::new();
+        edit.set_last_sequence(1);
+        edit.set_next_file_number(vs.next_file_number());
+        vs.log_and_apply(edit).unwrap();
+
+        // Simulate rotation/old-writer sync poison after a successful apply.
+        vs.poisoned.store(true, Ordering::Release);
+        let err = vs.sync_manifest().unwrap_err();
+        assert!(
+            err.to_string().contains("poisoned"),
+            "sync_manifest must not succeed while poisoned, got {err}"
+        );
+        // Second attempt still fail-closed (fsyncgate must not soft-recover).
+        assert!(vs.sync_manifest().is_err());
     }
 
     /// The file-number allocator must never move backwards, even if an edit

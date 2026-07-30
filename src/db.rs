@@ -44,6 +44,45 @@ use crate::types::{
 };
 use crate::wal::{WalReader, WalWriter};
 
+/// Confirm MANIFEST durability before unlinking inputs/WALs after an apply.
+///
+/// Fail-closed when already poisoned (e.g. rotation failed its old-writer
+/// sync while `log_and_apply` still returned Ok): a later "successful" sync
+/// can lie under fsyncgate and must not authorize cleanup.
+fn confirm_manifest_durable(
+    handle: &Arc<Mutex<Option<WalWriter>>>,
+    poisoned: &AtomicBool,
+) -> Result<()> {
+    if poisoned.load(Ordering::Acquire) {
+        return Err(Error::corruption(
+            "MANIFEST writer poisoned by an earlier write failure; \
+             reopen the database to recover"
+                .to_string(),
+        ));
+    }
+    {
+        let mut w = handle.lock();
+        if let Some(ref mut writer) = *w
+            && let Err(e) = writer.sync()
+        {
+            // Unconfirmed durability + fsyncgate risk on later syncs.
+            drop(w);
+            poisoned.store(true, Ordering::Release);
+            return Err(e).ctx();
+        }
+    }
+    // Catch poisons published while the handle was held (or after a no-op
+    // empty-writer sync) before the caller unlinks side effects.
+    if poisoned.load(Ordering::Acquire) {
+        return Err(Error::corruption(
+            "MANIFEST writer poisoned by an earlier write failure; \
+             reopen the database to recover"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Maximum number of dead-key registrations probed for auto-pruning after
 /// each flush. Bounds the extra read work per pass; the probes run off the
 /// writer-serializing paths (explicit `flush()` prunes after releasing the
@@ -925,28 +964,17 @@ impl DB {
                                                     cleanup
                                                 };
                                                 // Phase 4: sync manifest + cleanup (no lock)
-                                                {
-                                                    let handle = bg_inner
+                                                if let Err(e) = confirm_manifest_durable(
+                                                    &bg_inner
                                                         .lock()
                                                         .versions
-                                                        .manifest_sync_handle();
-                                                    let mut w = handle.lock();
-                                                    if let Some(ref mut writer) = *w
-                                                        && let Err(e) = writer.sync()
-                                                    {
-                                                        // Durability of the applied edit is
-                                                        // unconfirmed and a later sync could
-                                                        // falsely report it durable — poison
-                                                        // the writer (fail-stop, reopen to
-                                                        // recover).
-                                                        drop(w);
-                                                        bg_manifest_poisoned
-                                                            .store(true, Ordering::Release);
-                                                        return Err(format!(
-                                                            "manifest sync error: {}",
-                                                            e
-                                                        ));
-                                                    }
+                                                        .manifest_sync_handle(),
+                                                    &bg_manifest_poisoned,
+                                                ) {
+                                                    return Err(format!(
+                                                        "manifest sync error: {}",
+                                                        e
+                                                    ));
                                                 }
                                                 LeveledCompaction::run_post_compaction_cleanup(
                                                     &cleanup, &bg_path,
@@ -1104,21 +1132,11 @@ impl DB {
                                         cleanup
                                     };
                                     // Phase 4: sync manifest + delete old SSTs (no lock)
-                                    {
-                                        let handle =
-                                            bg_inner.lock().versions.manifest_sync_handle();
-                                        let mut w = handle.lock();
-                                        if let Some(ref mut writer) = *w
-                                            && let Err(e) = writer.sync()
-                                        {
-                                            // Durability of the applied edit is
-                                            // unconfirmed and a later sync could
-                                            // falsely report it durable — poison the
-                                            // writer (fail-stop, reopen to recover).
-                                            drop(w);
-                                            bg_manifest_poisoned.store(true, Ordering::Release);
-                                            return Err(format!("manifest sync error: {}", e));
-                                        }
+                                    if let Err(e) = confirm_manifest_durable(
+                                        &bg_inner.lock().versions.manifest_sync_handle(),
+                                        &bg_manifest_poisoned,
+                                    ) {
+                                        return Err(format!("manifest sync error: {}", e));
                                     }
                                     LeveledCompaction::run_post_compaction_cleanup(
                                         &cleanup, &bg_path,
@@ -2430,22 +2448,18 @@ impl DB {
                 cleanup
             };
             // Sync manifest + delete old SSTs outside the main lock
-            {
-                let handle = self.inner.lock().versions.manifest_sync_handle();
-                let mut w = handle.lock();
-                if let Some(ref mut writer) = *w
-                    && let Err(e) = writer.sync()
-                {
-                    // The edit is applied in memory but its durability could
-                    // not be confirmed — the same fail-stop condition as
-                    // drain_l0 and the background threads. Poison the writer
-                    // and record the background error so every entry point
-                    // sees a fatal engine state, not a retryable hiccup.
-                    drop(w);
-                    self.manifest_poisoned.store(true, Ordering::Release);
-                    self.set_bg_error(format!("compact_range manifest sync failed: {}", e));
-                    return Err(e).ctx();
-                }
+            if let Err(e) = confirm_manifest_durable(
+                &self.inner.lock().versions.manifest_sync_handle(),
+                &self.manifest_poisoned,
+            ) {
+                // The edit is applied in memory but its durability could
+                // not be confirmed — the same fail-stop condition as
+                // drain_l0 and the background threads. Poison (if not already)
+                // is enforced inside confirm_manifest_durable; record the
+                // background error so every entry point sees a fatal engine
+                // state, not a retryable hiccup.
+                self.set_bg_error(format!("compact_range manifest sync failed: {}", e));
+                return Err(e).ctx();
             }
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
         }
@@ -3379,20 +3393,16 @@ impl DB {
     /// auto-flush path, which cannot otherwise propagate this failure to
     /// any caller since the enclosing write still needs to return `Ok`).
     fn post_flush_cleanup(&self, old_wal_number: u64) -> Result<()> {
-        {
-            let handle = self.inner.lock().versions.manifest_sync_handle();
-            let mut w = handle.lock();
-            if let Some(ref mut writer) = *w
-                && let Err(e) = writer.sync()
-            {
-                // Poison first: a later "successful" sync could falsely
-                // report durability of the records this sync failed to
-                // persist (fsyncgate).
-                drop(w);
-                self.manifest_poisoned.store(true, Ordering::Release);
-                self.set_bg_error(format!("post-flush manifest sync failed: {}", e));
-                return Err(e).ctx();
-            }
+        if let Err(e) = confirm_manifest_durable(
+            &self.inner.lock().versions.manifest_sync_handle(),
+            &self.manifest_poisoned,
+        ) {
+            // Poison first: a later "successful" sync could falsely
+            // report durability of the records this sync failed to
+            // persist (fsyncgate). confirm_manifest_durable emits poison
+            // for fresh sync errors; already-poisoned rotation is fail-closed.
+            self.set_bg_error(format!("post-flush manifest sync failed: {}", e));
+            return Err(e).ctx();
         }
         let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
         if let Err(e) = fs::remove_file(&old_wal_path) {
@@ -3559,22 +3569,17 @@ impl DB {
                 cleanup
             };
             // Phase 4: sync manifest + delete old SSTs (no lock)
-            {
-                let handle = self.inner.lock().versions.manifest_sync_handle();
-                let mut w = handle.lock();
-                if let Some(ref mut writer) = *w
-                    && let Err(e) = writer.sync()
-                {
-                    // The edit is applied in memory but its durability could
-                    // not be confirmed — the same condition the background
-                    // thread treats as fail-stop. Poison the writer and
-                    // record it so `flush()` and `check_usable` see a fatal
-                    // engine state, not a retryable hiccup.
-                    drop(w);
-                    self.manifest_poisoned.store(true, Ordering::Release);
-                    self.set_bg_error(format!("drain_l0 manifest sync failed: {}", e));
-                    return Err(e).ctx();
-                }
+            if let Err(e) = confirm_manifest_durable(
+                &self.inner.lock().versions.manifest_sync_handle(),
+                &self.manifest_poisoned,
+            ) {
+                // The edit is applied in memory but its durability could
+                // not be confirmed — the same condition the background
+                // thread treats as fail-stop. confirm_manifest_durable
+                // enforces poison; record it so `flush()` and `check_usable`
+                // see a fatal engine state, not a retryable hiccup.
+                self.set_bg_error(format!("drain_l0 manifest sync failed: {}", e));
+                return Err(e).ctx();
             }
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
         }
