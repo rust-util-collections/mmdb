@@ -95,6 +95,11 @@ impl BidiIterator {
     }
 
     /// Whether the iterator has been exhausted.
+    ///
+    /// For materialized iterators this reports true exhaustion. For lazy
+    /// iterators the remaining work is not tracked for a shared `&self`
+    /// query, so this always returns `false` (same limitation as
+    /// [`Self::remaining`]).
     pub fn is_empty(&self) -> bool {
         match &self.inner {
             BidiInner::Materialized { front, back, .. } => front >= back,

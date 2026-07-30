@@ -11,7 +11,6 @@
 > changes.
 
 ## Open
-
 ### [HIGH] compaction: range-scoped picking can move tombstones below covered source keys
 - **Where**: `src/compaction/leveled.rs` (`pick_compaction_for_range`)
 - **What**: A narrow range compaction selects source files by their point-key metadata but does not close the selection over overlapping same-level siblings. It can move a range tombstone to L1 while a covered point remains in L0, after which level-aware iteration ignores the deeper tombstone and resurrects the point.
@@ -47,30 +46,6 @@
 - **What**: Default L0 pinning can synchronously read, checksum, allocate, and decompress a legal first data block of up to 64 MiB during locked flush installation, convoying writers and admin paths.
 - **Why**: Unlocked prewarm loads structural metadata but not the first data block; the cache miss is serviced only after the DB mutex is reacquired.
 - **Suggested fix**: Prepare the first-block cache payload before the install critical section and only publish/pin it after a successful install, with failure cleanup. Regress using a blocking loader or prepared-pin hook.
-
-### [LOW] SST: prefix keys are collected while Bloom filters are disabled
-- **Where**: `src/sst/table_builder.rs`
-- **What**: With `bloom_bits_per_key = 0` and `prefix_len > 0`, every distinct prefix is still cloned into a `HashSet`, although projection and finish paths never emit a prefix filter.
-- **Why**: Prefix collection checks only `prefix_len`; all consumers additionally check Bloom enablement.
-- **Suggested fix**: Gate collection on nonzero Bloom bits and assert the unused set stays empty.
-
-### [LOW] API docs: `BidiIterator::is_empty` promises a state it cannot report lazily
-- **Where**: `src/iterator/bidi_iter.rs`
-- **What**: The public method says it reports exhaustion, but every lazy iterator returns `false`, including initially empty and exhausted instances.
-- **Why**: Lazy exhaustion is not tracked for the shared `&self` query, while only `remaining()` documents its materialized-only behavior.
-- **Suggested fix**: Document `is_empty` as materialized-only or add explicit lazy exhaustion tracking and tests.
-
-### [LOW] API docs: compaction-filter snapshot guarantee incorrectly includes iterators
-- **Where**: `src/options.rs` (`CompactionFilter`)
-- **What**: The public contract says filtering pauses for an iterator-leaked snapshot, but ordinary DB iterators pin a SuperVersion and do not register in `SnapshotList`; only explicit `DB::snapshot` handles block filters.
-- **Why**: The documentation conflates iterator read-sequence capture with registered snapshots.
-- **Suggested fix**: Limit the guarantee to explicit snapshot handles and point readers to `DB::snapshot`.
-
-### [LOW] docs: README license badge links to a nonexistent file
-- **Where**: `README.md`
-- **What**: The MIT badge targets `LICENSE`, but no tracked license file exists, so the prominent repository link is broken.
-- **Why**: Package metadata declares MIT without a matching repository file.
-- **Suggested fix**: Add an authoritative license file or point the badge at an authoritative MIT-license page.
 
 ---
 

@@ -319,8 +319,11 @@ impl TableBuilder {
             self.filter_key_hashes.push(bloom_hash(user_key_for_bloom));
         }
 
-        // Collect prefix for prefix bloom filter
-        if self.options.prefix_len > 0 && user_key_for_bloom.len() >= self.options.prefix_len {
+        // Collect prefix for prefix bloom filter only when Bloom is enabled.
+        if self.options.bloom_bits_per_key > 0
+            && self.options.prefix_len > 0
+            && user_key_for_bloom.len() >= self.options.prefix_len
+        {
             self.prefix_set
                 .insert(user_key_for_bloom[..self.options.prefix_len].to_vec());
         }
@@ -893,4 +896,27 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::InvalidArgument);
         assert!(err.message().contains("prefix bloom filter block size"));
     }
+
+    #[test]
+    fn test_prefix_set_empty_when_bloom_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path= dir.path().join("no_bloom_prefix.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: 0,
+                prefix_len: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder.add(b"aakey", b"v1").unwrap();
+        builder.add(b"bbkey", b"v2").unwrap();
+        assert!(
+            builder.prefix_set.is_empty(),
+            "prefix_set must stay empty when bloom is disabled"
+        );
+        builder.finish().unwrap();
+    }
+
 }

@@ -333,11 +333,14 @@ pub enum CompactionFilterDecision {
 ///   could otherwise resurrect stale data, since an older, unfiltered version
 ///   of the same key may still live in a lower level and would then
 ///   incorrectly become visible.
-/// - No snapshots are currently active. Removing or changing a value while a
+/// - No explicit snapshots are currently active (handles from
+///   [`crate::DB::snapshot`]). Removing or changing a value while such a
 ///   snapshot is open could change what that snapshot observes, violating its
-///   MVCC visibility guarantee. This means filtering silently pauses for as
-///   long as any snapshot remains open — including one leaked via a forgotten
-///   iterator — and resumes once the last snapshot is released.
+///   MVCC visibility guarantee. Filtering therefore pauses while any
+///   registered snapshot remains open and resumes once the last one is
+///   released. Ordinary DB iterators pin a SuperVersion for their own
+///   read sequence and are **not** registered in the snapshot list; they
+///   do not by themselves pause filtering.
 /// - The entry is a `Value`. `Deletion` and `RangeDeletion` entries are never
 ///   passed to the filter.
 pub trait CompactionFilter: Send + Sync {
