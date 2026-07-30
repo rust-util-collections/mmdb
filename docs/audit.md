@@ -72,6 +72,16 @@
 
 ## Rejected
 
+### write path: `close`/`compact_range`/stop-drain holding `write_queue` across install can deadlock a group-commit leader
+- **Where**: `src/db.rs` (`close`, `compact_range`, `maybe_throttle_writes`, `wait_for_write_leader_idle`)
+- **Claim**: The new `wait_for_write_leader_idle` barrier could deadlock against a leader that needs `write_queue` to finish, or against `prune_settled_dead_keys` re-acquiring it.
+- **Reason**: The wait predicate is `leader_active`, which a leader clears only after re-acquiring `write_queue` in `write_batch_group`'s completion step and calling `write_cv.notify_all()` — so the waiter is always woken. `maybe_throttle_writes` runs before the caller enqueues or becomes leader, and every `prune_settled_dead_keys` call site (`flush`, `compact`, `compact_range`, the leader's post-wake harvest) releases the guard first, so no path re-enters the non-reentrant mutex while holding it.
+
+### iterator: `decode_internal_key` returning owned `uk` in the reverse path adds a hot-path allocation
+- **Where**: `src/iterator/db_iter.rs` (`prev`, the backward resolve loop)
+- **Claim**: Replacing the borrowed `&ikey[..uk_len]` with `uk.to_vec()` allocates once per entry examined during backward iteration.
+- **Reason**: The allocation is forced by the borrow checker, not incidental: the loop moves `ikey` into `prev_overshoot` and into `best_entry` while `uk` is still live. The same function already clones the user key into `candidate_uk` and `current_bound` on the normal path, so the added cost is one small `Vec` per examined entry on a path that already performs per-entry block decoding and clones — not a material change in path class, and no benchmark shows a regression.
+
 ### [MEDIUM] WAL: `WalWriter` needs a `Drop` impl to avoid losing buffered records
 - **Where**: `src/wal/writer.rs`
 - **What**: Claim: `BufWriter` discards its buffer on drop, so a `WalWriter` dropped without an explicit flush silently loses up to one buffer of records.
