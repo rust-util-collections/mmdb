@@ -12,7 +12,101 @@
 
 ## Open
 
-*(none)*
+### [CRITICAL] WAL: corrupt length can hide later valid records during tail recovery
+- **Where**: `src/wal/reader.rs` (`read_physical_record`, `rest_is_zero_padding`), `src/db.rs` (WAL recovery)
+- **What**: A corrupted physical-record length can make the reader consume later valid records before reporting a checksum mismatch. Recovery then checks only the bytes after that untrusted length, sees EOF or zero padding, and accepts the prefix as a torn active-WAL tail.
+- **Why**: Tail recovery treats every read error alike and starts its causal-hole check from the reader's advanced position. A length field that survived neither checksum nor semantic validation must not define where the corruption ends.
+- **Suggested fix**: Classify WAL read failures and tolerate only structurally truncated active tails; checksum, type, and invalid-length failures must fail closed. Regress with three same-block records whose middle length is enlarged through the third record.
+
+### [CRITICAL] close: pre-leader maintenance can install files after resources are released
+- **Where**: `src/db.rs` (`write_batch_inner`, `maybe_throttle_writes`, `drain_l0`, bounded `compact_range`, `close`)
+- **What**: A writer can be inside stop-trigger compaction before it enqueues and marks a group leader, while bounded `compact_range` has a similar gap between write-queue guards. Concurrent `close()` can observe no leader, release `LOCK` and caches, and let either operation later install SST/MANIFEST state.
+- **Why**: The close barrier tracks group-commit leadership rather than every maintenance operation that can outlive an initial usability check and mutate durable state.
+- **Suggested fix**: Serialize pre-enqueue maintenance and every compact-range mutation phase with close, rechecking usability while the serialization guard is held. Add barrier races that prove no durable mutation occurs after close.
+
+### [CRITICAL] SST/compaction: malformed internal keys are silently skipped or reinterpreted
+- **Where**: `src/types.rs`, `src/sst/table_builder.rs`, `src/sst/table_reader/mod.rs`, `src/iterator/db_iter.rs`, `src/compaction/leveled.rs`
+- **What**: CRC-valid keys shorter than the eight-byte trailer are skipped, while unknown value-type bytes are coerced to point deletions. Point reads and iterators can report false absence; both compaction loops can install output that omitted malformed entries and then delete the source SST.
+- **Why**: Persisted-key semantic boundaries use infallible decoding or `continue`, and the existing checked type decoder is confined to one bottommost-deletion branch.
+- **Suggested fix**: Add one fallible length/sequence/type decoder and use it at every persisted internal-key boundary, surface iterator corruption through `error()`, reject malformed builder input, and regress reads plus normal/forced compaction with CRC-valid malformed entries.
+
+### [HIGH] compaction: range-scoped picking can move tombstones below covered source keys
+- **Where**: `src/compaction/leveled.rs` (`pick_compaction_for_range`)
+- **What**: A narrow range compaction selects source files by their point-key metadata but does not close the selection over overlapping same-level siblings. It can move a range tombstone to L1 while a covered point remains in L0, after which level-aware iteration ignores the deeper tombstone and resurrects the point.
+- **Why**: Target-level overlap is transitively closed, but source-level overlap is not; `is_bottommost_level` only controls dropping and sequence zeroing, not whether a tombstone may move below a covered key.
+- **Suggested fix**: Transitively close source inputs before selecting target inputs for L0 and L1+ range picks. Regress a narrow compaction over separate point/tombstone SSTs and check get plus forward/reverse iteration.
+
+### [HIGH] iterator: overlapping range tombstones have quadratic construction and storage
+- **Where**: `src/iterator/range_del.rs` (`FragmentedRangeTombstoneList`), `src/sst/table_reader/mod.rs`
+- **What**: Every endpoint fragment clones and sorts every active `(sequence, level)` pair. Nested tombstones therefore require quadratic work and memory; per-table caching then expands the fragments and aggregate iterators fragment them again.
+- **Why**: The representation materializes the fragment-by-active-tombstone product instead of retaining each raw interval once or sharing active state.
+- **Suggested fix**: Preserve an O(T) canonical form and use an O(T)-space query representation or bounded fallback for high overlap. Regress nested N/2N inputs with cardinality and coverage assertions.
+
+### [HIGH] WAL: empty or inverted range deletes bypass rotation
+- **Where**: `src/db.rs` (`write_batch_inner`, `write_batch_group`), `src/memtable/mod.rs` (`MemTable::put`)
+- **What**: `delete_range(begin, end)` with `begin >= end` is acknowledged and appended to the WAL, but MemTable insertion and size accounting return early. Repetition grows the active WAL without ever reaching the memtable flush threshold.
+- **Why**: Range normalization occurs only after WAL encoding and sequence assignment; the rotation trigger observes only accounted memtable bytes.
+- **Suggested fix**: Elide invalid/no-op range entries before sequence assignment and WAL encoding, including inside `WriteBatch`. Regress repeated no-op ranges under a tiny write buffer.
+
+### [HIGH] API: `create_if_missing = false` creates a DB in an empty directory
+- **Where**: `src/db.rs` (`DB::open`)
+- **What**: An existing empty directory passes the path-existence check, then `VersionSet::open_with_cache` takes its missing-`CURRENT` creation path and writes a new database despite creation being disabled.
+- **Why**: The option checks directory existence rather than the database marker that distinguishes an existing DB.
+- **Suggested fix**: Require `CURRENT` before taking the lock or creating files when creation is disabled. Regress an empty temporary directory and assert it stays uninitialized.
+
+### [HIGH] API: lazy-delete pruning can forget a concurrent rewrite
+- **Where**: `src/db.rs` (`prune_settled_dead_keys`, write path)
+- **What**: Pruning observes an absent key without holding writer serialization, then removes its registration after a concurrent put commits the same key. Future compaction preserves that rewrite even though it occurred while lazy deletion was active.
+- **Why**: The absence probe and registration removal are a check-then-act sequence with no generation or write-order validation.
+- **Suggested fix**: Make final validation/removal atomic with relevant writes, or use equivalent registration generations. Add a deterministic race between the absence probe and removal.
+
+### [HIGH] manifest: phase-four syncs retain the main DB mutex
+- **Where**: `src/db.rs` (background compaction, `compact_range`, `post_flush_cleanup`, `drain_l0`)
+- **What**: Calls pass `&self.inner.lock().versions.manifest_sync_handle()` directly into `confirm_manifest_durable`. Rust keeps that temporary mutex guard alive through the sync, so fsync runs while holding the main DB mutex despite the documented unlocked phase.
+- **Why**: The handle clone and slow durability call share one statement and therefore one temporary lifetime.
+- **Suggested fix**: Clone the sync handle in a scoped lock, drop the guard, then call the durability helper. Regress with a blocked sync and concurrent mutex acquisition.
+
+### [MEDIUM] open: partial compaction-thread spawn failure leaks earlier workers
+- **Where**: `src/db.rs` (background compaction thread startup)
+- **What**: If a later worker spawn fails, `DB::open` returns immediately while already spawned workers retain shared state and wait indefinitely.
+- **Why**: The error path neither signals shutdown nor joins the handles accumulated before the failed spawn.
+- **Suggested fix**: On partial startup failure, signal and notify shutdown, then join all prior workers before returning the spawn error. Regress with an injectable failure on worker N.
+
+### [MEDIUM] iterator: `BidiIterator` hides underlying lazy-iteration failures
+- **Where**: `src/iterator/bidi_iter.rs`
+- **What**: SST I/O or corruption can make a lazy bidirectional iterator return `None`, but it exposes no `error()` accessor. The initial reverse transition also replaces the underlying state before all early returns, risking loss of the source error.
+- **Why**: The wrapper preserves the item-only `Iterator` surface but omits `DBIterator`'s separate error channel.
+- **Suggested fix**: Forward the underlying error for every lazy state and preserve state across reverse initialization. Regress forward and reverse failures.
+
+### [MEDIUM] SST: L0 first-block pinning performs large reads under the DB mutex
+- **Where**: `src/db.rs` (`install_flush`), `src/sst/table_reader/mod.rs` (`pin_metadata_in_cache`)
+- **What**: Default L0 pinning can synchronously read, checksum, allocate, and decompress a legal first data block of up to 64 MiB during locked flush installation, convoying writers and admin paths.
+- **Why**: Unlocked prewarm loads structural metadata but not the first data block; the cache miss is serviced only after the DB mutex is reacquired.
+- **Suggested fix**: Prepare the first-block cache payload before the install critical section and only publish/pin it after a successful install, with failure cleanup. Regress using a blocking loader or prepared-pin hook.
+
+### [LOW] SST: prefix keys are collected while Bloom filters are disabled
+- **Where**: `src/sst/table_builder.rs`
+- **What**: With `bloom_bits_per_key = 0` and `prefix_len > 0`, every distinct prefix is still cloned into a `HashSet`, although projection and finish paths never emit a prefix filter.
+- **Why**: Prefix collection checks only `prefix_len`; all consumers additionally check Bloom enablement.
+- **Suggested fix**: Gate collection on nonzero Bloom bits and assert the unused set stays empty.
+
+### [LOW] API docs: `BidiIterator::is_empty` promises a state it cannot report lazily
+- **Where**: `src/iterator/bidi_iter.rs`
+- **What**: The public method says it reports exhaustion, but every lazy iterator returns `false`, including initially empty and exhausted instances.
+- **Why**: Lazy exhaustion is not tracked for the shared `&self` query, while only `remaining()` documents its materialized-only behavior.
+- **Suggested fix**: Document `is_empty` as materialized-only or add explicit lazy exhaustion tracking and tests.
+
+### [LOW] API docs: compaction-filter snapshot guarantee incorrectly includes iterators
+- **Where**: `src/options.rs` (`CompactionFilter`)
+- **What**: The public contract says filtering pauses for an iterator-leaked snapshot, but ordinary DB iterators pin a SuperVersion and do not register in `SnapshotList`; only explicit `DB::snapshot` handles block filters.
+- **Why**: The documentation conflates iterator read-sequence capture with registered snapshots.
+- **Suggested fix**: Limit the guarantee to explicit snapshot handles and point readers to `DB::snapshot`.
+
+### [LOW] docs: README license badge links to a nonexistent file
+- **Where**: `README.md`
+- **What**: The MIT badge targets `LICENSE`, but no tracked license file exists, so the prominent repository link is broken.
+- **Why**: Package metadata declares MIT without a matching repository file.
+- **Suggested fix**: Add an authoritative license file or point the badge at an authoritative MIT-license page.
 
 ---
 
@@ -77,15 +171,10 @@
 - **What**: Claim: `BufWriter` discards its buffer on drop, so a `WalWriter` dropped without an explicit flush silently loses up to one buffer of records.
 - **Reason**: The premise is false — `std::io::BufWriter`'s `Drop` flushes the buffer (only errors are ignored, per its documentation). Independently, every commit path flushes or syncs the WAL before acknowledging a write, so drop-time behavior only concerns unacknowledged data on panic unwind.
 
-### [HIGH] WAL: unbounded growth without rotation
-- **Where**: `src/wal/writer.rs`, `src/db.rs` (`freeze_memtable_sync`)
-- **What**: Claim: nothing rotates the active WAL, so it can grow until the disk fills.
-- **Reason**: The WAL is rotated at every memtable freeze (`freeze_memtable_sync` creates the next WAL), and the write path freezes synchronously once `approximate_size() >= write_buffer_size` — writers block during the flush, so the active WAL is bounded by roughly `write_buffer_size` plus one batch. Retired WALs are deleted in `post_flush_cleanup`.
-
 ### [MEDIUM] memtable: range tombstones evade `approximate_size` accounting
 - **Where**: `src/memtable/mod.rs`
-- **What**: Claim: `delete_range` entries are nearly free in `approximate_size()`, so unbounded range-deletion volume never triggers a flush.
-- **Reason**: `MemTable::put` already accounts the duplicated begin/end keys plus `MemRangeTombstone` struct overhead for every `RangeDeletion` entry, in addition to the skiplist entry itself; sustained `delete_range` traffic advances the flush threshold like any other write.
+- **What**: Claim: valid `delete_range(begin, end)` entries with `begin < end` are nearly free in `approximate_size()`, so their volume never triggers a flush.
+- **Reason**: `MemTable::put` accounts the duplicated begin/end keys plus `MemRangeTombstone` struct overhead for every valid `RangeDeletion` entry, in addition to the skiplist entry itself. Invalid/no-op ranges are a separate open write-path defect because they are discarded before this accounting.
 
 ### [MEDIUM] write path: group-commit queue depth is unbounded
 - **Where**: `src/db.rs` (`WriteQueueState`)
