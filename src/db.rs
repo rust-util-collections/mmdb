@@ -3500,12 +3500,17 @@ impl DB {
     }
 
     /// Read, checksum, and decompress each listed file's first data block
-    /// for L0 pinning, entirely unlocked. Meant to be called from the same
+    /// for L0 pinning. Does not itself take `inner` — the caller controls
+    /// whether the DB lock is held. Meant to be called from the same
     /// unlocked phase as `flush_frozen_memtable`, right before the short
     /// locked `install_flush` call, so a legal block up to the ~64 MiB
-    /// max write-entry size is never read while holding the DB lock —
-    /// `install_flush` only has to publish these already-prepared blocks,
-    /// a cheap in-memory cache insert. Returns an empty `Vec` (no-op) when
+    /// max write-entry size is read unlocked and `install_flush` only has
+    /// to publish these already-prepared blocks, a cheap in-memory cache
+    /// insert. That holds for the auto-flush and `flush_and_install_frozen`
+    /// callers; `freeze_and_flush` (used only by `close()`) still calls
+    /// this while holding `inner`, per CC4's documented
+    /// `close`/`freeze_and_flush`-may-hold-lock exception — same as the
+    /// pre-split code on that path. Returns an empty `Vec` (no-op) when
     /// `pin_l0_filter_and_index_blocks_in_cache` is disabled.
     fn prepare_l0_block_pins(&self, file_numbers: &[u64]) -> Vec<(u64, PreparedBlockPin)> {
         if !self.options.pin_l0_filter_and_index_blocks_in_cache {
@@ -3555,9 +3560,10 @@ impl DB {
             .retain(|m| !Arc::ptr_eq(m, &frozen.old_mem));
 
         // Publish each already-read/checksummed/decompressed first block
-        // (prepared unlocked by `prepare_l0_block_pins`) into the shared
-        // cache — an in-memory map insert only, no I/O, so this stays cheap
-        // under the lock regardless of block size.
+        // (prepared by `prepare_l0_block_pins`, unlocked on all but the
+        // `close()` path — see that function's doc comment) into the
+        // shared cache — an in-memory map insert only, no I/O, so this
+        // stays cheap under the lock regardless of block size.
         if !prepared_pins.is_empty() {
             let version = inner.versions.current();
             for (number, prepared) in prepared_pins {
@@ -4356,8 +4362,10 @@ mod tests {
         }
     }
 
-    /// Regression: L0 first-block pinning (default on) must not read,
-    /// checksum, and decompress the block while holding `inner`. Park the
+    /// Regression: on the explicit `flush()` path, L0 first-block pinning
+    /// (default on) must not read, checksum, and decompress the block
+    /// while holding `inner` (`close()`'s `freeze_and_flush` is a
+    /// documented exception — see `prepare_l0_block_pins`). Park the
     /// flush thread inside `prepare_first_block_pin` (before it opens the
     /// file) via `PREPARE_FIRST_BLOCK_PIN_HOOK`, and confirm a direct
     /// `try_lock` on `inner` from another thread succeeds immediately
