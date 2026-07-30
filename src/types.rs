@@ -310,8 +310,14 @@ impl WriteBatch {
     }
 
     /// Add a range deletion. Deletes all keys in [begin, end).
-    /// Stored as: InternalKey(begin, seq, RangeDeletion) → end
+    /// Stored as: InternalKey(begin, seq, RangeDeletion) → end.
+    ///
+    /// Empty or inverted ranges (`begin >= end`) are no-ops and are not
+    /// appended, so they do not consume WAL space or sequences.
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
+        if begin >= end {
+            return;
+        }
         self.entries.push(WriteBatchEntry {
             value_type: ValueType::RangeDeletion,
             key: begin.to_vec(),
@@ -381,6 +387,9 @@ impl WriteBatchWithIndex {
     }
 
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
+        if begin >= end {
+            return;
+        }
         let pos = self.next_pos;
         self.next_pos += 1;
         self.batch.delete_range(begin, end);

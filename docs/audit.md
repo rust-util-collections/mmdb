@@ -24,12 +24,6 @@
 - **Why**: The representation materializes the fragment-by-active-tombstone product instead of retaining each raw interval once or sharing active state.
 - **Suggested fix**: Preserve an O(T) canonical form and use an O(T)-space query representation or bounded fallback for high overlap. Regress nested N/2N inputs with cardinality and coverage assertions.
 
-### [HIGH] WAL: empty or inverted range deletes bypass rotation
-- **Where**: `src/db.rs` (`write_batch_inner`, `write_batch_group`), `src/memtable/mod.rs` (`MemTable::put`)
-- **What**: `delete_range(begin, end)` with `begin >= end` is acknowledged and appended to the WAL, but MemTable insertion and size accounting return early. Repetition grows the active WAL without ever reaching the memtable flush threshold.
-- **Why**: Range normalization occurs only after WAL encoding and sequence assignment; the rotation trigger observes only accounted memtable bytes.
-- **Suggested fix**: Elide invalid/no-op range entries before sequence assignment and WAL encoding, including inside `WriteBatch`. Regress repeated no-op ranges under a tiny write buffer.
-
 ### [HIGH] API: lazy-delete pruning can forget a concurrent rewrite
 - **Where**: `src/db.rs` (`prune_settled_dead_keys`, write path)
 - **What**: Pruning observes an absent key without holding writer serialization, then removes its registration after a concurrent put commits the same key. Future compaction preserves that rewrite even though it occurred while lazy deletion was active.

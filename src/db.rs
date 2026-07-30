@@ -2928,7 +2928,21 @@ impl DB {
         Ok(())
     }
 
-    fn write_batch_inner(&self, batch: WriteBatch, write_options: &WriteOptions) -> Result<()> {
+    fn write_batch_inner(&self, mut batch: WriteBatch, write_options: &WriteOptions) -> Result<()> {
+        // Elide empty/inverted range deletes before seq assignment and WAL
+        // encode. MemTable::put already no-ops them for correctness, but they
+        // would still occupy WAL space and never grow approximate_size, so a
+        // stream of them would never rotate the log.
+        batch.entries.retain(|e| {
+            !(e.value_type == ValueType::RangeDeletion
+                && e.value
+                    .as_ref()
+                    .is_none_or(|end| e.key.as_slice() >= end.as_slice()))
+        });
+        if batch.is_empty() {
+            return Ok(());
+        }
+
         // The WAL record format stores the batch entry count as a u32
         // (encode_wal_record); a larger batch would silently truncate the
         // count and drop entries on recovery. Not reachable with realistic

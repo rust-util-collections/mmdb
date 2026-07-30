@@ -2248,6 +2248,40 @@ fn test_empty_range_deletion_is_noop() {
 }
 
 #[test]
+fn test_empty_range_deletion_does_not_grow_wal() {
+    // No-op ranges must not be WAL-encoded; otherwise repeated empty deletes
+    // never hit memtable size accounting and the active WAL grows without bound.
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 256,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+    for _ in 0..5000 {
+        db.delete_range(b"k", b"k").unwrap();
+        db.delete_range(b"z", b"a").unwrap();
+    }
+    let mut wal_bytes = 0u64;
+    let mut wal_files = 0u32;
+    for e in std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+    {
+        let path = e.path();
+        if path.extension().is_some_and(|ext| ext == "wal") {
+            wal_files += 1;
+            wal_bytes += e.metadata().unwrap().len();
+        }
+    }
+    assert!(wal_files >= 1);
+    assert!(
+        wal_bytes < 64 * 1024,
+        "no-op range deletes must not accumulate in the WAL (got {wal_bytes} bytes, {wal_files} files)"
+    );
+}
+
+#[test]
 fn test_num_levels_validation() {
     let dir = tempfile::tempdir().unwrap();
     for bad in [0usize, 1] {
