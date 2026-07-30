@@ -1055,6 +1055,18 @@ impl LeveledCompaction {
         }
 
         if !input_l0.is_empty() {
+            // A range tombstone's end key is not represented by the file's
+            // smallest/largest metadata, so the bounds filter above can pick
+            // a tombstone whose real reach extends past [begin, end) without
+            // pulling in a same-level sibling that holds a point covered
+            // only by that wider reach. Close the source level transitively
+            // over real point and tombstone extents — same as
+            // `pick_level_compaction` — before deriving the target-level
+            // inputs. Otherwise a lone selected tombstone can trivial-move
+            // to L1 while the point it covers stays behind at L0, and
+            // level-aware tombstone lookups (which only let a tombstone
+            // cover keys at its own level or shallower) resurrect it.
+            input_l0 = overlapping_files_for_inputs(l0_files, &input_l0);
             let input_l1 = overlapping_files_for_inputs(version.level_files(1), &input_l0);
             return Some(CompactionTask {
                 level: 0,
@@ -1074,6 +1086,10 @@ impl LeveledCompaction {
             }
 
             if !input_level.is_empty() {
+                // Same source-level closure as L0 above: a selected file's
+                // tombstone reach can cover a same-level sibling's point
+                // that the bounds filter alone would leave behind.
+                input_level = overlapping_files_for_inputs(files, &input_level);
                 let next_level = level + 1;
                 let input_next = if next_level < version.num_levels {
                     overlapping_files_for_inputs(version.level_files(next_level), &input_level)
@@ -2155,6 +2171,86 @@ mod tests {
             picked,
             HashSet::from([tombstone.number, value.number]),
             "the source-level tombstone covering m must move with the value file"
+        );
+    }
+
+    #[test]
+    fn test_range_picker_closes_source_range_tombstone_extent() {
+        use std::collections::HashSet;
+
+        use super::LeveledCompaction;
+        use crate::manifest::version_edit::{FileMetaData, VersionEdit};
+        use crate::manifest::version_set::VersionSet;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        fn build_sst(
+            dir: &std::path::Path,
+            number: u64,
+            key: InternalKey,
+            value: &[u8],
+        ) -> FileMetaData {
+            let path = dir.join(format!("{number:06}.sst"));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    internal_keys: true,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            builder.add(key.as_bytes(), value).unwrap();
+            let result = builder.finish().unwrap();
+            FileMetaData {
+                number,
+                file_size: result.file_size,
+                smallest_key: result.smallest_key.unwrap(),
+                largest_key: result.largest_key.unwrap(),
+                has_range_deletions: result.has_range_deletions,
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut versions = VersionSet::create(dir.path(), 3).unwrap();
+        // Tombstone's own metadata (smallest=largest="a") overlaps the
+        // requested [a, b) range directly, but its real reach ("a".."z",
+        // carried only in the range-tombstone block) covers `value`'s key
+        // "m" — which sits far outside the requested range and has no
+        // range deletions of its own, so the bounds-only filter alone would
+        // never select it.
+        let tombstone = build_sst(
+            dir.path(),
+            1,
+            InternalKey::new(b"a", 5, ValueType::RangeDeletion),
+            b"z",
+        );
+        let value = build_sst(
+            dir.path(),
+            2,
+            InternalKey::new(b"m", 10, ValueType::Value),
+            b"v",
+        );
+
+        let mut edit = VersionEdit::new();
+        edit.add_file(0, tombstone.clone());
+        edit.add_file(0, value.clone());
+        versions.log_and_apply(edit).unwrap();
+
+        let version = versions.current();
+        let task =
+            LeveledCompaction::pick_compaction_for_range(&version, Some(b"a"), Some(b"b")).unwrap();
+        assert_eq!(task.level, 0);
+        let picked: HashSet<u64> = task
+            .input_files_level
+            .iter()
+            .map(|tf| tf.meta.number)
+            .collect();
+        assert_eq!(
+            picked,
+            HashSet::from([tombstone.number, value.number]),
+            "the covered value file must move with the range tombstone even though \
+             its key falls outside the requested range"
         );
     }
 

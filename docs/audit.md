@@ -11,12 +11,6 @@
 > changes.
 
 ## Open
-### [HIGH] compaction: range-scoped picking can move tombstones below covered source keys
-- **Where**: `src/compaction/leveled.rs` (`pick_compaction_for_range`)
-- **What**: A narrow range compaction selects source files by their point-key metadata but does not close the selection over overlapping same-level siblings. It can move a range tombstone to L1 while a covered point remains in L0, after which level-aware iteration ignores the deeper tombstone and resurrects the point.
-- **Why**: Target-level overlap is transitively closed, but source-level overlap is not; `is_bottommost_level` only controls dropping and sequence zeroing, not whether a tombstone may move below a covered key.
-- **Suggested fix**: Transitively close source inputs before selecting target inputs for L0 and L1+ range picks. Regress a narrow compaction over separate point/tombstone SSTs and check get plus forward/reverse iteration.
-
 ### [HIGH] iterator: overlapping range tombstones have quadratic construction and storage
 - **Where**: `src/iterator/range_del.rs` (`FragmentedRangeTombstoneList`), `src/sst/table_reader/mod.rs`
 - **What**: Every endpoint fragment clones and sorts every active `(sequence, level)` pair. Nested tombstones therefore require quadratic work and memory; per-table caching then expands the fragments and aggregate iterators fragment them again.
