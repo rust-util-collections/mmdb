@@ -3,7 +3,6 @@
   "permissions": {
     "allow": [
       "Edit(docs/audit.md)",
-      "Write(docs/audit.md)",
       "Edit(Cargo.toml)",
       "Bash(cargo build:*)",
       "Bash(cargo check:*)",
