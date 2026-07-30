@@ -12,12 +12,6 @@
 
 ## Open
 
-### [CRITICAL] write: admin paths race in-flight group-commit leader
-- **Where**: `src/db.rs` (`close`, `flush`, `compact_range` pre-flush; `write_batch_inner` / `write_batch_group`)
-- **What**: `close` / `flush` / `compact_range` take `write_queue` without waiting for `!leader_active`. The group-commit leader drops that mutex for the whole of `write_batch_group`, including auto-freeze + unlocked SST write + install + WAL cleanup. Concurrent `close` can see an empty active memtable, skip flush, release the directory `LOCK`, and detach caches while the leader is still installing. Concurrent `flush` can return `Ok(())` mid auto-flush (hard loss with `disable_wal`).
-- **Why**: `write_queue` is documented as serializing admin vs writers, but leadership only keeps `leader_active`; empty active is exactly the post-freeze / pre-install shape, not "nothing pending".
-- **Suggested fix**: Under `write_queue`, wait on `write_cv` until `!leader_active` before any empty-active early return, freeze, or LOCK release. Re-check fail-stop after the wait. Regression: concurrent auto-flush + `close`/reopen and concurrent auto-flush + `flush` with `disable_wal`.
-
 ### [HIGH] sst/compaction: mid-block decode error can look like EOF and lose keys
 - **Where**: `src/sst/table_reader/iterator.rs` (`Iterator::next`); `src/compaction/leveled.rs` (`from_boxed(Box::new(TableIterator))`); `src/iterator/source.rs` (`from_boxed` / `iter_error`)
 - **What**: After `cursor_next` sets `err` and returns `None`, `Iterator::next` still loads later blocks and keeps yielding. Compaction builds sources via `from_boxed`, which cannot surface `iter_error`, so `merger.error()` stays `None` and the job can install truncated outputs then delete inputs.

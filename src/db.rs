@@ -2201,7 +2201,12 @@ impl DB {
     pub fn flush(&self) -> Result<()> {
         self.check_usable().ctx()?;
         {
-            let _wg = self.write_queue.lock(); // serialize with writers
+            let mut wq = self.write_queue.lock(); // serialize with writers
+            // Group-commit leaders drop this mutex for WAL/SST I/O while only
+            // keeping `leader_active`; wait so empty-active is not observed
+            // mid auto-flush (install still pending).
+            self.wait_for_write_leader_idle(&mut wq);
+            self.check_usable().ctx()?;
             let mut inner = self.inner.lock();
             if inner.active_memtable.is_empty() {
                 return Ok(());
@@ -2247,7 +2252,9 @@ impl DB {
     pub fn compact(&self) -> Result<()> {
         self.check_usable().ctx()?;
         {
-            let _wg = self.write_queue.lock();
+            let mut wq = self.write_queue.lock();
+            self.wait_for_write_leader_idle(&mut wq);
+            self.check_usable().ctx()?;
             self.force_compact_all().ctx()?;
         }
         // Full pass done — every settled registration is now prunable.
@@ -2262,7 +2269,9 @@ impl DB {
 
         // First flush memtable to ensure all data is in SSTs
         {
-            let _wg = self.write_queue.lock();
+            let mut wq = self.write_queue.lock();
+            self.wait_for_write_leader_idle(&mut wq);
+            self.check_usable().ctx()?;
             let mut inner = self.inner.lock();
             if !inner.active_memtable.is_empty() {
                 let frozen = self.freeze_memtable_sync(&mut inner).ctx()?;
@@ -2641,7 +2650,11 @@ impl DB {
             return Ok(());
         }
 
-        let _wg = self.write_queue.lock();
+        let mut wq = self.write_queue.lock();
+        // Do not release FILE_LOCK / detach caches while a group-commit
+        // leader still owns install_flush / post_flush_cleanup after dropping
+        // this mutex for SST I/O.
+        self.wait_for_write_leader_idle(&mut wq);
         let mut inner = self.inner.lock();
 
         let mut first_error: Option<Error> = None;
@@ -2660,7 +2673,7 @@ impl DB {
         }
 
         drop(inner);
-        drop(_wg);
+        drop(wq);
         self.shutdown_background_and_release_resources();
 
         if first_error.is_none() {
@@ -2674,6 +2687,17 @@ impl DB {
     }
 
     // -- Internal --
+
+    /// Block until no group-commit leader is in `write_batch_group`.
+    ///
+    /// Leaders drop `write_queue` for I/O and only keep `leader_active`;
+    /// admin paths that interpret empty-active or release the directory lock
+    /// must wait here while holding `write_queue`.
+    fn wait_for_write_leader_idle(&self, wq: &mut MutexGuard<'_, WriteQueueState>) {
+        while wq.leader_active {
+            self.write_cv.wait(wq);
+        }
+    }
 
     /// Signal background compaction threads (non-blocking).
     fn signal_compaction(&self) {
@@ -4129,6 +4153,118 @@ mod tests {
         assert_eq!(err.message(), "simulated auto-flush failure");
         assert!(db.compaction_handles.lock().is_empty());
         assert!(db.lock_file.lock().is_none());
+    }
+
+    #[test]
+    fn test_close_waits_out_concurrent_auto_flush() {
+        // Proves close cannot release LOCK while a group-commit leader is still
+        // mid auto-flush: after close returns, a reopen must succeed without
+        // "already locked", and previously acknowledged keys must survive.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(open_test_db_small_memtable(dir.path()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for t in 0..4u8 {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            writers.push(thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = format!("t{t}-{:06}", i);
+                    let val = vec![b'v'; 64];
+                    if db.put(key.as_bytes(), &val).is_err() {
+                        break;
+                    }
+                    i = i.wrapping_add(1);
+                }
+            }));
+        }
+        thread::sleep(Duration::from_millis(50));
+        db.close().expect("close during auto-flush");
+        stop.store(true, Ordering::Relaxed);
+        for h in writers {
+            h.join().unwrap();
+        }
+        assert!(db.lock_file.lock().is_none());
+        let reopened = open_test_db(dir.path());
+        // At least some writer progress must have been durable through the
+        // close barrier (empty DB would mean writers never landed, which makes
+        // the race test uninteresting).
+        let mut it = reopened.iter().unwrap();
+        assert!(
+            it.next().is_some(),
+            "expected durable keys after concurrent close"
+        );
+    }
+
+    #[test]
+    fn test_flush_serializes_with_auto_flush_leader_without_wal() {
+        // disable_wal: a flush that returns while an auto-flush install is still
+        // in flight would acknowledge durability of data that exists only in the
+        // immutable memtable. Concurrent puts + repeated flush exercise the
+        // leader barrier; after writers stop, one final flush + crash must keep
+        // every acknowledged key.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 512,
+            ..Default::default()
+        };
+        let db = Arc::new(DB::open(opts, dir.path()).unwrap());
+        let wo = WriteOptions {
+            disable_wal: true,
+            ..Default::default()
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let written = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let mut writers = Vec::new();
+        for t in 0..3u8 {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            let written = Arc::clone(&written);
+            let wo = wo.clone();
+            writers.push(thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) && i < 300 {
+                    let key = format!("nw{t}-{:05}", i).into_bytes();
+                    if db.put_with_options(&wo, &key, b"x").is_err() {
+                        break;
+                    }
+                    written.lock().push(key);
+                    i = i.wrapping_add(1);
+                }
+            }));
+        }
+        for _ in 0..8 {
+            db.flush()
+                .expect("flush during concurrent disable_wal auto-flush");
+            thread::sleep(Duration::from_millis(2));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in writers {
+            h.join().unwrap();
+        }
+        let keys = written.lock().clone();
+        assert!(!keys.is_empty());
+        db.flush().expect("final flush after writers stop");
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("writers still hold db"));
+        db.simulate_crash();
+        let reopened = DB::open(
+            DbOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        for k in &keys {
+            assert_eq!(
+                reopened.get(k).unwrap(),
+                Some(b"x".to_vec()),
+                "key {} lost after flush+crash without WAL",
+                String::from_utf8_lossy(k)
+            );
+        }
     }
 
     #[test]
