@@ -974,13 +974,16 @@ impl DB {
                                                     cleanup
                                                 };
                                                 // Phase 4: sync manifest + cleanup (no lock)
-                                                if let Err(e) = confirm_manifest_durable(
-                                                    &bg_inner
+                                                if let Err(e) = {
+                                                    let manifest_handle = bg_inner
                                                         .lock()
                                                         .versions
-                                                        .manifest_sync_handle(),
-                                                    &bg_manifest_poisoned,
-                                                ) {
+                                                        .manifest_sync_handle();
+                                                    confirm_manifest_durable(
+                                                        &manifest_handle,
+                                                        &bg_manifest_poisoned,
+                                                    )
+                                                } {
                                                     return Err(format!(
                                                         "manifest sync error: {}",
                                                         e
@@ -1142,10 +1145,14 @@ impl DB {
                                         cleanup
                                     };
                                     // Phase 4: sync manifest + delete old SSTs (no lock)
-                                    if let Err(e) = confirm_manifest_durable(
-                                        &bg_inner.lock().versions.manifest_sync_handle(),
-                                        &bg_manifest_poisoned,
-                                    ) {
+                                    if let Err(e) = {
+                                        let manifest_handle =
+                                            bg_inner.lock().versions.manifest_sync_handle();
+                                        confirm_manifest_durable(
+                                            &manifest_handle,
+                                            &bg_manifest_poisoned,
+                                        )
+                                    } {
                                         return Err(format!("manifest sync error: {}", e));
                                     }
                                     LeveledCompaction::run_post_compaction_cleanup(
@@ -2463,10 +2470,10 @@ impl DB {
                 cleanup
             };
             // Sync manifest + delete old SSTs outside the main lock
-            if let Err(e) = confirm_manifest_durable(
-                &self.inner.lock().versions.manifest_sync_handle(),
-                &self.manifest_poisoned,
-            ) {
+            if let Err(e) = {
+                let manifest_handle = self.inner.lock().versions.manifest_sync_handle();
+                confirm_manifest_durable(&manifest_handle, &self.manifest_poisoned)
+            } {
                 // The edit is applied in memory but its durability could
                 // not be confirmed — the same fail-stop condition as
                 // drain_l0 and the background threads. Poison (if not already)
@@ -3440,10 +3447,8 @@ impl DB {
     /// auto-flush path, which cannot otherwise propagate this failure to
     /// any caller since the enclosing write still needs to return `Ok`).
     fn post_flush_cleanup(&self, old_wal_number: u64) -> Result<()> {
-        if let Err(e) = confirm_manifest_durable(
-            &self.inner.lock().versions.manifest_sync_handle(),
-            &self.manifest_poisoned,
-        ) {
+        let manifest_handle = self.inner.lock().versions.manifest_sync_handle();
+        if let Err(e) = confirm_manifest_durable(&manifest_handle, &self.manifest_poisoned) {
             // Poison first: a later "successful" sync could falsely
             // report durability of the records this sync failed to
             // persist (fsyncgate). confirm_manifest_durable emits poison
@@ -3616,10 +3621,10 @@ impl DB {
                 cleanup
             };
             // Phase 4: sync manifest + delete old SSTs (no lock)
-            if let Err(e) = confirm_manifest_durable(
-                &self.inner.lock().versions.manifest_sync_handle(),
-                &self.manifest_poisoned,
-            ) {
+            if let Err(e) = {
+                let manifest_handle = self.inner.lock().versions.manifest_sync_handle();
+                confirm_manifest_durable(&manifest_handle, &self.manifest_poisoned)
+            } {
                 // The edit is applied in memory but its durability could
                 // not be confirmed — the same condition the background
                 // thread treats as fail-stop. confirm_manifest_durable

@@ -30,12 +30,6 @@
 - **Why**: The absence probe and registration removal are a check-then-act sequence with no generation or write-order validation.
 - **Suggested fix**: Make final validation/removal atomic with relevant writes, or use equivalent registration generations. Add a deterministic race between the absence probe and removal.
 
-### [HIGH] manifest: phase-four syncs retain the main DB mutex
-- **Where**: `src/db.rs` (background compaction, `compact_range`, `post_flush_cleanup`, `drain_l0`)
-- **What**: Calls pass `&self.inner.lock().versions.manifest_sync_handle()` directly into `confirm_manifest_durable`. Rust keeps that temporary mutex guard alive through the sync, so fsync runs while holding the main DB mutex despite the documented unlocked phase.
-- **Why**: The handle clone and slow durability call share one statement and therefore one temporary lifetime.
-- **Suggested fix**: Clone the sync handle in a scoped lock, drop the guard, then call the durability helper. Regress with a blocked sync and concurrent mutex acquisition.
-
 ### [MEDIUM] open: partial compaction-thread spawn failure leaks earlier workers
 - **Where**: `src/db.rs` (background compaction thread startup)
 - **What**: If a later worker spawn fails, `DB::open` returns immediately while already spawned workers retain shared state and wait indefinitely.
