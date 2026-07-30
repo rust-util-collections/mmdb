@@ -2292,11 +2292,16 @@ impl DB {
     pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
         self.check_usable().ctx()?;
 
+        // Hold write_queue across every flush/install phase so close cannot
+        // observe an empty active barrier mid-range job, release LOCK/caches,
+        // and let this call install SST/MANIFEST afterwards. Re-check closed
+        // under the same guard before the first mutation.
+        let mut wq = self.write_queue.lock();
+        self.wait_for_write_leader_idle(&mut wq);
+        self.check_usable().ctx()?;
+
         // First flush memtable to ensure all data is in SSTs
         {
-            let mut wq = self.write_queue.lock();
-            self.wait_for_write_leader_idle(&mut wq);
-            self.check_usable().ctx()?;
             let mut inner = self.inner.lock();
             if !inner.active_memtable.is_empty() {
                 let frozen = self.freeze_memtable_sync(&mut inner).ctx()?;
@@ -2307,14 +2312,14 @@ impl DB {
             }
         }
 
-        // No range specified: delegate to compact() so the full-compaction
-        // behavior (force_compact_all + dead-key prune) has a single home.
+        // No range specified: same full-compaction path as compact(), while
+        // still holding write_queue (compact() would re-lock and deadlock).
         if begin.is_none() && end.is_none() {
-            return self.compact();
+            self.force_compact_all().ctx()?;
+            drop(wq);
+            self.prune_settled_dead_keys(None, None, None);
+            return Ok(());
         }
-
-        // Compact files overlapping the specified range
-        let _wg = self.write_queue.lock();
 
         // Range-filtered compaction: compact files overlapping [begin, end)
         loop {
@@ -2471,7 +2476,7 @@ impl DB {
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
         }
 
-        drop(_wg);
+        drop(wq);
         // A range-scoped pass can only newly settle registrations inside
         // [begin, end): only those are probed. Out-of-range settled keys are
         // harvested by later capped flush passes or a full compact().
@@ -2663,6 +2668,14 @@ impl DB {
     /// Resources are released even when this returns a flush, sync, or
     /// previously recorded fail-stop error.
     pub fn close(&self) -> Result<()> {
+        // Serialize with every mutate path that holds `write_queue` across
+        // unlocked SST/MANIFEST I/O (`write_batch_group` leaders, stop-trigger
+        // drain, compact_range, flush, compact). Set `closed` only after the
+        // queue is ours and no leader is mid-install, so those paths cannot
+        // observe closed, abandon the barrier, and still install after
+        // LOCK/caches are released below.
+        let mut wq = self.write_queue.lock();
+        self.wait_for_write_leader_idle(&mut wq);
         if self
             .closed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2671,11 +2684,6 @@ impl DB {
             return Ok(());
         }
 
-        let mut wq = self.write_queue.lock();
-        // Do not release FILE_LOCK / detach caches while a group-commit
-        // leader still owns install_flush / post_flush_cleanup after dropping
-        // this mutex for SST I/O.
-        self.wait_for_write_leader_idle(&mut wq);
         let mut inner = self.inner.lock();
 
         let mut first_error: Option<Error> = None;
@@ -2861,26 +2869,41 @@ impl DB {
         let l0_count = self.l0_file_count.load(Ordering::Relaxed);
 
         if l0_count >= self.options.l0_stop_trigger {
-            // Slow path: drain L0 to reduce the file count. Uses drain_l0
-            // (not force_compact_all) so an ordinary write only pays for
-            // enough compaction to relieve L0 pressure — not a full
-            // multi-level database compaction — and does not hold db_mutex
-            // for the duration of the merge I/O (drain_l0 follows the
-            // standard short-lock pick/install pattern).
-            if let Err(e) = self.drain_l0(false) {
-                // The stop trigger is the last line of defense against
-                // unbounded L0 growth. If compaction is failing, admitting
-                // the write would silently disable the stall exactly when it
-                // matters most — fail-stop instead, matching the background
-                // compaction thread's error policy.
-                let msg = format!("inline L0 compaction failed: {}", e);
-                self.set_bg_error(msg.clone());
-                return Err(Error::background(msg));
+            // Hold write_queue across the entire stop-trigger drain so close
+            // cannot take the barrier, release LOCK/caches, and let this path
+            // install SST/MANIFEST afterwards. Keep the slowdown sleep outside
+            // the mutex: it does not mutate durable state.
+            let mut wq = self.write_queue.lock();
+            self.wait_for_write_leader_idle(&mut wq);
+            self.check_usable().ctx()?;
+            let still_over = {
+                let inner = self.inner.lock();
+                inner.versions.current().l0_file_count() >= self.options.l0_stop_trigger
+            };
+            if still_over {
+                // Slow path: drain L0 to reduce the file count. Uses drain_l0
+                // (not force_compact_all) so an ordinary write only pays for
+                // enough compaction to relieve L0 pressure — not a full
+                // multi-level database compaction — and does not hold db_mutex
+                // for the duration of the merge I/O (drain_l0 follows the
+                // standard short-lock pick/install pattern). write_queue stays
+                // held for close serialization.
+                if let Err(e) = self.drain_l0(false) {
+                    // The stop trigger is the last line of defense against
+                    // unbounded L0 growth. If compaction is failing, admitting
+                    // the write would silently disable the stall exactly when it
+                    // matters most — fail-stop instead, matching the background
+                    // compaction thread's error policy.
+                    let msg = format!("inline L0 compaction failed: {}", e);
+                    self.set_bg_error(msg.clone());
+                    return Err(Error::background(msg));
+                }
             }
             self.l0_file_count.store(
                 self.inner.lock().versions.current().l0_file_count(),
                 Ordering::Relaxed,
             );
+            drop(wq);
         } else if l0_count >= self.options.l0_slowdown_trigger {
             // Ensure the backlog is actually being worked on. The slowdown
             // state can be entered without any prior signal (e.g. an L0
@@ -4207,6 +4230,115 @@ mod tests {
             it.next().is_some(),
             "expected durable keys after concurrent close"
         );
+    }
+
+    #[test]
+    fn test_close_serializes_with_compact_range() {
+        // compact_range holds write_queue across flush+install. Concurrent close
+        // must either wait for that barrier before detaching LOCK or reject the
+        // range job via check_usable — never both detach and let install finish.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 256,
+            // Keep background out of the way so the range job does the install.
+            max_background_compactions: 0,
+            ..Default::default()
+        };
+        let db = Arc::new(DB::open(opts, dir.path()).unwrap());
+        for i in 0..40u32 {
+            let k = format!("cr{:04}", i);
+            db.put(k.as_bytes(), &[b'v'; 32]).unwrap();
+            if i % 5 == 4 {
+                db.flush().unwrap();
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for t in 0..3u8 {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            workers.push(thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let begin = format!("cr{:04}", (i * 3) % 40);
+                    let end = format!("cr{:04}", ((i * 3) + 8).min(40));
+                    let _ = db.compact_range(Some(begin.as_bytes()), Some(end.as_bytes()));
+                    let key = format!("w{t}-{:05}", i);
+                    let _ = db.put(key.as_bytes(), b"x");
+                    i = i.wrapping_add(1);
+                }
+            }));
+        }
+        thread::sleep(Duration::from_millis(40));
+        db.close().expect("close during compact_range");
+        stop.store(true, Ordering::Relaxed);
+        for h in workers {
+            h.join().unwrap();
+        }
+        assert!(db.lock_file.lock().is_none());
+        // Reopen must not hit "already locked" from a post-close installer.
+        let reopened = DB::open(
+            DbOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .expect("reopen after concurrent compact_range close");
+        assert_eq!(
+            reopened.get(b"cr0000").unwrap(),
+            Some(vec![b'v'; 32]),
+            "pre-close data must remain readable"
+        );
+    }
+
+    #[test]
+    fn test_close_serializes_with_l0_stop_drain() {
+        // Stop-trigger drain ran before becoming group leader and was outside
+        // the close barrier. Race writers intoL0 stop while closing.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions {
+            create_if_missing: true,
+            write_buffer_size: 128,
+            l0_compaction_trigger: 2,
+            l0_slowdown_trigger: 2,
+            l0_stop_trigger: 3,
+            max_background_compactions: 0,
+            ..Default::default()
+        };
+        let db = Arc::new(DB::open(opts, dir.path()).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for t in 0..4u8 {
+            let db = Arc::clone(&db);
+            let stop = Arc::clone(&stop);
+            writers.push(thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = format!("st{t}-{:06}", i);
+                    if db.put(key.as_bytes(), &[b'x'; 64]).is_err() {
+                        break;
+                    }
+                    i = i.wrapping_add(1);
+                }
+            }));
+        }
+        thread::sleep(Duration::from_millis(60));
+        db.close().expect("close during L0 stop drain");
+        stop.store(true, Ordering::Relaxed);
+        for h in writers {
+            h.join().unwrap();
+        }
+        assert!(db.lock_file.lock().is_none());
+        let _reopened = DB::open(
+            DbOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .expect("reopen after concurrent stop-drain close");
     }
 
     #[test]

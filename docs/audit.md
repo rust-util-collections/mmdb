@@ -12,12 +12,6 @@
 
 ## Open
 
-### [CRITICAL] close: pre-leader maintenance can install files after resources are released
-- **Where**: `src/db.rs` (`write_batch_inner`, `maybe_throttle_writes`, `drain_l0`, bounded `compact_range`, `close`)
-- **What**: A writer can be inside stop-trigger compaction before it enqueues and marks a group leader, while bounded `compact_range` has a similar gap between write-queue guards. Concurrent `close()` can observe no leader, release `LOCK` and caches, and let either operation later install SST/MANIFEST state.
-- **Why**: The close barrier tracks group-commit leadership rather than every maintenance operation that can outlive an initial usability check and mutate durable state.
-- **Suggested fix**: Serialize pre-enqueue maintenance and every compact-range mutation phase with close, rechecking usability while the serialization guard is held. Add barrier races that prove no durable mutation occurs after close.
-
 ### [CRITICAL] SST/compaction: malformed internal keys are silently skipped or reinterpreted
 - **Where**: `src/types.rs`, `src/sst/table_builder.rs`, `src/sst/table_reader/mod.rs`, `src/iterator/db_iter.rs`, `src/compaction/leveled.rs`
 - **What**: CRC-valid keys shorter than the eight-byte trailer are skipped, while unknown value-type bytes are coerced to point deletions. Point reads and iterators can report false absence; both compaction loops can install output that omitted malformed entries and then delete the source SST.
