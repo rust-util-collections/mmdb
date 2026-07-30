@@ -36,7 +36,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{
     META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuildResult, TableBuilder,
 };
-use crate::sst::table_reader::TableIterator;
+use crate::sst::table_reader::{PreparedBlockPin, TableIterator};
 use crate::stats::DbStats;
 use crate::types::{
     self, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, ValueType,
@@ -3319,8 +3319,14 @@ impl DB {
                         Ok(build_results) => {
                             let output_numbers: Vec<u64> =
                                 build_results.iter().map(|(n, _)| *n).collect();
+                            let prepared_pins = self.prepare_l0_block_pins(&output_numbers);
                             let mut inner = self.inner.lock(); // reacquire
-                            match self.install_flush(&mut inner, &frozen, build_results) {
+                            match self.install_flush(
+                                &mut inner,
+                                &frozen,
+                                build_results,
+                                prepared_pins,
+                            ) {
                                 Ok(()) => flush_wal = Some(old_wal),
                                 Err(e) => {
                                     // Clean up orphan SST files: log_and_apply did not
@@ -3385,7 +3391,8 @@ impl DB {
             }
         };
         let output_numbers: Vec<u64> = build_results.iter().map(|(n, _)| *n).collect();
-        if let Err(e) = self.install_flush(inner, &frozen, build_results) {
+        let prepared_pins = self.prepare_l0_block_pins(&output_numbers);
+        if let Err(e) = self.install_flush(inner, &frozen, build_results, prepared_pins) {
             // Clean up orphan SST files produced by the failed flush install.
             for num in &output_numbers {
                 let path = self.path.join(format!("{:06}.sst", num));
@@ -3420,8 +3427,9 @@ impl DB {
             }
         };
         let output_numbers: Vec<u64> = build_results.iter().map(|(n, _)| *n).collect();
+        let prepared_pins = self.prepare_l0_block_pins(&output_numbers);
         let mut inner = self.inner.lock();
-        if let Err(e) = self.install_flush(&mut inner, frozen, build_results) {
+        if let Err(e) = self.install_flush(&mut inner, frozen, build_results, prepared_pins) {
             drop(inner);
             // Clean up orphan SST files: log_and_apply did not persist the edit.
             for num in &output_numbers {
@@ -3491,18 +3499,43 @@ impl DB {
         Ok(results)
     }
 
+    /// Read, checksum, and decompress each listed file's first data block
+    /// for L0 pinning, entirely unlocked. Meant to be called from the same
+    /// unlocked phase as `flush_frozen_memtable`, right before the short
+    /// locked `install_flush` call, so a legal block up to the ~64 MiB
+    /// max write-entry size is never read while holding the DB lock —
+    /// `install_flush` only has to publish these already-prepared blocks,
+    /// a cheap in-memory cache insert. Returns an empty `Vec` (no-op) when
+    /// `pin_l0_filter_and_index_blocks_in_cache` is disabled.
+    fn prepare_l0_block_pins(&self, file_numbers: &[u64]) -> Vec<(u64, PreparedBlockPin)> {
+        if !self.options.pin_l0_filter_and_index_blocks_in_cache {
+            return Vec::new();
+        }
+        file_numbers
+            .iter()
+            .filter_map(|&number| {
+                // Cache hit: `flush_frozen_memtable`'s prewarm (or an
+                // earlier iteration of this same loop's own get_reader
+                // call) already opened and cached this reader.
+                let reader = self.table_cache.get_reader(number).ok()?;
+                let prepared = reader.prepare_first_block_pin()?;
+                Some((number, prepared))
+            })
+            .collect()
+    }
+
     /// Phase 3 (under lock, fast): install flush result into version.
     fn install_flush(
         &self,
         inner: &mut DBInner,
         frozen: &FrozenMemtable,
         build_results: Vec<(u64, TableBuildResult)>,
+        prepared_pins: Vec<(u64, PreparedBlockPin)>,
     ) -> Result<()> {
         let mut edit = VersionEdit::new();
         edit.set_log_number(frozen.new_wal_number);
         edit.set_next_file_number(inner.versions.next_file_number());
         edit.set_last_sequence(self.current_sequence());
-        let output_numbers: Vec<u64> = build_results.iter().map(|(n, _)| *n).collect();
         for (number, build_result) in build_results {
             edit.add_file(
                 0, // L0
@@ -3521,11 +3554,19 @@ impl DB {
             .immutable_memtables
             .retain(|m| !Arc::ptr_eq(m, &frozen.old_mem));
 
-        if self.options.pin_l0_filter_and_index_blocks_in_cache {
+        // Publish each already-read/checksummed/decompressed first block
+        // (prepared unlocked by `prepare_l0_block_pins`) into the shared
+        // cache — an in-memory map insert only, no I/O, so this stays cheap
+        // under the lock regardless of block size.
+        if !prepared_pins.is_empty() {
             let version = inner.versions.current();
-            for tf in version.level_files(0) {
-                if output_numbers.contains(&tf.meta.number) {
-                    tf.reader.pin_metadata_in_cache();
+            for (number, prepared) in prepared_pins {
+                if let Some(tf) = version
+                    .level_files(0)
+                    .iter()
+                    .find(|tf| tf.meta.number == number)
+                {
+                    tf.reader.publish_prepared_pin(prepared);
                 }
             }
         }
@@ -4313,6 +4354,61 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Regression: L0 first-block pinning (default on) must not read,
+    /// checksum, and decompress the block while holding `inner`. Park the
+    /// flush thread inside `prepare_first_block_pin` (before it opens the
+    /// file) via `PREPARE_FIRST_BLOCK_PIN_HOOK`, and confirm a direct
+    /// `try_lock` on `inner` from another thread succeeds immediately
+    /// instead of waiting behind it.
+    #[test]
+    fn flush_first_block_pin_read_does_not_hold_inner_lock() {
+        use crate::sst::table_reader::PREPARE_FIRST_BLOCK_PIN_HOOK;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.put(b"k1", &[b'x'; 4096]).unwrap();
+
+        thread::scope(|scope| {
+            let db_ref = &db;
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+            let (checked_tx, checked_rx) = std::sync::mpsc::channel::<bool>();
+
+            // `db.flush()` below runs directly on this thread (not
+            // spawned), so the hook — armed here — fires on this same
+            // thread and shares this thread's thread-local storage. It
+            // signals it has reached the read point this fix moved off
+            // the locked path, then waits (bounded) for the checker
+            // thread's verdict before letting the real read proceed.
+            PREPARE_FIRST_BLOCK_PIN_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    reached_tx.send(()).unwrap();
+                    let acquired = checked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(
+                        acquired,
+                        "a direct try_lock on `inner` failed while the first-block \
+                         pin read was in flight — the lock must not be held during \
+                         that I/O"
+                    );
+                }));
+            });
+
+            scope.spawn(move || {
+                reached_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                // A direct try_lock on `inner` — bypassing the
+                // write-queue/group-commit protocol entirely (so it is not
+                // confounded by group-commit's own, unrelated, "queued
+                // writers wait for the current leader" serialization) —
+                // must succeed immediately: nothing, including this
+                // flush, may be holding `inner` while the first-block pin
+                // read is in flight.
+                let acquired = db_ref.inner.try_lock().is_some();
+                let _ = checked_tx.send(acquired);
+            });
+
+            db.flush().unwrap();
+        });
     }
 
     fn open_test_db(dir: &Path) -> DB {

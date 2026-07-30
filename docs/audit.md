@@ -11,11 +11,8 @@
 > changes.
 
 ## Open
-### [MEDIUM] SST: L0 first-block pinning performs large reads under the DB mutex
-- **Where**: `src/db.rs` (`install_flush`), `src/sst/table_reader/mod.rs` (`pin_metadata_in_cache`)
-- **What**: Default L0 pinning can synchronously read, checksum, allocate, and decompress a legal first data block of up to 64 MiB during locked flush installation, convoying writers and admin paths.
-- **Why**: Unlocked prewarm loads structural metadata but not the first data block; the cache miss is serviced only after the DB mutex is reacquired.
-- **Suggested fix**: Prepare the first-block cache payload before the install critical section and only publish/pin it after a successful install, with failure cleanup. Regress using a blocking loader or prepared-pin hook.
+
+*(none)*
 
 ---
 

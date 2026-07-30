@@ -46,12 +46,33 @@ pub struct IndexEntry {
 /// Shared index entries parsed from the SST index block.
 type IndexEntries = Arc<Vec<IndexEntry>>;
 
+/// A first data block read, checksummed, and decompressed by
+/// [`TableReader::prepare_first_block_pin`], ready to be published into the
+/// shared cache by [`TableReader::publish_prepared_pin`] without further I/O.
+pub struct PreparedBlockPin {
+    file_number: u64,
+    offset: u64,
+    data: Vec<u8>,
+}
+
 /// Bloom filter data and range-del handle read from SST metaindex.
 struct MetaIndexData {
     bloom: Option<Vec<u8>>,
     prefix: Option<Vec<u8>>,
     prefix_len: Option<usize>,
     range_del_handle: Option<BlockHandle>,
+}
+
+// Test-only seam: fires once, immediately before `prepare_first_block_pin`
+// reads its data block, so a test can deterministically prove that step
+// runs unlocked (e.g. by blocking here while a concurrent write proceeds).
+// `pub(crate)` + thread-local so `db.rs`'s own tests can reach it without
+// any cross-test leakage; `#[cfg(test)]`-only so it never builds into
+// `test-utils` or release.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREPARE_FIRST_BLOCK_PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Reader for an SST file.
@@ -680,26 +701,54 @@ impl TableReader {
         Ok(Arc::new(data))
     }
 
-    /// Pin this file's first data block in cache as non-evictable (for L0 files).
-    /// Pre-populates the index entry cache and pins the first data block
-    /// so that init_heap's first peek() always hits cache.
-    pub fn pin_metadata_in_cache(&self) {
-        // Populate the OnceLock index entry cache eagerly
+    /// Read, checksum-verify, and decompress this file's first data block
+    /// (if any, and if not already cached) without touching the shared
+    /// cache. Pure I/O/CPU work with no cache-visible side effect, so it is
+    /// safe to call before taking any lock that must stay short.
+    ///
+    /// Returns `None` when there is nothing to prepare: no block cache
+    /// configured, no data blocks, the block is already cached, or the
+    /// index/read/decode failed (logged and treated as best-effort, same
+    /// as the previous single-phase behavior).
+    pub fn prepare_first_block_pin(&self) -> Option<PreparedBlockPin> {
         let entries = match self.cached_index_entries() {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!("pin_metadata_in_cache: index decode error: {}", e);
-                return;
+                tracing::warn!("prepare_first_block_pin: index decode error: {}", e);
+                return None;
             }
         };
-        // Pin first data block in cache (non-evictable)
-        if let Some(entry) = entries.first()
-            && let Some(ref cache) = self.block_cache
-            && cache.get(self.file_number, entry.handle.offset).is_none()
-            && let Ok(mut file) = self.open_file()
-            && let Ok(data) = Self::read_block_data(&mut file, &entry.handle)
-        {
-            cache.insert_pinned(self.file_number, entry.handle.offset, data);
+        let entry = entries.first()?;
+        let cache = self.block_cache.as_ref()?;
+        if cache.get(self.file_number, entry.handle.offset).is_some() {
+            return None;
+        }
+        #[cfg(test)]
+        if let Some(hook) = PREPARE_FIRST_BLOCK_PIN_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        let mut file = self.open_file().ok()?;
+        let data = Self::read_block_data(&mut file, &entry.handle).ok()?;
+        Some(PreparedBlockPin {
+            file_number: self.file_number,
+            offset: entry.handle.offset,
+            data,
+        })
+    }
+
+    /// Publish a block prepared by
+    /// [`prepare_first_block_pin`](Self::prepare_first_block_pin) into the
+    /// shared cache as pinned (non-evictable). Only an in-memory map
+    /// insert — no I/O — so it is safe to call while holding a lock that
+    /// must stay short (e.g. the flush-install critical section).
+    pub fn publish_prepared_pin(&self, prepared: PreparedBlockPin) {
+        if prepared.file_number != self.file_number {
+            // Defensive: a prepared pin must be published through a reader
+            // for the same physical file it was read from.
+            return;
+        }
+        if let Some(ref cache) = self.block_cache {
+            cache.insert_pinned(prepared.file_number, prepared.offset, prepared.data);
         }
     }
 
