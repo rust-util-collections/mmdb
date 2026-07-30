@@ -247,20 +247,33 @@ impl WalReader {
                 return self.fail_corruption("non-padding WAL zero record");
             }
 
-            // Verify checksum. A mismatch after a full payload read must fail
-            // closed: an untrusted length may already have swallowed later
-            // records, so zero-padding after the reader's advanced position
-            // does not prove a torn active tail.
+            // Verify checksum. A mismatch after a full payload read is only a
+            // torn-tail candidate when the payload ends in bytes that were
+            // never written — i.e. it has a non-empty all-zero suffix. That is
+            // exactly the shape a crash mid-append leaves behind (written
+            // prefix + filesystem zero-extension), and recovery still has to
+            // prove every byte to EOF is zero before truncating.
+            //
+            // Without the zero-suffix requirement, an untrusted length that
+            // swallowed later *valid* records would also reach EOF and look
+            // like a clean tail, silently dropping committed data. Those
+            // swallowed records carry their own non-zero headers/payloads, so
+            // the declared payload does not end in zeros and this fails closed.
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&[record_type as u8]);
             hasher.update(&data);
             let expected_checksum = hasher.finalize();
 
             if checksum != expected_checksum {
-                return self.fail_corruption(format!(
+                let msg = format!(
                     "WAL checksum mismatch: expected {:#x}, got {:#x}",
                     expected_checksum, checksum
-                ));
+                );
+                return if data.last().is_some_and(|&b| b == 0) {
+                    self.fail_truncation(msg)
+                } else {
+                    self.fail_corruption(msg)
+                };
             }
 
             return Ok(Some((record_type, data)));
@@ -414,6 +427,46 @@ mod tests {
         );
         // With the pre-fix policy, rest_is_zero_padding alone would return
         // true (EOF after swallowing C) and hide the third record.
+        assert!(reader.rest_is_zero_padding().unwrap());
+    }
+
+    /// Regression: a crash mid-append can leave a record whose header and
+    /// leading payload bytes landed while the tail was zero-extended by the
+    /// filesystem. The declared length is still valid and the type byte is
+    /// still valid, so the failure surfaces at the checksum — but it is a
+    /// genuine torn active tail and recovery must be allowed to truncate it.
+    /// Classifying every post-payload checksum failure as semantic corruption
+    /// made such a WAL unopenable, so a normal crash could refuse to reopen.
+    #[test]
+    fn test_zero_extended_payload_tail_is_truncation_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_extended_tail.wal");
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"complete-one").unwrap();
+            writer.add_record(b"second-record-payload").unwrap();
+            writer.sync().unwrap();
+        }
+
+        // Zero the tail of the second record's payload, leaving its header and
+        // the payload's first bytes intact — the filesystem zero-extension a
+        // crash mid-append produces.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first_len = HEADER_SIZE + u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let second_payload_start = first_len + HEADER_SIZE;
+        for b in bytes[second_payload_start + 4..].iter_mut() {
+            *b = 0;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), b"complete-one");
+        let err = reader.read_record().unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "got {err}");
+        assert!(
+            reader.last_error_is_truncation(),
+            "a zero-extended payload tail must stay a torn-tail candidate"
+        );
         assert!(reader.rest_is_zero_padding().unwrap());
     }
 
