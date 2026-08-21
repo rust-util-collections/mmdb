@@ -32,6 +32,7 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | Put / Get / Delete | Implemented |
 | WriteBatch (atomic multi-key writes) | Implemented |
 | WAL with group commit & crash recovery | Implemented |
+| Read-only open for immutable/permission-restricted stores | Implemented |
 | SST files with prefix-compressed blocks | Implemented |
 | Bloom filters (per-key + prefix bloom) | Implemented |
 | Block cache (moka LRU) with L0 first-block pinning (insert_pinned) | Implemented |
@@ -201,6 +202,8 @@ the public size-limit constants.
 ```rust
 impl DB {
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self>;
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self>;
+    pub fn open_read_only_with_options(options: DbOptions, path: impl AsRef<Path>) -> Result<Self>;
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()>;
     pub fn put_with_options(&self, options: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()>;
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
@@ -297,6 +300,12 @@ struct WriteOptions {
 }
 ```
 
+Read-only open takes a shared lock when the store contains `LOCK`. If `LOCK`
+is absent, it proceeds unlocked to support immutable snapshots; the caller must
+then keep the directory stable for the handle's entire lifetime. Never use an
+unlocked read-only handle alongside a live writer, because recovery could mix
+MANIFEST, SST, and WAL states and produce incomplete reads.
+
 ---
 
 ## Error Handling
@@ -304,8 +313,8 @@ struct WriteOptions {
 All fallible APIs return `mmdb::Result<T> = Result<T, mmdb::Error>`.
 
 `Error` carries a typed [`ErrorKind`] (`Io`, `Corruption`, `InvalidArgument`,
-`DbClosed`, `Background`) for programmatic matching, plus a full propagation
-trace — the origin `file:line:column` and one frame per `.ctx()` /
+`DbClosed`, `ReadOnly`, `Background`) for programmatic matching, plus a full
+propagation trace — the origin `file:line:column` and one frame per `.ctx()` /
 `.with_ctx(..)` hop — and preserves the underlying source error (e.g.
 `std::io::Error`) for `std::error::Error::source()` downcasting.
 `Display`/`Debug` render the complete chain:

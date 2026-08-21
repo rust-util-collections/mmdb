@@ -391,8 +391,10 @@ pub struct DB {
     read_counter: AtomicU64,
     /// Tracks active snapshots for compaction safety.
     snapshot_list: Arc<SnapshotList>,
-    /// Exclusive directory lock (LOCK file). Prevents concurrent DB access.
-    /// The File handle holds the flock; released automatically when dropped.
+    /// Directory lock (`LOCK` file): exclusive for writable handles, shared for
+    /// read-only handles, and absent for a read-only immutable snapshot that
+    /// does not contain `LOCK`. The File handle holds the flock; released
+    /// automatically when dropped.
     /// Interior mutability lets explicit `close()` release it before `DB` drops.
     lock_file: Mutex<Option<fs::File>>,
     /// Keys registered for lazy deletion. Checked during compaction
@@ -527,6 +529,13 @@ thread_local! {
 
 impl DB {
     /// Open an existing database without writing to its store directory.
+    ///
+    /// If the store contains `LOCK`, this takes a shared lock and rejects a
+    /// concurrent writer. If `LOCK` is absent, opening proceeds unlocked so
+    /// immutable snapshots remain usable; in that case the caller must keep
+    /// the directory stable for this handle's entire lifetime. Do not use the
+    /// unlocked form with a live writer: recovery could observe inconsistent
+    /// MANIFEST, SST, and WAL states and return incomplete reads.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_read_only_with_options(DbOptions::default(), path)
     }
@@ -536,6 +545,13 @@ impl DB {
     /// Writer-only options such as [`DbOptions::create_if_missing`],
     /// [`DbOptions::error_if_exists`], and the L0 write-throttling thresholds
     /// are ignored.
+    ///
+    /// If the store contains `LOCK`, this takes a shared lock and rejects a
+    /// concurrent writer. If `LOCK` is absent, opening proceeds unlocked so
+    /// immutable snapshots remain usable; in that case the caller must keep
+    /// the directory stable for this handle's entire lifetime. Do not use the
+    /// unlocked form with a live writer: recovery could observe inconsistent
+    /// MANIFEST, SST, and WAL states and return incomplete reads.
     pub fn open_read_only_with_options(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
         Self::open_impl(options, path, true)
     }

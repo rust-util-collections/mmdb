@@ -1,15 +1,15 @@
 # Proposal: Read-Only Open Mode
 
-Status: **Draft** · Author: ktmlm · Scope: `DB::open` family, read path,
+Status: **Implemented** · Author: ktmlm · Scope: `DB::open` family, read path,
 mutation guards, shutdown path
 
 ## 1. Goal
 
-Let an existing DB be opened on a **read-only medium** (RO filesystem,
-read-only permissions, immutable snapshot mount) and read from, with **zero
-write-intent syscalls targeting the store directory** from open through drop.
-Today this is impossible: `DB::open` creates/opens writable files and performs
-recovery writes before any read can succeed.
+The implemented mode lets an existing DB be opened on a **read-only medium**
+(RO filesystem, read-only permissions, immutable snapshot mount) and read
+from, with **zero write-intent syscalls targeting the store directory** from
+open through drop. Before this mode, `DB::open` created/opened writable files
+and performed recovery writes before any read could succeed.
 
 Read-only mode guarantees:
 
@@ -30,18 +30,16 @@ Non-goals:
 
 ## 2. Current write-capability inventory
 
-### 2.1 Open — `DB::open` (`src/db.rs:525`)
+### 2.1 Writable open — `DB::open_impl`
 
 | Site | Operation |
 |------|-----------|
-| `db.rs:551` | `create_dir_all` when `create_if_missing` |
-| `db.rs:574-581` | create/open `LOCK` writable and take `flock(LOCK_EX)` |
-| `version_set.rs:330-333` | reopen and truncate MANIFEST to its valid tail |
-| `db.rs:727-729` | create the fresh WAL |
-| `db.rs:734-770` | flush recovered WAL state to SST |
-| `db.rs:769-783` | append and sync the new log number in MANIFEST |
-| `db.rs:788` | unlink obsolete files via `remove_orphan_files` |
-| `db.rs:842+` | spawn workers that can compact and write |
+| `DB::open_impl` writable preflight | `create_dir_all`; create/open `LOCK` writable and take `flock(LOCK_EX)` |
+| `VersionSet::recover_with_cache_mode` | reopen and truncate MANIFEST to its valid tail |
+| `DB::open_impl` writer-arming branch | create the fresh WAL; flush recovered WAL state to SST |
+| `DB::open_impl` writer-arming branch | append and sync the new log number in MANIFEST |
+| `DB::remove_orphan_files` | unlink obsolete files |
+| `DB::open_impl` worker loop | spawn workers that can compact and write |
 
 The existing exclusive lock is acquired **before** MANIFEST/WAL recovery. That
 ordering is a correctness boundary and must not be moved into a post-recovery
@@ -49,9 +47,9 @@ ordering is a correctness boundary and must not be moved into a post-recovery
 
 ### 2.2 Read and memory-only paths
 
-`get_with_options` periodically calls `check_read_compaction()`
-(`db.rs:2957-2977`). It adds level-≥2 hints and signals a compaction worker, so
-a point read can indirectly cause store writes.
+`get_with_options` periodically calls `check_read_compaction()`. It adds
+level-≥2 hints and signals a compaction worker, so a point read can indirectly
+cause store writes.
 
 Snapshot tracking, cache population, statistics, and iterator state mutate
 memory but not the store and remain allowed. They must not be confused with
