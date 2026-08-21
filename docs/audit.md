@@ -68,6 +68,11 @@
 - **What**: Only `num_levels >= 2` is validated; a huge value allocates per-level `Vec` headers in every `Version` and one merge source per level in every iterator.
 - **Reason**: The cost is linear, small, and entirely self-inflicted configuration; introducing an upper bound now could refuse to open stores created with larger values. Revisit if per-level state stops being O(1).
 
+### [LOW] API: `open_read_only` cannot open stores configured with `num_levels > 7`
+- **Where**: `src/db.rs` (`open_read_only`), `src/options.rs` (`num_levels` default = 7)
+- **What**: `open_read_only` builds `DbOptions::default()`, so recovery refuses any store that has a live file at `level >= 7` with `ErrorKind::Corruption` ("configured with num_levels 7"), even though the store is healthy under its original `num_levels`.
+- **Reason**: `num_levels` is not persisted in MANIFEST, so the convenience method cannot infer it; the documented fallback (`DB::open_read_only_with_options` and the matching `num_levels`) already covers non-default stores, and the error message names that fix. Persisting or deriving `num_levels` is disproportionate for an unusual (>7-level) configuration.
+
 ---
 
 ## Rejected
