@@ -300,11 +300,70 @@ struct WriteOptions {
 }
 ```
 
-Read-only open takes a shared lock when the store contains `LOCK`. If `LOCK`
-is absent, it proceeds unlocked to support immutable snapshots; the caller must
-then keep the directory stable for the handle's entire lifetime. Never use an
-unlocked read-only handle alongside a live writer, because recovery could mix
-MANIFEST, SST, and WAL states and produce incomplete reads.
+## Read-only databases
+
+`DB::open_read_only` opens an existing store without modifying its directory.
+Valid records from residual WAL files are replayed into memory, so reads see
+the same recovered state as a writable open while `CURRENT`, MANIFEST, WAL,
+SST, and `LOCK` files remain unchanged through open, reads, `close`, and drop.
+
+```rust
+use std::path::Path;
+
+use mmdb::{DB, ErrorKind};
+
+fn inspect(path: &Path) -> mmdb::Result<()> {
+    let db = DB::open_read_only(path)?;
+
+    if let Some(value) = db.get(b"key")? {
+        println!("{}", String::from_utf8_lossy(&value));
+    }
+
+    // A read-only handle reports mutation attempts explicitly.
+    let err = db.put(b"key", b"new value").unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::ReadOnly);
+
+    db.close()
+}
+```
+
+Use `DB::open_read_only_with_options` to configure read/cache behavior. In
+particular, `num_levels` is not persisted in the MANIFEST: a store written
+with a non-default value should be opened with the same value (this is required
+when a live SST occupies level 7 or higher).
+
+```rust
+use std::path::Path;
+
+use mmdb::{DB, DbOptions};
+
+fn open_custom(path: &Path) -> mmdb::Result<DB> {
+    DB::open_read_only_with_options(
+        DbOptions {
+            num_levels: 10,
+            block_cache_capacity: 256 * 1024 * 1024,
+            ..DbOptions::default()
+        },
+        path,
+    )
+}
+```
+
+| Operation on a read-only handle | Behavior |
+|---------------------------------|----------|
+| `get*`, iterators, snapshots, properties | Fully supported |
+| `close` and drop | Release resources without changing the store |
+| `put*`, `delete*`, `write*`, `flush`, `compact*` | Return `ErrorKind::ReadOnly` before side effects |
+| `lazy_delete*` | No-op (the existing infallible API cannot return an error) |
+
+On Unix, an existing `LOCK` file is opened without write access and held with
+a shared, non-blocking lock. Multiple read-only handles can coexist, while a
+writer is rejected. If `LOCK` is absent, no file is created and the handle
+proceeds unlocked; the caller must keep the directory stable for the handle's
+entire lifetime. Platforms without Unix `flock` should also be treated as
+unlocked. Never use an unlocked read-only handle alongside a live writer,
+because recovery could mix MANIFEST, SST, and WAL states and produce
+incomplete reads.
 
 ---
 

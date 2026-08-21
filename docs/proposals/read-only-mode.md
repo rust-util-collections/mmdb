@@ -158,6 +158,10 @@ Requirements:
 5. Keep recovered WAL contents in `active_memtable`. Publish them through the
    initial `SuperVersion`; do not flush or clear them.
 
+The `flock` guarantees above apply on Unix. On targets without Unix `flock`,
+both read-only and writable handles lack OS-level exclusion, so callers must
+treat a read-only open as the unlocked snapshot case.
+
 ### 4.3 VersionSet read-only state
 
 Extend `recover_with_cache` (or add a named recover-only wrapper) so read-only
