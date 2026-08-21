@@ -62,6 +62,9 @@ fn confirm_manifest_durable(
     }
     {
         let mut w = handle.lock();
+        if w.is_none() {
+            return Err(Error::read_only());
+        }
         if let Some(ref mut writer) = *w
             && let Err(e) = writer.sync()
         {
@@ -521,10 +524,22 @@ thread_local! {
 }
 
 impl DB {
+    /// Open an existing database without writing to its store directory.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open(
+            DbOptions {
+                read_only: true,
+                ..DbOptions::default()
+            },
+            path,
+        )
+    }
+
     /// Open or create a database.
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
         let mut options = options;
         let path = path.as_ref().to_path_buf();
+        let read_only = options.read_only;
 
         // A leveled LSM needs at least L0 plus one lower level; `num_levels < 2`
         // would panic during L0 counting / L0→L1 compaction.
@@ -540,14 +555,26 @@ impl DB {
         // any slowdown delay can engage, so the configured window is
         // unreachable — reject the misconfiguration loudly instead of
         // silently reinterpreting it at write time.
-        if options.l0_slowdown_trigger > options.l0_stop_trigger {
+        if !read_only && options.l0_slowdown_trigger > options.l0_stop_trigger {
             return Err(Error::invalid_argument(format!(
                 "l0_slowdown_trigger ({}) must be <= l0_stop_trigger ({})",
                 options.l0_slowdown_trigger, options.l0_stop_trigger
             )));
         }
 
-        if options.create_if_missing {
+        if read_only {
+            // Read-only open always means "open an existing DB". Normalize
+            // the creation/existence flags so the stored options reflect the
+            // capability actually granted to this handle.
+            options.create_if_missing = false;
+            options.error_if_exists = false;
+            if !path.join("CURRENT").exists() {
+                return Err(Error::invalid_argument(format!(
+                    "DB does not exist: {}",
+                    path.display()
+                )));
+            }
+        } else if options.create_if_missing {
             fs::create_dir_all(&path).ctx()?;
         } else if !path.join("CURRENT").exists() {
             // Match RocksDB/LevelDB: existence means a DB marker (`CURRENT`),
@@ -559,7 +586,7 @@ impl DB {
             )));
         }
 
-        if options.error_if_exists {
+        if !read_only && options.error_if_exists {
             let current = path.join("CURRENT");
             if current.exists() {
                 return Err(Error::invalid_argument(format!(
@@ -569,8 +596,36 @@ impl DB {
             }
         }
 
-        // Acquire exclusive directory lock to prevent concurrent DB access
-        let lock_file = {
+        // Lock before reading CURRENT/MANIFEST/WAL. Writable handles create
+        // the lock file and take LOCK_EX. Read-only handles open an existing
+        // lock file without write intent and take LOCK_SH; immutable snapshots
+        // that do not contain LOCK proceed unlocked by design.
+        let lock_file = if read_only {
+            let lock_path = path.join("LOCK");
+            match OpenOptions::new().read(true).open(&lock_path) {
+                Ok(file) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::fd::AsRawFd;
+                        // SAFETY: flock only observes the valid fd borrowed from `file`.
+                        let ret =
+                            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+                        if ret != 0 {
+                            let err = io::Error::last_os_error();
+                            return Err(Error::invalid_argument(format!(
+                                "failed to lock DB directory {} for reading: {} \
+                                 (is a writer using it?)",
+                                path.display(),
+                                err
+                            )));
+                        }
+                    }
+                    Some(file)
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e).ctx(),
+            }
+        } else {
             let lock_path = path.join("LOCK");
             let file = OpenOptions::new()
                 .create(true)
@@ -614,9 +669,17 @@ impl DB {
         ));
 
         // Open or create VersionSet (handles MANIFEST)
-        let mut versions =
+        let mut versions = if read_only {
+            VersionSet::recover_read_only_with_cache(
+                &path,
+                options.num_levels,
+                Some(table_cache.clone()),
+            )
+            .ctx()?
+        } else {
             VersionSet::open_with_cache(&path, options.num_levels, Some(table_cache.clone()))
-                .ctx()?;
+                .ctx()?
+        };
         let mut max_sequence = versions.last_sequence();
 
         // Recover from any WAL files not yet flushed
@@ -720,72 +783,80 @@ impl DB {
             }
         }
 
-        // Create the fresh WAL up front so its number can be recorded in the
-        // SAME MANIFEST edit that installs the recovered SST. Otherwise a crash
-        // between installing the SST and advancing `log_number` would replay the
-        // same WALs again and create a duplicate L0 file with identical keys.
-        let wal_number = versions.new_file_number();
-        let wal_path = path.join(format!("{:06}.wal", wal_number));
-        let wal_writer = WalWriter::new(&wal_path).ctx()?;
-
-        // If we recovered data from WALs, flush it to SST before deleting
-        // the old WALs. This ensures the data persists even if we crash again
-        // before writing to the new WAL.
-        if !wal_numbers.is_empty() && active_memtable.approximate_size() > 0 {
-            let make_opts = || TableBuildOptions {
-                block_size: options.block_size,
-                block_restart_interval: options.block_restart_interval,
-                bloom_bits_per_key: options.bloom_bits_per_key,
-                internal_keys: true,
-                compression: options.compression,
-                prefix_len: options.prefix_len,
-                block_property_collectors: options
-                    .block_property_collectors
-                    .iter()
-                    .map(|f| f())
-                    .collect(),
-            };
-            let outputs = {
-                let mut alloc = || Ok(versions.new_file_number());
-                Self::write_memtable_ssts(&active_memtable, &path, &make_opts, &mut alloc).ctx()?
-            };
-
-            let mut edit = VersionEdit::new();
-            edit.set_log_number(wal_number);
-            edit.set_last_sequence(max_sequence);
-            edit.set_next_file_number(versions.next_file_number());
-            for (sst_number, build_result) in outputs {
-                edit.add_file(
-                    0,
-                    FileMetaData {
-                        number: sst_number,
-                        file_size: build_result.file_size,
-                        smallest_key: build_result.smallest_key.unwrap_or_default(),
-                        largest_key: build_result.largest_key.unwrap_or_default(),
-                        has_range_deletions: build_result.has_range_deletions,
-                    },
-                );
-            }
-            versions.log_and_apply(edit).ctx()?;
-            versions.sync_manifest().ctx()?;
-
-            // Reset the memtable — data is now safely in SST
-            active_memtable = Arc::new(MemTable::new());
+        let (wal_writer, wal_number) = if read_only {
+            // Preserve the recovered WAL boundary as descriptive state. The
+            // replayed memtable remains live and is published below.
+            (None, versions.log_number())
         } else {
-            // No recovered data: still record the new log number so the old
-            // WALs are skipped on the next open.
-            let mut edit = VersionEdit::new();
-            edit.set_log_number(wal_number);
-            edit.set_next_file_number(versions.next_file_number());
-            edit.set_last_sequence(max_sequence);
-            versions.log_and_apply(edit).ctx()?;
-            versions.sync_manifest().ctx()?;
-        }
+            // Create the fresh WAL up front so its number can be recorded in the
+            // SAME MANIFEST edit that installs the recovered SST. Otherwise a crash
+            // between installing the SST and advancing `log_number` would replay the
+            // same WALs again and create a duplicate L0 file with identical keys.
+            let wal_number = versions.new_file_number();
+            let wal_path = path.join(format!("{:06}.wal", wal_number));
+            let wal_writer = WalWriter::new(&wal_path).ctx()?;
 
-        // Safe to clean up obsolete files now — the new log_number is durable
-        // (so old WALs will never be replayed even if we crash here) and the
-        // recovered version set defines the complete live SST set.
-        Self::remove_orphan_files(&path, &versions);
+            // If we recovered data from WALs, flush it to SST before deleting
+            // the old WALs. This ensures the data persists even if we crash again
+            // before writing to the new WAL.
+            if !wal_numbers.is_empty() && active_memtable.approximate_size() > 0 {
+                let make_opts = || TableBuildOptions {
+                    block_size: options.block_size,
+                    block_restart_interval: options.block_restart_interval,
+                    bloom_bits_per_key: options.bloom_bits_per_key,
+                    internal_keys: true,
+                    compression: options.compression,
+                    prefix_len: options.prefix_len,
+                    block_property_collectors: options
+                        .block_property_collectors
+                        .iter()
+                        .map(|f| f())
+                        .collect(),
+                };
+                let outputs = {
+                    let mut alloc = || Ok(versions.new_file_number());
+                    Self::write_memtable_ssts(&active_memtable, &path, &make_opts, &mut alloc)
+                        .ctx()?
+                };
+
+                let mut edit = VersionEdit::new();
+                edit.set_log_number(wal_number);
+                edit.set_last_sequence(max_sequence);
+                edit.set_next_file_number(versions.next_file_number());
+                for (sst_number, build_result) in outputs {
+                    edit.add_file(
+                        0,
+                        FileMetaData {
+                            number: sst_number,
+                            file_size: build_result.file_size,
+                            smallest_key: build_result.smallest_key.unwrap_or_default(),
+                            largest_key: build_result.largest_key.unwrap_or_default(),
+                            has_range_deletions: build_result.has_range_deletions,
+                        },
+                    );
+                }
+                versions.log_and_apply(edit).ctx()?;
+                versions.sync_manifest().ctx()?;
+
+                // Reset the memtable — data is now safely in SST
+                active_memtable = Arc::new(MemTable::new());
+            } else {
+                // No recovered data: still record the new log number so the old
+                // WALs are skipped on the next open.
+                let mut edit = VersionEdit::new();
+                edit.set_log_number(wal_number);
+                edit.set_next_file_number(versions.next_file_number());
+                edit.set_last_sequence(max_sequence);
+                versions.log_and_apply(edit).ctx()?;
+                versions.sync_manifest().ctx()?;
+            }
+
+            // Safe to clean up obsolete files now — the new log_number is durable
+            // (so old WALs will never be replayed even if we crash here) and the
+            // recovered version set defines the complete live SST set.
+            Self::remove_orphan_files(&path, &versions);
+            (Some(wal_writer), wal_number)
+        };
 
         let next_sequence = max_sequence.checked_add(1).ok_or_else(|| {
             Error::invalid_argument("sequence number space exhausted".to_string())
@@ -798,7 +869,7 @@ impl DB {
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
             immutable_memtables: Vec::new(),
-            wal_writer: Some(wal_writer),
+            wal_writer,
             wal_number,
             versions,
         }));
@@ -834,7 +905,11 @@ impl DB {
             }));
             (l0, sv)
         };
-        let num_compaction_threads = options.max_background_compactions.max(1);
+        let num_compaction_threads = if read_only {
+            0
+        } else {
+            options.max_background_compactions.max(1)
+        };
         let mut compaction_handles = Vec::with_capacity(num_compaction_threads);
 
         let read_compaction_hints = Arc::new(Mutex::new(Vec::<CompactionHint>::new()));
@@ -1353,7 +1428,9 @@ impl DB {
         // making the stall permanent). The thread re-checks
         // `pick_compaction` and goes back to sleep if there is nothing
         // to do, so an unconditional signal is free.
-        db.signal_compaction();
+        if !read_only {
+            db.signal_compaction();
+        }
 
         Ok(db)
     }
@@ -1368,7 +1445,7 @@ impl DB {
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
         let mut batch = WriteBatch::new();
         batch.put(key, value);
         self.write_batch_inner(batch, write_options)
@@ -1379,7 +1456,7 @@ impl DB {
     }
 
     pub fn delete_with_options(&self, write_options: &WriteOptions, key: &[u8]) -> Result<()> {
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
         let mut batch = WriteBatch::new();
         batch.delete(key);
         self.write_batch_inner(batch, write_options)
@@ -1396,7 +1473,7 @@ impl DB {
         begin: &[u8],
         end: &[u8],
     ) -> Result<()> {
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
         let mut batch = WriteBatch::new();
         batch.delete_range(begin, end);
         self.write_batch_inner(batch, write_options)
@@ -1411,7 +1488,7 @@ impl DB {
         write_options: &WriteOptions,
         batch: WriteBatch,
     ) -> Result<()> {
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -2314,14 +2391,14 @@ impl DB {
     /// compaction trouble still surfaces loudly through the write path's
     /// L0 stop trigger and the background thread's fail-stop policy.
     pub fn flush(&self) -> Result<()> {
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
         {
             let mut wq = self.write_queue.lock(); // serialize with writers
             // Group-commit leaders drop this mutex for WAL/SST I/O while only
             // keeping `leader_active`; wait so empty-active is not observed
             // mid auto-flush (install still pending).
             self.wait_for_write_leader_idle(&mut wq);
-            self.check_usable().ctx()?;
+            self.check_writable().ctx()?;
             let mut inner = self.inner.lock();
             if inner.active_memtable.is_empty() {
                 return Ok(());
@@ -2365,11 +2442,11 @@ impl DB {
     /// prefer relying on background compaction instead of calling this
     /// directly.
     pub fn compact(&self) -> Result<()> {
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
         {
             let mut wq = self.write_queue.lock();
             self.wait_for_write_leader_idle(&mut wq);
-            self.check_usable().ctx()?;
+            self.check_writable().ctx()?;
             self.force_compact_all().ctx()?;
         }
         // Full pass done — every settled registration is now prunable.
@@ -2380,7 +2457,7 @@ impl DB {
     /// Compact all keys in the given range across all levels.
     /// If `begin` is None, starts from the beginning. If `end` is None, goes to the end.
     pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
 
         // Hold write_queue across every flush/install phase so close cannot
         // observe an empty active barrier mid-range job, release LOCK/caches,
@@ -2388,7 +2465,7 @@ impl DB {
         // under the same guard before the first mutation.
         let mut wq = self.write_queue.lock();
         self.wait_for_write_leader_idle(&mut wq);
-        self.check_usable().ctx()?;
+        self.check_writable().ctx()?;
 
         // First flush memtable to ensure all data is in SSTs
         {
@@ -2616,7 +2693,12 @@ impl DB {
     /// removed by a later compaction like any other registered key — do
     /// not reuse a key until its lazy deletion has completed or
     /// [`clear_dead_keys`](Self::clear_dead_keys) has been called.
+    ///
+    /// This method is a no-op when the DB was opened read-only.
     pub fn lazy_delete(&self, key: &[u8]) {
+        if self.options.read_only {
+            return;
+        }
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
         let inserted = set.insert(key.to_vec());
@@ -2636,7 +2718,11 @@ impl DB {
     /// disabled — opt-in only), a batch containing any newly registered key
     /// queues a background sweep — see [`lazy_delete`](Self::lazy_delete) for
     /// its exact semantics and the write-stall tradeoff of opting in.
+    /// This method is a no-op when the DB was opened read-only.
     pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
+        if self.options.read_only {
+            return;
+        }
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
         let mut any_new = false;
@@ -2828,13 +2914,15 @@ impl DB {
 
         let mut first_error: Option<Error> = None;
 
-        if !inner.active_memtable.is_empty()
+        if !self.options.read_only
+            && !inner.active_memtable.is_empty()
             && let Err(e) = self.freeze_and_flush(&mut inner)
         {
             first_error = Some(e);
         }
 
-        if let Some(ref mut wal) = inner.wal_writer
+        if !self.options.read_only
+            && let Some(ref mut wal) = inner.wal_writer
             && let Err(e) = wal.sync()
             && first_error.is_none()
         {
@@ -2870,6 +2958,9 @@ impl DB {
 
     /// Signal background compaction threads (non-blocking).
     fn signal_compaction(&self) {
+        if self.options.read_only {
+            return;
+        }
         let (lock, cvar) = &*self.compaction_notify;
         if let Ok(mut has_work) = lock.lock() {
             *has_work = true;
@@ -2955,6 +3046,9 @@ impl DB {
     /// Periodically check read-level samples and generate compaction hints.
     /// Called every 1024 reads from get_with_options.
     fn maybe_check_read_compaction(&self) {
+        if self.options.read_only {
+            return;
+        }
         let count = self.read_counter.fetch_add(1, Ordering::Relaxed);
         if !count.is_multiple_of(1024) {
             return;
@@ -2982,6 +3076,14 @@ impl DB {
         }
         if let Some(error) = self.fail_stop_error() {
             return Err(error);
+        }
+        Ok(())
+    }
+
+    fn check_writable(&self) -> Result<()> {
+        self.check_usable()?;
+        if self.options.read_only {
+            return Err(Error::read_only());
         }
         Ok(())
     }
@@ -3015,7 +3117,7 @@ impl DB {
             // the mutex: it does not mutate durable state.
             let mut wq = self.write_queue.lock();
             self.wait_for_write_leader_idle(&mut wq);
-            self.check_usable().ctx()?;
+            self.check_writable().ctx()?;
             let still_over = {
                 let inner = self.inner.lock();
                 inner.versions.current().l0_file_count() >= self.options.l0_stop_trigger
@@ -3212,7 +3314,7 @@ impl DB {
     /// the leader can harvest settled dead-key registrations after it has
     /// woken the group's waiters.
     fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<bool> {
-        self.check_usable()?;
+        self.check_writable()?;
         let mut need_sync = false;
         let mut inner = self.inner.lock();
 

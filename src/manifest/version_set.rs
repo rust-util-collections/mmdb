@@ -163,6 +163,25 @@ impl VersionSet {
         num_levels: usize,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
+        Self::recover_with_cache_mode(db_path, num_levels, table_cache, false)
+    }
+
+    /// Recover an existing VersionSet without opening or repairing its
+    /// MANIFEST for append.
+    pub fn recover_read_only_with_cache(
+        db_path: &Path,
+        num_levels: usize,
+        table_cache: Option<Arc<TableCache>>,
+    ) -> Result<Self> {
+        Self::recover_with_cache_mode(db_path, num_levels, table_cache, true)
+    }
+
+    fn recover_with_cache_mode(
+        db_path: &Path,
+        num_levels: usize,
+        table_cache: Option<Arc<TableCache>>,
+        read_only: bool,
+    ) -> Result<Self> {
         // Read CURRENT to find manifest file
         let current_path = db_path.join("CURRENT");
         let manifest_name = fs::read_to_string(&current_path)
@@ -327,10 +346,14 @@ impl VersionSet {
         // recovered file set must still satisfy the read-path invariant.
         Self::validate_level_disjointness(&version).ctx()?;
 
-        // Reopen manifest for appending, truncating any corrupt tail
-        let valid_offset = reader.last_valid_offset();
-        let manifest_writer =
-            WalWriter::open_append_truncated(&manifest_path, valid_offset).ctx()?;
+        // Writable recovery repairs a torn tail and reopens the MANIFEST for
+        // append. Read-only recovery must leave the file byte-for-byte intact.
+        let manifest_writer = if read_only {
+            None
+        } else {
+            let valid_offset = reader.last_valid_offset();
+            Some(WalWriter::open_append_truncated(&manifest_path, valid_offset).ctx()?)
+        };
 
         Ok(Self {
             db_path: db_path.to_path_buf(),
@@ -340,7 +363,7 @@ impl VersionSet {
             log_number,
             last_sequence,
             manifest_number,
-            manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
+            manifest_writer: Arc::new(Mutex::new(manifest_writer)),
             table_cache,
             edits_since_snapshot: edits_replayed,
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -367,6 +390,9 @@ impl VersionSet {
     /// memory nor durably. Callers rely on this to safely delete output SSTs
     /// referenced by a failed edit.
     pub fn log_and_apply(&mut self, edit: VersionEdit) -> Result<()> {
+        if self.manifest_writer.lock().is_none() {
+            return Err(Error::read_only());
+        }
         if self.is_poisoned() {
             return Err(Error::corruption(
                 "MANIFEST writer poisoned by an earlier write failure; \
@@ -544,6 +570,9 @@ impl VersionSet {
     /// `log_and_apply` (before the referencing MANIFEST record), so this only
     /// needs to fsync the MANIFEST writer itself.
     pub fn sync_manifest(&self) -> Result<()> {
+        if self.manifest_writer.lock().is_none() {
+            return Err(Error::read_only());
+        }
         // Already-poisoned writers must not be treated as /successfully
         // synced/ — e.g. rotation may have failed its old-writer sync and
         // set the flag while log_and_apply still returned Ok. A later sync
@@ -832,6 +861,37 @@ impl VersionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_recovery_leaves_manifest_unchanged_and_rejects_writes() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        drop(VersionSet::create(path, 7).unwrap());
+
+        let manifest_path = path.join("MANIFEST-000001");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&manifest_path)
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let before = fs::read(&manifest_path).unwrap();
+
+        let mut vs = VersionSet::recover_read_only_with_cache(path, 7, None).unwrap();
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        assert_eq!(
+            vs.sync_manifest().unwrap_err().kind(),
+            crate::ErrorKind::ReadOnly
+        );
+        assert_eq!(
+            vs.log_and_apply(VersionEdit::new()).unwrap_err().kind(),
+            crate::ErrorKind::ReadOnly
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+    }
 
     #[test]
     fn test_create_and_recover() {

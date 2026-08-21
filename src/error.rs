@@ -43,6 +43,8 @@ pub enum ErrorKind {
     InvalidArgument,
     /// The database has been closed; no further operations are possible.
     DbClosed,
+    /// The database was opened without write capability.
+    ReadOnly,
     /// A background task (flush/compaction) failed earlier; writes are
     /// rejected until the database is reopened.
     Background,
@@ -56,6 +58,7 @@ impl ErrorKind {
             Self::Corruption => "Corruption",
             Self::InvalidArgument => "Invalid argument",
             Self::DbClosed => "DB is closed",
+            Self::ReadOnly => "DB is read-only",
             Self::Background => "Background error",
         }
     }
@@ -131,6 +134,12 @@ impl Error {
     #[track_caller]
     pub fn db_closed() -> Self {
         Self::new(ErrorKind::DbClosed, ErrorKind::DbClosed.as_str().to_owned())
+    }
+
+    /// Create an [`ErrorKind::ReadOnly`] error.
+    #[track_caller]
+    pub fn read_only() -> Self {
+        Self::new(ErrorKind::ReadOnly, ErrorKind::ReadOnly.as_str().to_owned())
     }
 
     /// Create an [`ErrorKind::Io`] error, preserving `e` as the source.
