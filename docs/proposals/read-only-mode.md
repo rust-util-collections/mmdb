@@ -1,204 +1,330 @@
 # Proposal: Read-Only Open Mode
 
-Status: **Draft** · Author: ktmlm · Scope: `DB::open` family, read path, shutdown path
+Status: **Draft** · Author: ktmlm · Scope: `DB::open` family, read path,
+mutation guards, shutdown path
 
 ## 1. Goal
 
-Let a DB be opened on a **read-only medium** (RO filesystem, read-only
-permissions, snapshot mount) and read from, with **zero write syscalls to the
-store directory** from open through drop. Today this is impossible: `DB::open`
-unconditionally writes, so an RO disk fails at the first write with `EROFS`
-before any read succeeds.
+Let an existing DB be opened on a **read-only medium** (RO filesystem,
+read-only permissions, immutable snapshot mount) and read from, with **zero
+write-intent syscalls targeting the store directory** from open through drop.
+Today this is impossible: `DB::open` creates/opens writable files and performs
+recovery writes before any read can succeed.
 
-Non-goals: multi-process "read-only + live writer" shared access, and
-removing the existing writable fast path.
+Read-only mode guarantees:
 
-## 2. Current write inventory (the exact problem)
+- `CURRENT`, MANIFEST, SST, and recoverable WAL state are visible to reads;
+- open, reads, `close`, and `Drop` do not create, append, truncate, sync,
+  rename, or unlink files in the store;
+- disk-mutating APIs fail with `ErrorKind::ReadOnly` before side effects;
+- the existing writable path retains its lock-before-recovery ordering and
+  behavior.
 
-Every write during the lifetime of a `DB`, mapped to source:
+Non-goals:
+
+- reading concurrently with a live writer when no cooperative `LOCK` file is
+  available;
+- making a mutable directory snapshot consistent; the caller must provide a
+  stable snapshot or successful cooperative lock;
+- removing or slowing the existing writable fast path.
+
+## 2. Current write-capability inventory
 
 ### 2.1 Open — `DB::open` (`src/db.rs:525`)
 
-| # | Site | Operation |
-|---|------|-----------|
-| 1 | `db.rs:551` | `create_dir_all` (only `create_if_missing`) |
-| 2 | `db.rs:574-581` | `LOCK` file: `create(true).write(true).open` + `flock(LOCK_EX)` |
-| 3 | `version_set.rs:330-333` | `WalWriter::open_append_truncated` — reopen MANIFEST for append (even with no corrupt tail) |
-| 4 | `db.rs:727-729` | `WalWriter::new` — create the fresh WAL |
-| 5 | `db.rs:734-770` | flush recovered WAL → SST (`write_memtable_ssts`) |
-| 6 | `db.rs:769-783` | `log_and_apply` + `sync_manifest` — **every** open writes one MANIFEST edit (new `log_number`) |
-| 7 | `db.rs:788` | `remove_orphan_files` — unlink obsolete files |
-| 8 | `db.rs:842+` | spawn background compaction threads |
+| Site | Operation |
+|------|-----------|
+| `db.rs:551` | `create_dir_all` when `create_if_missing` |
+| `db.rs:574-581` | create/open `LOCK` writable and take `flock(LOCK_EX)` |
+| `version_set.rs:330-333` | reopen and truncate MANIFEST to its valid tail |
+| `db.rs:727-729` | create the fresh WAL |
+| `db.rs:734-770` | flush recovered WAL state to SST |
+| `db.rs:769-783` | append and sync the new log number in MANIFEST |
+| `db.rs:788` | unlink obsolete files via `remove_orphan_files` |
+| `db.rs:842+` | spawn workers that can compact and write |
 
-### 2.2 Read path — should be inert, but leaks
+The existing exclusive lock is acquired **before** MANIFEST/WAL recovery. That
+ordering is a correctness boundary and must not be moved into a post-recovery
+"arm writer" phase.
 
-`get_with_options` runs `check_read_compaction()` (`db.rs:2962-2977`), which
-pushes level-≥2 samples into `read_compaction_hints` and calls
-`signal_compaction()` — **a read can start a background compaction**, i.e. a
-write. This is the only read-path write leak.
+### 2.2 Read and memory-only paths
 
-### 2.3 Shutdown
+`get_with_options` periodically calls `check_read_compaction()`
+(`db.rs:2957-2977`). It adds level-≥2 hints and signals a compaction worker, so
+a point read can indirectly cause store writes.
 
-- `close()` (`db.rs:2810`): `freeze_and_flush` (write SST) + WAL `sync` +
-  `remove_orphan_files`.
-- `Drop` (`db.rs:4186`): WAL `sync` + release LOCK/caches.
+Snapshot tracking, cache population, statistics, and iterator state mutate
+memory but not the store and remain allowed. They must not be confused with
+the zero-store-write guarantee.
 
-## 3. Architecture — where the logical spaces are entangled
+### 2.3 Explicit and indirect mutation APIs
 
-The read space and write space are entangled at exactly three points; fixing
-them is both the clean design **and** the thing that makes read-only cheap.
+Disk-mutating public entry points are `put*`, `delete*`, `delete_range*`,
+`write*`, `flush`, `compact`, and `compact_range`.
 
-**E1 — Open is a fused recover+arm sequence.** `open` interleaves "recover
-read state" (CURRENT → MANIFEST → SST → WAL→memtable) with "arm the writer"
-(create WAL, append MANIFEST, flush, spawn compaction). There is no seam. In
-reality the recovery loop is *already* read-only all the way up to the flush at
-`db.rs:734` — the writes only begin at "create fresh WAL" (`db.rs:727`).
-Read-only is literally "stop before the arm-write tail."
+`lazy_delete` and `lazy_delete_batch` are also logically mutating operations:
+they update `dead_keys` and can request a background force-rewrite. Their
+current `()` return type cannot report `ErrorKind::ReadOnly`; §4.5 defines the
+compatibility policy.
 
-**E2 — The read path can trigger writes** (`check_read_compaction`). This
-coupling is undesirable on its own; read-only requires severing it.
+### 2.4 Shutdown
 
-**E3 — The manifest writer is only *half*-optional.** It is already
-`Arc<Mutex<Option<WalWriter>>>` (`version_set.rs:41`), but
-`recover_with_cache` always constructs `Some` via `open_append_truncated`
-(`version_set.rs:332`). Making the `None` case first-class (read-only) is a
-small, real change, not a new abstraction.
+- `close()` can flush the recovered/active memtable to SST, rotate WAL, append
+  and sync MANIFEST, and unlink the retired WAL.
+- `Drop` syncs the WAL when one is present, then releases workers, caches, and
+  the directory lock.
 
-### Recommendation on structure
+## 3. Architecture
 
-Keep **one** `DB` type with a `read_only: bool` mode, rather than a separate
-`ReadOnlyDB` type. Rationale:
+Keep one `DB` type with a `read_only: bool` capability flag rather than adding
+a parallel `ReadOnlyDB` API. The read-visible state is already represented by
+`SuperVersion`; writable resources can be absent or inert:
 
-- The write-only state (`write_queue`, `WalWriter`, compaction handles,
-  `dead_keys`, `snapshot_list`) is already isolated behind `Option`-typed seams
-  or is simply left unused when writes never happen.
-- A second type would double the public API and break `vsdb`'s `DbOptions`-based
-  call sites for marginal type-safety gain.
+- `DBInner::wal_writer` is already `Option<WalWriter>`;
+- `VersionSet::manifest_writer` is already
+  `Arc<Mutex<Option<WalWriter>>>`;
+- `compaction_handles` can be empty;
+- write queues, compaction notifications, and dead-key state can remain
+  allocated but inactive.
 
-The structural change is **phase-splitting `open`**, not a rewrite.
+The structural change is to split `open` into **preflight/lock**, **read-state
+recovery**, and **optional writer arming**. Recovery is not the first phase:
+both writable and cooperatively locked read-only opens must lock before they
+read mutable metadata.
 
 ## 4. Design
 
-### 4.1 API
+### 4.1 API and option semantics
 
 ```rust
-// options.rs
 pub struct DbOptions {
     // ...
-    /// Open without ever writing to the store. Reads only; all write
-    /// methods return `Error::read_only`. `create_if_missing`/`error_if_exists`
-    /// are ignored (treated as false).
-    pub read_only: bool,          // default false
+    /// Open an existing store without acquiring write capability.
+    pub read_only: bool, // default false
 }
-```
 
-Convenience entry point (thin wrapper, reads better than a bool):
-
-```rust
-// db.rs / lib.rs
 impl DB {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(DbOptions { read_only: true, ..DbOptions::default() }, path)
+        Self::open(
+            DbOptions {
+                read_only: true,
+                ..DbOptions::default()
+            },
+            path,
+        )
     }
 }
 ```
 
-### 4.2 Split `open` into two phases
+When `read_only` is true:
 
-```
+- the DB must already exist; `CURRENT` missing is an error;
+- `create_if_missing` and `error_if_exists` are normalized to `false`;
+- writer-only tuning options are retained in `DbOptions` but never activate
+  writer machinery or writer-only validation;
+- callers needing non-default read/cache settings use `DB::open` with
+  `read_only: true`.
+
+Adding a public `DbOptions` field is a Rust source-compatibility change for
+downstream exhaustive struct literals. Release notes must call this out; a
+major-version boundary is required if the project promises strict source
+compatibility for such construction.
+
+### 4.2 Three-phase open
+
+```text
 open(options, path)
-  ├─ recover_read_state(path)            // pure read, shared by both modes
-  │     read CURRENT → recover VersionSet (manifest_writer = None when RO)
-  │     read_dir → wal_numbers → replay WAL → active_memtable
-  │     open SST handles in recovered version
-  └─ arm_write_capability()              // SKIPPED entirely when read_only
-        create LOCK + flock(EX)
-        create fresh WAL
-        if recovered memtable non-empty → flush to SST
-        log_and_apply(new log_number) + sync_manifest
-        remove_orphan_files
-        spawn compaction threads
+  ├─ preflight_and_lock(path, mode)
+  │    RW: create directory if allowed; create/open LOCK RW; flock(EX)
+  │    RO: require CURRENT; open existing LOCK read-only; flock(SH)
+  │        if LOCK is absent, continue only under documented snapshot semantics
+  ├─ recover_read_state(path, mode)
+  │    read CURRENT → replay MANIFEST → open live SST handles
+  │    enumerate WALs → replay recoverable records into active_memtable
+  │    RO: manifest_writer = None; never truncate a torn MANIFEST tail
+  └─ arm_write_capability()                 // RW only
+       create fresh WAL
+       flush non-empty recovered memtable to SST
+       log_and_apply(new log_number) + sync_manifest
+       remove_orphan_files
+       spawn compaction workers
 ```
 
-Concretely in `db.rs`:
+Requirements:
 
-1. Recover phase is the existing code from `db.rs:626-721` (read_dir → sort →
-   replay into `active_memtable`), **plus** a `read_only` flag threaded into
-   `VersionSet::recover_with_cache`.
-2. Wrap everything from `db.rs:727` (`let wal_number = ...; WalWriter::new`)
-   through `db.rs:788` (`remove_orphan_files`) and `db.rs:842+` (spawn) in
-   `if !read_only { ... }`. For read-only, skip; set `wal_writer: None`,
-   `wal_number: 0`, and leave `max_sequence`/`next_file_number` as recovered
-   (they are never consumed because no writes happen).
+1. Preserve the writable path's existing lock-before-recovery order.
+2. Acquire an existing read-only `LOCK` with `LOCK_SH | LOCK_NB` **before**
+   reading CURRENT/MANIFEST. A writer's `LOCK_EX` and other shared readers then
+   cooperate correctly.
+3. If `LOCK` is absent, do not create it in read-only mode. An unlocked open is
+   permitted only because live-writer sharing is a non-goal; document that the
+   underlying snapshot must be stable.
+4. Read-only mode calls an explicit recover-only VersionSet entry point. It
+   must not call `open_with_cache`, whose missing-CURRENT branch creates a new
+   MANIFEST, even after a separate `exists()` check.
+5. Keep recovered WAL contents in `active_memtable`. Publish them through the
+   initial `SuperVersion`; do not flush or clear them.
 
-### 4.3 Per-site changes
+### 4.3 VersionSet read-only state
 
-| Site | Read-only behavior |
-|------|--------------------|
-| `create_dir_all` (`db.rs:551`) | skip; `open_read_only` must fail if `CURRENT` missing (reuse the `!CURRENT.exists()` guard at `db.rs:552`) |
-| LOCK (`db.rs:573`) | do **not** `create`/`write`. If a `LOCK` file already exists, take `flock(LOCK_SH)` cooperatively; otherwise proceed unlocked. Many readers may share |
-| MANIFEST reopen (`version_set.rs:332`) | pass `read_only`; skip `open_append_truncated`; leave `manifest_writer = None`. Add an explicit guard in `log_and_apply`/`sync_manifest`: write on a `None` writer → `Error::read_only` (defensive; the read-only path never calls them) |
-| fresh WAL (`db.rs:727`) | skip |
-| WAL→SST flush (`db.rs:734`) | **skip the flush, keep the memtable** — see §5 |
-| MANIFEST edit+sync (`db.rs:769/781`) | skip |
-| `remove_orphan_files` (`db.rs:788`) | skip |
-| compaction threads (`db.rs:842`) | do not spawn; `compaction_handles` empty |
-| `check_read_compaction()` (`db.rs:2962`) | short-circuit when `read_only` (and only then) |
-| `close()` (`db.rs:2810`) | skip `freeze_and_flush` and WAL `sync`; only join threads (none) + release caches/LOCK |
-| `Drop` (`db.rs:4190`) | mind `wal_writer.is_none()` → no sync |
-| write methods (`put`/`delete`/`WriteBatch` apply/`flush`/`compact*`) | `check_usable` → return `Error::read_only()` |
+Extend `recover_with_cache` (or add a named recover-only wrapper) so read-only
+recovery leaves `manifest_writer = None` and does not call
+`WalWriter::open_append_truncated`.
 
-### 4.4 Error type
+`None` must become a fail-closed state, not a silent no-op:
 
-Add `ErrorKind::ReadOnly` + `Error::read_only()` in `src/error.rs`. All write
-entry points return it; it must **not** be conflated with an `EROFS` I/O error.
+- `VersionSet::log_and_apply` checks for a writer at function entry, before
+  opening new SSTs, directory fsync, in-memory version changes, or manifest
+  rotation;
+- `VersionSet::sync_manifest` returns `ErrorKind::ReadOnly` on `None`;
+- `confirm_manifest_durable` also rejects a `None` writer instead of treating
+  an empty handle as a successful sync.
 
-## 5. Semantics: residual WAL (the correctness crux)
+These checks are defensive backstops. Correct read-only control flow never
+reaches them.
 
-If the RO medium holds WAL files with committed-but-unflushed data, reading
-them into the memtable is **correct** — the data is recoverable on every open,
-and no disk write is needed. The current recovery loop already does exactly
-this *before* flushing (`db.rs:670-721`). Read-only therefore:
+### 4.4 DB state construction
 
-- **default**: replay WAL → `active_memtable`, do not flush. Reads see the
-  committed data; the WAL stays on disk and is re-read on the next open.
-- torn-tail tolerance (`db.rs:693-718`) is unchanged and applies.
+For read-only mode:
 
-No refusal-to-open is required. (Contrast: silently *dropping* the WAL would
-be data loss — never do that.)
+- set `wal_writer: None`;
+- retain the recovered `versions.log_number()` as `wal_number` rather than
+  using the invalid sentinel `0` (changing `wal_number` to `Option<u64>` is
+  preferable if the wider refactor is acceptable);
+- set `committed_sequence` to the maximum of MANIFEST and recovered WAL
+  sequences;
+- initialize the otherwise-unused next-write sequence consistently with the
+  recovered state, so shared read/snapshot helpers retain existing invariants;
+- leave `compaction_handles` empty and do not send the startup compaction
+  signal.
 
-## 6. Phased implementation
+### 4.5 Mutation guards
 
-1. **Phase 0 — seams (no behavior change).** Thread a `read_only` param through
-   `VersionSet::recover_with_cache` (default `false`), make `manifest_writer =
-   None` path legal, add `read_only` field to `DbOptions` (default `false`).
-   All existing tests green.
-2. **Phase 1 — split `open`.** Extract `recover_read_state` / gate the
-   arm-write tail behind `if !read_only`. Writable path behavior identical.
-3. **Phase 2 — read-only behavior.** Apply §4.3 table; add `ErrorKind::ReadOnly`;
-   short-circuit `check_read_compaction`; fix `close`/`Drop`.
-4. **Phase 3 — hardening.** Sever `check_read_compaction` coupling behind a mode
-   check free of the read hot path; write entry points return `ReadOnly`.
+Keep `check_usable()` mode-neutral because all read APIs call it. Add a
+separate guard:
 
-## 7. Risks & verification
+```rust
+fn check_writable(&self) -> Result<()> {
+    self.check_usable()?;
+    if self.options.read_only {
+        return Err(Error::read_only());
+    }
+    Ok(())
+}
+```
 
-- **Regression of the writable hot path**: gated by `if !read_only`, so the
-  audit should diff "writable behavior before/after" via the existing
-  `crash_recovery` / `e2e_scenarios` / `proptest_db` suites — no changes
-  expected.
-- **Accidental write in read-only**: add a canary that wraps the store dir and
-  asserts zero `write`/`create`/`unlink` syscalls during read-only
-  open+read+drop (`test-utils`). This is the acceptance test.
-- **WAL-with-residual-data**: new test opens RO over a store that was killed
-  mid-write (reuse `DB::simulate_crash`), asserts committed keys are readable
-  and the WAL file is untouched.
-- **`remove_orphan_files` / MANIFEST edit are the two "silent" writes** most
-  likely to be missed — covered explicitly by the canary, not by unit review.
+Use `check_writable()` at every disk-mutating public entry point and again at
+central internal mutation gateways such as `write_batch_group`. The redundant
+internal guard protects future call sites. Define whether an empty
+`WriteBatch` returns `ReadOnly` or `Ok(())`; recommended behavior is
+`ReadOnly`, because the method itself is unavailable in this mode.
 
-## 8. Open questions
+For `lazy_delete` and `lazy_delete_batch`, the recommended compatible v1
+behavior is a documented no-op in read-only mode. They cannot affect reads
+until compaction and cannot report an error without breaking their signatures.
+Add fallible `try_lazy_delete* -> Result<()>` variants if callers need explicit
+feedback; changing the existing signatures should be reserved for a major
+release. `clear_dead_keys` remains an allowed memory-only cleanup operation.
 
-- Should `open_read_only` refuse when `CURRENT` is absent (recommended) or
-  implicitly treat it as "empty DB"? Recommended: refuse, mirroring `db.rs:552`.
-- Do we need cooperative `flock(LOCK_SH)` against a live writer, or is
-  "proceed unlocked" acceptable for v1? Recommended: SH when the file exists,
-  unlocked otherwise — cheap and useful.
+### 4.6 Read path, close, and Drop
+
+- Short-circuit `maybe_check_read_compaction` before counters, hints, or
+  notification work when read-only. With no workers this is also a bounded
+  memory requirement, not only a write-prevention measure.
+- `signal_compaction` should defensively no-op in read-only mode.
+- `close()` skips `freeze_and_flush` and WAL sync, then performs ordinary
+  in-memory shutdown and releases the shared lock/caches.
+- `Drop` already skips WAL sync when `wal_writer` is `None`; keep that invariant
+  explicit in tests.
+
+### 4.7 Error type
+
+Add `ErrorKind::ReadOnly` and `Error::read_only()`. It represents a capability
+error and must not be conflated with an `EROFS` I/O error. Add the new variant
+to `ErrorKind::as_str` and error-kind tests.
+
+## 5. Residual WAL semantics
+
+If the medium contains committed-but-unflushed WAL data, replaying it into the
+memtable is required for correctness. The existing recovery loop already
+replays eligible WALs before its flush step.
+
+Read-only behavior is therefore:
+
+- replay every WAL selected by the existing
+  `wal_number >= versions.log_number()` rule in file-number order;
+- preserve the existing strict corruption checks and recoverable active-tail
+  tolerance;
+- retain replayed point entries, deletions, and range deletions in the active
+  memtable for the DB lifetime;
+- expose the maximum recovered committed sequence to normal reads and
+  snapshots;
+- leave every WAL byte unchanged and repeat recovery on the next open.
+
+Silently ignoring WALs or refusing every store with residual WAL would make
+read-only snapshots unnecessarily incomplete. A corrupt non-recoverable WAL
+continues to fail open exactly as it does in writable mode.
+
+## 6. Implementation phases
+
+1. **Capability seams, no writable behavior change.** Add `read_only`,
+   `ErrorKind::ReadOnly`, `check_writable`, and fail-closed optional MANIFEST
+   writer semantics. Keep the writable open flow byte-for-byte equivalent.
+2. **Split open without reordering the lock.** Extract preflight/lock and
+   recovery helpers, still exercising only the writable mode in tests.
+3. **Construct read-only state.** Add shared/read-only lock handling, explicit
+   recover-only VersionSet flow, residual-WAL memtable publication, and inert
+   background state.
+4. **Close all mutation paths.** Gate public/internal writers, read-triggered
+   compaction, lazy-delete behavior, `close`, and `Drop`.
+5. **Acceptance hardening.** Add immutable-file and syscall-level tests, then
+   run all existing crash-recovery, end-to-end, and property suites unchanged.
+
+## 7. Verification
+
+### 7.1 Functional matrix
+
+Cover at least:
+
+- SST-only DB on read-only permissions;
+- residual WAL containing puts, point deletes, and range deletes;
+- recoverable torn WAL tail and recoverable torn MANIFEST tail;
+- non-recoverable corruption still failing closed;
+- `CURRENT` absent, `LOCK` absent, and `LOCK` present;
+- multiple shared readers;
+- shared reader rejected while a writer holds `LOCK_EX`, and writer rejected
+  while readers hold `LOCK_SH`;
+- every disk mutation API returning `ErrorKind::ReadOnly` before side effects;
+- `close` and implicit `Drop` with a non-empty recovered memtable;
+- writable regression suites: `crash_recovery`, `e2e_scenarios`, and
+  `proptest_db`.
+
+### 7.2 Zero-write acceptance
+
+The repository currently calls `std::fs` directly, so `test-utils` cannot
+literally wrap the store directory without first introducing a filesystem
+abstraction. Use two complementary checks:
+
+1. A portable integration test snapshots the recursive file set, content
+   hashes, sizes, and modification times before read-only open/read/close/drop
+   and asserts they are unchanged afterward.
+2. A Linux acceptance test runs that scenario under `strace` (following
+   threads) and rejects store-targeted `open`/`openat` calls with write/create/
+   truncate flags, plus write/pwrite/truncate/rename/unlink/fsync/fdatasync
+   operations. This catches transient create-then-delete behavior that an
+   after-the-fact hash cannot see.
+
+A permissions-only test is useful for demonstrating operation on an RO medium,
+but is not sufficient evidence of zero attempted writes and may be ineffective
+when tests run with elevated privileges.
+
+## 8. Resolved policy decisions
+
+- `CURRENT` absent: refuse read-only open; never create an empty DB.
+- Existing `LOCK`: take non-blocking `LOCK_SH` before recovery.
+- Missing `LOCK`: proceed unlocked only for a caller-provided stable snapshot;
+  concurrent live writers remain unsupported.
+- Residual WAL: replay and retain in memory.
+- Existing `lazy_delete*`: documented no-op in read-only v1; fallible variants
+  may be added separately.
+- One `DB` type: retained; capability checks provide runtime enforcement.
