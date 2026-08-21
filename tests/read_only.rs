@@ -138,9 +138,8 @@ fn read_only_ignores_writer_only_open_options() {
     db.close().unwrap();
     drop(db);
 
-    let db = DB::open(
+    let db = DB::open_read_only_with_options(
         DbOptions {
-            read_only: true,
             create_if_missing: true,
             error_if_exists: true,
             l0_slowdown_trigger: 100,

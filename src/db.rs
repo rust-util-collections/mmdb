@@ -336,6 +336,8 @@ impl Drop for CompactionClaim {
 pub struct DB {
     path: PathBuf,
     options: DbOptions,
+    /// Whether this handle was opened without write capability.
+    read_only: bool,
     inner: Arc<Mutex<DBInner>>,
     /// Global sequence number (next to assign).
     sequence: Arc<AtomicU64>,
@@ -526,20 +528,26 @@ thread_local! {
 impl DB {
     /// Open an existing database without writing to its store directory.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(
-            DbOptions {
-                read_only: true,
-                ..DbOptions::default()
-            },
-            path,
-        )
+        Self::open_read_only_with_options(DbOptions::default(), path)
+    }
+
+    /// Open an existing database read-only with custom read/cache options.
+    ///
+    /// Writer-only options such as [`DbOptions::create_if_missing`],
+    /// [`DbOptions::error_if_exists`], and the L0 write-throttling thresholds
+    /// are ignored.
+    pub fn open_read_only_with_options(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(options, path, true)
     }
 
     /// Open or create a database.
     pub fn open(options: DbOptions, path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(options, path, false)
+    }
+
+    fn open_impl(options: DbOptions, path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         let mut options = options;
         let path = path.as_ref().to_path_buf();
-        let read_only = options.read_only;
 
         // A leveled LSM needs at least L0 plus one lower level; `num_levels < 2`
         // would panic during L0 counting / L0→L1 compaction.
@@ -1388,6 +1396,7 @@ impl DB {
         let db = Self {
             path,
             options,
+            read_only,
             inner,
             sequence: sequence_start.clone(),
             committed_sequence,
@@ -2696,7 +2705,7 @@ impl DB {
     ///
     /// This method is a no-op when the DB was opened read-only.
     pub fn lazy_delete(&self, key: &[u8]) {
-        if self.options.read_only {
+        if self.read_only {
             return;
         }
         let threshold = self.options.lazy_delete_compaction_threshold;
@@ -2720,7 +2729,7 @@ impl DB {
     /// its exact semantics and the write-stall tradeoff of opting in.
     /// This method is a no-op when the DB was opened read-only.
     pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
-        if self.options.read_only {
+        if self.read_only {
             return;
         }
         let threshold = self.options.lazy_delete_compaction_threshold;
@@ -2914,14 +2923,14 @@ impl DB {
 
         let mut first_error: Option<Error> = None;
 
-        if !self.options.read_only
+        if !self.read_only
             && !inner.active_memtable.is_empty()
             && let Err(e) = self.freeze_and_flush(&mut inner)
         {
             first_error = Some(e);
         }
 
-        if !self.options.read_only
+        if !self.read_only
             && let Some(ref mut wal) = inner.wal_writer
             && let Err(e) = wal.sync()
             && first_error.is_none()
@@ -2958,7 +2967,7 @@ impl DB {
 
     /// Signal background compaction threads (non-blocking).
     fn signal_compaction(&self) {
-        if self.options.read_only {
+        if self.read_only {
             return;
         }
         let (lock, cvar) = &*self.compaction_notify;
@@ -3046,7 +3055,7 @@ impl DB {
     /// Periodically check read-level samples and generate compaction hints.
     /// Called every 1024 reads from get_with_options.
     fn maybe_check_read_compaction(&self) {
-        if self.options.read_only {
+        if self.read_only {
             return;
         }
         let count = self.read_counter.fetch_add(1, Ordering::Relaxed);
@@ -3082,7 +3091,7 @@ impl DB {
 
     fn check_writable(&self) -> Result<()> {
         self.check_usable()?;
-        if self.options.read_only {
+        if self.read_only {
             return Err(Error::read_only());
         }
         Ok(())

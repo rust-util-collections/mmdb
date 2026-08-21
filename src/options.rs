@@ -11,13 +11,6 @@ pub type SkipPointFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 /// Database-level options.
 #[derive(Clone)]
 pub struct DbOptions {
-    /// Open an existing database without acquiring write capability.
-    ///
-    /// Read-only mode never creates, truncates, appends, syncs, renames, or
-    /// removes files in the store directory. Disk-mutating methods return
-    /// [`crate::ErrorKind::ReadOnly`]. The database must already exist;
-    /// [`Self::create_if_missing`] and [`Self::error_if_exists`] are ignored.
-    pub read_only: bool,
     /// Create the database if it does not already exist.
     ///
     /// Existence is defined by the `CURRENT` marker (same as
@@ -130,7 +123,6 @@ pub struct DbOptions {
 impl Default for DbOptions {
     fn default() -> Self {
         Self {
-            read_only: false,
             create_if_missing: true,
             error_if_exists: false,
             write_buffer_size: 64 * 1024 * 1024, // 64 MB
@@ -165,7 +157,6 @@ impl Default for DbOptions {
 impl fmt::Debug for DbOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DbOptions")
-            .field("read_only", &self.read_only)
             .field("create_if_missing", &self.create_if_missing)
             .field("error_if_exists", &self.error_if_exists)
             .field("write_buffer_size", &self.write_buffer_size)

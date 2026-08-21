@@ -76,8 +76,9 @@ compatibility policy.
 
 ## 3. Architecture
 
-Keep one `DB` type with a `read_only: bool` capability flag rather than adding
-a parallel `ReadOnlyDB` API. The read-visible state is already represented by
+Keep one `DB` type with a private `read_only: bool` capability flag rather than
+adding a parallel `ReadOnlyDB` API or changing the exhaustively constructible
+public `DbOptions` struct. The read-visible state is already represented by
 `SuperVersion`; writable resources can be absent or inert:
 
 - `DBInner::wal_writer` is already `Option<WalWriter>`;
@@ -97,43 +98,37 @@ read mutable metadata.
 ### 4.1 API and option semantics
 
 ```rust
-pub struct DbOptions {
-    // ...
-    /// Open an existing store without acquiring write capability.
-    pub read_only: bool, // default false
-}
-
 impl DB {
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(
-            DbOptions {
-                read_only: true,
-                ..DbOptions::default()
-            },
-            path,
-        )
+        Self::open_read_only_with_options(DbOptions::default(), path)
+    }
+
+    pub fn open_read_only_with_options(
+        options: DbOptions,
+        path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::open_impl(options, path, true)
     }
 }
 ```
 
-When `read_only` is true:
+The read-only entry points:
 
 - the DB must already exist; `CURRENT` missing is an error;
 - `create_if_missing` and `error_if_exists` are normalized to `false`;
 - writer-only tuning options are retained in `DbOptions` but never activate
   writer machinery or writer-only validation;
-- callers needing non-default read/cache settings use `DB::open` with
-  `read_only: true`.
+- callers needing non-default read/cache settings use
+  `DB::open_read_only_with_options`.
 
-Adding a public `DbOptions` field is a Rust source-compatibility change for
-downstream exhaustive struct literals. Release notes must call this out; a
-major-version boundary is required if the project promises strict source
-compatibility for such construction.
+Keeping the mode out of `DbOptions` preserves source compatibility for
+downstream exhaustive struct literals. `DB::open` remains the writable entry
+point; the private `open_impl` receives the capability explicitly.
 
 ### 4.2 Three-phase open
 
 ```text
-open(options, path)
+open_impl(options, path, read_only)
   ├─ preflight_and_lock(path, mode)
   │    RW: create directory if allowed; create/open LOCK RW; flock(EX)
   │    RO: require CURRENT; open existing LOCK read-only; flock(SH)
@@ -206,7 +201,7 @@ separate guard:
 ```rust
 fn check_writable(&self) -> Result<()> {
     self.check_usable()?;
-    if self.options.read_only {
+    if self.read_only {
         return Err(Error::read_only());
     }
     Ok(())
@@ -267,9 +262,10 @@ continues to fail open exactly as it does in writable mode.
 
 ## 6. Implementation phases
 
-1. **Capability seams, no writable behavior change.** Add `read_only`,
-   `ErrorKind::ReadOnly`, `check_writable`, and fail-closed optional MANIFEST
-   writer semantics. Keep the writable open flow byte-for-byte equivalent.
+1. **Capability seams, no writable behavior change.** Add the private DB
+   `read_only` capability, `ErrorKind::ReadOnly`, `check_writable`, and
+   fail-closed optional MANIFEST writer semantics. Keep the writable open flow
+   byte-for-byte equivalent.
 2. **Split open without reordering the lock.** Extract preflight/lock and
    recovery helpers, still exercising only the writable mode in tests.
 3. **Construct read-only state.** Add shared/read-only lock handling, explicit
