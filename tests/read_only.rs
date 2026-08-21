@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fs, path::Path, process::Command, time::SystemTime};
+use std::{collections::BTreeMap, fs, path::Path, time::SystemTime};
+
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 use mmdb::{DB, DbOptions, ErrorKind, WriteBatch};
 
