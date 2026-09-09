@@ -7,5 +7,5 @@ Simplicity = stable, deterministic execution — not shorter text.
 
 - **Keep signal**: explicit names, file:line evidence, safety steps that remove guesswork.
 - **Cut variance**: duplicate truth, discretionary branches, rework without new evidence, speculative features, risk-free ceremony.
-- **Keep controls**: one-issue-one-commit, worktree ownership, adversarial refutation, crash evidence, final gates.
+- **Keep controls**: one-issue-one-commit, worktree ownership, independent checks of findings against existing guards, crash evidence, final gates.
 - **Admit only improvements that name the ambiguity or failure they remove.**

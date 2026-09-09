@@ -2,6 +2,9 @@
 
 Evidence standard and subsystem map. Apply `pragmatic-engineering.md`: only
 findings/process that remove a concrete failure mode.
+Use `workflow-policy.md`'s neutral task framing in every agent request and
+returned finding. Report the storage operation and expected/actual results;
+do not substitute a different scenario for the code path being reviewed.
 
 ## 1. Context
 

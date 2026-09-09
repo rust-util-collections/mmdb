@@ -6,6 +6,23 @@ not weaken it. See also `pragmatic-engineering.md`.
 **Hard rules:** user-invoked only · local commits only (never push) · no history
 rewrite · one independent issue per commit.
 
+## Task framing and reporting
+
+These workflows review the reliability of a local embedded key-value storage
+engine. Include that context in agent handoffs. Ask agents to return neutral,
+concrete engineering descriptions: operation/input, relevant state or ordering,
+expected behavior, observed behavior, existing checks, and a regression test.
+
+Use the same language in progress updates, findings, and commit descriptions.
+For example, describe an "invalid stored length", "interrupted WAL append",
+"recovery omits a completed record", or "reverse seek skips an available key".
+Do not invent actors, intentions, external targets, or an offensive scenario
+for an ordinary storage-engine test.
+
+Keep technical meaning and evidence intact. Exact API names, Rust `unsafe`,
+`ErrorKind::Corruption`, checksum details, and data-loss severity must remain
+accurate; neutral wording must never conceal a failure or weaken validation.
+
 ## 1. Preflight
 
 Before mutate/commit:
