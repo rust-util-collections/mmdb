@@ -12,12 +12,6 @@
 
 ## Open
 
-### [HIGH] read path: sequence capture can precede the retained file view
-- **Where**: `src/db.rs` (`get_with_options`, `iter_with_range`, `iter_with_prefix`, `iter_with_batch`)
-- **What**: Ordinary reads resolve their sequence before pinning a SuperVersion.
-- **Why**: A concurrent overwrite, flush, and non-bottommost compaction can discard the version at that sequence before the reader loads its file view. The remaining newer version is filtered out, so an always-present key can appear absent. Ordinary reads do not register a snapshot.
-- **Suggested fix**: Pin the SuperVersion before resolving the committed sequence on every read constructor; exercise the publication gap deterministically.
-
 ### [HIGH] iterator: backward heap construction reopens exhausted sources
 - **Where**: `src/iterator/merge.rs` (`init_heap`), `src/iterator/level_iter.rs` (failed backward seek)
 - **What**: Backward heap initialization issues forward prefetch/peek operations even though backward seeks have already positioned each source.

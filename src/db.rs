@@ -450,6 +450,12 @@ fn collect_tombstones_overlapping_bounds(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_READ_VIEW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 // Test-only seam for deterministically racing a concurrent write against
 // `prune_settled_dead_keys`'s window between its unlocked absence probe and
 // its locked re-verify-and-remove step. Thread-local (not a `DB` field) so
@@ -1507,10 +1513,10 @@ impl DB {
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.check_usable().ctx()?;
 
-        let seq = self.resolve_read_sequence(options.snapshot);
-
-        // Lock-free read via SuperVersion.
+        // Pin the files/memtables before selecting visibility: compaction
+        // may otherwise remove the captured sequence before we retain its data.
         let sv = self.get_super_version();
+        let seq = self.resolve_read_sequence(options.snapshot);
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
@@ -1716,10 +1722,10 @@ impl DB {
     ) -> Result<DBIterator> {
         self.check_usable().ctx()?;
 
-        let seq = self.resolve_read_sequence(options.snapshot);
-
-        // Lock-free read: use SuperVersion instead of locking inner.
+        // Pin the files/memtables before selecting visibility: compaction
+        // may otherwise remove the captured sequence before we retain its data.
         let sv = self.get_super_version();
+        let seq = self.resolve_read_sequence(options.snapshot);
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
@@ -1923,21 +1929,10 @@ impl DB {
     /// Set `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to further
     /// restrict iteration to a sub-range inside the prefix.
     pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator> {
-        let seq = self.resolve_read_sequence(options.snapshot);
-        self.iter_with_prefix_inner(prefix, seq, options)
-    }
-
-    /// Create a prefix-bounded iterator at a specific sequence number.
-    fn iter_with_prefix_inner(
-        &self,
-        prefix: &[u8],
-        seq: SequenceNumber,
-        options: &ReadOptions,
-    ) -> Result<DBIterator> {
         self.check_usable().ctx()?;
 
-        // Lock-free read via SuperVersion.
         let sv = self.get_super_version();
+        let seq = self.resolve_read_sequence(options.snapshot);
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
@@ -2134,6 +2129,7 @@ impl DB {
     pub fn iter_with_batch(&self, batch: &WriteBatchWithIndex) -> Result<DBIterator> {
         self.check_usable().ctx()?;
 
+        let sv = self.get_super_version();
         let seq = self.current_sequence();
         let batch_count = batch.operation_count();
         // Reserve the top of the sequence space for the batch overlay.
@@ -2153,8 +2149,6 @@ impl DB {
         }
         let batch_entries = batch.sorted_entries(batch_base_seq).ctx()?;
 
-        // Lock-free read via SuperVersion.
-        let sv = self.get_super_version();
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
@@ -3016,6 +3010,10 @@ impl DB {
 
     /// Get the current SuperVersion snapshot — single atomic load, truly lock-free.
     fn get_super_version(&self) -> arc_swap::Guard<Arc<SuperVersion>> {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_READ_VIEW.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
         self.super_version.load()
     }
 
@@ -4338,6 +4336,93 @@ impl Drop for Snapshot<'_> {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+
+    #[test]
+    fn read_view_precedes_sequence_during_compaction() {
+        for constructor in 0..4 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Arc::new(
+                DB::open(
+                    DbOptions {
+                        l0_compaction_trigger: usize::MAX,
+                        l0_slowdown_trigger: usize::MAX,
+                        l0_stop_trigger: usize::MAX,
+                        ..Default::default()
+                    },
+                    dir.path(),
+                )
+                .unwrap(),
+            );
+            // Keep the race deterministic: this test drives compaction itself.
+            {
+                let (lock, cv) = &*db.compaction_notify;
+                let _guard = lock.lock().unwrap();
+                db.compaction_shutdown.store(true, Ordering::Release);
+                cv.notify_all();
+            }
+            for handle in db.compaction_handles.lock().drain(..) {
+                handle.join().unwrap();
+            }
+            db.put(b"a", b"lower").unwrap();
+            db.put(b"z", b"lower").unwrap();
+            db.flush().unwrap();
+            // A lower-level extent forces the later m compaction to retain
+            // sequence numbers without containing an older value of m itself.
+            {
+                let mut inner = db.inner.lock();
+                let file = inner.versions.current().level_files(0)[0].meta.clone();
+                let mut edit = VersionEdit::new();
+                edit.delete_file(0, file.number);
+                edit.add_file(2, file);
+                inner.versions.log_and_apply(edit).unwrap();
+                inner.versions.sync_manifest().unwrap();
+                db.install_super_version(&inner);
+            }
+            db.put(b"m", b"old").unwrap();
+            db.flush().unwrap();
+            let old_seq = db.current_sequence();
+            let writer = db.clone();
+            BEFORE_READ_VIEW.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    writer.put(b"m", b"new").unwrap();
+                    writer.flush().unwrap();
+                    writer.drain_l0(true).unwrap();
+                    let version = writer.inner.lock().versions.current();
+                    assert!(version.level_files(0).is_empty());
+                    assert!(version.level_files(1).iter().all(|file| {
+                        file.reader
+                            .get_internal_with_seq(b"m", old_seq, false)
+                            .unwrap()
+                            .is_none()
+                    }));
+                }));
+            });
+            let options = ReadOptions {
+                snapshot: Some(u64::MAX),
+                ..Default::default()
+            };
+            let value = match constructor {
+                0 => db.get_with_options(&options, b"m").unwrap(),
+                _ => {
+                    let mut iter = match constructor {
+                        1 => db
+                            .iter_with_range(&options, Some(b"m"), Some(b"n"))
+                            .unwrap(),
+                        2 => db.iter_with_prefix(b"m", &options).unwrap(),
+                        _ => db.iter_with_batch(&WriteBatchWithIndex::new()).unwrap(),
+                    };
+                    let value = iter.find(|(key, _)| key == b"m").map(|(_, value)| value);
+                    assert!(iter.error().is_none());
+                    value
+                }
+            };
+            assert_eq!(
+                value.as_deref(),
+                Some(b"new".as_slice()),
+                "constructor {constructor}"
+            );
+        }
+    }
 
     #[test]
     fn dead_key_sweep_scheduler_preserves_requests_queued_while_running() {
