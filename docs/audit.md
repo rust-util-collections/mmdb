@@ -18,6 +18,12 @@
 - **Why**: When a middle record has an incorrect stored length, its read can include a later checksum-valid record ending in zero, or extend beyond EOF. Recovery then accepts the prefix and can delete the WAL or truncate the MANIFEST containing the later committed state.
 - **Suggested fix**: Before allowing tail recovery, check the failed payload's actual consumed bytes for later checksum-valid physical fragments; preserve ordinary torn/zero-extended tail recovery and test both failure shapes through WAL and MANIFEST recovery.
 
+### [CRITICAL] MANIFEST: failure publication can race a later durability confirmation
+- **Where**: `src/db.rs` (`confirm_manifest_durable`), `src/manifest/version_set.rs` (`log_and_apply`, `sync_manifest`, MANIFEST rotation)
+- **What**: A failed append or sync releases the MANIFEST writer lock before publishing poison. A concurrent confirmation can acquire the writer, successfully sync, observe no poison, and authorize input/WAL deletion in that gap.
+- **Why**: Background compaction workers confirm durability outside the DB mutex using the same writer handle. Checks before acquiring the writer do not serialize with the failed operation; a later successful sync cannot establish durability of records affected by the earlier failure.
+- **Suggested fix**: Publish failure while holding the writer guard and recheck poison under that guard before every append/sync; deterministically exercise overlapping confirmations and queued appends.
+
 ### [HIGH] read path: sequence capture can precede the retained file view
 - **Where**: `src/db.rs` (`get_with_options`, `iter_with_range`, `iter_with_prefix`, `iter_with_batch`)
 - **What**: Ordinary reads resolve their sequence before pinning a SuperVersion.
@@ -30,17 +36,29 @@
 - **Why**: With `b"b"` in L1 and `b"a\xff"` in the memtable, reverse prefix seeks for `b"a\xff"` reopen the out-of-range L1 source. Its key triggers the prefix stop before the matching memtable key is returned.
 - **Suggested fix**: Populate forward buffers only in forward mode; backward heaps must use the buffers seeded by backward positioning. Test reverse prefix seeks and exhausted single/multiple sources.
 
-### [MEDIUM] iterator: lazy bidirectional wrapping loses a buffered entry
+### [MEDIUM] iterator: lazy bidirectional wrapping loses or widens the remaining range
 - **Where**: `src/iterator/bidi_iter.rs` (first lazy `next_back`), `src/iterator/db_iter.rs` (`ensure_current`, `last_user_key`)
 - **What**: The backward frontier uses the last examined user key as if it had already been consumed.
-- **Why**: `valid()` or `key()` buffers a visible entry without returning it. Wrapping that iterator in `BidiIterator::lazy` then excludes the buffered key, so a one-key iterator becomes empty.
+- **Why**: `valid()` or `key()` buffers a visible entry without returning it. Wrapping that iterator in `BidiIterator::lazy` then excludes the buffered key, so a one-key iterator becomes empty. A pending, uninspected `seek(b"b")` instead leaves no frontier and reverse iteration reintroduces earlier keys.
 - **Suggested fix**: Preserve the inclusive boundary of buffered entries separately from the exclusive boundary of consumed entries; test wrapping after inspection and after consumption.
 
 ### [MEDIUM] write path: a maximum-sized range deletion cannot be flushed
 - **Where**: `src/db.rs` (`write_batch_inner`), `src/sst/table_builder.rs` (range-deletion metadata limit), `src/types.rs` (write limits)
 - **What**: The generic write-entry limit exceeds the range-deletion metadata budget by 4096 bytes.
 - **Why**: An otherwise valid range deletion near `MAX_WRITE_ENTRY_SIZE` can be acknowledged into the WAL, then cause every flush and writable recovery to return an error because its single metadata entry exceeds `META_BLOCK_HARD_LIMIT`.
-- **Suggested fix**: Validate a range-specific payload ceiling before WAL/sequence assignment, tie it to the builder's framing allowance, and test atomic rejection plus a flushable boundary entry.
+- **Suggested fix**: Validate a range-specific payload ceiling before WAL/sequence assignment, leaving room for both framing and metadata below the output-split threshold. A nearly full single-entry budget also fails when a small distinct-begin tombstone precedes it. Test atomic rejection and flush/recovery at the admitted boundary.
+
+### [MEDIUM] cache: eviction can leave reverse-index entries after cached blocks are gone
+- **Where**: `src/cache/block_cache.rs` (`BlockCache::insert`, eviction listener)
+- **What**: Cache insertion precedes reverse-index registration. Eviction can remove the offset before registration occurs, leaving an offset with no cached block and no future eviction callback.
+- **Why**: Concurrent inserts of two-byte blocks into a one-byte cache produced zero cached blocks but retained reverse offsets after all maintenance completed. These offsets persist until file invalidation or member detach and are not bounded by cache capacity.
+- **Suggested fix**: Register the offset before insertion can invoke eviction, without holding reverse-index locks through cache callbacks; add a deterministic eviction-order regression.
+
+### [MEDIUM] SST: final collector properties can produce an unreadable index block
+- **Where**: `src/sst/table_builder.rs` (`flush_data_block`, `write_raw_block`), `src/options.rs` (`BlockPropertyCollector`)
+- **What**: Properties from the final data block are added after the last metadata projection check. Finishing the builder can report success for an index larger than the reader's 64 MiB block limit.
+- **Why**: One tiny key with 1024 collectors, each returning a legal 65,535-byte property and a five-byte name, produces a 67,117,114-byte index. Flush and recovery reject that output when opening it; pre-install reader validation preserves the WAL. Individual property-length checks do not bound their aggregate.
+- **Suggested fix**: Validate aggregate index metadata after collector output is available and enforce the encoded block limit before compression/writing. Document that excessive collector metadata returns `InvalidArgument` and test the final-block path.
 
 ### [LOW] CI: read-only integration tests are never executed
 - **Where**: `.github/workflows/ci.yml` (`test` job)
@@ -127,17 +145,17 @@
 - **Claim**: Replacing the borrowed `&ikey[..uk_len]` with `uk.to_vec()` allocates once per entry examined during backward iteration.
 - **Reason**: The allocation is forced by the borrow checker, not incidental: the loop moves `ikey` into `prev_overshoot` and into `best_entry` while `uk` is still live. The same function already clones the user key into `candidate_uk` and `current_bound` on the normal path, so the added cost is one small `Vec` per examined entry on a path that already performs per-entry block decoding and clones — not a material change in path class, and no benchmark shows a regression.
 
-### [MEDIUM] WAL: `WalWriter` needs a `Drop` impl to avoid losing buffered records
+### WAL: `WalWriter` needs a `Drop` impl to avoid losing buffered records
 - **Where**: `src/wal/writer.rs`
 - **What**: Claim: `BufWriter` discards its buffer on drop, so a `WalWriter` dropped without an explicit flush silently loses up to one buffer of records.
 - **Reason**: The premise is false — `std::io::BufWriter`'s `Drop` flushes the buffer (only errors are ignored, per its documentation). Independently, every commit path flushes or syncs the WAL before acknowledging a write, so drop-time behavior only concerns unacknowledged data on panic unwind.
 
-### [MEDIUM] memtable: range tombstones evade `approximate_size` accounting
+### memtable: range tombstones evade `approximate_size` accounting
 - **Where**: `src/memtable/mod.rs`
 - **What**: Claim: valid `delete_range(begin, end)` entries with `begin < end` are nearly free in `approximate_size()`, so their volume never triggers a flush.
 - **Reason**: `MemTable::put` accounts the duplicated begin/end keys plus `MemRangeTombstone` struct overhead for every valid `RangeDeletion` entry, in addition to the skiplist entry itself. Empty/inverted ranges are removed in `write_batch_inner` before WAL encoding and sequence assignment.
 
-### [MEDIUM] write path: group-commit queue depth is unbounded
+### write path: group-commit queue depth is unbounded
 - **Where**: `src/db.rs` (`WriteQueueState`)
 - **What**: Claim: the `VecDeque<*mut WriteRequest>` grows without limit, allowing unbounded memory growth under write pressure.
 - **Reason**: Each queue entry is a raw pointer to a *blocked* caller's stack frame; a thread enqueues at most one request and then waits on the condvar until the leader completes it. Queue depth therefore equals the number of concurrently blocked writer threads — the caller's thread budget — and cannot accumulate beyond it.
