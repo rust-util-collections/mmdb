@@ -1,6 +1,6 @@
-# Workflow Safety and Atomic Commit Policy
+# Reliability Review and Atomic Commit Policy
 
-SSOT safety for `/x-review`, `/x-commit`, `/x-fix`, `/x-overhaul`. Skills must
+Shared workflow rules for `/x-review`, `/x-commit`, `/x-fix`, `/x-overhaul`. Skills must
 not weaken it. See also `pragmatic-engineering.md`.
 
 **Hard rules:** user-invoked only · local commits only (never push) · no history
@@ -16,12 +16,30 @@ expected behavior, observed behavior, existing checks, and a regression test.
 Use the same language in progress updates, findings, and commit descriptions.
 For example, describe an "invalid stored length", "interrupted WAL append",
 "recovery omits a completed record", or "reverse seek skips an available key".
-Do not invent actors, intentions, external targets, or an offensive scenario
-for an ordinary storage-engine test.
+Describe the actual local operation and result. Do not invent actors, intentions,
+or external targets for an ordinary storage-engine test.
 
 Keep technical meaning and evidence intact. Exact API names, Rust `unsafe`,
 `ErrorKind::Corruption`, checksum details, and data-loss severity must remain
 accurate; neutral wording must never conceal a failure or weaken validation.
+This applies equally to task titles, agent prompts, test descriptions, tool-call
+summaries, registry entries, and final reports. Use the user's language for
+conversation; preserve identifiers and code verbatim.
+
+### Review-agent handoffs
+
+Prefer a fresh, narrowly scoped agent context (`fork_turns="none"` when that
+option is available). Supply the repository path, assigned files, applicable
+shared guides, current baseline, and the concrete review question. Summarize
+relevant verified facts instead of forwarding the entire conversation. Use the
+handoff and response templates in `review-core.md`; agents read those guides
+before reviewing their assigned files.
+
+A new session derives scope and status from the current checkout and
+`docs/audit.md`, not from another session's completion claims. A failed or
+incomplete agent run does not establish coverage: record the remaining work
+and complete it locally or report the actual limitation. Do not speculate
+about a tool/service failure or reproduce unrelated service notices in handoffs.
 
 ## 1. Preflight
 
@@ -65,12 +83,12 @@ One issue / root cause / behavior change → one commit.
 - Unit-caused failure → fix before commit. Pre-existing failure → report with evidence, never claim success.
 - Same failure repeats with no progress → stop and report.
 
-## 5. Audit dispositions
+## 5. Finding dispositions
 
 | state | meaning |
 |-------|---------|
 | Open | confirmed, actionable |
-| Won't Fix | real; safe fix currently disproportionate |
-| Rejected | material claim disproven (not a severity). Skip routine noise. |
+| Won't Fix | confirmed; a complete fix currently has disproportionate cost or regression risk |
+| Rejected | material concern ruled out by code or test evidence (not a severity). Skip routine noise. |
 
 Evidence only — no dates or “last reviewed” markers.

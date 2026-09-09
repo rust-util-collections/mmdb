@@ -22,7 +22,7 @@ duplicated range-del entry). Severe undercount → late flush/OOM. `approximate_
 
 ## Bug patterns
 
-**Bad memory order (tech 6.1)** — Relaxed publish of next before payload visible.
+**Bad memory order (tech 6.1)** — Relaxed publication of next before node contents are visible.
 **Arena padding** — track alignment in size.
 **Dup full key** — should be impossible (unique seq); define behavior if not.
 

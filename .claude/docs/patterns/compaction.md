@@ -38,7 +38,7 @@ normal and forced.
 
 ## Bug patterns
 
-**Zombies (tech 4.1):** tombdrop non-bottommost; key still deeper.
+**Deleted key reappears (tech 4.1):** tombstone removed above bottommost while an older value remains deeper.
 **Stall:** compact holds `db_mutex` waiting on work that needs it — release before I/O.
 **Rate limiter:** burst + no indefinite block.
 **Bottommost range:** union of **all** input extents (`add_file_extents`), not per-file only.

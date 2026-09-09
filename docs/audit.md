@@ -1,4 +1,4 @@
-# Audit Findings
+# Storage-Engine Review Findings
 
 > Auto-managed by /x-review and /x-fix.
 >
@@ -12,10 +12,10 @@
 
 ## Open
 
-### [CRITICAL] WAL/MANIFEST: tail classification can discard later complete records
+### [CRITICAL] WAL/MANIFEST: tail recovery can omit later complete records
 - **Where**: `src/wal/reader.rs` (`read_physical_record`), `src/db.rs` and `src/manifest/version_set.rs` (recovery)
-- **What**: Failed physical reads classify a zero-suffixed payload or an EOF short read as a torn tail without inspecting the bytes already consumed under the untrusted length.
-- **Why**: An enlarged middle-record length can consume a later checksum-valid record ending in zero, or extend beyond EOF. Recovery then accepts the prefix and can delete the WAL or truncate the MANIFEST containing the later committed state.
+- **What**: Failed physical reads classify a zero-suffixed payload or an EOF short read as a torn tail without inspecting the bytes already consumed under the invalid stored length.
+- **Why**: When a middle record has an incorrect stored length, its read can include a later checksum-valid record ending in zero, or extend beyond EOF. Recovery then accepts the prefix and can delete the WAL or truncate the MANIFEST containing the later committed state.
 - **Suggested fix**: Before allowing tail recovery, check the failed payload's actual consumed bytes for later checksum-valid physical fragments; preserve ordinary torn/zero-extended tail recovery and test both failure shapes through WAL and MANIFEST recovery.
 
 ### [HIGH] read path: sequence capture can precede the retained file view
@@ -39,7 +39,7 @@
 ### [MEDIUM] write path: a maximum-sized range deletion cannot be flushed
 - **Where**: `src/db.rs` (`write_batch_inner`), `src/sst/table_builder.rs` (range-deletion metadata limit), `src/types.rs` (write limits)
 - **What**: The generic write-entry limit exceeds the range-deletion metadata budget by 4096 bytes.
-- **Why**: An otherwise valid range deletion near `MAX_WRITE_ENTRY_SIZE` can be acknowledged into the WAL, then fail every flush and writable recovery because its single metadata entry exceeds `META_BLOCK_HARD_LIMIT`.
+- **Why**: An otherwise valid range deletion near `MAX_WRITE_ENTRY_SIZE` can be acknowledged into the WAL, then cause every flush and writable recovery to return an error because its single metadata entry exceeds `META_BLOCK_HARD_LIMIT`.
 - **Suggested fix**: Validate a range-specific payload ceiling before WAL/sequence assignment, tie it to the builder's framing allowance, and test atomic rejection plus a flushable boundary entry.
 
 ### [LOW] CI: read-only integration tests are never executed
@@ -86,7 +86,7 @@
 ### [MEDIUM] API: `WriteBatch` has no entry-count or aggregate-size cap
 - **Where**: `src/types.rs` (WriteBatch), `src/db.rs` (`write_batch_inner`)
 - **What**: A caller can assemble arbitrarily large batches; the write path encodes the whole batch as one WAL record and applies it under the write lock.
-- **Reason**: Batch memory is allocated by the caller before `write()` is ever reached, so an engine-side cap cannot protect the process — it only adds config surface. The per-entry caps and WAL u32 entry-count guard bound individual encodings; the transient WAL-encode duplication is bounded by the caller's own batch size. Per-user-key SST metadata accumulation is a separate limitation below.
+- **Reason**: Batch memory is allocated by the caller before `write()` is ever reached, so an engine-side cap cannot protect the process — it only adds config surface. The per-entry caps and WAL u32 entry-count guard bound individual encodings; the transient WAL-encode duplication is bounded by the caller's own batch size. Per-user-key SST metadata accumulation is a separate limitation recorded below.
 
 ### [MEDIUM] SST: metadata for one user key can exceed a single-file limit
 - **Where**: `src/db.rs` (`write_memtable_ssts`), `src/sst/table_builder.rs` (`projected_index_size`, range-deletion accounting)

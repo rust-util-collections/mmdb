@@ -1,4 +1,4 @@
-# Unsafe Code Audit
+# Rust Pointer and Concurrency Review
 
 ## Live concentration
 
@@ -16,7 +16,7 @@ Safe parsing in `block`/`format`/`types` is ordinary review unless new unsafe ap
 - Present and specific (prereqs named)
 - Prereqs checkable from nearby code
 
-### 2. UB checklist
+### 2. Pointer validity checklist (undefined behavior / UB)
 
 | | Check |
 |-|-------|
@@ -49,15 +49,15 @@ Safe parsing in `block`/`format`/`types` is ordinary review unless new unsafe ap
 - No transmute in tree today — any new one is high scrutiny
 - Same size/validity/align/lifetime if added
 
-## Risk
+## Review priority
 
-| Location | Risk | Why |
+| Location | Priority | Why |
 |----------|------|-----|
 | skiplist_impl | CRITICAL | concurrent raw layout |
 | skiplist | HIGH | deref + Send |
 | db | HIGH | pointer protocol, Send/Sync, lock |
 | table_reader | LOW | advisory fadvise |
 
-## Red flags
+## Conditions requiring detailed review
 No SAFETY · transmute size mismatch · unchecked `from_raw_parts` · Relaxed pointer
 publish without another edge · `Box::from_raw` on possibly freed · public unsafe without `# Safety`.

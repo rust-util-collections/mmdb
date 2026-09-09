@@ -12,7 +12,7 @@ whole-key + prefix blooms; 48B footer (metaindex, index, magic); None/LZ4/Zstd.
 **S2 Restarts** — offsets of shared=0 entries; correct interval.
 **S3 Handles** — index/meta (offset,size) match on-disk after compression header.
 **S4 Bloom** — no false negative: same hash + probe count builder/reader.
-**S5 Compress round-trip** — type byte before payload; matching decompress path.
+**S5 Compress round-trip** — type byte before encoded block data; matching decompress path.
 **S6 Magic** — validate before trusting footer handles.
 
 ## Bug patterns
@@ -20,7 +20,7 @@ whole-key + prefix blooms; 48B footer (metaindex, index, magic); None/LZ4/Zstd.
 **Off-by-one shared_len (tech 2.4)** — rest of block wrong. Test 0/1/full prefixes.
 **Index seek** — first block with last_key ≥ target.
 **Hash seed mismatch** — same double-hash `h1 + i*h2`.
-**Decompress size** — cap by max block size (untrusted length).
+**Decompress size** — cap by max block size before accepting the stored length.
 
 ## Checklist
 

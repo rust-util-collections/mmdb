@@ -1,6 +1,6 @@
 # MMDB Design Anti-Patterns
 
-Design lens for reviews. Language/protocol bugs: `technical-patterns.md`, `patterns/*`.
+Design lens for reviews. Language/protocol behavior checks: `technical-patterns.md`, `patterns/*`.
 Report only with a concrete failure; apply `false-positive-guide.md` first.
 
 | Prefix | Question |
@@ -35,7 +35,7 @@ Skip documented single-writer + intentional snapshot reads unless a multi-writer
 - **2** Unbounded concurrency when fan-out can grow with L0.
 - **3** Retry/compaction without budget that amplifies load.
 - **4** Hot-path full-file materialization when streaming/blocks suffice.
-- **5** Expensive work before a cheap reject (corrupt/range/options).
+- **5** Expensive work before checking stored fields, ranges, or options.
 
 ## D-STATE
 
@@ -49,7 +49,7 @@ Skip documented single-writer + intentional snapshot reads unless a multi-writer
 
 - **1** Durability side effect dropped after log/catch while reporting success.
 - **2** Partial success returned as full success.
-- **3** Silent degrade (checksum ignored; corrupt table as empty).
+- **3** Incorrect success result (checksum not checked; unreadable table returned as empty).
 - **4** Distinct failures collapsed (retry vs fatal unclear).
 - **5** Crash mid-protocol → unrecoverable or lying on-disk state.
 

@@ -1,6 +1,6 @@
 ---
 name: x-commit
-description: Review, fix, validate, and commit MMDB worktree changes as atomic commits. Use only when the user explicitly invokes /x-commit.
+description: Check MMDB worktree changes for correctness, fix confirmed issues, validate, and create atomic local commits. Use only when the user explicitly invokes /x-commit.
 disable-model-invocation: true
 ---
 
@@ -10,6 +10,11 @@ Review owned worktree changes → fix confirmed defects → validate → local c
 Never push. User-invoked only. New commits only (no amend/rebase/force-push).
 
 ## Setup
+
+Review local embedded-storage behavior using the neutral task/report language
+in [workflow-policy.md](../../docs/workflow-policy.md). Any review agents use
+the scoped handoff and evidence templates in
+[review-core.md](../../docs/review-core.md).
 
 Read `workflow-policy.md`, `commit-protocol.md`, `pragmatic-engineering.md`,
 `review-core.md`, `technical-patterns.md`, `false-positive-guide.md`;
@@ -31,7 +36,7 @@ design-shaped → `design-patterns.md`. Preflight + ledger (incl. **frozen paths
 
 Map guides → full functions/callers/errors/tests → invariants, crash, concurrency,
 unsafe, quantified hot-path perf, design (if any), placeholders, public API →
-refute via FP guide → fix completely + regression → re-review until clean. No-progress
+check existing guards via FP guide → fix completely + regression → re-review until clean. No-progress
 loop → stop and report.
 
 Investigate parallel OK; edit/commit sequential.

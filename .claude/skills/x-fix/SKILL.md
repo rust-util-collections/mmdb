@@ -1,15 +1,20 @@
 ---
 name: x-fix
-description: Resolve the MMDB audit backlog sequentially, with one finding per validated local commit. Use only when the user explicitly invokes /x-fix.
+description: Resolve confirmed MMDB reliability findings sequentially, with one finding per validated local commit. Use only when the user explicitly invokes /x-fix.
 disable-model-invocation: true
 ---
 
-# Fix the MMDB Audit Backlog
+# Resolve MMDB Reliability Findings
 
 Clear actionable `docs/audit.md` Open → self-review → local commits. Never push.
 User-invoked only. New commits only.
 
 ## Setup
+
+Review local embedded-storage behavior using the neutral task/report language
+in [workflow-policy.md](../../docs/workflow-policy.md). Any review agents use
+the scoped handoff and evidence templates in
+[review-core.md](../../docs/review-core.md).
 
 Read `workflow-policy.md`, `commit-protocol.md`, `pragmatic-engineering.md`,
 `review-core.md`, `technical-patterns.md`, `false-positive-guide.md`.
@@ -20,7 +25,7 @@ Preflight + ledger (freeze paths as work proceeds). Empty Open → “nothing to
 ### 1. Triage (CRITICAL → LOW)
 
 Per entry before edit: code/callers/tests + guides (+ `design-patterns.md` if design);
-reproduce from current code; dedupe root causes; false → Rejected; real but unsafe/disproportionate → Won't Fix + reason.
+reproduce from current code; dedupe root causes; ruled out by evidence → Rejected; confirmed but a complete correction has disproportionate cost or regression risk → Won't Fix + reason.
 
 ### 2. One finding → one commit (blocking)
 

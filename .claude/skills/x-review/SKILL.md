@@ -1,16 +1,21 @@
 ---
 name: x-review
-description: Deep regression review of MMDB changes or the full repository. Use only when the user explicitly invokes /x-review.
+description: Review correctness, recovery, and resource behavior in MMDB changes or the full repository. Use only when the user explicitly invokes /x-review.
 argument-hint: "[N | all | staged | worktree | <hash> | <hash1>..<hash2>] [--fix]"
 disable-model-invocation: true
 ---
 
-# Deep Regression Review for MMDB
+# MMDB Storage-Engine Reliability Review
 
 High-signal review. Code read-only unless `--fix`; may update only
 `docs/audit.md`. Never commit or push. User-invoked only.
 
 ## Setup
+
+Review local embedded-storage behavior using the neutral task/report language
+in [workflow-policy.md](../../docs/workflow-policy.md). Any review agents use
+the scoped handoff and evidence templates in
+[review-core.md](../../docs/review-core.md).
 
 Read: `workflow-policy.md`, `pragmatic-engineering.md`, `technical-patterns.md`,
 `review-core.md` (Subsystem Map), `false-positive-guide.md`. Design-shaped /
@@ -47,7 +52,7 @@ fixes after report. Historical scope: only still-present HEAD defects.
 ### Phase 2 — Evidence
 
 Small single-subsystem → review direct. Agents only if context split helps
-(read-only; exact scope + guides + high-signal rule).
+(read-only; fresh scoped context + shared handoff template + applicable guides).
 
 Non-trivial dimensions (minimum sufficient):
 
@@ -59,21 +64,23 @@ Non-trivial dimensions (minimum sufficient):
 `all`: disjoint subsystem batches (each Rust file one owner); cross-subsystem +
 design only for gaps. fmt/compile/clippy → tools, not agents.
 
-Each candidate: location + invariant · realistic trigger · wrong outcome · why
-guards fail · minimal fix + test. Drop style, speculation, FP hits.
+Each candidate: location + invariant · concrete conditions · expected/observed
+results · existing checks · minimal correction + test. Drop style-only notes,
+speculation, and candidates already covered by existing checks.
 
 ### Phase 3 — Verify
 
-Orchestrator re-reads and tries to **refute**. One independent verifier only if
-still ambiguous. Voting ≠ proof. Keep only code-demonstrable items; merge same
-root cause.
+The parent re-reads the relevant code and checks whether existing guards or
+caller constraints already explain the result. Use one independent verifier
+only if still ambiguous. Agreement is not proof. Keep only code-demonstrable
+items; merge findings with the same root cause.
 
 ### Phase 4 — Completeness
 
 Diff: every changed file, public contract, failure path, relevant test.
-`all`: ledger vs depth results; critic only uncovered files/invariants. No rework.
+`all`: ledger vs depth results; additional review only for uncovered files/invariants. No rework.
 
-### Phase 5 — Audit registry
+### Phase 5 — Findings registry
 
 Update `docs/audit.md` from current code:
 
@@ -89,8 +96,8 @@ Update `docs/audit.md` from current code:
 ## Open
 ### [SEVERITY] subsystem: summary
 - **Where**: file:line_range
-- **What**: defect
-- **Why**: trigger, outcome, invariant
+- **What**: expected behavior and observed difference
+- **Why**: concrete conditions, invariant, and existing checks
 - **Suggested fix**: direction
 
 ## Won't Fix
@@ -104,11 +111,11 @@ Update `docs/audit.md` from current code:
 
 ### Phase 6 — Report
 
-Scope, coverage, findings (severity, loc, trigger, outcome, fix). Zero → say so
+Scope, coverage, findings (severity, location, conditions, expected/observed results, correction). Zero → say so
 + what was covered.
 
 ### Phase 7 — `--fix` only
 
-Sequential fixes; preserve baseline; stop on unsafe overlap. Regression tests +
+Sequential fixes; preserve baseline; stop when overlap cannot be separated from existing work. Regression tests +
 smallest validate per fix; re-review; update audit. No version/commit/push —
 user runs `/x-commit` after inspect.

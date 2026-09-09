@@ -1,6 +1,7 @@
-# MMDB Technical Bug Patterns
+# MMDB Storage-Engine Correctness Patterns
 
-LSM-Tree / Rust bug catalog. Load before review or debug.
+LSM-Tree / Rust behavior checks. Load before review or debugging.
+Describe findings using the shared conditions/expected/observed template.
 
 ## 1. Concurrency & atomicity
 
@@ -26,7 +27,7 @@ Latest-state paths must revalidate under DB lock before install (e.g. `install_c
 ### 1.4 Iterator ownership regression
 **Pattern:** Borrow MemTable/SST without holding owning Arc across flush/compact/evict.
 **Where:** `db_iter.rs`, `merge.rs`.
-**Impact:** UAF / garbage.
+**Impact:** Reads access storage whose lifetime has ended or return incorrect bytes.
 **Check:** Safe paths own Arcs + pin SV. Report only real borrow/raw regression — not unlink/evict while Arc lives.
 
 ## 2. Data integrity
@@ -46,7 +47,7 @@ Latest-state paths must revalidate under DB lock before install (e.g. `install_c
 ### 2.3 CRC scope
 **Pattern:** CRC misses type byte, or compressbound vs verify-after-decompress mismatch.
 **Where:** `wal/record|writer|reader`.
-**Impact:** Silent corrupt recovery.
+**Impact:** Recovery accepts a record with inconsistent stored bytes.
 **Check:** `crc32(type || payload)` writer=reader.
 
 ### 2.4 Block prefix compression
@@ -66,7 +67,7 @@ Latest-state paths must revalidate under DB lock before install (e.g. `install_c
 ### 3.1 FD leak on open error
 **Pattern:** SST open fails mid-construct; FD escapes Drop.
 **Where:** `TableReader::open_with_all`.
-**Impact:** FD exhaustion under corrupt files.
+**Impact:** Repeated failures to open invalid files exhaust available descriptors.
 **Check:** Owned `File` + RAII (current: low risk unless raw-fd refactor).
 
 ### 3.2 WAL accumulation
@@ -91,7 +92,7 @@ Latest-state paths must revalidate under DB lock before install (e.g. `install_c
 
 ### 4.1 Premature tombstone drop
 **Pattern:** Non-bottommost drops tombstone; key still lower.
-**Impact:** Zombie keys.
+**Impact:** Previously deleted keys become readable again.
 **Check:** Keep unless bottommost **and** no covering snapshot.
 
 ### 4.2 Seq zero wrong level

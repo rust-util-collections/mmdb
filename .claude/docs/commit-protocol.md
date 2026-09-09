@@ -26,11 +26,11 @@ freeze set + this-invocation fix/format paths.
    - docs-only → none;
    - one subsystem → its filter + relevant integration binary;
    - `db.rs` / write / compaction / manifest / cross-cutting → `cargo test`;
-   - crash-safety → include `cargo test --test crash_recovery` unless already covered by a full `cargo test`.
+   - interrupted-write/recovery behavior → include `cargo test --test crash_recovery` unless already covered by a full `cargo test`.
 4. On fail: fix if caused by the unit; else report pre-existing with evidence. No empty gates or infinite loops.
 5. Stage exact freeze + unit fix/format paths — never `git add -A`.
 6. `git diff --cached` = exactly one unit, no baseline/post-freeze paths.
-7. Match repo commit style; HEREDOC multi-line; no co-author/generated-by.
+7. Match repo commit style and the shared neutral reporting language; HEREDOC multi-line; no co-author/generated-by.
 8. Verify commit; compare `git status --short` to baseline.
 
 Never amend a prior commit for a later fix.

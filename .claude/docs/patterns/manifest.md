@@ -14,7 +14,7 @@ Validate before append; after install, rotation deferred/poison — never ambigu
 
 **MAN3 Fail-stop poison** — failed MANIFEST append/sync, new-SST dir sync, or post-CURRENT dir sync → poison until reopen where documented. Shared poison; public ops observe it.
 
-**MAN4 Recovery ≡ live apply** — same file set/counters. Exact-level deletes; delete-before-add for trivial move; reject dups/level mismatch/missing SST; torn zero-pad tail only. Open only files live after full replay.
+**MAN4 Recovery ≡ live apply** — same file set/counters. Exact-level deletes; delete-before-add for trivial move; reject dups/level mismatch/missing SST; incomplete zero-padded final append only. Open only files live after full replay.
 
 **MAN5 IDs monotonic** — file# / seq never reuse or regress. Max-forward apply; `ensure_file_number_at_least` for parallel reserve.
 
@@ -31,7 +31,7 @@ post dir-sync fail poison (no switch-back / divergence).
 - [ ] SST+dir before MANIFEST durability
 - [ ] Ambiguous write/sync → consistent poison
 - [ ] Recovery = live invariants
-- [ ] Torn-tail cannot hide later valid records
+- [ ] Tail recovery must retain every later complete record
 - [ ] Allocators/last-seq never regress
 - [ ] CURRENT tmp/sync/rename/install/dir order
 - [ ] Old MANIFEST delete only after durable CURRENT

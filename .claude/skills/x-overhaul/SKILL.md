@@ -1,13 +1,13 @@
 ---
 name: x-overhaul
-description: Audit MMDB (full repo or scoped range), resolve findings safely, and create atomic local commits. Use only when the user explicitly invokes /x-overhaul.
+description: Review MMDB storage-engine correctness (full repo or scoped range), resolve confirmed findings, and create atomic local commits. Use only when the user explicitly invokes /x-overhaul.
 argument-hint: "[N | all | staged | worktree | <hash> | <hash1>..<hash2>]"
 disable-model-invocation: true
 ---
 
-# MMDB Audit-Fix-Commit Pipeline
+# MMDB Review-Fix-Commit Pipeline
 
-Review scope → dispose every confirmed finding → fix actionable → local commits.
+Review scope → record a disposition for every confirmed finding → fix actionable items → local commits.
 Unlike `/x-review`, always fixes and commits (no `--fix`). Never push.
 User-invoked only. New commits only.
 
@@ -25,6 +25,11 @@ this run changed.
 
 ## Setup
 
+Review local embedded-storage behavior using the neutral task/report language
+in [workflow-policy.md](../../docs/workflow-policy.md). Any review agents use
+the scoped handoff and evidence templates in
+[review-core.md](../../docs/review-core.md).
+
 Preflight (`workflow-policy.md`); `pragmatic-engineering.md`; read `x-review` +
 `x-fix` skills + `commit-protocol.md`; ledger before mutations.
 
@@ -33,7 +38,7 @@ Preflight (`workflow-policy.md`); `pragmatic-engineering.md`; read `x-review` +
 `/x-review <scope>` without `--fix`:
 
 1. Coverage: full ledger (`all`) or diff+callers.
-2. Agents with disjoint ownership when needed; `all` → each Rust file once in depth.
+2. Read-only agents with disjoint ownership when needed, using the shared handoff template; `all` → each Rust file once in depth.
 3. Cross-subsystem / design / completeness only for depth gaps.
 4. Verify + dedupe.
 5. Update `docs/audit.md` (`all` re-evals all sections; narrow scopes prune/merge
@@ -43,7 +48,7 @@ Preflight (`workflow-policy.md`); `pragmatic-engineering.md`; read `x-review` +
 ## Phase 2 — Resolve
 
 Full `/x-fix` on Phase-1 (and still-applicable Open) findings: severity order;
-safe complete fix or Won't Fix/Rejected; one root cause per commit; mutations
+complete validated fix or evidence-backed Won't Fix/Rejected; one root cause per commit; mutations
 sequential; re-review changed files only. Correctness > open-count cosmetics.
 Out-of-scope Open untouched.
 

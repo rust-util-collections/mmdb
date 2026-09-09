@@ -39,16 +39,22 @@ Project skills live under `.claude/skills/<name>/SKILL.md` and are
 user-invocable only.
 
 - `/x-review` — deep regression analysis of recent changes
-- `/x-fix` — fix audit backlog: resolve `docs/audit.md` → self-review → commit
+- `/x-fix` — resolve recorded findings: resolve `docs/audit.md` → self-review → commit
 - `/x-commit` — self-reviewing commit: review uncommitted changes → fix → commit
-- `/x-overhaul` — audit-fix-commit pipeline (full repo or scoped like `/x-review`)
+- `/x-overhaul` — review-fix-commit pipeline (full repo or scoped like `/x-review`)
+
+All four workflows follow the neutral task/report wording in
+[workflow-policy.md](.claude/docs/workflow-policy.md). Review local storage
+operations and expected/observed results. Use the scoped agent handoff in
+[review-core.md](.claude/docs/review-core.md); pass only relevant repository
+context, and preserve precise Rust/API terms and finding severity.
 
 Supporting docs (`.claude/docs/`):
-- `workflow-policy.md` — worktree safety, one-issue-one-commit
+- `workflow-policy.md` — neutral task framing, scoped handoffs, worktree ownership, atomic commits
 - `pragmatic-engineering.md` — root goal, low variance
 - `technical-patterns.md` / `design-patterns.md` — LSM bugs + D-\* design lens
-- `review-core.md` — evidence standard + Subsystem Map
-- `false-positive-guide.md` — suppress noise
+- `review-core.md` — evidence/report templates + Subsystem Map
+- `false-positive-guide.md` — check existing guarantees before recording findings
 - `commit-protocol.md` — validate → commit → version/tag
 - `patterns/*` — per-subsystem checklists
 

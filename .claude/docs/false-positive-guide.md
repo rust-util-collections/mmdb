@@ -1,11 +1,13 @@
-# MMDB False Positive Guide
+# MMDB Checks Before Recording a Finding
 
-Match before reporting. Suppress, or say why the rule does not apply.
+Check these existing guarantees before reporting. Omit a candidate they already
+cover, or explain why the guarantee does not cover the described conditions.
 
 ## FP-1: Safe Rust ownership
 
-**Skip:** UAF/double-free/dangling in safe Rust (no `unsafe`/raw ptr).
-**Keep:** Logical UAF (e.g. index into Vec after mutation).
+**Skip:** Freed-storage access, repeated deallocation, or invalid references
+claimed in safe Rust without an `unsafe`/raw-pointer path.
+**Keep:** Stale logical positions (e.g. an index into a Vec after mutation).
 
 ## FP-2: Continuous lock
 
@@ -30,8 +32,9 @@ Focus on semantics clippy cannot see.
 
 ## FP-6: Advice without downside
 
-No pure “consider”. Need wrong result, crash, or leak scenario.
-Bad: “add bounds check”. Good: “corrupt SST prefix_len > key.len() panics on slice”.
+No unsupported “consider” advice. Name an observable result.
+Vague: “add bounds check”. Concrete: “stored SST prefix_len > key.len() causes
+a slice panic instead of returning a decoding error”.
 
 ## FP-7: Test code standards
 

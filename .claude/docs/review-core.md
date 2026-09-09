@@ -32,7 +32,7 @@ One primary row per Rust file. Concurrency/unsafe are overlays.
 Guides under `.claude/docs/patterns/`. Tests/benches/CI/docs/`.claude` → map to
 the subsystem they cover; check alignment.
 
-## 2. Risk (effort, not a finding)
+## 2. Review priority (effort, not a finding)
 
 | Class | Examples | Default |
 |-------|----------|---------|
@@ -46,16 +46,16 @@ the subsystem they cover; check alignment.
 
 ## 3. Evidence
 
-For each risky change:
+For each change requiring detailed review:
 
 1. Name the invariant (mapped guide).
-2. Build a realistic trigger (input, order, crash, corrupt boundary).
+2. Describe concrete conditions (input, operation order, interrupted write, invalid stored field).
 3. Trace full path (callers, cleanup, existing guards).
-4. State outcome: wrong value, loss, corruption, panic, leak, deadlock, or **quantified** hot-path cost.
+4. State the observed result: incorrect value, missing persisted data, unreadable record, panic, retained resource, blocked operation, or **quantified** hot-path cost.
 5. Note smallest regression test that would fail pre-fix.
 
 **Boundaries:** empty/single entry, first/last block keys, restarts, L0 limits,
-snapshots, malformed disk data, max sizes, partial I/O errors.
+snapshots, invalid stored fields, max sizes, partial I/O errors.
 
 **Concurrency:** Build lock/atomic protocol from code. Cycles, guard lifetime,
 publication, wait predicates, shutdown. `Relaxed` OK for counter/hints; Acquire/Release only when a happens-before edge is required.
@@ -83,10 +83,10 @@ fmt / compile / clippy → tools, not agents. Still LOW if tools miss:
 
 - no `#[allow(...)]`
 - import repeated paths; group prefixes
-- public docs + `CLAUDE.md` + this map + guides stay aligned
+- public docs + `AGENTS.md` / `CLAUDE.md` + this map + guides stay aligned
 - every unsafe has accurate `// SAFETY:`
 
-## 5. Audit (`docs/audit.md`)
+## 5. Findings registry (`docs/audit.md`)
 
 - Prune fixed in-scope `Open`.
 - Re-check `Won't Fix` / `Rejected` when cited code/callers/assumptions/subsystem
@@ -98,10 +98,12 @@ fmt / compile / clippy → tools, not agents. Still LOW if tools miss:
 ```text
 [SEVERITY] subsystem: summary
 WHERE: file:line_range
-TRIGGER: input/order/failure
-OUTCOME: observable wrong behavior
-WHY: invariant + why guards fail
-FIX: minimal direction + regression test
+CONDITIONS: local input, operation order, or interrupted I/O
+EXPECTED: required storage-engine behavior
+OBSERVED: code-demonstrated or test-observed result
+CHECKS: relevant invariant and why existing checks do not cover these conditions
+CHANGE: minimal correction
+TEST: regression case and actual execution status
 ```
 
 - **CRITICAL**: loss/corruption, UB, memory safety, unrecoverable durability
@@ -111,7 +113,31 @@ FIX: minimal direction + regression test
 
 Observations ≠ `## Open`.
 
+## Agent handoff and response
+
+Use this compact handoff, filling only the relevant fields:
+
+```text
+Task: Review local MMDB storage-engine reliability in the assigned files.
+Repository: <absolute path>
+Baseline and scope: <HEAD, scope, existing changes to preserve>
+Assigned files: <exact, disjoint file list>
+Read first: <absolute paths to workflow-policy.md, review-core.md,
+             false-positive-guide.md, and applicable subsystem guides>
+Mode: Read-only investigation; no repository edits or commits.
+Question: <the behavior or invariants to check>
+Evidence already available: <relevant verified facts, or none>
+Return: Files actually reviewed; confirmed expected/observed differences
+using the finding template; existing checks that ruled out candidates;
+applicable registry dispositions; work still incomplete.
+```
+
+For a test result, state the setup, operation sequence, expected output, actual
+output, and command run. Distinguish executed tests from code tracing and
+proposed tests. Do not use speculative intent or a dramatic narrative to
+explain an ordinary concurrency, decoding, or recovery case.
+
 ## Quality gate
 
-Concrete trigger + outcome only. Refute via `false-positive-guide.md`. Agent
-agreement and pattern IDs are not proof.
+Concrete conditions and expected/observed results only. Check each finding
+against `false-positive-guide.md`. Agent agreement and pattern IDs are not proof.
