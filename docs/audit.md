@@ -12,12 +12,6 @@
 
 ## Open
 
-### [MEDIUM] write path: a maximum-sized range deletion cannot be flushed
-- **Where**: `src/db.rs` (`write_batch_inner`), `src/sst/table_builder.rs` (range-deletion metadata limit), `src/types.rs` (write limits)
-- **What**: The generic write-entry limit exceeds the range-deletion metadata budget by 4096 bytes.
-- **Why**: An otherwise valid range deletion near `MAX_WRITE_ENTRY_SIZE` can be acknowledged into the WAL, then cause every flush and writable recovery to return an error because its single metadata entry exceeds `META_BLOCK_HARD_LIMIT`.
-- **Suggested fix**: Validate a range-specific payload ceiling before WAL/sequence assignment, leaving room for both framing and metadata below the output-split threshold. A nearly full single-entry budget also fails when a small distinct-begin tombstone precedes it. Test atomic rejection and flush/recovery at the admitted boundary.
-
 ### [MEDIUM] cache: eviction can leave reverse-index entries after cached blocks are gone
 - **Where**: `src/cache/block_cache.rs` (`BlockCache::insert`, eviction listener)
 - **What**: Cache insertion precedes reverse-index registration. Eviction can remove the offset before registration occurs, leaving an offset with no cached block and no future eviction callback.
@@ -79,7 +73,7 @@
 ### [MEDIUM] SST: metadata for one user key can exceed a single-file limit
 - **Where**: `src/db.rs` (`write_memtable_ssts`), `src/sst/table_builder.rs` (`projected_index_size`, range-deletion accounting)
 - **What**: Output splitting waits for a user-key boundary. Four versions of one 8 MiB key under the default 4 KiB block size can exceed the index budget while remaining below the default memtable threshold. Multiple large range tombstones sharing one begin key can similarly exceed their metadata block budget. Writes can be acknowledged before flush and writable recovery reject the oversized metadata.
-- **Reason**: WAL data remains intact, and read-only recovery can inspect it. Larger `block_size` can recover the point-version case; ordinary small vsdb keys do not approach it. A general fix requires per-key admission accounting across writes/recovery or a format and lookup change permitting same-key metadata to span files. Those changes are disproportionate for this unusual key/endpoint workload; the independently fixable single-range-entry boundary remains actionable above.
+- **Reason**: WAL data remains intact, and read-only recovery can inspect it. Larger `block_size` can recover the point-version case; ordinary small vsdb keys do not approach it. A general fix requires per-key admission accounting across writes/recovery or a format and lookup change permitting same-key metadata to span files. Those changes are disproportionate for this unusual key/endpoint workload; single-range admission now reserves framing and split headroom, but repeated begin keys can still exceed the aggregate budget.
 
 ### [MEDIUM] API: snapshots and iterators are uncapped pinning resources
 - **Where**: `src/db.rs` (`SnapshotList`, iterator constructors)

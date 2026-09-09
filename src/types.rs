@@ -27,11 +27,19 @@ pub const MAX_SEQUENCE_NUMBER: SequenceNumber = (1 << 56) - 1;
 /// builder splits output files when the aggregate index grows large.
 pub const MAX_USER_KEY_SIZE: usize = 8 * 1024 * 1024;
 
-/// Maximum allowed user key + value payload for a single write entry.
+/// Maximum allowed user key + value payload for a single point-write entry.
+/// Range deletions use the smaller [`MAX_RANGE_DELETE_SIZE`] limit.
 ///
 /// Mirrors the table builder's per-entry limit (one entry plus framing must
 /// fit in a readable 64 MiB block), minus the 8-byte internal-key trailer.
 pub const MAX_WRITE_ENTRY_SIZE: usize = 64 * 1024 * 1024 - 64 - 8;
+
+/// Maximum combined begin + end length for a range deletion (33,550,264 bytes).
+///
+/// Reserves room for metadata already below the 32 MiB SST split threshold,
+/// the internal-key trailer, and entry framing in the range-deletion block.
+/// Writes above this limit return `InvalidArgument` before WAL/sequence changes.
+pub const MAX_RANGE_DELETE_SIZE: usize = 32 * 1024 * 1024 - 4096 - 64 - 8;
 
 /// Operation type stored in the low 8 bits of the packed trailer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

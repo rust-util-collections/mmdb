@@ -64,5 +64,6 @@ pub use options::{
 };
 pub use sst::format::CompressionType;
 pub use types::{
-    MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, WriteBatch, WriteBatchWithIndex,
+    MAX_RANGE_DELETE_SIZE, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, WriteBatch,
+    WriteBatchWithIndex,
 };

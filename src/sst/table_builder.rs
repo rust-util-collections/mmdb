@@ -42,6 +42,10 @@ const META_ENTRY_OVERHEAD: usize = 64;
 const _: () = {
     assert!(crate::types::MAX_WRITE_ENTRY_SIZE + 8 <= MAX_DECOMPRESSED_BLOCK_SIZE - 64);
     assert!(
+        crate::types::MAX_RANGE_DELETE_SIZE + 8 + META_ENTRY_OVERHEAD + META_BLOCK_SPLIT_THRESHOLD
+            <= META_BLOCK_HARD_LIMIT
+    );
+    assert!(
         2 * (crate::types::MAX_USER_KEY_SIZE + 8) + META_ENTRY_OVERHEAD
             <= META_BLOCK_SPLIT_THRESHOLD
     );

@@ -39,8 +39,8 @@ use crate::sst::table_builder::{
 use crate::sst::table_reader::{PreparedBlockPin, TableIterator};
 use crate::stats::DbStats;
 use crate::types::{
-    self, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, ValueType,
-    WriteBatch, WriteBatchWithIndex, tombstone_overlaps_bounds,
+    self, MAX_RANGE_DELETE_SIZE, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE,
+    SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex, tombstone_overlaps_bounds,
 };
 use crate::wal::{WalReader, WalWriter};
 
@@ -1474,6 +1474,7 @@ impl DB {
     }
 
     /// Delete all keys in the range [begin, end).
+    /// The combined endpoint length must not exceed [`MAX_RANGE_DELETE_SIZE`].
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()> {
         self.delete_range_with_options(&WriteOptions::default(), begin, end)
     }
@@ -3211,11 +3212,16 @@ impl DB {
                 )));
             }
             let val_len = entry.value.as_ref().map_or(0, |v| v.len());
-            if entry.key.len().saturating_add(val_len) > MAX_WRITE_ENTRY_SIZE {
+            let limit = if entry.value_type == ValueType::RangeDeletion {
+                MAX_RANGE_DELETE_SIZE
+            } else {
+                MAX_WRITE_ENTRY_SIZE
+            };
+            if entry.key.len().saturating_add(val_len) > limit {
                 return Err(Error::invalid_argument(format!(
                     "entry size {} (key + value) exceeds maximum {}",
                     entry.key.len() + val_len,
-                    MAX_WRITE_ENTRY_SIZE
+                    limit
                 )));
             }
         }
@@ -4336,6 +4342,79 @@ impl Drop for Snapshot<'_> {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+
+    #[test]
+    fn oversized_range_delete_rejects_batch_before_wal_and_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.put(b"existing", b"value").unwrap();
+        let sequence = db.sequence.load(Ordering::Acquire);
+        let wal_path = dir
+            .path()
+            .join(format!("{:06}.wal", db.inner.lock().wal_number));
+        let wal_before = fs::read(&wal_path).unwrap();
+        let mut batch = WriteBatch::new();
+        batch.put(b"new", b"value");
+        batch.delete_range(b"a", &vec![b'z'; MAX_RANGE_DELETE_SIZE]);
+        assert_eq!(
+            db.write(batch).unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(db.sequence.load(Ordering::Acquire), sequence);
+        assert_eq!(fs::read(wal_path).unwrap(), wal_before);
+        assert_eq!(db.get(b"new").unwrap(), None);
+        assert_eq!(
+            db.get(b"existing").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+        db.put(b"after", b"accepted").unwrap();
+    }
+
+    #[test]
+    fn boundary_range_delete_flushes_with_existing_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            write_buffer_size: 512 * 1024 * 1024,
+            block_cache_capacity: 0,
+            pin_l0_filter_and_index_blocks_in_cache: false,
+            l0_compaction_trigger: usize::MAX,
+            ..Default::default()
+        };
+        let db = DB::open(options.clone(), dir.path()).unwrap();
+        for key in [b"a1", b"b1", b"c1", b"z1"] {
+            db.put(key, b"value").unwrap();
+        }
+        let snapshot = db.snapshot();
+        // The first two tombstones leave metadata exactly one byte below
+        // the split threshold. The boundary entry must still fit that file.
+        let budget = META_BLOCK_SPLIT_THRESHOLD - 1;
+        for (begin, projected) in [(b'a', budget / 2), (b'b', budget - budget / 2)] {
+            let end = vec![begin; projected - 8 - 64 - 1];
+            db.delete_range(&[begin], &end).unwrap();
+        }
+        db.delete_range(b"c", &vec![b'c'; MAX_RANGE_DELETE_SIZE - 1])
+            .unwrap();
+        db.flush().unwrap();
+        for key in [b"a1", b"b1", b"c1"] {
+            assert_eq!(db.get(key).unwrap(), None);
+            assert_eq!(
+                db.get_with_options(&snapshot.read_options(), key)
+                    .unwrap()
+                    .as_deref(),
+                Some(b"value".as_slice())
+            );
+        }
+        db.compact().unwrap();
+        assert_eq!(db.get(b"z1").unwrap().as_deref(), Some(b"value".as_slice()));
+        drop(snapshot);
+        db.simulate_crash();
+        let recovered = DB::open(options, dir.path()).unwrap();
+        assert_eq!(recovered.get(b"c1").unwrap(), None);
+        assert_eq!(
+            recovered.get(b"z1").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+    }
 
     #[test]
     fn read_view_precedes_sequence_during_compaction() {
