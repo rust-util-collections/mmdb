@@ -2427,3 +2427,50 @@ fn reverse_prefix_keeps_exhausted_level_out_of_heap() {
     assert_eq!(iter.next(), Some((b"a\xff".to_vec(), b"mem".to_vec())));
     assert!(iter.next().is_none());
 }
+
+#[test]
+fn lazy_bidi_preserves_the_remaining_frontier() {
+    use mmdb::BidiIterator;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    for key in [b"a", b"b", b"c", b"d"] {
+        db.put(key, key).unwrap();
+    }
+    for preparation in 0..5 {
+        for alternate in [false, true] {
+            let mut iter = db.iter().unwrap();
+            if preparation == 4 {
+                assert_eq!(iter.next().unwrap().0, b"a");
+            } else {
+                iter.seek(b"b");
+                match preparation {
+                    1 => assert!(iter.valid()),
+                    2 => assert_eq!(iter.key(), Some(b"b".as_slice())),
+                    3 => assert_eq!(iter.value(), Some(b"b".as_slice())),
+                    _ => {}
+                }
+            }
+            let mut bidi = BidiIterator::lazy(iter);
+            assert_eq!(bidi.next_back().unwrap().0, b"d");
+            if alternate {
+                assert_eq!(bidi.next().unwrap().0, b"b");
+                assert_eq!(bidi.next_back().unwrap().0, b"c");
+            } else {
+                assert_eq!(bidi.next_back().unwrap().0, b"c");
+                assert_eq!(bidi.next_back().unwrap().0, b"b");
+            }
+            assert!(bidi.next_back().is_none());
+            assert!(bidi.next().is_none());
+            assert!(bidi.error().is_none());
+        }
+    }
+    let mut only = db
+        .iter_with_range(&ReadOptions::default(), Some(b"b"), Some(b"c"))
+        .unwrap();
+    assert!(only.valid());
+    let mut bidi = BidiIterator::lazy(only);
+    assert_eq!(bidi.next_back().unwrap().0, b"b");
+    assert!(bidi.next_back().is_none());
+    assert!(bidi.next().is_none());
+}

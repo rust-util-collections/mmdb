@@ -12,12 +12,6 @@
 
 ## Open
 
-### [MEDIUM] iterator: lazy bidirectional wrapping loses or widens the remaining range
-- **Where**: `src/iterator/bidi_iter.rs` (first lazy `next_back`), `src/iterator/db_iter.rs` (`ensure_current`, `last_user_key`)
-- **What**: The backward frontier uses the last examined user key as if it had already been consumed.
-- **Why**: `valid()` or `key()` buffers a visible entry without returning it. Wrapping that iterator in `BidiIterator::lazy` then excludes the buffered key, so a one-key iterator becomes empty. A pending, uninspected `seek(b"b")` instead leaves no frontier and reverse iteration reintroduces earlier keys.
-- **Suggested fix**: Preserve the inclusive boundary of buffered entries separately from the exclusive boundary of consumed entries; test wrapping after inspection and after consumption.
-
 ### [MEDIUM] write path: a maximum-sized range deletion cannot be flushed
 - **Where**: `src/db.rs` (`write_batch_inner`), `src/sst/table_builder.rs` (range-deletion metadata limit), `src/types.rs` (write limits)
 - **What**: The generic write-entry limit exceeds the range-deletion metadata budget by 4096 bytes.

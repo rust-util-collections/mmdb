@@ -229,6 +229,15 @@ impl DBIterator {
         effective.to_vec()
     }
 
+    /// Tighten the inclusive lower bound, retaining the existing upper bound.
+    pub(crate) fn set_lower_bound(&mut self, bound: Vec<u8>) {
+        let lower = match self.iterate_lower_bound.take() {
+            Some(previous) => previous.max(bound),
+            None => bound,
+        };
+        self.set_bounds(Some(lower), self.iterate_upper_bound.clone());
+    }
+
     /// Set an exclusive upper bound on user keys.
     /// Iteration stops when user key >= this bound.
     /// Models RocksDB's `ReadOptions::iterate_upper_bound`.

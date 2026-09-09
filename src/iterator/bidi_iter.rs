@@ -63,7 +63,8 @@ impl BidiIterator {
         }
     }
 
-    /// Create a lazy streaming iterator from a DBIterator.
+    /// Create a lazy streaming iterator over the DBIterator's remaining entries.
+    /// Inspected but unconsumed entries and any current seek position are preserved.
     pub fn lazy(db_iter: DBIterator) -> Self {
         Self {
             inner: BidiInner::Lazy {
@@ -225,7 +226,12 @@ impl DoubleEndedIterator for BidiIterator {
                 }
             }
             BidiInner::Lazy { forward_only, .. } if *forward_only => None,
-            BidiInner::Lazy { .. } => {
+            BidiInner::Lazy { db_iter, .. } => {
+                // Resolve the remaining front without consuming it. last_user_key
+                // also names inspected entries and cannot be an exclusive bound.
+                // Returning here on exhaustion retains the iterator and its error.
+                let first_remaining = db_iter.key()?.to_vec();
+                db_iter.set_lower_bound(first_remaining);
                 // First next_back(): use seek_to_last() for O(log N) access.
                 // This is the hot path for vsdb's `last()` = `iter().next_back()`.
                 let placeholder = BidiInner::Materialized {
@@ -238,9 +244,6 @@ impl DoubleEndedIterator for BidiIterator {
                     unreachable!()
                 };
 
-                // Snapshot last_user_key before seek_to_last destroys it
-                let last_fwd_key = db_iter.last_user_key().map(|k| k.to_vec());
-
                 db_iter.seek_to_last();
                 // Every path below restores `db_iter` into `LazyBackStarted`
                 // before returning — including exhaustion/error and the
@@ -252,7 +255,7 @@ impl DoubleEndedIterator for BidiIterator {
                 if !db_iter.valid() {
                     self.inner = BidiInner::LazyBackStarted(LazyBidiState {
                         db_iter,
-                        last_fwd_key,
+                        last_fwd_key: None,
                         last_back_key: None,
                     });
                     return None;
@@ -263,36 +266,22 @@ impl DoubleEndedIterator for BidiIterator {
                     // `db_iter`.
                     self.inner = BidiInner::LazyBackStarted(LazyBidiState {
                         db_iter,
-                        last_fwd_key,
+                        last_fwd_key: None,
                         last_back_key: None,
                     });
                     return None;
                 };
-                // If forward iteration already consumed this key (or past it),
-                // there is nothing left to yield from the back; otherwise we would
-                // re-yield a key already returned by next(). Mirrors the frontier
-                // check in the LazyBackStarted branch.
-                if let Some(fk) = last_fwd_key.as_deref()
-                    && k.as_slice() <= fk
-                {
-                    self.inner = BidiInner::LazyBackStarted(LazyBidiState {
-                        db_iter,
-                        last_fwd_key,
-                        last_back_key: Some(k),
-                    });
-                    return None;
-                }
                 let Some(v) = db_iter.value().map(|v| v.to_vec()) else {
                     self.inner = BidiInner::LazyBackStarted(LazyBidiState {
                         db_iter,
-                        last_fwd_key,
+                        last_fwd_key: None,
                         last_back_key: Some(k),
                     });
                     return None;
                 };
                 self.inner = BidiInner::LazyBackStarted(LazyBidiState {
                     db_iter,
-                    last_fwd_key,
+                    last_fwd_key: None,
                     last_back_key: Some(k.clone()),
                 });
 
