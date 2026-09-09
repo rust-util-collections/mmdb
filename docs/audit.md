@@ -12,12 +12,6 @@
 
 ## Open
 
-### [MEDIUM] SST: final collector properties can produce an unreadable index block
-- **Where**: `src/sst/table_builder.rs` (`flush_data_block`, `write_raw_block`), `src/options.rs` (`BlockPropertyCollector`)
-- **What**: Properties from the final data block are added after the last metadata projection check. Finishing the builder can report success for an index larger than the reader's 64 MiB block limit.
-- **Why**: One tiny key with 1024 collectors, each returning a legal 65,535-byte property and a five-byte name, produces a 67,117,114-byte index. Flush and recovery reject that output when opening it; pre-install reader validation preserves the WAL. Individual property-length checks do not bound their aggregate.
-- **Suggested fix**: Validate aggregate index metadata after collector output is available and enforce the encoded block limit before compression/writing. Document that excessive collector metadata returns `InvalidArgument` and test the final-block path.
-
 ### [LOW] CI: read-only integration tests are never executed
 - **Where**: `.github/workflows/ci.yml` (`test` job)
 - **What**: CI enumerates the integration binaries but omits `tests/read_only.rs`.

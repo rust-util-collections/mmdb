@@ -366,6 +366,12 @@ impl fmt::Debug for dyn CompactionFilter {
 
 /// Collects properties from key-value pairs during SST building.
 /// One instance per property type per SST file build.
+///
+/// Each name and serialized property must fit in 65,535 bytes, with at most
+/// 65,535 properties per block. Properties from all data blocks also share
+/// the SST's index budget with keys and framing: the builder reserves space
+/// below the reader's 64 MiB decompressed block limit. Excessive generated
+/// metadata makes the flush or compaction return `InvalidArgument`.
 pub trait BlockPropertyCollector: Send + Sync {
     /// Called for each key-value pair added to the current data block.
     fn add(&mut self, key: &[u8], value: &[u8]);

@@ -24,7 +24,10 @@ use crate::sst::{
     format::*,
     table_reader::MAX_DECOMPRESSED_BLOCK_SIZE,
 };
-use crate::types::{ValueType, compare_internal_key, decode_internal_key, user_key};
+use crate::types::{
+    MAX_RANGE_DELETE_SIZE, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, ValueType,
+    compare_internal_key, decode_internal_key, user_key,
+};
 
 /// Soft threshold at which callers that can split their output across
 /// multiple SST files (flush, compaction) should cut the current file, so
@@ -37,18 +40,15 @@ pub(crate) const META_BLOCK_SPLIT_THRESHOLD: usize = 32 * 1024 * 1024;
 const META_ENTRY_OVERHEAD: usize = 64;
 
 // Compile-time ties between the write-path limits in `types` and the SST
-// format limits enforced here: any entry the write path accepts must be
-// flushable into a readable SST.
+// format limits enforced here, reserving framing for individual entries.
+// Aggregate metadata limits are checked as the table is built.
 const _: () = {
-    assert!(crate::types::MAX_WRITE_ENTRY_SIZE + 8 <= MAX_DECOMPRESSED_BLOCK_SIZE - 64);
+    assert!(MAX_WRITE_ENTRY_SIZE + 8 <= MAX_DECOMPRESSED_BLOCK_SIZE - 64);
     assert!(
-        crate::types::MAX_RANGE_DELETE_SIZE + 8 + META_ENTRY_OVERHEAD + META_BLOCK_SPLIT_THRESHOLD
+        MAX_RANGE_DELETE_SIZE + 8 + META_ENTRY_OVERHEAD + META_BLOCK_SPLIT_THRESHOLD
             <= META_BLOCK_HARD_LIMIT
     );
-    assert!(
-        2 * (crate::types::MAX_USER_KEY_SIZE + 8) + META_ENTRY_OVERHEAD
-            <= META_BLOCK_SPLIT_THRESHOLD
-    );
+    assert!(2 * (MAX_USER_KEY_SIZE + 8) + META_ENTRY_OVERHEAD <= META_BLOCK_SPLIT_THRESHOLD);
 };
 
 /// Options for building an SST table.
@@ -425,13 +425,28 @@ impl TableBuilder {
             .map(|c| (c.name().to_string(), c.finish_block()))
             .collect();
 
-        let handle = self.write_raw_block(&block_data).ctx()?;
-        let props_size: usize = props.iter().map(|(n, d)| n.len() + d.len() + 8).sum();
-        self.index_block_projected += last_key
-            .len()
+        // Properties are only known now, including for the final data block.
+        // Validate them before publishing a block to the pending index.
+        let props_size = props.iter().fold(0usize, |total, (name, data)| {
+            total
+                .saturating_add(name.len())
+                .saturating_add(data.len())
+                .saturating_add(8)
+        });
+        let projected_index = self
+            .index_block_projected
+            .saturating_add(last_key.len())
             .saturating_add(first_key.len())
             .saturating_add(props_size)
             .saturating_add(META_ENTRY_OVERHEAD);
+        if projected_index > META_BLOCK_HARD_LIMIT {
+            return Err(Error::invalid_argument(format!(
+                "index block size {} including block properties exceeds maximum {}",
+                projected_index, META_BLOCK_HARD_LIMIT
+            )));
+        }
+        let handle = self.write_raw_block(&block_data).ctx()?;
+        self.index_block_projected = projected_index;
         self.index_entries.push(PendingIndexEntry {
             last_key,
             handle,
@@ -443,6 +458,13 @@ impl TableBuilder {
     }
 
     fn write_raw_block(&mut self, data: &[u8]) -> Result<BlockHandle> {
+        if data.len() > MAX_DECOMPRESSED_BLOCK_SIZE {
+            return Err(Error::invalid_argument(format!(
+                "encoded block size {} exceeds maximum readable block size {}",
+                data.len(),
+                MAX_DECOMPRESSED_BLOCK_SIZE
+            )));
+        }
         let (block_data, compression_type) = match self.options.compression {
             CompressionType::Lz4 => {
                 let compressed = lz4_flex::compress_prepend_size(data);
@@ -601,7 +623,55 @@ pub struct TableBuildResult {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use crate::options::BlockPropertyCollector;
     use crate::sst::table_reader::TableReader;
+
+    struct LargePropertyCollector(String);
+
+    impl BlockPropertyCollector for LargePropertyCollector {
+        fn add(&mut self, _key: &[u8], _value: &[u8]) {}
+
+        fn finish_block(&mut self) -> Vec<u8> {
+            vec![7; u16::MAX as usize]
+        }
+
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    #[test]
+    fn final_collector_properties_respect_index_limit() {
+        for count in [512, 1024] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("properties.sst");
+            let options = TableBuildOptions {
+                compression: CompressionType::Lz4,
+                block_property_collectors: (0..count)
+                    .map(|i| {
+                        Box::new(LargePropertyCollector(format!("p{i:04}")))
+                            as Box<dyn BlockPropertyCollector>
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let mut builder = TableBuilder::new(&path, options).unwrap();
+            builder.add(b"key", b"value").unwrap();
+            // Every property fits its u16 fields, but 1024 together exceed
+            // the reader's decompressed index limit, even when compressed.
+            if count == 1024 {
+                assert_eq!(
+                    builder.finish().unwrap_err().kind(),
+                    ErrorKind::InvalidArgument
+                );
+            } else {
+                builder.finish().unwrap();
+                let reader = TableReader::open(&path).unwrap();
+                assert_eq!(reader.get(b"key").unwrap(), Some(b"value".to_vec()));
+                assert_eq!(reader.iter().unwrap().len(), 1);
+            }
+        }
+    }
 
     #[test]
     fn test_build_table() {
