@@ -12,12 +12,6 @@
 
 ## Open
 
-### [CRITICAL] MANIFEST: failure publication can race a later durability confirmation
-- **Where**: `src/db.rs` (`confirm_manifest_durable`), `src/manifest/version_set.rs` (`log_and_apply`, `sync_manifest`, MANIFEST rotation)
-- **What**: A failed append or sync releases the MANIFEST writer lock before publishing poison. A concurrent confirmation can acquire the writer, successfully sync, observe no poison, and authorize input/WAL deletion in that gap.
-- **Why**: Background compaction workers confirm durability outside the DB mutex using the same writer handle. Checks before acquiring the writer do not serialize with the failed operation; a later successful sync cannot establish durability of records affected by the earlier failure.
-- **Suggested fix**: Publish failure while holding the writer guard and recheck poison under that guard before every append/sync; deterministically exercise overlapping confirmations and queued appends.
-
 ### [HIGH] read path: sequence capture can precede the retained file view
 - **Where**: `src/db.rs` (`get_with_options`, `iter_with_range`, `iter_with_prefix`, `iter_with_batch`)
 - **What**: Ordinary reads resolve their sequence before pinning a SuperVersion.

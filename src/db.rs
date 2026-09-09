@@ -26,7 +26,7 @@ use crate::iterator::db_iter::DBIterator;
 use crate::iterator::level_iter::LevelIterator;
 use crate::iterator::merge::IterSource;
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
-use crate::manifest::version_set::VersionSet;
+use crate::manifest::version_set::{VersionSet, confirm_manifest_durable};
 use crate::memtable::MemTable;
 use crate::memtable::skiplist::MemTableCursorIter;
 use crate::options::{
@@ -43,48 +43,6 @@ use crate::types::{
     WriteBatch, WriteBatchWithIndex, tombstone_overlaps_bounds,
 };
 use crate::wal::{WalReader, WalWriter};
-
-/// Confirm MANIFEST durability before unlinking inputs/WALs after an apply.
-///
-/// Fail-closed when already poisoned (e.g. rotation failed its old-writer
-/// sync while `log_and_apply` still returned Ok): a later "successful" sync
-/// can lie under fsyncgate and must not authorize cleanup.
-fn confirm_manifest_durable(
-    handle: &Arc<Mutex<Option<WalWriter>>>,
-    poisoned: &AtomicBool,
-) -> Result<()> {
-    if poisoned.load(Ordering::Acquire) {
-        return Err(Error::corruption(
-            "MANIFEST writer poisoned by an earlier write failure; \
-             reopen the database to recover"
-                .to_string(),
-        ));
-    }
-    {
-        let mut w = handle.lock();
-        if w.is_none() {
-            return Err(Error::read_only());
-        }
-        if let Some(ref mut writer) = *w
-            && let Err(e) = writer.sync()
-        {
-            // Unconfirmed durability + fsyncgate risk on later syncs.
-            drop(w);
-            poisoned.store(true, Ordering::Release);
-            return Err(e).ctx();
-        }
-    }
-    // Catch poisons published while the handle was held (or after a no-op
-    // empty-writer sync) before the caller unlinks side effects.
-    if poisoned.load(Ordering::Acquire) {
-        return Err(Error::corruption(
-            "MANIFEST writer poisoned by an earlier write failure; \
-             reopen the database to recover"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
 
 /// Maximum number of dead-key registrations probed for auto-pruning after
 /// each flush. Bounds the extra read work per pass; the probes run off the

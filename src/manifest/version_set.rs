@@ -20,6 +20,45 @@ use crate::types::{MAX_SEQUENCE_NUMBER, SequenceNumber, compare_internal_key, us
 use crate::wal::{WalReader, WalWriter};
 use parking_lot::Mutex;
 
+// Thread-local fault scheduling stays out of production and test-utils builds.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MANIFEST_APPEND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BEFORE_SYNC_POISON: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn check_manifest_poison(poisoned: &AtomicBool) -> Result<()> {
+    if poisoned.load(Ordering::Acquire) {
+        return Err(Error::corruption(
+            "MANIFEST writer poisoned by an earlier write failure; reopen the database to recover",
+        ));
+    }
+    Ok(())
+}
+
+/// Confirm durability under the same guard that publishes sync failures.
+/// A queued caller must observe poison before attempting another sync, since
+/// a later successful fsync cannot recover an earlier failed durability claim.
+pub(crate) fn confirm_manifest_durable(
+    handle: &Arc<Mutex<Option<WalWriter>>>,
+    poisoned: &AtomicBool,
+) -> Result<()> {
+    let mut writer = handle.lock();
+    let writer = writer.as_mut().ok_or_else(Error::read_only)?;
+    check_manifest_poison(poisoned)?;
+    if let Err(error) = writer.sync() {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_SYNC_POISON.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        poisoned.store(true, Ordering::Release);
+        return Err(error).ctx();
+    }
+    check_manifest_poison(poisoned)
+}
+
 /// Manages the MANIFEST file and the current Version.
 pub struct VersionSet {
     db_path: PathBuf,
@@ -393,13 +432,7 @@ impl VersionSet {
         if self.manifest_writer.lock().is_none() {
             return Err(Error::read_only());
         }
-        if self.is_poisoned() {
-            return Err(Error::corruption(
-                "MANIFEST writer poisoned by an earlier write failure; \
-                 reopen the database to recover"
-                    .to_string(),
-            ));
-        }
+        check_manifest_poison(&self.poisoned)?;
 
         // Build new version from current + edit FIRST, before persisting.
         // This ensures that if an SST fails to open, the MANIFEST is not
@@ -509,6 +542,7 @@ impl VersionSet {
             // SST directory entries) could falsely report durability of the
             // entries this one failed to persist. Poison the writer so no
             // further edits are appended; reopen to recover.
+            let _writer = self.manifest_writer.lock();
             self.poisoned.store(true, Ordering::Release);
             return Err(e).ctx();
         }
@@ -517,8 +551,13 @@ impl VersionSet {
         // Callers on hot paths should release the main lock and call
         // `sync_manifest()` separately to avoid stalling other operations.
         let encoded = edit.encode();
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_MANIFEST_APPEND.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
         {
             let mut w = self.manifest_writer.lock();
+            check_manifest_poison(&self.poisoned)?;
             if let Some(ref mut writer) = *w
                 && let Err(e) = writer.add_record(&encoded)
             {
@@ -527,8 +566,8 @@ impl VersionSet {
                 // produce mid-file corruption that recovery rejects (only
                 // *tail* corruption is tolerated). Poison the writer so no
                 // more records can follow; recovery truncates the torn tail.
-                drop(w);
                 self.poisoned.store(true, Ordering::Release);
+                drop(w);
                 return Err(e).ctx();
             }
         }
@@ -570,34 +609,7 @@ impl VersionSet {
     /// `log_and_apply` (before the referencing MANIFEST record), so this only
     /// needs to fsync the MANIFEST writer itself.
     pub fn sync_manifest(&self) -> Result<()> {
-        if self.manifest_writer.lock().is_none() {
-            return Err(Error::read_only());
-        }
-        // Already-poisoned writers must not be treated as /successfully
-        // synced/ — e.g. rotation may have failed its old-writer sync and
-        // set the flag while log_and_apply still returned Ok. A later sync
-        // can falsely report durability (fsyncgate); fail closed so callers
-        // skip input/WAL unlink.
-        if self.is_poisoned() {
-            return Err(Error::corruption(
-                "MANIFEST writer poisoned by an earlier write failure; \
-                 reopen the database to recover"
-                    .to_string(),
-            ));
-        }
-        let mut w = self.manifest_writer.lock();
-        if let Some(ref mut writer) = *w
-            && let Err(e) = writer.sync()
-        {
-            // A failed fsync may leave dirty pages marked clean (fsyncgate):
-            // a later "successful" sync would falsely report durability of
-            // the records that this sync failed to persist. Poison the writer
-            // so no further records are appended; reopen to recover.
-            drop(w);
-            self.poisoned.store(true, Ordering::Release);
-            return Err(e).ctx();
-        }
-        Ok(())
+        confirm_manifest_durable(&self.manifest_writer, &self.poisoned)
     }
 
     /// Return a handle for syncing the MANIFEST outside the main DB lock.
@@ -654,6 +666,7 @@ impl VersionSet {
     /// `log_and_apply` fails fast without applying anything; only a reopen
     /// recovers. Callers use this to distinguish a fail-stop condition from
     /// a cleanly-rejected (retryable) edit.
+    #[cfg(test)]
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
     }
@@ -738,27 +751,15 @@ impl VersionSet {
         // below turns out not to be durable (post-publish dir-fsync failure +
         // crash), recovery falls back to the old MANIFEST — which must then
         // contain everything `log_and_apply` reported as applied.
-        {
-            let mut w = self.manifest_writer.lock();
-            if let Some(ref mut writer) = *w
-                && let Err(e) = writer.sync()
-            {
-                drop(w);
-                drop(new_writer);
-                let _ = fs::remove_file(&new_manifest_path);
-                // Unlike the new-writer failures above (whose file is simply
-                // discarded), this fsync failed on the writer that stays in
-                // service: a later sync of it could falsely report durability
-                // of the records this one failed to persist (fsyncgate).
-                // Poison instead of deferring.
-                self.poisoned.store(true, Ordering::Release);
-                tracing::error!(
-                    "MANIFEST compaction could not sync the old manifest; \
-                     poisoning manifest writer (reopen the database to recover): {}",
-                    e
-                );
-                return;
-            }
+        if let Err(e) = self.sync_manifest() {
+            drop(new_writer);
+            let _ = fs::remove_file(&new_manifest_path);
+            tracing::error!(
+                "MANIFEST compaction could not sync the old manifest; \
+                 reopen the database to recover: {}",
+                e
+            );
+            return;
         }
 
         // Publish CURRENT in two phases so a post-rename fsync failure cannot
@@ -796,6 +797,7 @@ impl VersionSet {
             // MANIFEST. Both contain every applied edit thanks to the old-
             // writer sync above. Poison further edits so the two files cannot
             // diverge, and keep the old MANIFEST as the fallback.
+            let _writer = self.manifest_writer.lock();
             self.poisoned.store(true, Ordering::Release);
             tracing::error!(
                 "MANIFEST rotation could not fsync the DB directory; \
@@ -861,6 +863,85 @@ impl VersionSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
+
+    #[test]
+    fn manifest_sync_failure_blocks_following_confirmation() {
+        use crate::wal::writer::FAIL_NEXT_SYNC;
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vs = VersionSet::create(dir.path(), 7).unwrap();
+        let handle = vs.manifest_sync_handle();
+        let poison = vs.poison_flag();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let next_handle = handle.clone();
+            let next_poison = poison.clone();
+            scope.spawn(move || {
+                start_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                ready_tx.send(()).unwrap();
+                result_tx
+                    .send(confirm_manifest_durable(&next_handle, &next_poison))
+                    .unwrap();
+            });
+            let checked_handle = handle.clone();
+            BEFORE_SYNC_POISON.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    start_tx.send(()).unwrap();
+                    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(
+                        checked_handle.try_lock().is_none(),
+                        "the failed sync must retain the writer until poison is published"
+                    );
+                }));
+            });
+            FAIL_NEXT_SYNC.with(|fail| fail.set(true));
+            assert_eq!(
+                confirm_manifest_durable(&handle, &poison)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Io
+            );
+            assert_eq!(
+                result_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Corruption
+            );
+        });
+    }
+
+    #[test]
+    fn manifest_append_rechecks_concurrent_sync_failure() {
+        use crate::wal::writer::FAIL_NEXT_SYNC;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut vs = VersionSet::create(dir.path(), 7).unwrap();
+        let path = dir.path().join("MANIFEST-000001");
+        let before = fs::read(&path).unwrap();
+        let handle = vs.manifest_sync_handle();
+        let poison = vs.poison_flag();
+        BEFORE_MANIFEST_APPEND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                FAIL_NEXT_SYNC.with(|fail| fail.set(true));
+                assert!(confirm_manifest_durable(&handle, &poison).is_err());
+            }));
+        });
+        let mut edit = VersionEdit::new();
+        edit.set_last_sequence(7);
+        assert_eq!(
+            vs.log_and_apply(edit).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
+        assert_eq!(vs.last_sequence(), 0);
+        drop(vs);
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
 
     #[test]
     fn torn_manifest_payload_keeps_prefix_and_accepts_new_edits() {
@@ -944,13 +1025,10 @@ mod tests {
 
         let mut vs = VersionSet::recover_read_only_with_cache(path, 7, None).unwrap();
         assert_eq!(fs::read(&manifest_path).unwrap(), before);
-        assert_eq!(
-            vs.sync_manifest().unwrap_err().kind(),
-            crate::ErrorKind::ReadOnly
-        );
+        assert_eq!(vs.sync_manifest().unwrap_err().kind(), ErrorKind::ReadOnly);
         assert_eq!(
             vs.log_and_apply(VersionEdit::new()).unwrap_err().kind(),
-            crate::ErrorKind::ReadOnly
+            ErrorKind::ReadOnly
         );
         assert_eq!(fs::read(&manifest_path).unwrap(), before);
     }

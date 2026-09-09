@@ -7,6 +7,11 @@ use std::path::Path;
 use crate::error::{Result, ResultExt};
 use crate::wal::record::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_NEXT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// WAL writer. Appends records to a file, splitting across block boundaries.
 pub struct WalWriter {
     writer: BufWriter<File>,
@@ -94,6 +99,10 @@ impl WalWriter {
     /// Flush and fsync the WAL file.
     pub fn sync(&mut self) -> Result<()> {
         self.writer.flush().ctx()?;
+        #[cfg(test)]
+        if FAIL_NEXT_SYNC.with(|fail| fail.replace(false)) {
+            return Err(std::io::Error::other("injected WAL sync failure")).ctx();
+        }
         self.writer.get_ref().sync_all().ctx()?;
         Ok(())
     }
