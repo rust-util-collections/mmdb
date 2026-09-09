@@ -12,12 +12,7 @@
 
 ## Open
 
-### [LOW] CI: read-only integration tests are never executed
-- **Where**: `.github/workflows/ci.yml` (`test` job)
-- **What**: CI enumerates the integration binaries but omits `tests/read_only.rs`.
-- **Why**: Compilation alone does not exercise the read-only mutation guards, residual WAL recovery, or cooperative locking checks, so behavioral regressions can pass CI.
-- **Suggested fix**: Run the existing read-only integration binary in the test job.
-
+None.
 
 ---
 

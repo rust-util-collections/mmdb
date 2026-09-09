@@ -56,6 +56,7 @@ jobs:
       - run: cargo test --test bidi_debug
       - run: cargo test --test lazy_delete
       - run: cargo test --test shared_cache
+      - run: cargo test --test read_only
       # scale_profile is profiling-only and intentionally excluded.
 
   bench-compile:
