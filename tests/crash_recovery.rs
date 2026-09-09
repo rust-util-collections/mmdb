@@ -1074,3 +1074,39 @@ fn test_reopen_removes_stale_current_tmp_files() {
     );
     assert!(path.join("CURRENT").exists(), "CURRENT itself must survive");
 }
+
+#[test]
+fn enlarged_payload_preserves_later_wal_writes() {
+    for adjustment in [-1isize, 0, 17] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        for key in [b"a", b"b", b"c"] {
+            db.put_with_options(
+                &WriteOptions {
+                    sync: true,
+                    ..Default::default()
+                },
+                key,
+                b"value\0\0",
+            )
+            .unwrap();
+        }
+        db.simulate_crash();
+        let path = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "wal"))
+            .unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let middle = 7 + u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let enlarged = (bytes.len() - middle - 7)
+            .checked_add_signed(adjustment)
+            .unwrap();
+        bytes[middle + 4..middle + 6].copy_from_slice(&(enlarged as u16).to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        assert!(DB::open_read_only(dir.path()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(DB::open(DbOptions::default(), dir.path()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}

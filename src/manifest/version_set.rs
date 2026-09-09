@@ -863,6 +863,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn torn_manifest_payload_keeps_prefix_and_accepts_new_edits() {
+        for zero_extended in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut vs = VersionSet::create(dir.path(), 7).unwrap();
+            for seq in [1, 0x0001_0203_0405_0607] {
+                let mut edit = VersionEdit::new();
+                edit.set_last_sequence(seq);
+                vs.log_and_apply(edit).unwrap();
+            }
+            vs.sync_manifest().unwrap();
+            drop(vs);
+            let path = dir.path().join("MANIFEST-000001");
+            let mut bytes = fs::read(&path).unwrap();
+            let tail = bytes.len() - 4;
+            if zero_extended {
+                bytes[tail..].fill(0);
+            } else {
+                bytes.truncate(tail);
+            }
+            fs::write(&path, bytes).unwrap();
+            let mut recovered = VersionSet::recover(dir.path(), 7).unwrap();
+            assert_eq!(recovered.last_sequence(), 1);
+            let mut edit = VersionEdit::new();
+            edit.set_last_sequence(2);
+            recovered.log_and_apply(edit).unwrap();
+            recovered.sync_manifest().unwrap();
+            drop(recovered);
+            assert_eq!(
+                VersionSet::recover(dir.path(), 7).unwrap().last_sequence(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn enlarged_payload_preserves_later_manifest_edits() {
+        for adjustment in [-1isize, 0, 17] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut vs = VersionSet::create(dir.path(), 7).unwrap();
+            for seq in [1, 2] {
+                let mut edit = VersionEdit::new();
+                edit.set_last_sequence(seq);
+                vs.log_and_apply(edit).unwrap();
+            }
+            vs.sync_manifest().unwrap();
+            drop(vs);
+            let path = dir.path().join("MANIFEST-000001");
+            let mut bytes = fs::read(&path).unwrap();
+            let middle = 7 + u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+            let enlarged = (bytes.len() - middle - 7)
+                .checked_add_signed(adjustment)
+                .unwrap();
+            bytes[middle + 4..middle + 6].copy_from_slice(&(enlarged as u16).to_le_bytes());
+            fs::write(&path, &bytes).unwrap();
+            assert!(VersionSet::recover_read_only_with_cache(dir.path(), 7, None).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(VersionSet::recover(dir.path(), 7).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn read_only_recovery_leaves_manifest_unchanged_and_rejects_writes() {
         use std::io::Write;
 

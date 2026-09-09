@@ -12,12 +12,6 @@
 
 ## Open
 
-### [CRITICAL] WAL/MANIFEST: tail recovery can omit later complete records
-- **Where**: `src/wal/reader.rs` (`read_physical_record`), `src/db.rs` and `src/manifest/version_set.rs` (recovery)
-- **What**: Failed physical reads classify a zero-suffixed payload or an EOF short read as a torn tail without inspecting the bytes already consumed under the invalid stored length.
-- **Why**: When a middle record has an incorrect stored length, its read can include a later checksum-valid record ending in zero, or extend beyond EOF. Recovery then accepts the prefix and can delete the WAL or truncate the MANIFEST containing the later committed state.
-- **Suggested fix**: Before allowing tail recovery, check the failed payload's actual consumed bytes for later checksum-valid physical fragments; preserve ordinary torn/zero-extended tail recovery and test both failure shapes through WAL and MANIFEST recovery.
-
 ### [CRITICAL] MANIFEST: failure publication can race a later durability confirmation
 - **Where**: `src/db.rs` (`confirm_manifest_durable`), `src/manifest/version_set.rs` (`log_and_apply`, `sync_manifest`, MANIFEST rotation)
 - **What**: A failed append or sync releases the MANIFEST writer lock before publishing poison. A concurrent confirmation can acquire the writer, successfully sync, observe no poison, and authorize input/WAL deletion in that gap.

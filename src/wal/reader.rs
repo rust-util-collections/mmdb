@@ -1,7 +1,7 @@
 //! WAL reader: reads and reassembles records from a WAL file.
 
 use std::fs::File;
-use std::io::{BufReader, ErrorKind, Read, Seek};
+use std::io::{BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::{Error, Result, ResultExt};
@@ -20,9 +20,9 @@ pub struct WalReader {
     last_valid_offset: u64,
     /// Set when the most recent `read_record` failure is a structural short
     /// read (partial header/payload/trailer, Zero header, multi-fragment EOF).
-    /// Checksum, type, and other semantic failures clear it — those must not
-    /// be treated as torn tails even if the remaining file bytes are zero,
-    /// because an untrusted length can already have consumed later records.
+    /// Zero-suffixed checksum failures are also candidates, but payload
+    /// failures first exclude later checksum-valid fragments hidden by an
+    /// invalid stored length. Recovery must still verify the unread suffix.
     last_error_is_truncation: bool,
 }
 
@@ -47,8 +47,8 @@ impl WalReader {
 
     /// True when the previous `read_record` error is a structural short-read
     /// that recovery may treat as a torn active log tail (subject to
-    /// [`Self::rest_is_zero_padding`]). Checksum, type, and other semantic
-    /// failures return false.
+    /// [`Self::rest_is_zero_padding`]). A zero-extended payload can also be a
+    /// candidate; any later checksum-valid fragment makes the failure fatal.
     pub fn last_error_is_truncation(&self) -> bool {
         self.last_error_is_truncation
     }
@@ -92,6 +92,46 @@ impl WalReader {
     fn fail_corruption<T>(&mut self, msg: impl Into<String>) -> Result<T> {
         self.last_error_is_truncation = false;
         Err(Error::corruption(msg.into()))
+    }
+
+    /// Check the failed payload and the rest of its physical block for a
+    /// complete checksummed fragment. An invalid length can consume a later
+    /// record, including one ending in zero or extending past our read position.
+    /// Read-ahead is bounded to this block and restores the position so recovery
+    /// still checks every unread byte for zero padding. This conservative scan
+    /// runs only on failed reads, never on the normal replay path.
+    fn payload_contains_later_fragment(&mut self, data: &[u8]) -> Result<bool> {
+        let remaining = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
+        let position = self.reader.stream_position().ctx()?;
+        let mut suffix = data.to_vec();
+        let read_result = (&mut self.reader)
+            .take((remaining - data.len()) as u64)
+            .read_to_end(&mut suffix);
+        self.reader.seek(SeekFrom::Start(position)).ctx()?;
+        read_result.ctx()?;
+
+        for start in 0..suffix.len().saturating_sub(HEADER_SIZE - 1) {
+            let header = &suffix[start..start + HEADER_SIZE];
+            let Some(record_type) = RecordType::from_u8(header[6]) else {
+                continue;
+            };
+            if record_type == RecordType::Zero {
+                continue;
+            }
+            let length = u16::from_le_bytes([header[4], header[5]]) as usize;
+            let end = start + HEADER_SIZE + length;
+            if end > suffix.len() {
+                continue;
+            }
+            let checksum = u32::from_le_bytes(header[..4].try_into().unwrap());
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&[record_type as u8]);
+            hasher.update(&suffix[start + HEADER_SIZE..end]);
+            if hasher.finalize() == checksum {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Return an iterator over all records in the WAL.
@@ -231,34 +271,32 @@ impl WalReader {
                 ));
             }
 
-            // Read the data
+            // Track actual bytes read: unwritten buffer zeros are not evidence
+            // that an invalid stored length stopped at the final record.
             let mut data = vec![0u8; length];
-            match self.reader.read_exact(&mut data) {
-                Ok(()) => {}
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-                    return self.fail_truncation("truncated WAL record payload");
+            let mut consumed = 0;
+            while consumed < length {
+                match self.reader.read(&mut data[consumed..]) {
+                    Ok(0) => {
+                        return if self.payload_contains_later_fragment(&data[..consumed])? {
+                            self.fail_corruption("later WAL fragment inside truncated payload")
+                        } else {
+                            self.fail_truncation("truncated WAL record payload")
+                        };
+                    }
+                    Ok(n) => consumed += n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e).ctx(),
                 }
-                Err(e) => return Err(e).ctx(),
             }
-
-            self.block_offset += HEADER_SIZE + length;
 
             if matches!(record_type, RecordType::Zero) {
                 return self.fail_corruption("non-padding WAL zero record");
             }
 
-            // Verify checksum. A mismatch after a full payload read is only a
-            // torn-tail candidate when the payload ends in bytes that were
-            // never written — i.e. it has a non-empty all-zero suffix. That is
-            // exactly the shape a crash mid-append leaves behind (written
-            // prefix + filesystem zero-extension), and recovery still has to
-            // prove every byte to EOF is zero before truncating.
-            //
-            // Without the zero-suffix requirement, an untrusted length that
-            // swallowed later *valid* records would also reach EOF and look
-            // like a clean tail, silently dropping committed data. Those
-            // swallowed records carry their own non-zero headers/payloads, so
-            // the declared payload does not end in zeros and this fails closed.
+            // A checksum mismatch with a zero suffix can be an interrupted
+            // append, but only if no later checksum-valid fragment is hidden
+            // inside the declared payload (or crosses its end).
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&[record_type as u8]);
             hasher.update(&data);
@@ -269,13 +307,16 @@ impl WalReader {
                     "WAL checksum mismatch: expected {:#x}, got {:#x}",
                     expected_checksum, checksum
                 );
-                return if data.last().is_some_and(|&b| b == 0) {
+                return if data.last().is_some_and(|&b| b == 0)
+                    && !self.payload_contains_later_fragment(&data)?
+                {
                     self.fail_truncation(msg)
                 } else {
                     self.fail_corruption(msg)
                 };
             }
 
+            self.block_offset += HEADER_SIZE + length;
             return Ok(Some((record_type, data)));
         }
     }
@@ -305,6 +346,35 @@ mod tests {
     use super::*;
     use crate::wal::writer::WalWriter;
     use std::{fs::OpenOptions, io::SeekFrom};
+
+    #[test]
+    fn enlarged_payload_preserves_later_fragments() {
+        for adjustment in [-1isize, 0, 17] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("length.wal");
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"first").unwrap();
+            writer.add_record(b"middle").unwrap();
+            writer.add_record(b"last\0\0").unwrap();
+            writer.sync().unwrap();
+            drop(writer);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let middle = HEADER_SIZE + b"first".len();
+            let enlarged = (bytes.len() - middle - HEADER_SIZE)
+                .checked_add_signed(adjustment)
+                .unwrap();
+            bytes[middle + 4..middle + 6].copy_from_slice(&(enlarged as u16).to_le_bytes());
+            std::fs::write(&path, bytes).unwrap();
+
+            let mut reader = WalReader::new(&path).unwrap();
+            assert_eq!(reader.read_record().unwrap().unwrap(), b"first");
+            assert!(reader.read_record().is_err());
+            assert!(
+                !reader.last_error_is_truncation(),
+                "adjustment {adjustment}"
+            );
+        }
+    }
 
     #[test]
     fn test_empty_wal() {
