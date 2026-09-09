@@ -36,6 +36,11 @@ type CacheValue = Arc<Vec<u8>>;
 /// on one lock; sharding bounds that fan-in.
 const FO_SHARDS: usize = 16;
 
+#[cfg(test)]
+thread_local! {
+    static MAINTAIN_AFTER_INSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Maximum number of internal segments in the pool's LRU store.
 ///
 /// A pool concentrates the hit traffic of every member DB (e.g. 16
@@ -279,28 +284,29 @@ impl BlockCache {
 
     /// Insert a block into the cache.
     ///
-    /// The moka write and the `index.add()` below are not atomic as a
-    /// pair. If a concurrent `invalidate_file()` for this file runs its
-    /// index read-and-clear (`take_file`) after the moka write lands but
-    /// before `index.add()` runs, the snapshot it reads misses this
-    /// offset, so `invalidate_file` never targets it — the block stays
-    /// live in moka past its file's removal, reclaimed only by later LRU
-    /// pressure. This is bounded, not a correctness bug: SST file numbers
-    /// are never reused, so the stray entry can never be misread as data
-    /// belonging to a different file, only reclaimed late instead of
-    /// promptly. Making the pair atomic would require locking per insert,
-    /// reintroducing the contention `FO_SHARDS` sharding exists to avoid,
-    /// so this is accepted as-is — a structurally similar cutoff-not-
-    /// barrier tradeoff to the one documented on the `detached` field.
+    /// Register the offset before moka can evict it, so eviction cannot
+    /// leave bookkeeping behind after the cached block is gone.
+    ///
+    /// Registration and insertion are not atomic: `invalidate_file()` can
+    /// clear the index and invalidate the key before insertion completes.
+    /// An older entry's removal callback can also clear a replacement's
+    /// registration. The remaining cache bytes are bounded by LRU capacity
+    /// and cannot alias another file because SST file numbers are never
+    /// reused. As with detach, invalidation is a cutoff rather than a
+    /// barrier against concurrent insertion.
     pub fn insert(&self, file_number: u64, block_offset: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let arc = Arc::new(data);
         if self.pool.disabled || self.detached.load(Ordering::Relaxed) {
             return arc;
         }
+        self.pool.index.add(self.member, file_number, block_offset);
         self.pool
             .inner
             .insert((self.member, file_number, block_offset), arc.clone());
-        self.pool.index.add(self.member, file_number, block_offset);
+        #[cfg(test)]
+        if MAINTAIN_AFTER_INSERT.replace(false) {
+            self.pool.inner.run_pending_tasks();
+        }
         arc
     }
 
@@ -384,8 +390,7 @@ impl BlockCache {
     ///
     /// Reads-and-clears the reverse index (`take_file`) and invalidates
     /// only the offsets that snapshot contains — see `insert()`'s doc for
-    /// the narrow race where a concurrently-inserted offset for this file
-    /// can land in the index just after that snapshot and be missed here.
+    /// races where concurrent insertion can outlive this invalidation.
     /// Accepted as a bounded, benign tradeoff rather than fixed.
     pub fn invalidate_file(&self, file_number: u64) {
         if self.detached.load(Ordering::Relaxed) {
@@ -461,6 +466,22 @@ impl BlockCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_during_insert_prunes_reverse_offsets() {
+        let cache = BlockCache::new(1);
+        for offset in 0..1024 {
+            // A concurrent maintenance pass can evict an oversized block
+            // as soon as insertion makes it visible to moka.
+            MAINTAIN_AFTER_INSERT.set(true);
+            cache.insert(1, offset, vec![7; 2]);
+        }
+        cache.pool.inner.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 0);
+        for shard in &cache.pool.index.shards {
+            assert!(shard.lock().is_empty());
+        }
+    }
 
     #[test]
     fn test_lru_segments_scale_with_capacity() {

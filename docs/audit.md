@@ -12,12 +12,6 @@
 
 ## Open
 
-### [MEDIUM] cache: eviction can leave reverse-index entries after cached blocks are gone
-- **Where**: `src/cache/block_cache.rs` (`BlockCache::insert`, eviction listener)
-- **What**: Cache insertion precedes reverse-index registration. Eviction can remove the offset before registration occurs, leaving an offset with no cached block and no future eviction callback.
-- **Why**: Concurrent inserts of two-byte blocks into a one-byte cache produced zero cached blocks but retained reverse offsets after all maintenance completed. These offsets persist until file invalidation or member detach and are not bounded by cache capacity.
-- **Suggested fix**: Register the offset before insertion can invoke eviction, without holding reverse-index locks through cache callbacks; add a deterministic eviction-order regression.
-
 ### [MEDIUM] SST: final collector properties can produce an unreadable index block
 - **Where**: `src/sst/table_builder.rs` (`flush_data_block`, `write_raw_block`), `src/options.rs` (`BlockPropertyCollector`)
 - **What**: Properties from the final data block are added after the last metadata projection check. Finishing the builder can report success for an index larger than the reader's 64 MiB block limit.
