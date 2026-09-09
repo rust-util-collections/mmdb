@@ -61,14 +61,18 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
         self.initialized = true;
 
-        // Phase 1: issue prefetch hints for all seekable sources (overlaps I/O)
-        for source in self.sources.iter_mut() {
-            source.prefetch_hint();
-        }
-        // Phase 2: peek all sources (I/O should hit page cache / block cache
-        // thanks to the prefetch hints issued above).
-        for source in self.sources.iter_mut() {
-            let _ = source.peek();
+        // Backward seeks already seeded the buffers. Forward peek/prefetch
+        // would reopen a source that correctly exhausted before its first key.
+        if self.direction == Direction::Forward {
+            // Phase 1: issue prefetch hints for all seekable sources (overlaps I/O)
+            for source in self.sources.iter_mut() {
+                source.prefetch_hint();
+            }
+            // Phase 2: peek all sources (I/O should hit page cache / block cache
+            // thanks to the prefetch hints issued above).
+            for source in self.sources.iter_mut() {
+                let _ = source.peek();
+            }
         }
 
         // Collect non-exhausted source indices
@@ -194,10 +198,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
         // Single-source fast path: bypass heap entirely (mirrors next_entry).
         if self.single_source {
-            if !self.initialized {
-                self.initialized = true;
-                let _ = self.sources[0].peek();
-            }
+            self.initialized = true;
             // Check has_peeked directly — do NOT call take_peeked() which
             // would trigger forward advance_into_buffers when source is exhausted backward.
             if !self.sources[0].has_peeked {
@@ -556,6 +557,29 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backward_seek_keeps_exhausted_sources_out_of_heap() {
+        for source_count in [1, 2] {
+            let sources = (0..source_count)
+                .map(|i| IterSource::new(vec![(vec![b'b' + i], b"value".to_vec())]))
+                .collect();
+            let mut merger = MergingIterator::new(sources, |a, b| a.cmp(b));
+            merger.seek_for_prev(b"a");
+            assert!(merger.prev_entry().is_none());
+            assert!(merger.prev_entry().is_none());
+            merger.seek_to_first();
+            assert_eq!(merger.next_entry().unwrap().0, b"b");
+        }
+        let sources = [b"a", b"b"]
+            .into_iter()
+            .map(|key| IterSource::new(vec![(key.to_vec(), b"value".to_vec())]))
+            .collect();
+        let mut merger = MergingIterator::new(sources, |a, b| a.cmp(b));
+        merger.seek_for_prev(b"a");
+        assert_eq!(merger.prev_entry().unwrap().0, b"a");
+        assert!(merger.prev_entry().is_none());
+    }
 
     #[test]
     fn test_merging_iterator_basic() {

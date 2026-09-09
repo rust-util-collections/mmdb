@@ -12,12 +12,6 @@
 
 ## Open
 
-### [HIGH] iterator: backward heap construction reopens exhausted sources
-- **Where**: `src/iterator/merge.rs` (`init_heap`), `src/iterator/level_iter.rs` (failed backward seek)
-- **What**: Backward heap initialization issues forward prefetch/peek operations even though backward seeks have already positioned each source.
-- **Why**: With `b"b"` in L1 and `b"a\xff"` in the memtable, reverse prefix seeks for `b"a\xff"` reopen the out-of-range L1 source. Its key triggers the prefix stop before the matching memtable key is returned.
-- **Suggested fix**: Populate forward buffers only in forward mode; backward heaps must use the buffers seeded by backward positioning. Test reverse prefix seeks and exhausted single/multiple sources.
-
 ### [MEDIUM] iterator: lazy bidirectional wrapping loses or widens the remaining range
 - **Where**: `src/iterator/bidi_iter.rs` (first lazy `next_back`), `src/iterator/db_iter.rs` (`ensure_current`, `last_user_key`)
 - **What**: The backward frontier uses the last examined user key as if it had already been consumed.

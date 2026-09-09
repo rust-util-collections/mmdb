@@ -2405,3 +2405,25 @@ fn test_startup_drains_inherited_l0_backlog() {
         );
     }
 }
+
+#[test]
+fn reverse_prefix_keeps_exhausted_level_out_of_heap() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    db.put(b"b", b"disk").unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(db.get_property("num-files-at-level1").as_deref(), Some("1"));
+    db.put(b"a\xff", b"mem").unwrap();
+    let mut iter = db
+        .iter_with_prefix(b"a\xff", &ReadOptions::default())
+        .unwrap();
+    iter.seek_to_last();
+    assert_eq!(iter.key(), Some(b"a\xff".as_slice()));
+    iter.prev();
+    assert!(!iter.valid());
+    assert!(iter.error().is_none());
+    iter.seek_to_first();
+    assert_eq!(iter.next(), Some((b"a\xff".to_vec(), b"mem".to_vec())));
+    assert!(iter.next().is_none());
+}
