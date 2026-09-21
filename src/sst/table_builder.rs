@@ -1,12 +1,4 @@
 //! SST table builder: constructs a complete SST file from sorted key-value pairs.
-//!
-//! Usage:
-//! ```ignore
-//! let mut builder = TableBuilder::new(options, file);
-//! builder.add(key1, value1);
-//! builder.add(key2, value2);
-//! builder.finish()?;
-//! ```
 
 use std::{
     cmp::Ordering,
