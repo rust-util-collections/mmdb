@@ -98,16 +98,13 @@ pub struct DbOptions {
     /// reaches this threshold, a background sweep is automatically
     /// scheduled: every populated level is force-rewritten through the
     /// compaction filter so the registered keys are physically removed
-    /// even when no organic compaction is pending. Comparable in cost to
-    /// an explicit [`DB::compact`] over the whole store — **and, unlike
-    /// `compact()`, each level's rewrite holds the DB's write-serializing
-    /// lock for its full duration** (the same lock `put`/`write`/new
-    /// snapshots need), so writers and new-snapshot creation stall for
-    /// however long the largest populated level takes to rewrite. Default:
-    /// `0` (disabled) — this is an explicit opt-in for callers who accept
-    /// that tradeoff for guaranteed physical removal of dead keys; use
-    /// [`DB::compact`]/[`DB::compact_range`] for an administrative,
-    /// caller-invoked equivalent instead if the stall is unacceptable.
+    /// even when no organic compaction is pending. Each level rewrite
+    /// holds the DB mutex for its full duration, so new snapshots stall
+    /// for that rewrite. The sweep does not hold the write queue: writers
+    /// stall only while the mutex is held and can proceed between levels.
+    /// [`DB::compact`] holds the write queue for the entire call as well as
+    /// the DB mutex for each level rewrite, so it stalls writers longer,
+    /// not shorter. Default: `0` (disabled).
     pub lazy_delete_compaction_threshold: usize,
     /// Optional shared block-cache pool. `None` (the default) gives this
     /// DB a private cache sized by `block_cache_capacity` — the

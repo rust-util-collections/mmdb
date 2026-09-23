@@ -2672,12 +2672,14 @@ impl DB {
     /// later compactions reach that data, exactly as with
     /// [`compact`](Self::compact).
     ///
-    /// **Warning:** unlike [`compact`](Self::compact), each level's sweep
-    /// rewrite holds the DB's write-serializing lock for its full
-    /// duration, stalling writers and new-snapshot creation for however
-    /// long the largest populated level takes to rewrite. Only opt in
-    /// (set a nonzero threshold) if that stall is acceptable for your
-    /// workload; see `DbOptions::lazy_delete_compaction_threshold`.
+    /// **Warning:** each level's sweep rewrite holds the DB mutex for its
+    /// full duration, so new snapshots stall for that rewrite. The sweep
+    /// does not hold the write queue; writers stall only while the mutex
+    /// is held. [`compact`](Self::compact) holds the write queue for the
+    /// whole call and the DB mutex for each level rewrite, so it does not
+    /// shorten the writer stall. Only opt in (set a nonzero threshold) if
+    /// the snapshot stall is acceptable; see
+    /// `DbOptions::lazy_delete_compaction_threshold`.
     ///
     /// **Note:** The key remains readable via `get()` until compaction
     /// physically removes it. Use regular `delete()` if immediate
