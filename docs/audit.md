@@ -1,14 +1,14 @@
 # Storage-Engine Review Findings
 
-> Auto-managed by /x-review and /x-fix.
+> Maintained by `/x-review`, `/x-fix`, and `/x-overhaul`. Forms and severities: `.claude/docs/review-core.md`.
 >
-> **Won't Fix ≠ permanent.** Re-evaluate an entry when a review touches its
-> code, callers, assumptions, or subsystem; a full audit re-evaluates every
-> entry.
+> Severities: CRITICAL, HIGH, MEDIUM, LOW.
 >
-> **Rejected is not Won't Fix.** Rejected entries are disproven claims, not
-> deferred defects. Re-check them only when their cited code or invariant
-> changes.
+> **Won't Fix** is a confirmed defect whose complete fix has disproportionate cost or regression risk. Not a feature request or a documented contract. `/x-review` does not add these. Re-check one when a review touches its code, callers, assumptions, or subsystem; a full audit re-checks every entry.
+>
+> **Rejected** is a disproven claim, not a deferred defect. Re-check it only when its cited code or invariant changes.
+>
+> Do not reclassify an entry just to empty Open. No dates.
 
 ## Open
 
@@ -43,7 +43,7 @@ None.
 - **What**: `(num_restarts as usize) * 4 + 4` can overflow on a 32-bit target for corrupted input.
 - **Reason**: The supported and CI target is 64-bit Linux; no 32-bit support is declared. Revisit if 32-bit targets are added.
 
-### [VERY LOW] memtable: skiplist node destructors skipped if `all_nodes.push` unwinds after `ptr::write`
+### [LOW] memtable: skiplist node destructors skipped if `all_nodes.push` unwinds after `ptr::write`
 - **Where**: `src/memtable/skiplist_impl.rs`
 - **What**: If the `all_nodes` bookkeeping push unwound between `ptr::write` initializing a node and the push completing, the node's key/value heap allocations would never be dropped.
 - **Reason**: `Vec::push` aborts via `handle_alloc_error` on allocation failure, and its capacity-overflow panic requires `len > isize::MAX`; no unwinding path reaches the window on supported targets. Reordering the unsafe insert protocol to close an unreachable leak carries more regression risk than value.
@@ -57,16 +57,6 @@ None.
 - **Where**: `src/db.rs` (`write_memtable_ssts`), `src/sst/table_builder.rs` (`projected_index_size`, range-deletion accounting)
 - **What**: Output splitting waits for a user-key boundary. Four versions of one 8 MiB key under the default 4 KiB block size can exceed the index budget while remaining below the default memtable threshold. Multiple large range tombstones sharing one begin key can similarly exceed their metadata block budget. Writes can be acknowledged before flush and writable recovery reject the oversized metadata.
 - **Reason**: WAL data remains intact, and read-only recovery can inspect it. Larger `block_size` can recover the point-version case; ordinary small vsdb keys do not approach it. A general fix requires per-key admission accounting across writes/recovery or a format and lookup change permitting same-key metadata to span files. Those changes are disproportionate for this unusual key/endpoint workload; single-range admission now reserves framing and split headroom, but repeated begin keys can still exceed the aggregate budget.
-
-### [MEDIUM] API: snapshots and iterators are uncapped pinning resources
-- **Where**: `src/db.rs` (`SnapshotList`, iterator constructors)
-- **What**: Snapshots register retention sequences; iterators hold owning memtable/SST reader references. Nothing limits how many handles a caller may hold.
-- **Reason**: These are caller-owned RAII handles — the standard LSM engine contract (RocksDB likewise imposes no cap). An engine-side limit would turn application handle leaks into spurious engine errors instead of a diagnosable application defect.
-
-### [MEDIUM] options: no global memory budget across subsystems
-- **Where**: `src/options.rs` (`DbOptions`)
-- **What**: There is no `max_total_memory`-style option enforcing one budget across memtables, caches, iterators, and compaction.
-- **Reason**: Cross-subsystem budget accounting is a feature request, not a defect; each subsystem is individually bounded and documented (`write_buffer_size`, `block_cache_capacity`, `max_open_files`, rate limiter). Revisit if a hosting environment requires hard aggregate limits.
 
 ### [LOW] options: `num_levels` accepts arbitrarily large values
 - **Where**: `src/options.rs`, `src/db.rs` (open-time validation)
@@ -94,15 +84,15 @@ None.
 
 ### WAL: `WalWriter` needs a `Drop` impl to avoid losing buffered records
 - **Where**: `src/wal/writer.rs`
-- **What**: Claim: `BufWriter` discards its buffer on drop, so a `WalWriter` dropped without an explicit flush silently loses up to one buffer of records.
+- **Claim**: `BufWriter` discards its buffer on drop, so a `WalWriter` dropped without an explicit flush silently loses up to one buffer of records.
 - **Reason**: The premise is false — `std::io::BufWriter`'s `Drop` flushes the buffer (only errors are ignored, per its documentation). Independently, every commit path flushes or syncs the WAL before acknowledging a write, so drop-time behavior only concerns unacknowledged data on panic unwind.
 
 ### memtable: range tombstones evade `approximate_size` accounting
 - **Where**: `src/memtable/mod.rs`
-- **What**: Claim: valid `delete_range(begin, end)` entries with `begin < end` are nearly free in `approximate_size()`, so their volume never triggers a flush.
+- **Claim**: valid `delete_range(begin, end)` entries with `begin < end` are nearly free in `approximate_size()`, so their volume never triggers a flush.
 - **Reason**: `MemTable::put` accounts the duplicated begin/end keys plus `MemRangeTombstone` struct overhead for every valid `RangeDeletion` entry, in addition to the skiplist entry itself. Empty/inverted ranges are removed in `write_batch_inner` before WAL encoding and sequence assignment.
 
 ### write path: group-commit queue depth is unbounded
 - **Where**: `src/db.rs` (`WriteQueueState`)
-- **What**: Claim: the `VecDeque<*mut WriteRequest>` grows without limit, allowing unbounded memory growth under write pressure.
+- **Claim**: the `VecDeque<*mut WriteRequest>` grows without limit, allowing unbounded memory growth under write pressure.
 - **Reason**: Each queue entry is a raw pointer to a *blocked* caller's stack frame; a thread enqueues at most one request and then waits on the condvar until the leader completes it. Queue depth therefore equals the number of concurrently blocked writer threads — the caller's thread budget — and cannot accumulate beyond it.

@@ -1,7 +1,7 @@
 # MMDB Storage-Engine Correctness Patterns
 
 LSM-Tree / Rust behavior checks. Load before review or debugging.
-Describe findings using the shared conditions/expected/observed template.
+Describe findings with the registry fields in `review-core.md`.
 
 ## 1. Concurrency & atomicity
 
@@ -14,9 +14,9 @@ Latest-state paths must revalidate under DB lock before install (e.g. `install_c
 
 ### 1.2 Group-commit ordering
 **Pattern:** WAL vs MemTable phase reorder, or `committed_sequence` before all MemTable inserts → later batch visible without earlier.
-**Where:** `write_batch_group()`. Correct today: bulk reserve seq → WAL loop (order preserved) → shared fsync/flush → MemTable loop (same order) → publish seq after inserts.
+**Where:** `write_batch_group()`.
 **Impact:** Linearizability break.
-**Check:** Both loops same group order; no skip/reorder; publish after inserts.
+**Check:** Re-read the function. Required order is bulk reserve seq, WAL loop in group order, shared fsync/flush, MemTable loop in that same order, then publish seq. Flag a skip, reorder, or publish-before-insert. A previous reading is not proof.
 
 ### 1.3 Flush vs compaction race
 **Pattern:** Flush L0 while compact reads file list; VersionEdit clobber.

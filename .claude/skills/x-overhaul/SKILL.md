@@ -1,62 +1,53 @@
 ---
 name: x-overhaul
-description: Review MMDB storage-engine correctness (full repo or scoped range), resolve confirmed findings, and create atomic local commits. Use only when the user explicitly invokes /x-overhaul.
-argument-hint: "[N | all | staged | worktree | <hash> | <hash1>..<hash2>]"
+description: Review an MMDB scope, resolve confirmed in-scope findings, and commit. Default is the latest commit; pass all for the full repository. One local release if src/ changed. Use only when the user explicitly invokes /x-overhaul.
+argument-hint: "[N | all | staged | worktree | <rev> | <rev1>..<rev2>]"
 disable-model-invocation: true
 ---
 
 # MMDB Review-Fix-Commit Pipeline
 
-Review scope → record a disposition for every confirmed finding → fix actionable items → local commits.
-Unlike `/x-review`, always fixes and commits (no `--fix`). Never push.
-User-invoked only. New commits only.
+Review the scope, record dispositions, fix in-scope Open, then one local
+release if `src/` changed. Never push. User-invoked only. New commits only.
+
+Do not run `/x-fix` or `/x-review` as nested workflows. Use their evidence and
+per-finding commit rules only. Their exit and release rules do not apply.
 
 ## Input
 
-`$ARGUMENTS` — same scopes as `/x-review` without `--fix`:
+Parse the user argument with the scope table in `workflow-policy.md`. Empty is
+the latest commit, same as `/x-review`. The full repository is `all`. Reject
+`--fix` and any other extra token.
 
-| Input | Scope |
-|-------|-------|
-| *(empty)* or `all` | Full repo (default) |
-| `N` / `staged` / `worktree` / hash / range | Diff-bound |
-
-Non-full: fix only findings rooted in that diff. Post-fix re-review = files
-this run changed.
+Unless the scope is `all`, fix only findings rooted in that diff, re-review
+only files this run changed, and leave other Open entries untouched.
 
 ## Setup
 
-Review local embedded-storage behavior using the neutral task/report language
-in [workflow-policy.md](../../docs/workflow-policy.md). Any review agents use
-the scoped handoff and evidence templates in
-[review-core.md](../../docs/review-core.md).
+[workflow-policy.md](../../docs/workflow-policy.md),
+[commit-protocol.md](../../docs/commit-protocol.md),
+[review-core.md](../../docs/review-core.md), and `pragmatic-engineering.md`.
+Preflight and ledger before any edit.
 
-Preflight (`workflow-policy.md`); `pragmatic-engineering.md`; read `x-review` +
-`x-fix` skills + `commit-protocol.md`; ledger before mutations.
+## 1. Review
 
-## Phase 1 — Review
+Same evidence and registry rules as `/x-review`. Do not commit yet. `all`
+re-checks every Won't Fix entry. A narrow scope must not drop an unrelated Open
+entry unless the code shows the defect is gone.
 
-`/x-review <scope>` without `--fix`:
+## 2. Resolve
 
-1. Coverage: full ledger (`all`) or diff+callers.
-2. Read-only agents with disjoint ownership when needed, using the shared handoff template; `all` → each Rust file once in depth.
-3. Cross-subsystem / design / completeness only for depth gaps.
-4. Verify + dedupe.
-5. Update `docs/audit.md` (`all` re-evals all sections; narrow scopes prune/merge
-   in-scope without dropping unrelated Open unless proven fixed). No timestamps.
-6. If registry changed → docs-only inventory commit before fixes (may list many findings).
+Triage and fix in-scope Open with the `/x-fix` per-finding rules: severity
+order, one root cause per commit, sequential edits, targeted tests. A finding
+ends as a fix, Won't Fix, or Rejected. Do not relabel Open to clear the list.
+No release and no final gate in this phase.
 
-## Phase 2 — Resolve
+## 3. Gate and release
 
-Full `/x-fix` on Phase-1 (and still-applicable Open) findings: severity order;
-complete validated fix or evidence-backed Won't Fix/Rejected; one root cause per commit; mutations
-sequential; re-review changed files only. Correctness > open-count cosmetics.
-Out-of-scope Open untouched.
-
-## Phase 3 — Gate, version, tag
-
-Final gate; regressions in new commits. Rust changed → one patch bump + separate
-release commit + annotated tag. Nothing changed → no empty commit/bump/tag.
+The cargo gate in `commit-protocol.md` once if behavior changed. Docs-only → skip. Then the release step in
+`commit-protocol.md`, once. Nothing to commit → no empty commit, bump, or tag.
 
 ## Output
 
-Scope, coverage, dispositions, validations, hashes/subjects, version/tag, baseline left alone.
+Scope, coverage, dispositions, validations, hashes and subjects, version and
+tag if any, and the baseline left alone.

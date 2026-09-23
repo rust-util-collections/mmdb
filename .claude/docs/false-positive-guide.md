@@ -89,3 +89,9 @@ catalog the bug.
 `insert`/reverse-index and detach vs unpinned insert are cutoff-not-barrier.
 IDs never reuse → wrong data cannot swap; cold unreachable until LRU.
 **Keep:** wrong-data visibility, ID reuse, unbounded retain, pin-path races.
+
+## FP-17: Not a defect
+
+A feature request, documented contract, or by-design limit is not a finding.
+Do not record it as Open or Won't Fix. A claim that the code disproves is
+Rejected. Delete an existing entry when a re-check shows it was never a defect.

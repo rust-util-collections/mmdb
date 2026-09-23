@@ -4,7 +4,28 @@ Shared workflow rules for `/x-review`, `/x-commit`, `/x-fix`, `/x-overhaul`. Ski
 not weaken it. See also `pragmatic-engineering.md`.
 
 **Hard rules:** user-invoked only · local commits only (never push) · no history
-rewrite · one independent issue per commit.
+rewrite · one independent issue per commit · version bump and tag only in
+`/x-overhaul`, once.
+
+## Scope
+
+`/x-review` and `/x-overhaul` take one optional scope and nothing else. That text
+is the user argument (`$ARGUMENTS` where the harness substitutes it; otherwise
+the words after the command). Reject unknown input. Do not guess. Do not accept
+`--fix`.
+
+| Input | Scope |
+|-------|-------|
+| *(empty)* | Latest commit |
+| `N` | Last N commits, N a positive integer |
+| `staged` | `git diff --cached` |
+| `worktree` | Staged + unstaged + untracked |
+| `all` | Full repository |
+| `<rev>` | One commit. `git rev-parse --verify <rev>` must succeed |
+| `<rev1>..<rev2>` | Two-dot range. Verify both revs. Not three-dot |
+
+Historical scope: only defects still present at HEAD. Empty is never the full
+repository. Full repository requires `all`.
 
 ## Task framing and reporting
 
@@ -58,10 +79,11 @@ Dirty tree OK; clear ownership required.
 ## 2. Preserve existing work
 
 - No `stash` / `clean` / `checkout --` / `restore` / destructive `reset` to fake a clean tree.
-- Never touch unrelated baseline (revert, overwrite, stage, commit).
+- Never touch unrelated baseline (revert, overwrite, stage, commit, or format).
 - If a needed fix overlaps baseline and cannot be separated safely → stop and report.
 - Review agents read-only. Parallelism: investigation/validation only. Edits and
   commits on one tree: sequential.
+- Do not create a worktree to hide a dirty tree.
 
 ## 3. Atomic commit units
 
@@ -72,23 +94,29 @@ One issue / root cause / behavior change → one commit.
 - No drive-by cleanup, format churn, or refactors.
 - Stage exact paths/hunks (`git add -A` forbidden). Inspect `git diff --cached` before every commit.
 - New commits only — no amend, rebase, history rewrite, or force-push. No remote push.
+- Do not commit a registry inventory ahead of the fixes. Each fix commit carries
+  that finding's audit hunk. Remaining registry-only edits are one later commit.
 
 ## 4. Validation and failure
 
-- Smallest relevant checks per unit.
-- Dirty-tree validation covers everything present. If other units can interfere,
-  validate `HEAD` + only the candidate in a disposable worktree (no stash);
-  remove it after.
-- Full-repo gate once after the last behavior change.
+- Smallest relevant checks per unit. Do not run `tests/scale_profile.rs` or `--release`.
+- Dirty-tree validation covers everything present. If unrelated files can change
+  the result and the test command cannot exclude them, stop and report.
+- Final gate once after the last behavior change: the cargo commands in `commit-protocol.md`.
+- Agent-chosen checks use `cargo`, not `make`. If the user names a `make` target, run that target.
 - Unit-caused failure → fix before commit. Pre-existing failure → report with evidence, never claim success.
 - Same failure repeats with no progress → stop and report.
+- A gate failure after a commit → new commit, then re-run. Do not amend.
 
 ## 5. Finding dispositions
 
 | state | meaning |
 |-------|---------|
 | Open | confirmed, actionable |
-| Won't Fix | confirmed; a complete fix currently has disproportionate cost or regression risk |
-| Rejected | material concern ruled out by code or test evidence (not a severity). Skip routine noise. |
+| Won't Fix | confirmed defect; a complete fix has disproportionate cost or regression risk. Fix-time only. Not a feature request or documented contract. |
+| Rejected | material claim ruled out by code or tests (not a severity). Skip routine noise. |
+| omit | feature request, documented contract, style |
 
+`/x-review` records Open and Rejected. It does not add Won't Fix. Do not
+reclassify an entry to empty Open. Forms and severities: `review-core.md`.
 Evidence only — no dates or “last reviewed” markers.

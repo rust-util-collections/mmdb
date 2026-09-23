@@ -1,53 +1,65 @@
 ---
 name: x-fix
-description: Resolve confirmed MMDB reliability findings sequentially, with one finding per validated local commit. Use only when the user explicitly invokes /x-fix.
+description: Resolve confirmed MMDB reliability findings sequentially, one validated local commit each. Does not bump the version or tag. Use only when the user explicitly invokes /x-fix.
 disable-model-invocation: true
 ---
 
 # Resolve MMDB Reliability Findings
 
-Clear actionable `docs/audit.md` Open → self-review → local commits. Never push.
-User-invoked only. New commits only.
+Clear actionable `docs/audit.md` Open, then self-review and commit. Never push,
+bump, or tag. User-invoked only. New commits only.
 
 ## Setup
 
-Review local embedded-storage behavior using the neutral task/report language
-in [workflow-policy.md](../../docs/workflow-policy.md). Any review agents use
-the scoped handoff and evidence templates in
+[workflow-policy.md](../../docs/workflow-policy.md),
+[commit-protocol.md](../../docs/commit-protocol.md), and the evidence rules in
 [review-core.md](../../docs/review-core.md).
 
-Read `workflow-policy.md`, `commit-protocol.md`, `pragmatic-engineering.md`,
-`review-core.md`, `technical-patterns.md`, `false-positive-guide.md`.
-Preflight + ledger (freeze paths as work proceeds). Empty Open → “nothing to fix”.
+Also read `pragmatic-engineering.md`, `technical-patterns.md`, and
+`false-positive-guide.md`. Preflight and freeze paths before editing. Empty
+Open → "nothing to fix".
 
 ## Protocol
 
 ### 1. Triage (CRITICAL → LOW)
 
-Per entry before edit: code/callers/tests + guides (+ `design-patterns.md` if design);
-reproduce from current code; dedupe root causes; ruled out by evidence → Rejected; confirmed but a complete correction has disproportionate cost or regression risk → Won't Fix + reason.
+Before editing, read the code, callers, tests, and guides (`design-patterns.md`
+if the shape is a design issue). Reproduce from current code. Dedupe root
+causes.
 
-### 2. One finding → one commit (blocking)
+- Ruled out → Rejected.
+- Confirmed, but a complete fix has disproportionate cost or regression risk →
+  Won't Fix + reason.
+- Feature request or documented contract → delete the entry. Do not keep it as
+  Won't Fix.
+- Do not reclassify an entry just to empty Open.
 
-1. Root-cause fix + focused regression.
-2. Trace error/crash/concurrency/cleanup.
-3. Drop that Open entry (code + tests + registry = unit).
-4. Per-unit validation (`commit-protocol.md`).
-5. Stage freeze + fix paths; inspect cached; commit before next.
+### 2. One finding → one commit
 
-Registry-only disposition = one unit. Same root cause may batch symptoms. Mutating
-agents never parallel (read/validate may).
+1. Root-cause fix and a focused regression.
+2. Trace the error, crash, concurrency, and cleanup paths.
+3. Drop that Open entry in the same commit.
+4. Per-unit validation in `commit-protocol.md`.
+5. Stage the freeze set plus this fix. Inspect the cached diff. Commit before
+   the next finding.
+
+A registry-only disposition is one unit. Batch several of those into one commit
+at the end. The same root cause may batch symptoms. Edits and commits are
+sequential. Reads and tests may be parallel.
 
 ### 3. Self-review
 
-Review `starting_HEAD..HEAD` + remaining worktree via `/x-review` evidence rules.
-New confirmed → Open → same one-finding loop. Stop on no-progress or baseline overlap.
+Review `starting_HEAD..HEAD` and the remaining owned worktree with the
+`/x-review` evidence rules. Do not reopen unrelated Open. A new confirmed
+defect in this range goes back through the same loop. Stop on no progress or
+on overlap with the baseline.
 
-### 4. Final gate, version, tag
+### 4. Gate
 
-Full gate once. If any Rust source changed: one version-bump-and-tag for the whole
-invocation. Finish with no Open unless blocked (report blocker). No dates in audit.
+The cargo gate in `commit-protocol.md` once after the last behavior commit. Docs-only → skip. A remaining
+Open entry is a valid result; report the blocker. No version bump or tag.
 
 ## Output
 
-Dispositions, fixes, Rejected/Won't Fix, validations, hashes/subjects, version/tag, baseline left alone.
+Dispositions, fixes, Rejected and Won't Fix, validations, hashes and subjects,
+and the baseline left alone.

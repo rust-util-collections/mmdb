@@ -11,10 +11,10 @@ reporting language, scoped agent handoffs, and worktree/commit rules.
 
 Project workflows are user-invoked from `.claude/skills/`:
 
-- `x-review`: inspect changes or the full repository and record findings.
-- `x-fix`: resolve recorded findings with validated local commits.
-- `x-commit`: review and commit the intended worktree changes.
-- `x-overhaul`: full review, resolution, validation, and local release steps.
+- `x-review`: inspect a scope (default: latest commit) and record findings. Does not commit.
+- `x-fix`: resolve recorded findings with validated local commits. Does not release.
+- `x-commit`: review and commit the intended worktree changes. Does not release.
+- `x-overhaul`: same scopes as `x-review` (`all` for the full repo), resolve in-scope findings, then one local release if `src/` changed.
 
 When invoked, read that workflow's `SKILL.md`. For delegated reviews, use the
 handoff and finding templates in

@@ -1,7 +1,7 @@
 # Atomic Commit Protocol
 
-Validate → commit → version for `/x-commit`, `/x-fix`, `/x-overhaul`.
-Use with `workflow-policy.md`.
+Validate → commit for `/x-commit`, `/x-fix`, and `/x-overhaul`.
+Release only for `/x-overhaul`. Use with `workflow-policy.md`.
 
 ## Invocation ledger
 
@@ -10,7 +10,7 @@ Before first edit, record:
 - start `HEAD`, branch, package version at that `HEAD` and in the worktree;
 - staged / unstaged / untracked baseline;
 - **frozen owned paths** (sorted) and planned units;
-- whether any tracked `.rs` will change.
+- for `/x-overhaul`: whether any tracked `src/**/*.rs` will change.
 
 Keep the ledger across commits (`git diff HEAD` loses earlier units). Stage only
 freeze set + this-invocation fix/format paths.
@@ -18,46 +18,56 @@ freeze set + this-invocation fix/format paths.
 ## Per-unit validate and commit
 
 1. One issue/root cause/behavior change + its tests/docs/audit only.
-2. Checks:
-   - Docs/config only: `git diff --check` + structure sanity; skip Rust gates.
-   - Rust: `cargo fmt --all -- --check`; if needed, `make fmt` only on owned paths (inspect).
-   - Rust: `make lint` — no `#[allow(...)]`.
-3. Smallest proving tests:
+2. Format:
+   - Docs/config only: `git diff --check`. Skip Rust gates.
+   - Rust: `cargo fmt --all -- --check`. If an owned file fails, `cargo fmt -- <those paths>` and inspect the diff. If another file fails, report it; do not format it. Do not run `make fmt` or bare `cargo fmt` unless the user asked for that.
+3. Smallest proving tests. Not `tests/scale_profile.rs`, not `cargo test --release`, not the full suite:
    - docs-only → none;
-   - one subsystem → its filter + relevant integration binary;
-   - `db.rs` / write / compaction / manifest / cross-cutting → `cargo test`;
-   - interrupted-write/recovery behavior → include `cargo test --test crash_recovery` unless already covered by a full `cargo test`.
-4. On fail: fix if caused by the unit; else report pre-existing with evidence. No empty gates or infinite loops.
-5. Stage exact freeze + unit fix/format paths — never `git add -A`.
-6. `git diff --cached` = exactly one unit, no baseline/post-freeze paths.
+   - one subsystem → its filter, plus the integration binary that covers a behavior change;
+   - interrupted-write/recovery → `cargo test --test crash_recovery`.
+4. On fail: fix if caused by the unit; else report pre-existing with the command and output. No empty gates or infinite loops.
+5. Stage exact freeze + unit fix/format paths — never `git add -A` or `git commit -a`.
+6. `git diff --cached` = exactly one unit, no baseline/post-freeze paths. Stage only this finding's audit hunk.
 7. Match repo commit style and the shared neutral reporting language; HEREDOC multi-line; no co-author/generated-by.
 8. Verify commit; compare `git status --short` to baseline.
 
-Never amend a prior commit for a later fix.
+Never amend a prior commit for a later fix. Clippy runs in the final gate, not once per unit.
 
 ## Final repository gate
 
-After last behavior commit (once per stable code state):
+After the last behavior commit, once, run these cargo commands. Do not substitute a `make` target unless the user asked for that target.
 
-1. `cargo fmt --all -- --check`
-2. `make lint`
-3. `make test` (debug + release)
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --lib
+cargo test --test crash_recovery
+cargo test --test e2e_scenarios
+cargo test --test integration
+cargo test --test proptest_db
+cargo test --test bidi_debug
+cargo test --test lazy_delete
+cargo test --test shared_cache
+cargo test --test read_only
+```
 
-Regression → new atomic commit, then re-run. Docs-only: skip Rust gates.
+No `scale_profile`. No `--release`. Regression → new atomic commit, then re-run. Docs-only: skip.
 
-## Version bump and release tag
+## Release (`/x-overhaul` only)
 
-If any tracked `.rs` changed in this invocation:
+`/x-commit` and `/x-fix` do not bump or tag. Do not backfill missing tags.
 
-1. Once: `Cargo.toml` `X.Y.Z` at start-HEAD → `X.Y.(Z+1)`. If baseline already has the target, verify only.
+If this invocation changed any tracked `src/**/*.rs`:
+
+1. Once: `Cargo.toml` `X.Y.Z` at start-HEAD → `X.Y.(Z+1)`. If the worktree already has that version, verify only.
 2. `cargo metadata --no-deps --format-version 1`.
-3. Stage `Cargo.toml`, inspect cached diff.
-4. Separate final commit (only exception to one-issue-one-commit). Never per-finding bumps.
-5. Annotated tag on that commit: `v` + version (from metadata or `Cargo.toml`).
+3. Stage only `Cargo.toml`. Inspect the cached diff.
+4. Separate final commit. This is the only extra exception to one-issue-one-commit.
+5. Annotated tag on that commit: `v` + the new version.
 
-Skip when no Rust source changed. No empty commits. Do not force-add `Cargo.lock` (library).
+Skip when `src/` did not change. No empty commits. Do not force-add `Cargo.lock`.
 
 ## Final state
 
-Report every new hash/subject and version result. Owned changes committed;
-unrelated baseline untouched. Global clean worktree not required.
+Report every new hash/subject and, for `/x-overhaul`, the version result.
+Owned changes committed; unrelated baseline untouched. A clean worktree is not required.

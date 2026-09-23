@@ -27,7 +27,7 @@ One primary row per Rust file. Concurrency/unsafe are overlays.
 | compaction | `src/compaction/**` | `patterns/compaction.md` |
 | manifest | `src/manifest/**` | `patterns/manifest.md`, `concurrency.md` |
 | cache | `src/cache/**` | `patterns/cache.md`, `concurrency.md` |
-| types/API | `types.rs`, `lib.rs`, `rate_limiter.rs` | `technical-patterns.md` |
+| types/API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` |
 
 Guides under `.claude/docs/patterns/`. Tests/benches/CI/docs/`.claude` → map to
 the subsystem they cover; check alignment.
@@ -79,39 +79,42 @@ errors, docs, tests when they change.
 
 ## 4. Deterministic / style
 
-fmt / compile / clippy → tools, not agents. Still LOW if tools miss:
+fmt, compile, and clippy are tools, not findings. Import order, naming, and
+formatting are not findings.
 
-- no `#[allow(...)]`
-- import repeated paths; group prefixes
-- public docs + `AGENTS.md` / `CLAUDE.md` + this map + guides stay aligned
-- every unsafe has accurate `// SAFETY:`
+Record only what those tools will not see:
+
+- `#[allow(...)]` in production code
+- public behavior, defaults, errors, or docs that disagree
+- `// SAFETY:` missing, vague, or false
 
 ## 5. Findings registry (`docs/audit.md`)
 
-- Prune fixed in-scope `Open`.
-- Re-check `Won't Fix` / `Rejected` when cited code/callers/assumptions/subsystem
-  touched; full audit → all entries.
-- Real but disproportionate → `Won't Fix` + current reason.
-- Material disproven → `Rejected` (no severity). Drop routine noise.
-- No dates/freshness markers.
+Severities: CRITICAL, HIGH, MEDIUM, LOW. No other label.
 
-```text
-[SEVERITY] subsystem: summary
-WHERE: file:line_range
-CONDITIONS: local input, operation order, or interrupted I/O
-EXPECTED: required storage-engine behavior
-OBSERVED: code-demonstrated or test-observed result
-CHECKS: relevant invariant and why existing checks do not cover these conditions
-CHANGE: minimal correction
-TEST: regression case and actual execution status
-```
-
-- **CRITICAL**: loss/corruption, UB, memory safety, unrecoverable durability
+- **CRITICAL**: loss, corruption, UB, memory safety, unrecoverable durability
 - **HIGH**: wrong results, deadlock, realistic crash, exhaustion, material hot-path hit
 - **MEDIUM**: edge bug, error-policy gap, bounded leak
-- **LOW**: convention/docs with real maintenance cost
+- **LOW**: contract or docs drift with a real maintenance cost
 
-Observations ≠ `## Open`.
+`/x-review` may add or prune Open, add Rejected, and move a stale Won't Fix
+back to Open or Rejected. It does not add Won't Fix. `/x-fix` and
+`/x-overhaul` may add Won't Fix during triage. Do not reclassify an entry to
+empty Open. No dates.
+
+Open:
+
+```markdown
+### [SEVERITY] subsystem: summary
+- **Where**: file:line_range
+- **What**: expected behavior and observed result
+- **Why**: conditions, invariant, and why existing checks miss
+- **Fix**: minimal correction
+```
+
+Won't Fix uses Where, What, and Reason. Rejected uses Where, Claim, and Reason,
+with no severity. Observations, style, feature requests, and documented
+contracts are not entries.
 
 ## Agent handoff and response
 
@@ -127,9 +130,9 @@ Read first: <absolute paths to workflow-policy.md, review-core.md,
 Mode: Read-only investigation; no repository edits or commits.
 Question: <the behavior or invariants to check>
 Evidence already available: <relevant verified facts, or none>
-Return: Files actually reviewed; confirmed expected/observed differences
-using the finding template; existing checks that ruled out candidates;
-applicable registry dispositions; work still incomplete.
+Return: Files actually reviewed; registry-ready entries from section 5;
+test command and result if one was executed; existing checks that ruled
+candidates out; work still incomplete.
 ```
 
 For a test result, state the setup, operation sequence, expected output, actual

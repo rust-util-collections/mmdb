@@ -1,121 +1,80 @@
 ---
 name: x-review
-description: Review correctness, recovery, and resource behavior in MMDB changes or the full repository. Use only when the user explicitly invokes /x-review.
-argument-hint: "[N | all | staged | worktree | <hash> | <hash1>..<hash2>] [--fix]"
+description: Review correctness, recovery, and resource behavior in an MMDB scope. Default is the latest commit. Use only when the user explicitly invokes /x-review.
+argument-hint: "[N | all | staged | worktree | <rev> | <rev1>..<rev2>]"
 disable-model-invocation: true
 ---
 
 # MMDB Storage-Engine Reliability Review
 
-High-signal review. Code read-only unless `--fix`; may update only
-`docs/audit.md`. Never commit or push. User-invoked only.
+High-signal review. Code is read-only. May update only `docs/audit.md`. Never
+commit, push, bump, or tag. User-invoked only. Fixes belong to `/x-fix` or
+`/x-overhaul`.
 
 ## Setup
 
-Review local embedded-storage behavior using the neutral task/report language
-in [workflow-policy.md](../../docs/workflow-policy.md). Any review agents use
-the scoped handoff and evidence templates in
-[review-core.md](../../docs/review-core.md).
+Use the neutral task/report language in
+[workflow-policy.md](../../docs/workflow-policy.md). Review agents use the
+handoff in [review-core.md](../../docs/review-core.md).
 
 Read: `workflow-policy.md`, `pragmatic-engineering.md`, `technical-patterns.md`,
-`review-core.md` (Subsystem Map), `false-positive-guide.md`. Design-shaped /
-multi-subsystem → also `design-patterns.md`.
+`review-core.md`, `false-positive-guide.md`. Design-shaped or multi-subsystem
+→ also `design-patterns.md`.
 
 ## Input
 
-`$ARGUMENTS` — one optional scope + optional `--fix`:
-
-| Input | Scope |
-|-------|-------|
-| *(empty)* | Latest commit |
-| `N` | Last N commits (positive int) |
-| `staged` | `git diff --cached` |
-| `worktree` | Staged + unstaged + untracked |
-| `all` | Full repo |
-| `<hash>` | One commit |
-| `<hash1>..<hash2>` | Range |
-
-Validate revs with Git. Reject bad args; never guess. `--fix`: apply confirmed
-fixes after report. Historical scope: only still-present HEAD defects.
+Parse the user argument with the scope table in `workflow-policy.md`. Reject
+anything else, including `--fix`.
 
 ## Protocol
 
-### Phase 1 — Scope
+### 1. Scope
 
 1. Worktree baseline (`workflow-policy.md`).
-2. Changed files + full diff + callers/tests. `worktree` includes untracked
-   (`git status --short`). `all` → ledger: `src/`, `tests/`, `benches/`,
+2. Changed files, full diff, callers, tests. `worktree` includes untracked
+   (`git status --short`). `all` → ledger of `src/`, `tests/`, `benches/`,
    build/CI, public docs, `.claude/`.
-3. Map via Subsystem Map; load guides (concurrency/unsafe when relevant).
-4. Mark generated/vendored/out-of-scope in the ledger — do not silent-drop.
+3. Map via the Subsystem Map. Load concurrency/unsafe guides when relevant.
+4. Mark generated, vendored, and out-of-scope rows. Do not silent-drop them.
 
-### Phase 2 — Evidence
+### 2. Evidence
 
-Small single-subsystem → review direct. Agents only if context split helps
-(read-only; fresh scoped context + shared handoff template + applicable guides).
+Small single-subsystem → review directly. Use a read-only agent only when a
+fresh context split helps. `all`: disjoint batches, each Rust file one owner.
+fmt/compile/clippy are tools, not agents.
 
-Non-trivial dimensions (minimum sufficient):
+Cover what the diff actually touches: correctness, crash, concurrency, unsafe,
+design shape, public API, quantified hot-path cost.
 
-- correctness / invariants
-- crash / concurrency / unsafe
-- design shape if locks/resources/bounds/install/failure/API (`design-patterns.md`)
-- API / quantified perf / placeholders (`review-core.md`)
+Each candidate needs a location, invariant, concrete conditions, expected and
+observed results, existing checks, a minimal correction, and a regression test.
+Drop style, speculation, feature requests, documented contracts, and anything
+an existing check already covers.
 
-`all`: disjoint subsystem batches (each Rust file one owner); cross-subsystem +
-design only for gaps. fmt/compile/clippy → tools, not agents.
+### 3. Verify
 
-Each candidate: location + invariant · concrete conditions · expected/observed
-results · existing checks · minimal correction + test. Drop style-only notes,
-speculation, and candidates already covered by existing checks.
+Re-read the cited code. Keep only code-demonstrable items. One extra reader
+only if the result is still ambiguous. Agreement is not proof. Merge one root
+cause into one finding.
 
-### Phase 3 — Verify
+### 4. Completeness
 
-The parent re-reads the relevant code and checks whether existing guards or
-caller constraints already explain the result. Use one independent verifier
-only if still ambiguous. Agreement is not proof. Keep only code-demonstrable
-items; merge findings with the same root cause.
+Diff scope: every changed file, public contract, failure path, and relevant
+test. `all`: compare the ledger with the results; review only uncovered files
+or invariants. No rework.
 
-### Phase 4 — Completeness
+### 5. Registry
 
-Diff: every changed file, public contract, failure path, relevant test.
-`all`: ledger vs depth results; additional review only for uncovered files/invariants. No rework.
+Update `docs/audit.md` from current code, using the forms in `review-core.md`.
 
-### Phase 5 — Findings registry
+1. Prune fixed or obsolete in-scope Open.
+2. Add confirmed Open. Dedupe. Sort CRITICAL → LOW.
+3. Re-check intersecting Won't Fix (`all` → all). A stale reason becomes Open
+   or Rejected. Do not add Won't Fix.
+4. A material disproven claim becomes Rejected. Drop noise and non-defects.
+5. No dates.
 
-Update `docs/audit.md` from current code:
+### 6. Report
 
-1. Prune fixed/obsolete in-scope Open.
-2. Add confirmed Open, dedupe, CRITICAL→LOW.
-3. Re-check intersecting Won't Fix (`all` → all).
-4. Disproportionate real → Won't Fix + Reason.
-5. Material disproven → Rejected (no severity); drop routine noise; re-check only
-   if cited code/invariant changed.
-6. No dates/freshness markers.
-
-```markdown
-## Open
-### [SEVERITY] subsystem: summary
-- **Where**: file:line_range
-- **What**: expected behavior and observed difference
-- **Why**: concrete conditions, invariant, and existing checks
-- **Suggested fix**: direction
-
-## Won't Fix
-### [SEVERITY] subsystem: summary
-- **Where** / **What** / **Reason**
-
-## Rejected
-### subsystem: claim
-- **Where** / **Claim** / **Reason**
-```
-
-### Phase 6 — Report
-
-Scope, coverage, findings (severity, location, conditions, expected/observed results, correction). Zero → say so
-+ what was covered.
-
-### Phase 7 — `--fix` only
-
-Sequential fixes; preserve baseline; stop when overlap cannot be separated from existing work. Regression tests +
-smallest validate per fix; re-review; update audit. No version/commit/push —
-user runs `/x-commit` after inspect.
+Scope, coverage, and findings: severity, location, conditions, expected and
+observed results, correction. Zero findings → say so, and say what was covered.

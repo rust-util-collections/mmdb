@@ -9,6 +9,7 @@ MMDB is a pure-Rust LSM-Tree key-value storage engine, optimized as the backend 
 ```bash
 make all          # fmt + lint + test
 make test         # cargo test && cargo test --release
+make ci           # fmt check + clippy + the CI test set (no release, no scale_profile)
 make lint         # cargo clippy --all-targets -- -D warnings (matches CI)
 make bench        # cargo bench (criterion)
 cargo test --test integration   # integration tests only
@@ -16,6 +17,8 @@ cargo test --test crash_recovery
 cargo test --test e2e_scenarios
 cargo test --test proptest_db
 ```
+
+Agents use the cargo commands in `.claude/docs/commit-protocol.md` for their own checks. Run a `make` target only when the user asks for it. `make fmt` is allowed.
 
 MSRV: Rust 1.89 (edition 2024)
 
@@ -38,10 +41,10 @@ MSRV: Rust 1.89 (edition 2024)
 Project skills live under `.claude/skills/<name>/SKILL.md` and are
 user-invocable only.
 
-- `/x-review` — deep regression analysis of recent changes
-- `/x-fix` — resolve recorded findings: resolve `docs/audit.md` → self-review → commit
-- `/x-commit` — self-reviewing commit: review uncommitted changes → fix → commit
-- `/x-overhaul` — review-fix-commit pipeline (full repo or scoped like `/x-review`)
+- `/x-review` — review a scope (default: latest commit). Updates `docs/audit.md` only
+- `/x-fix` — resolve Open findings, one validated commit each. No version bump
+- `/x-commit` — review and commit the current worktree. No version bump
+- `/x-overhaul` — same scopes as `/x-review` (`all` for the full repo), then fix in-scope findings and one local release if `src/` changed
 
 All four workflows follow the neutral task/report wording in
 [workflow-policy.md](.claude/docs/workflow-policy.md). Review local storage
@@ -58,7 +61,7 @@ Supporting docs (`.claude/docs/`):
 - `commit-protocol.md` — validate → commit → version/tag
 - `patterns/*` — per-subsystem checklists
 
-Audit registry: `docs/audit.md` (project root) — auto-managed by `/x-review` and `/x-fix`; it separates actionable Open findings, accepted Won't Fix risks, and disproven Rejected claims.
+Audit registry: `docs/audit.md` — maintained by `/x-review`, `/x-fix`, and `/x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim.
 
 ## Conventions
 
