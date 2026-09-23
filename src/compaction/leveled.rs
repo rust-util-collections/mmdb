@@ -5,7 +5,6 @@
 //!
 //! After compaction, the old files are deleted and new files are installed.
 
-use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::fs::remove_file;
 use std::path::Path;
@@ -257,8 +256,7 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
     // at input-file boundaries), so a target-level file sitting inside such a
     // gap MUST be included as an input — otherwise the installed output would
     // overlap it, breaking the L1+ disjointness invariant and making keys
-    // unreachable via binary search. This mirrors `total_key_range` used by
-    // the background pickers.
+    // unreachable via binary search.
     {
         let mut agg_smallest: Option<&[u8]> = None;
         let mut agg_largest: Option<&[u8]> = None;
@@ -965,15 +963,12 @@ impl LeveledCompaction {
         // All L0 files participate (they may overlap with each other)
         let input_l0: Vec<TableFile> = l0_files.to_vec();
 
-        // Find the total key range of L0 files
-        let (smallest, largest) = Self::total_key_range(&input_l0);
-
-        // Find overlapping L1 files
-        let input_l1 = if input_l0.iter().any(|tf| tf.meta.has_range_deletions) {
-            version.level_files(1).to_vec()
-        } else {
-            Self::overlapping_files(version.level_files(1), &smallest, &largest)
-        };
+        // A range tombstone's end key is not in SST smallest/largest metadata.
+        // Metadata-only overlap misses an L1 tombstone whose begin key sits
+        // outside the L0 span; install then discards the output and this same
+        // pick repeats. Close L1 over point and tombstone extents, matching
+        // `pick_level_compaction` and `pick_compaction_for_range`.
+        let input_l1 = overlapping_files_for_inputs(version.level_files(1), &input_l0);
         if input_l1
             .iter()
             .any(|tf| in_flight.contains(&tf.meta.number))
@@ -1897,28 +1892,6 @@ impl LeveledCompaction {
         result
     }
 
-    /// Compute the total key range of a set of files.
-    /// Uses `compare_internal_key` for correct variable-length user key ordering.
-    fn total_key_range(files: &[TableFile]) -> (Vec<u8>, Vec<u8>) {
-        let mut smallest = Vec::new();
-        let mut largest = Vec::new();
-
-        for f in files {
-            if smallest.is_empty()
-                || compare_internal_key(&f.meta.smallest_key, &smallest) == CmpOrdering::Less
-            {
-                smallest = f.meta.smallest_key.clone();
-            }
-            if largest.is_empty()
-                || compare_internal_key(&f.meta.largest_key, &largest) == CmpOrdering::Greater
-            {
-                largest = f.meta.largest_key.clone();
-            }
-        }
-
-        (smallest, largest)
-    }
-
     /// Check whether a compaction range is effectively bottommost.
     ///
     /// `first_checked_level` is the source level for a moving compaction and the
@@ -1954,37 +1927,40 @@ impl LeveledCompaction {
         }
         true
     }
-
-    /// Find files in a level that overlap with the given key range.
-    /// Uses **user key** comparison to detect overlap correctly.
-    ///
-    /// Internal key comparison is wrong here: two files sharing the same user
-    /// key at different sequence numbers can appear non-overlapping in internal
-    /// key order (higher seq sorts first). For example, an L0 tombstone at
-    /// (key, seq=100) sorts *before* an L1 value at (key, seq=0), making the
-    /// internal-key ranges disjoint even though both files contain the same
-    /// user key.
-    fn overlapping_files(files: &[TableFile], smallest: &[u8], largest: &[u8]) -> Vec<TableFile> {
-        let smallest_uk = user_key(smallest);
-        let largest_uk = user_key(largest);
-        files
-            .iter()
-            .filter(|f| {
-                let file_largest_uk = user_key(&f.meta.largest_key);
-                let file_smallest_uk = user_key(&f.meta.smallest_key);
-                // File overlaps if: file.largest_uk >= smallest_uk AND file.smallest_uk <= largest_uk.
-                // This is metadata-only; range-aware callers use `overlapping_files_for_inputs`.
-                file_largest_uk >= smallest_uk && file_smallest_uk <= largest_uk
-            })
-            .cloned()
-            .collect()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::db::DB;
     use crate::options::DbOptions;
+
+    #[test]
+    fn l0_compaction_includes_l1_range_tombstone_extent() {
+        // A range tombstone's end key is not in SST smallest/largest metadata.
+        // After the tombstone sits alone at L1, an L0 point inside [begin, end)
+        // must pull that L1 file in. Metadata-only overlap misses it, install
+        // discards the output, and the same pick repeats.
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.delete_range(b"a", b"z").unwrap();
+        db.flush().unwrap();
+        db.compact().unwrap();
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("0"));
+        assert_eq!(db.get_property("num-files-at-level1").as_deref(), Some("1"));
+
+        db.put(b"m", b"v").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"v".as_slice()));
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("1"));
+
+        db.compact().unwrap();
+        assert_eq!(
+            db.get(b"m").unwrap().as_deref(),
+            Some(b"v".as_slice()),
+            "newer point must survive the L1 range tombstone"
+        );
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("0"));
+    }
 
     #[test]
     fn test_discarded_trivial_move_preserves_live_input_file() {
