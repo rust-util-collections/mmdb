@@ -89,9 +89,16 @@ impl Block {
         for i in 0..num_restarts {
             let offset = restart_offset + (i as usize) * 4;
             let restart = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            // A restart must point at an entry. An empty segment (duplicate
+            // offset, or a restart at the entry-region end) makes reverse
+            // iteration a clean miss while a forward scan still yields keys.
+            // An empty block's first restart is the only offset that may
+            // equal the entry-region end.
+            let empty_block = restart_offset == 0 && i == 0 && restart == 0;
             if (i == 0 && restart != 0)
                 || restart > restart_offset
-                || (i > 0 && restart < prev_restart)
+                || (restart == restart_offset && !empty_block)
+                || (i > 0 && restart <= prev_restart)
             {
                 return Err(Error::corruption("bad restart offset"));
             }
@@ -553,6 +560,27 @@ impl<'a> Iterator for BlockIterator<'a> {
 mod tests {
     use super::*;
     use crate::sst::block_builder::BlockBuilder;
+
+    #[test]
+    fn empty_restart_segment_is_corruption() {
+        let mut builder = BlockBuilder::new(1);
+        builder.add(b"a", b"1");
+        builder.add(b"b", b"2");
+        let mut data = builder.finish();
+        let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+        assert!(num_restarts >= 2);
+        let restart_offset = data.len() - (num_restarts as usize) * 4 - 4;
+        assert!(restart_offset > 0);
+        let last = restart_offset + (num_restarts as usize - 1) * 4;
+        data[last..last + 4].copy_from_slice(&(restart_offset as u32).to_le_bytes());
+        match Block::from_vec(data) {
+            Err(err) => assert!(
+                err.to_string().contains("bad restart offset"),
+                "empty last restart segment must not decode, got {err}"
+            ),
+            Ok(_) => panic!("empty last restart segment must not decode"),
+        }
+    }
 
     #[test]
     fn test_varint_encode_decode() {
