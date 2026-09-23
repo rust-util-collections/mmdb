@@ -291,7 +291,15 @@ impl WalReader {
             }
 
             if matches!(record_type, RecordType::Zero) {
-                return self.fail_corruption("non-padding WAL zero record");
+                // The writer never emits type 0. A zero-extended tear can leave
+                // a non-zero checksum, a zero type byte, and a zero payload.
+                // A non-zero payload is a real record whose type byte changed,
+                // and a later fragment in this block is not a torn tail: both
+                // fail closed so recovery does not drop a committed record.
+                if data.iter().any(|&b| b != 0) || self.payload_contains_later_fragment(&data)? {
+                    return self.fail_corruption("non-padding WAL zero record");
+                }
+                return self.fail_truncation("zero-extended WAL header");
             }
 
             // A checksum mismatch with a zero suffix can be an interrupted
@@ -561,5 +569,82 @@ mod tests {
         assert!(reader.read_record().is_err());
         assert!(reader.last_error_is_truncation());
         assert!(reader.rest_is_zero_padding().unwrap());
+    }
+
+    #[test]
+    fn test_zero_extended_partial_header_is_truncation_candidate() {
+        // Crash mid-header: checksum bytes landed, length and type were
+        // zero-extended. Recovery must treat that as a torn active tail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial_header.wal");
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"complete-one").unwrap();
+            writer.sync().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00]);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), b"complete-one");
+        let err = reader.read_record().unwrap_err();
+        assert!(
+            reader.last_error_is_truncation(),
+            "zero-extended partial header must be a torn-tail candidate, got {err}"
+        );
+        assert!(reader.rest_is_zero_padding().unwrap());
+    }
+
+    #[test]
+    fn test_zero_type_hiding_later_record_is_not_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_then_record.wal");
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"complete-one").unwrap();
+            writer.add_record(b"still-here").unwrap();
+            writer.sync().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let first_len = HEADER_SIZE + u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let mut injected = bytes[..first_len].to_vec();
+        injected.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00]);
+        injected.extend_from_slice(&bytes[first_len..]);
+        std::fs::write(&path, injected).unwrap();
+
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), b"complete-one");
+        let err = reader.read_record().unwrap_err();
+        let recoverable =
+            reader.last_error_is_truncation() && reader.rest_is_zero_padding().unwrap_or(false);
+        assert!(
+            !recoverable,
+            "a zero type in front of a later record must not be a recoverable torn tail, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_zero_type_with_nonzero_payload_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flipped_type.wal");
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"complete-one").unwrap();
+            writer.add_record(b"committed").unwrap();
+            writer.sync().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let first_len = HEADER_SIZE + u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        bytes[first_len + 6] = 0;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), b"complete-one");
+        let err = reader.read_record().unwrap_err();
+        assert!(
+            !reader.last_error_is_truncation(),
+            "a type-0 record with a non-zero payload must fail closed, got {err}"
+        );
     }
 }
