@@ -1090,6 +1090,9 @@ impl DB {
                                                             Some(&bg_block_cache),
                                                             &bg_path,
                                                             Some(&bg_stats),
+                                                            !bg_snapshot_list
+                                                                .as_sorted_vec()
+                                                                .is_empty(),
                                                         )
                                                         .map_err(|e| {
                                                             format!(
@@ -1246,6 +1249,7 @@ impl DB {
                                             Some(&bg_block_cache),
                                             &bg_path,
                                             Some(&bg_stats),
+                                            !bg_snapshot_list.as_sorted_vec().is_empty(),
                                         )
                                         .map_err(|e| format!("compaction install error: {}", e))?;
                                         // Unpin L0 inputs that actually left L0.
@@ -2594,6 +2598,7 @@ impl DB {
                     Some(&self.block_cache),
                     &self.path,
                     Some(&self.stats),
+                    !self.snapshot_list.as_sorted_vec().is_empty(),
                 )
                 .ctx()?;
                 // Unpin L0 inputs that actually left L0 — a trivial move
@@ -3882,6 +3887,7 @@ impl DB {
                     Some(&self.block_cache),
                     &self.path,
                     Some(&self.stats),
+                    !self.snapshot_list.as_sorted_vec().is_empty(),
                 )
                 .ctx()?;
                 // Unpin L0 inputs that actually left L0. Covers both a
@@ -5091,6 +5097,87 @@ mod tests {
         assert_eq!(
             db.get(b"stop-key").unwrap().as_deref(),
             Some(b"v".as_slice())
+        );
+    }
+
+    #[test]
+    fn snapshot_during_compaction_filter_keeps_removed_value() {
+        // The filter parks, a snapshot is registered, then the filter removes
+        // the key. Install must discard that output so the snapshot still
+        // sees the pre-filter value.
+        struct RemoveAfterGate {
+            target: Vec<u8>,
+            entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl CompactionFilter for RemoveAfterGate {
+            fn filter(&self, _: usize, key: &[u8], _: &[u8]) -> CompactionFilterDecision {
+                if key != self.target.as_slice() {
+                    return CompactionFilterDecision::Keep;
+                }
+                if let Some(release) = self.release.lock().take() {
+                    if let Some(entered) = self.entered.lock().take() {
+                        let _ = entered.send(());
+                    }
+                    let _ = release.recv_timeout(Duration::from_secs(10));
+                }
+                CompactionFilterDecision::Remove
+            }
+            fn is_noop(&self) -> bool {
+                false
+            }
+        }
+
+        let target = 0u32.to_be_bytes();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DB::open(
+                DbOptions {
+                    create_if_missing: true,
+                    write_buffer_size: 256,
+                    l0_compaction_trigger: 1,
+                    compaction_filter: Some(Arc::new(RemoveAfterGate {
+                        target: target.to_vec(),
+                        entered: Mutex::new(Some(entered_tx)),
+                        release: Mutex::new(Some(release_rx)),
+                    })),
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .unwrap(),
+        );
+
+        db.put(&target, b"visible").unwrap();
+        for i in 1u32..8 {
+            db.put(&i.to_be_bytes(), &[b'x'; 64]).unwrap();
+        }
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("background compaction never reached the filter");
+
+        let snap = db.snapshot();
+        assert_eq!(
+            db.get_with_options(&snap.read_options(), &target)
+                .unwrap()
+                .as_deref(),
+            Some(b"visible".as_slice())
+        );
+
+        let compacting = Arc::clone(&db);
+        let compact = thread::spawn(move || compacting.compact());
+        thread::sleep(Duration::from_millis(50));
+        release_tx.send(()).unwrap();
+        compact.join().unwrap().unwrap();
+
+        assert_eq!(
+            db.get_with_options(&snap.read_options(), &target)
+                .unwrap()
+                .as_deref(),
+            Some(b"visible".as_slice()),
+            "snapshot taken during compaction must still see the pre-filter value"
         );
     }
 

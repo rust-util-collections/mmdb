@@ -89,6 +89,9 @@ pub struct CompactionOutput {
     pub next_file_number_hint: u64,
     /// Range tombstone extents per output file, for the install precheck.
     output_tombstones: OutputTombstones,
+    /// True when the compaction filter removed or replaced a value. Install
+    /// must discard this output if a snapshot was registered after pick.
+    filter_mutated: bool,
 }
 
 /// Deferred cleanup actions that must be performed AFTER the manifest is
@@ -362,6 +365,7 @@ struct SubCompactionOutput {
     new_files: Vec<(u32, FileMetaData)>,
     /// Range tombstone extents per output file (see `OutputTombstones`).
     output_tombstones: OutputTombstones,
+    filter_mutated: bool,
 }
 
 /// Compute split points from target-level file boundaries.
@@ -612,6 +616,7 @@ fn execute_sub_compaction_io(
     let mut last_range_del_key: Option<Vec<u8>> = None;
     let mut last_written_seq: SequenceNumber = 0;
     let mut snapshot_idx: usize = ctx.active_snapshots.len();
+    let mut filter_mutated = false;
     let mut range_tombstones = RangeTombstoneTracker::new();
     // Pre-populate the tracker with every tombstone that can cover a key in
     // this sub-task's range — in particular straddlers whose start key is
@@ -754,8 +759,12 @@ fn execute_sub_compaction_io(
         {
             match filter.filter(params.target_level, user_key, final_value.as_slice()) {
                 CompactionFilterDecision::Keep => {}
-                CompactionFilterDecision::Remove => continue,
+                CompactionFilterDecision::Remove => {
+                    filter_mutated = true;
+                    continue;
+                }
                 CompactionFilterDecision::ChangeValue(new_val) => {
+                    filter_mutated = true;
                     final_value = LazyValue::Inline(new_val);
                 }
             }
@@ -871,6 +880,7 @@ fn execute_sub_compaction_io(
     Ok(SubCompactionOutput {
         new_files,
         output_tombstones,
+        filter_mutated,
     })
 }
 
@@ -1156,6 +1166,7 @@ impl LeveledCompaction {
                 // No new file numbers are consumed by a metadata-only move.
                 next_file_number_hint: file_number_start,
                 output_tombstones: OutputTombstones::new(),
+                filter_mutated: false,
             });
         }
 
@@ -1297,6 +1308,7 @@ impl LeveledCompaction {
         // Merge sub-compaction outputs
         let mut edit = VersionEdit::new();
         let mut output_tombstones = OutputTombstones::new();
+        let mut filter_mutated = false;
         for sub_out in sub_outputs {
             for file_entry in sub_out.new_files {
                 edit.new_files.push(file_entry);
@@ -1304,6 +1316,7 @@ impl LeveledCompaction {
             // File numbers come from a shared atomic counter, so per-sub maps
             // are disjoint and extend cannot collide.
             output_tombstones.extend(sub_out.output_tombstones);
+            filter_mutated |= sub_out.filter_mutated;
         }
 
         // Record deletions (orchestrator responsibility)
@@ -1333,6 +1346,7 @@ impl LeveledCompaction {
             input_file_numbers,
             next_file_number_hint: file_counter.load(Ordering::Relaxed),
             output_tombstones,
+            filter_mutated,
         })
     }
 
@@ -1346,6 +1360,7 @@ impl LeveledCompaction {
         block_cache: Option<&Arc<BlockCache>>,
         db_path: &Path,
         stats: Option<&Arc<DbStats>>,
+        live_snapshots_present: bool,
     ) -> Result<PostCompactionCleanup> {
         // Files this compaction physically CREATED. A trivial move's "new"
         // file is the live input file itself (same number, relabeled to the
@@ -1370,7 +1385,16 @@ impl LeveledCompaction {
         // Guard against stale compaction results. If any input file has already
         // been removed, or if a concurrent install added an unexpected target-level
         // overlap while this compaction was doing I/O, this output is based on an
-        // outdated version and must be discarded.
+        // outdated version and must be discarded. A filter mutation captured
+        // against an empty snapshot list must also be discarded if a snapshot
+        // was registered before install: that snapshot has to observe the
+        // pre-filter value.
+        let snapshot_raced = output.filter_mutated && live_snapshots_present;
+        if snapshot_raced {
+            tracing::warn!(
+                "discarding compaction output: filter changed values after a snapshot was registered"
+            );
+        }
         let discard = {
             let version = versions.current();
             let stale = output.input_files.iter().any(|(level, expected)| {
@@ -1381,7 +1405,9 @@ impl LeveledCompaction {
                         .iter()
                         .any(|tf| tf.meta == *expected)
             });
-            stale || Self::outputs_overlap_unexpected_current_files(&output, &version)
+            snapshot_raced
+                || stale
+                || Self::outputs_overlap_unexpected_current_files(&output, &version)
         };
         if discard {
             cleanup_output_files(db_path, &created_files, None);
@@ -2034,6 +2060,7 @@ mod tests {
             input_file_numbers: HashSet::new(),
             next_file_number_hint: versions.next_file_number(),
             output_tombstones: OutputTombstones::new(),
+            filter_mutated: false,
         };
 
         // Install must DISCARD the move (file #1's range now overlaps the
@@ -2047,6 +2074,7 @@ mod tests {
             None,
             dir.path(),
             None,
+            false,
         )
         .unwrap();
 
