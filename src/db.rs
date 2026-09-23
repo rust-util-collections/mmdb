@@ -3127,19 +3127,15 @@ impl DB {
                 inner.versions.current().l0_file_count() >= self.options.l0_stop_trigger
             };
             if still_over {
-                // Slow path: drain L0 to reduce the file count. Uses drain_l0
-                // (not force_compact_all) so an ordinary write only pays for
-                // enough compaction to relieve L0 pressure — not a full
-                // multi-level database compaction — and does not hold db_mutex
-                // for the duration of the merge I/O (drain_l0 follows the
-                // standard short-lock pick/install pattern). write_queue stays
-                // held for close serialization.
-                if let Err(e) = self.drain_l0(false) {
-                    // The stop trigger is the last line of defense against
-                    // unbounded L0 growth. If compaction is failing, admitting
-                    // the write would silently disable the stall exactly when it
-                    // matters most — fail-stop instead, matching the background
-                    // compaction thread's error policy.
+                // Slow path: drain L0, not the whole database, and do not hold
+                // db_mutex across the merge I/O. write_queue stays held for
+                // close serialization. drain_l0(false) returns Ok while another
+                // compaction holds the L0 claim; admitting the write then lets
+                // later flushes add L0 files for as long as that claim is live.
+                // Wait until L0 is actually drained. If compaction fails,
+                // admitting the write would silently disable the stall —
+                // fail-stop instead, matching the background thread.
+                if let Err(e) = self.drain_l0(true) {
                     let msg = format!("inline L0 compaction failed: {}", e);
                     self.set_bg_error(msg.clone());
                     return Err(Error::background(msg));
@@ -3764,11 +3760,13 @@ impl DB {
     ///
     /// When a pick is blocked because another in-flight compaction has
     /// claimed the current L0 files, `wait_for_inflight` selects the policy:
-    /// `false` returns immediately (opportunistic callers — the in-flight
-    /// compaction is already doing the work), while `true` waits for the
-    /// claim to settle and re-picks so L0 is genuinely drained on return
-    /// (required by `force_compact_all`, whose level passes would otherwise
-    /// run before L0 data reached them).
+    /// `false` returns immediately (opportunistic callers such as flush's
+    /// post-trigger drain — the in-flight compaction is already doing the
+    /// work), while `true` waits for the claim to settle and re-picks so L0
+    /// is genuinely drained on return. The L0 stop trigger and
+    /// `force_compact_all` require `true`: returning while the claim is held
+    /// leaves L0 at or above the stop count, and later flushes then add files
+    /// without bound.
     fn drain_l0(&self, wait_for_inflight: bool) -> Result<()> {
         let force_opts = DbOptions {
             l0_compaction_trigger: 1,
@@ -5009,6 +5007,90 @@ mod tests {
             reopened.get(b"cr0000").unwrap(),
             Some(vec![b'v'; 32]),
             "pre-close data must remain readable"
+        );
+    }
+
+    #[test]
+    fn l0_stop_trigger_waits_while_compaction_holds_l0_claim() {
+        // A compaction filter parks the in-flight L0 merge. The stop trigger
+        // must not admit another write until that claim drops; otherwise
+        // flushes keep adding L0 files for the whole compaction.
+        struct GateFilter {
+            entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl CompactionFilter for GateFilter {
+            fn filter(&self, _: usize, _: &[u8], _: &[u8]) -> CompactionFilterDecision {
+                if let Some(release) = self.release.lock().take() {
+                    if let Some(entered) = self.entered.lock().take() {
+                        let _ = entered.send(());
+                    }
+                    let _ = release.recv_timeout(Duration::from_secs(10));
+                }
+                CompactionFilterDecision::Keep
+            }
+            fn is_noop(&self) -> bool {
+                false
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DB::open(
+                DbOptions {
+                    create_if_missing: true,
+                    write_buffer_size: 256,
+                    l0_compaction_trigger: 1,
+                    l0_slowdown_trigger: 1,
+                    l0_stop_trigger: 1,
+                    compaction_filter: Some(Arc::new(GateFilter {
+                        entered: Mutex::new(Some(entered_tx)),
+                        release: Mutex::new(Some(release_rx)),
+                    })),
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .unwrap(),
+        );
+
+        // no_slowdown fails fast once L0 hits the trigger, so setup cannot
+        // block inside the stop-trigger drain while the filter is parked.
+        let setup = WriteOptions {
+            no_slowdown: true,
+            ..Default::default()
+        };
+        for i in 0u32..16 {
+            let _ = db.put_with_options(&setup, &i.to_be_bytes(), &[b'x'; 64]);
+        }
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("background compaction never reached the filter");
+        assert!(
+            db.l0_file_count.load(Ordering::Relaxed) >= 1,
+            "stop trigger must observe the claimed L0 file"
+        );
+
+        let writer = Arc::clone(&db);
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::clone(&finished);
+        let handle = thread::spawn(move || {
+            writer.put(b"stop-key", b"v").unwrap();
+            finished_flag.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !finished.load(Ordering::Acquire),
+            "write returned while an L0 compaction still held the stop-trigger claim"
+        );
+        release_tx.send(()).unwrap();
+        handle.join().unwrap();
+        assert!(finished.load(Ordering::Acquire));
+        assert_eq!(
+            db.get(b"stop-key").unwrap().as_deref(),
+            Some(b"v".as_slice())
         );
     }
 
