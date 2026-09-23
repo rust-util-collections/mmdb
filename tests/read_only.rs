@@ -157,6 +157,37 @@ fn read_only_ignores_writer_only_open_options() {
 
 #[cfg(unix)]
 #[test]
+fn directory_lock_reopen_does_not_see_stale_flock() {
+    // close/fput can defer releasing a flock. A same-process reopen must not
+    // observe EAGAIN after the previous handle has been dropped.
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let db = DB::open(DbOptions::default(), path).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.simulate_crash();
+        let reader = DB::open_read_only(path).unwrap();
+        assert_eq!(reader.get(b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+        drop(reader);
+
+        let first = DB::open_read_only(path).unwrap();
+        let second = DB::open_read_only(path).unwrap();
+        drop(first);
+        drop(second);
+        let writer = DB::open(
+            DbOptions {
+                create_if_missing: false,
+                ..Default::default()
+            },
+            path,
+        )
+        .unwrap();
+        writer.close().unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn read_only_handles_share_lock_and_exclude_writers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path();
