@@ -4,12 +4,13 @@ pub use iterator::TableIterator;
 
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io,
     path::Path,
     sync::{Arc, OnceLock},
 };
 
-use parking_lot::{Mutex, MutexGuard};
+#[cfg(not(unix))]
+use parking_lot::Mutex;
 
 use crate::cache::block_cache::BlockCache;
 use crate::error::{Error, Result, ResultExt};
@@ -73,6 +74,48 @@ struct MetaIndexData {
 thread_local! {
     pub(crate) static PREPARE_FIRST_BLOCK_PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Fires once on this thread right after a block's raw bytes are read.
+    static AFTER_BLOCK_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// An open, immutable SST file. On unix, block reads are positional
+/// (`pread`), so concurrent cache misses on one file proceed in parallel;
+/// elsewhere a mutex guards the shared file cursor.
+struct SstFile {
+    #[cfg(unix)]
+    file: File,
+    #[cfg(not(unix))]
+    file: Mutex<File>,
+    /// Captured at open; SST files never change size.
+    size: u64,
+}
+
+impl SstFile {
+    fn new(file: File, size: u64) -> Self {
+        Self {
+            #[cfg(unix)]
+            file,
+            #[cfg(not(unix))]
+            file: Mutex::new(file),
+            size,
+        }
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = self.file.lock();
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(buf)
+        }
+    }
 }
 
 /// Reader for an SST file.
@@ -82,7 +125,7 @@ pub struct TableReader {
     filter_data: Option<Vec<u8>>,
     prefix_filter_data: Option<Vec<u8>>,
     prefix_filter_len: Option<usize>,
-    file: Mutex<File>,
+    file: SstFile,
     block_cache: Option<Arc<BlockCache>>,
     stats: Option<Arc<DbStats>>,
     /// Cached index entries, shared across all TableIterators for this file.
@@ -121,7 +164,7 @@ impl TableReader {
         block_cache: Option<Arc<BlockCache>>,
         stats: Option<Arc<DbStats>>,
     ) -> Result<Self> {
-        let mut file = File::open(path).ctx()?;
+        let file = File::open(path).ctx()?;
         let file_size = file.metadata().ctx()?.len();
 
         if file_size < FOOTER_SIZE as u64 {
@@ -130,20 +173,20 @@ impl TableReader {
                 file_size
             )));
         }
+        let file = SstFile::new(file, file_size);
 
         // Read footer
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64))).ctx()?;
         let mut footer_buf = [0u8; FOOTER_SIZE];
-        file.read_exact(&mut footer_buf).ctx()?;
+        file.read_exact_at(&mut footer_buf, file_size - FOOTER_SIZE as u64)
+            .ctx()?;
         let (metaindex_handle, index_handle) = decode_footer(&footer_buf).ctx()?;
 
         // Read index block
-        let index_data =
-            Self::read_block_data_with_size(&mut file, &index_handle, file_size).ctx()?;
+        let index_data = Self::read_block_data(&file, &index_handle).ctx()?;
         let index_block = Block::from_vec(index_data).ctx()?;
 
         // Read filters and range-del handle from metaindex
-        let meta = Self::read_metaindex(&mut file, &metaindex_handle, file_size).ctx()?;
+        let meta = Self::read_metaindex(&file, &metaindex_handle).ctx()?;
 
         let reader = Self {
             file_number,
@@ -151,7 +194,7 @@ impl TableReader {
             filter_data: meta.bloom,
             prefix_filter_data: meta.prefix,
             prefix_filter_len: meta.prefix_len,
-            file: Mutex::new(file),
+            file,
             block_cache,
             stats,
             index_entry_cache: OnceLock::new(),
@@ -473,17 +516,9 @@ impl TableReader {
         }
     }
 
-    fn read_block_data(file: &mut File, handle: &BlockHandle) -> Result<Vec<u8>> {
-        let file_size = file.metadata().ctx()?.len();
-        Self::read_block_data_with_size(file, handle, file_size)
-    }
-
-    fn read_block_data_with_size(
-        file: &mut File,
-        handle: &BlockHandle,
-        file_size: u64,
-    ) -> Result<Vec<u8>> {
+    fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
         const MAX_COMPRESSED_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+        let file_size = file.size;
         let end = handle
             .offset
             .checked_add(handle.size)
@@ -502,13 +537,16 @@ impl TableReader {
                 handle.size, MAX_COMPRESSED_BLOCK_SIZE
             )));
         }
-        file.seek(SeekFrom::Start(handle.offset)).ctx()?;
-        let mut data = vec![0u8; handle.size as usize];
-        file.read_exact(&mut data).ctx()?;
-
-        // Read and verify trailer
-        let mut trailer = [0u8; BLOCK_TRAILER_SIZE];
-        file.read_exact(&mut trailer).ctx()?;
+        // Read the block and its trailer in one positional read.
+        let size = handle.size as usize;
+        let mut data = vec![0u8; size + BLOCK_TRAILER_SIZE];
+        file.read_exact_at(&mut data, handle.offset).ctx()?;
+        let trailer: [u8; BLOCK_TRAILER_SIZE] = data[size..].try_into().unwrap();
+        data.truncate(size);
+        #[cfg(test)]
+        if let Some(hook) = AFTER_BLOCK_READ.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
 
         let compression_type = CompressionType::from_u8(trailer[0])
             .ok_or_else(|| Error::corruption("unknown compression type"))
@@ -587,11 +625,7 @@ impl TableReader {
         Ok(data)
     }
 
-    fn read_metaindex(
-        file: &mut File,
-        metaindex_handle: &BlockHandle,
-        file_size: u64,
-    ) -> Result<MetaIndexData> {
+    fn read_metaindex(file: &SstFile, metaindex_handle: &BlockHandle) -> Result<MetaIndexData> {
         // Every writer emits a metaindex block (an empty block still carries
         // its restart array), and the footer has no checksum: a zero size can
         // only be corruption, and reading it as "no metadata" would drop the
@@ -600,8 +634,7 @@ impl TableReader {
             return Err(Error::corruption("zero-size SST metaindex block"));
         }
 
-        let metaindex_data =
-            Self::read_block_data_with_size(file, metaindex_handle, file_size).ctx()?;
+        let metaindex_data = Self::read_block_data(file, metaindex_handle).ctx()?;
         let metaindex = Block::from_vec(metaindex_data).ctx()?;
 
         let mut bloom = None;
@@ -613,10 +646,10 @@ impl TableReader {
         for (key, value) in &mut iter {
             if key == b"filter.bloom" {
                 let handle = BlockHandle::decode(&value).ctx()?;
-                bloom = Some(Self::read_block_data_with_size(file, &handle, file_size).ctx()?);
+                bloom = Some(Self::read_block_data(file, &handle).ctx()?);
             } else if key == b"filter.prefix" {
                 let handle = BlockHandle::decode(&value).ctx()?;
-                prefix = Some(Self::read_block_data_with_size(file, &handle, file_size).ctx()?);
+                prefix = Some(Self::read_block_data(file, &handle).ctx()?);
             } else if key == PREFIX_FILTER_LEN_NAME.as_bytes() {
                 if value.len() != 8 {
                     return Err(Error::corruption(
@@ -690,8 +723,7 @@ impl TableReader {
             s.record_cache_miss();
         }
 
-        let mut file = self.open_file().ctx()?;
-        let data = Self::read_block_data(&mut file, handle).ctx()?;
+        let data = Self::read_block_data(&self.file, handle).ctx()?;
 
         if fill_cache && let Some(ref cache) = self.block_cache {
             return Ok(cache.insert(self.file_number, handle.offset, data));
@@ -726,8 +758,7 @@ impl TableReader {
         if let Some(hook) = PREPARE_FIRST_BLOCK_PIN_HOOK.with(|h| h.borrow_mut().take()) {
             hook();
         }
-        let mut file = self.open_file().ok()?;
-        let data = Self::read_block_data(&mut file, &entry.handle).ok()?;
+        let data = Self::read_block_data(&self.file, &entry.handle).ok()?;
         Some(PreparedBlockPin {
             file_number: self.file_number,
             offset: entry.handle.offset,
@@ -760,15 +791,18 @@ impl TableReader {
             let (Ok(offset), Ok(len)) = (i64::try_from(offset), i64::try_from(len)) else {
                 return;
             };
-            if let Ok(file) = self.open_file() {
-                // SAFETY: `posix_fadvise` is an advisory hint with no safety
-                // invariants beyond a valid fd. The fd is obtained from a live
-                // `File` via `AsRawFd` and remains valid for the `MutexGuard`
-                // lifetime. Checked conversions keep offset and length
-                // non-negative in the platform `off_t` representation.
-                unsafe {
-                    libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED);
-                }
+            // SAFETY: `posix_fadvise` is an advisory hint with no safety
+            // invariants beyond a valid fd. The fd belongs to the `File` this
+            // reader owns, which stays open for the duration of `&self`.
+            // Checked conversions keep offset and length non-negative in the
+            // platform `off_t` representation.
+            unsafe {
+                libc::posix_fadvise(
+                    self.file.file.as_raw_fd(),
+                    offset,
+                    len,
+                    libc::POSIX_FADV_WILLNEED,
+                );
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -776,16 +810,71 @@ impl TableReader {
             let _ = (offset, len);
         }
     }
-
-    /// Get a file handle for reading. Uses the held file via mutex.
-    fn open_file(&self) -> Result<MutexGuard<'_, File>> {
-        Ok(self.file.lock())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::TableReader;
+
+    /// Regression: every cache-miss read of a file held one `Mutex<File>`
+    /// through the read, CRC, and decompression, so independent misses on
+    /// the same SST ran one at a time.
+    #[test]
+    fn cache_miss_reads_of_one_file_run_concurrently() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("000001.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..4u64 {
+            let key = InternalKey::new(format!("k{i}").as_bytes(), 10 - i, ValueType::Value);
+            builder.add(key.as_bytes(), b"v").unwrap();
+        }
+        builder.finish().unwrap();
+        let reader = TableReader::open(&path).unwrap();
+        let index = reader.cached_index_entries().unwrap();
+        let (first, second) = (index[0].handle, index[1].handle);
+
+        let (parked_tx, parked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let reader = &reader;
+            scope.spawn(move || {
+                super::AFTER_BLOCK_READ.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        parked_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }));
+                });
+                reader.read_block_cached_opt(&first, false).unwrap();
+            });
+            parked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+            let (done_tx, done_rx) = mpsc::channel();
+            scope.spawn(move || {
+                reader.read_block_cached_opt(&second, false).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            let finished = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            release_tx.send(()).unwrap();
+            assert!(
+                finished,
+                "a miss on another block waited for the parked read"
+            );
+        });
+    }
 
     #[test]
     fn test_zero_prefix_filter_length_is_rejected() {
