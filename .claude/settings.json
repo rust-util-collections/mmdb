@@ -21,7 +21,8 @@
       "Bash(git show:*)",
       "Bash(git blame:*)",
       "Bash(git branch)",
-      "Bash(git rev-parse:*)"
+      "Bash(git rev-parse:*)",
+      "Bash(git ls-files:*)"
     ],
     "deny": [
       "Bash(git stash)",
@@ -29,6 +30,10 @@
       "Bash(git clean)",
       "Bash(git clean:*)",
       "Bash(git checkout --:*)",
+      "Bash(git checkout .)",
+      "Bash(git checkout -f:*)",
+      "Bash(git checkout --force:*)",
+      "Bash(git checkout HEAD --:*)",
       "Bash(git restore:*)",
       "Bash(git add -A)",
       "Bash(git add -A:*)",
@@ -39,6 +44,10 @@
       "Bash(git add --update)",
       "Bash(git add --update:*)",
       "Bash(git add .)",
+      "Bash(git add * -A*)",
+      "Bash(git add * --all*)",
+      "Bash(git add * -u*)",
+      "Bash(git add * --update*)",
       "Bash(git commit --amend)",
       "Bash(git commit --amend:*)",
       "Bash(git commit -a)",
@@ -46,6 +55,9 @@
       "Bash(git commit -am:*)",
       "Bash(git commit --all)",
       "Bash(git commit --all:*)",
+      "Bash(git commit * --amend*)",
+      "Bash(git commit * -a*)",
+      "Bash(git commit * --all*)",
       "Bash(git reset)",
       "Bash(git reset:*)",
       "Bash(git rebase)",
@@ -59,7 +71,15 @@
       "Bash(git branch -f:*)",
       "Bash(git branch --force:*)",
       "Bash(git filter-branch:*)",
-      "Bash(git replace:*)"
+      "Bash(git replace:*)",
+      "Bash(git tag -d:*)",
+      "Bash(git tag --delete:*)",
+      "Bash(git tag -f:*)",
+      "Bash(git tag --force:*)",
+      "Bash(git tag * -d*)",
+      "Bash(git tag * --delete*)",
+      "Bash(git tag * -f*)",
+      "Bash(git tag * --force*)"
     ]
   }
 }

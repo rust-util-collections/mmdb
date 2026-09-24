@@ -2,6 +2,7 @@
 name: x-commit
 description: Check MMDB worktree changes for correctness, fix confirmed issues, validate, and create atomic local commits. Does not bump the version or tag.
 disable-model-invocation: true
+allowed-tools: Bash(git add *) Bash(git commit *)
 ---
 
 # Self-Reviewing Commit for MMDB

@@ -2,6 +2,7 @@
 name: x-fix
 description: Resolve Open findings in docs/audit.md sequentially, one validated local commit each. Does not bump the version or tag.
 disable-model-invocation: true
+allowed-tools: Bash(git add *) Bash(git commit *)
 ---
 
 # Resolve MMDB Reliability Findings

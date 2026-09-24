@@ -3,6 +3,7 @@ name: x-overhaul
 description: Review an MMDB scope, resolve confirmed in-scope findings, and commit. Default is the latest commit; pass all for the full repository. One local release if src/ changed.
 argument-hint: "[N | all | staged | worktree | <rev> | <rev1>..<rev2>]"
 disable-model-invocation: true
+allowed-tools: Bash(git add *) Bash(git commit *) Bash(git tag -a *)
 ---
 
 # MMDB Review-Fix-Commit Pipeline
