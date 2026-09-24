@@ -30,7 +30,7 @@
 | Feature | RocksDB | Pebble | mmdb | Notes |
 |---------|---------|--------|------|-------|
 | SkipList (lock-free) | Yes | Yes | Yes | Single-writer multi-reader, arena allocation |
-| Backward O(1) (prev pointer) | Yes | Yes | Yes | Level-0 doubly-linked list + cached tail |
+| Backward O(1) (prev pointer) | Yes | Yes | No | Forward links only: `prev` re-seeks in O(log N) (`seek_lt_raw`); the cached tail makes `seek_to_last` O(1) |
 | Multiple MemTable implementations | Yes (HashSkipList, Vector) | No | No | SkipList is sufficient |
 
 ## SST / Block
@@ -54,7 +54,7 @@
 | Compaction Filter | Yes | Yes | Yes | Keep/Remove/ChangeValue |
 | Read-triggered compaction | Yes | Yes | Yes | Hot key sampling, hint-driven |
 | Sub-compaction parallelism | Yes | Yes | Yes | std::thread::scope, split on Ln+1 file boundaries |
-| CompactionIter snapshot boundary awareness | Yes | Yes | Partial | Zeroing logic, no multi-version retention |
+| CompactionIter snapshot boundary awareness | Yes | Yes | Yes | Keeps one version per snapshot stripe; zeroes sequence numbers at the bottommost level |
 | Tiered/Universal Compaction | Yes | No | No | Leveled only |
 
 ## Write Path
