@@ -16,6 +16,24 @@ use crate::types::{LazyValue, compare_internal_key, user_key as user_key_from_in
 ///
 /// Opens one file's `TableIterator` at a time, advancing to the next file
 /// only when the current one is exhausted.
+/// Result of checking one file against a `LevelIterator`'s filters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FileFilter {
+    Pass,
+    /// Rejected by the prefix bloom; neighbouring files may still match.
+    Skip,
+    /// Entirely below the start hint, as is every earlier file.
+    BeforeRange,
+    /// Entirely at or past the end hint, as is every later file.
+    AfterRange,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Files checked against the range and prefix filters on this thread.
+    static FILES_FILTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub struct LevelIterator {
     /// L1+ files, sorted by smallest_key (non-overlapping).
     files: Vec<TableFile>,
@@ -85,29 +103,33 @@ impl LevelIterator {
         self
     }
 
-    /// Check whether a file passes all configured filters.
-    fn file_passes_filters(&self, tf: &TableFile) -> bool {
+    /// Check a file against all configured filters. Files in a level are
+    /// sorted and disjoint, so a range rejection also rejects every file
+    /// beyond it in that direction; only a prefix-bloom rejection is local.
+    fn check_file_filters(&self, tf: &TableFile) -> FileFilter {
+        #[cfg(test)]
+        FILES_FILTERED.with(|n| n.set(n.get() + 1));
         // Range filter: file's largest user key must be >= start_hint
         if let Some(ref start) = self.start_hint {
             let largest_uk = user_key_from_internal(&tf.meta.largest_key);
             if largest_uk < start.as_slice() {
-                return false;
+                return FileFilter::BeforeRange;
             }
         }
         // Range filter: file's smallest user key must be < end_hint
         if let Some(ref end) = self.end_hint {
             let smallest_uk = user_key_from_internal(&tf.meta.smallest_key);
             if smallest_uk >= end.as_slice() {
-                return false;
+                return FileFilter::AfterRange;
             }
         }
         // Prefix bloom filter
         if let Some(ref prefix) = self.prefix_filter
             && !tf.reader.prefix_may_match(prefix)
         {
-            return false;
+            return FileFilter::Skip;
         }
-        true
+        FileFilter::Pass
     }
 
     /// Seek to the first entry >= target.
@@ -127,9 +149,17 @@ impl LevelIterator {
     fn open_file_and_seek(&mut self, target: Option<&[u8]>) {
         while self.file_index < self.files.len() {
             let tf = &self.files[self.file_index];
-            if !self.file_passes_filters(tf) {
-                self.file_index += 1;
-                continue;
+            match self.check_file_filters(tf) {
+                FileFilter::Pass => {}
+                FileFilter::AfterRange => {
+                    self.file_index = self.files.len();
+                    self.current_iter = None;
+                    return;
+                }
+                FileFilter::Skip | FileFilter::BeforeRange => {
+                    self.file_index += 1;
+                    continue;
+                }
             }
             // Skip files whose smallest user key >= upper_bound
             if let Some(ref ub) = self.upper_bound {
@@ -237,8 +267,14 @@ impl super::merge::SeekableIterator for LevelIterator {
             }
             self.file_index -= 1;
             let tf = &self.files[self.file_index];
-            if !self.file_passes_filters(tf) {
-                continue;
+            match self.check_file_filters(tf) {
+                FileFilter::Pass => {}
+                FileFilter::BeforeRange => {
+                    self.file_index = 0;
+                    self.current_iter = None;
+                    return None;
+                }
+                FileFilter::Skip | FileFilter::AfterRange => continue,
             }
             let mut table_iter =
                 TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
@@ -282,8 +318,10 @@ impl super::merge::SeekableIterator for LevelIterator {
         let min_try = 0;
         for try_idx in (min_try..=start).rev() {
             let tf = &self.files[try_idx];
-            if !self.file_passes_filters(tf) {
-                continue;
+            match self.check_file_filters(tf) {
+                FileFilter::Pass => {}
+                FileFilter::BeforeRange => break,
+                FileFilter::Skip | FileFilter::AfterRange => continue,
             }
             let mut table_iter =
                 TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
@@ -326,8 +364,10 @@ impl super::merge::SeekableIterator for LevelIterator {
         // Start from the last file and work backward
         for idx in (0..self.files.len()).rev() {
             let tf = &self.files[idx];
-            if !self.file_passes_filters(tf) {
-                continue;
+            match self.check_file_filters(tf) {
+                FileFilter::Pass => {}
+                FileFilter::BeforeRange => break,
+                FileFilter::Skip | FileFilter::AfterRange => continue,
             }
             let mut table_iter =
                 TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
@@ -452,6 +492,42 @@ mod tests {
     use std::sync::Arc;
 
     /// Build an SST file with internal keys in the given range [start, end).
+    /// Regression: range-hint rejections shared the prefix-bloom `continue`,
+    /// so a seek into a gap in the hinted range visited every remaining file
+    /// of the level instead of stopping at the first one past the range.
+    #[test]
+    fn range_hint_rejection_stops_the_file_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<TableFile> = (0..100)
+            .filter(|i| !(10..12).contains(i))
+            .map(|i| build_sst(dir.path(), i as u64, i, i + 1))
+            .collect();
+        let hinted = || {
+            LevelIterator::new(files.clone())
+                .with_range_hints(Some(b"key_000010".to_vec()), Some(b"key_000011".to_vec()))
+        };
+        let filtered = |f: &dyn Fn()| {
+            FILES_FILTERED.with(|n| n.set(0));
+            f();
+            FILES_FILTERED.with(|n| n.get())
+        };
+        let target = InternalKey::new(b"key_000010", 100, ValueType::Value);
+
+        let forward = filtered(&|| {
+            let mut it = hinted();
+            it.seek_to(target.as_bytes());
+            assert!(it.next().is_none());
+        });
+        assert!(forward <= 2, "forward seek filtered {forward} files");
+
+        let backward = filtered(&|| {
+            let mut it = hinted();
+            it.seek_for_prev(target.as_bytes());
+            assert!(it.current().is_none());
+        });
+        assert!(backward <= 2, "backward seek filtered {backward} files");
+    }
+
     fn build_sst(dir: &Path, file_num: u64, start: usize, end: usize) -> TableFile {
         let path = dir.join(format!("{:06}.sst", file_num));
         let mut builder = TableBuilder::new(
