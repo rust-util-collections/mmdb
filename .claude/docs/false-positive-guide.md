@@ -68,11 +68,12 @@ with material accumulation, not mere eligibility.
 MMDB is `[start, end)`. Verify use-site ops (`key < end`, not `<=`) and a concrete
 mis-included/excluded key before filing.
 
-## FP-13: Won't Fix without re-check
+## FP-13: Won't Fix is not a standing exemption
 
-Not permanent. Re-check when review touches cited code/callers/assumptions/
-subsystem; full audit → every entry. Carry-forward without check → LOW process.
-No freshness dates in `audit.md`.
+An existing Won't Fix does not rule a candidate out by itself. Re-check its
+reason when the review touches its cited code, callers, assumptions, or
+subsystem; full audit → every entry. A stale reason moves the entry to Open or
+Rejected (`workflow-policy.md` §5).
 
 ## FP-14: Legitimate no-ops
 

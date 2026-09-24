@@ -1,6 +1,6 @@
 ---
 name: x-review
-description: Review correctness, recovery, and resource behavior in an MMDB scope. Default is the latest commit. Use only when the user explicitly invokes /x-review.
+description: Review correctness, recovery, and resource behavior in an MMDB scope and update docs/audit.md. Default is the latest commit.
 argument-hint: "[N | all | staged | worktree | <rev> | <rev1>..<rev2>]"
 disable-model-invocation: true
 ---
@@ -8,18 +8,30 @@ disable-model-invocation: true
 # MMDB Storage-Engine Reliability Review
 
 High-signal review. Code is read-only. May update only `docs/audit.md`. Never
-commit, push, bump, or tag. User-invoked only. Fixes belong to `/x-fix` or
-`/x-overhaul`.
+commit, push, bump, or tag. Fixes belong to `/x-fix` or `/x-overhaul`.
+
+## Invocation state
+
+Captured when this skill loaded. This is the worktree baseline
+(`workflow-policy.md` §1).
+
+!`git status --short --branch`
+
+HEAD: !`git rev-parse HEAD`
 
 ## Setup
 
-Use the neutral task/report language in
-[workflow-policy.md](../../docs/workflow-policy.md). Review agents use the
-handoff in [review-core.md](../../docs/review-core.md).
+Read first:
+[workflow-policy.md](../../docs/workflow-policy.md),
+[pragmatic-engineering.md](../../docs/pragmatic-engineering.md),
+[technical-patterns.md](../../docs/technical-patterns.md),
+[review-core.md](../../docs/review-core.md),
+[false-positive-guide.md](../../docs/false-positive-guide.md).
+Design-shaped or multi-subsystem → also
+[design-patterns.md](../../docs/design-patterns.md).
 
-Read: `workflow-policy.md`, `pragmatic-engineering.md`, `technical-patterns.md`,
-`review-core.md`, `false-positive-guide.md`. Design-shaped or multi-subsystem
-→ also `design-patterns.md`.
+Task/report wording follows `workflow-policy.md`. Review agents use the
+handoff in `review-core.md`.
 
 ## Input
 
@@ -30,7 +42,7 @@ anything else, including `--fix`.
 
 ### 1. Scope
 
-1. Worktree baseline (`workflow-policy.md`).
+1. Worktree baseline: the invocation state above.
 2. Changed files, full diff, callers, tests. `worktree` includes untracked
    (`git status --short`). `all` → ledger of `src/`, `tests/`, `benches/`,
    build/CI, public docs, `.claude/`.

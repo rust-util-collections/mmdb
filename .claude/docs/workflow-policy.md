@@ -9,10 +9,10 @@ rewrite · one independent issue per commit · version bump and tag only in
 
 ## Scope
 
-`/x-review` and `/x-overhaul` take one optional scope and nothing else. That text
-is the user argument (`$ARGUMENTS` where the harness substitutes it; otherwise
-the words after the command). Reject unknown input. Do not guess. Do not accept
-`--fix`.
+`/x-review` and `/x-overhaul` take one optional scope and nothing else. The
+scope is the text after the command; Claude Code appends it to the skill as an
+`ARGUMENTS: <value>` line, and no such line means empty. Reject unknown input.
+Do not guess. Do not accept `--fix`.
 
 | Input | Scope |
 |-------|-------|
@@ -49,8 +49,9 @@ conversation; preserve identifiers and code verbatim.
 
 ### Review-agent handoffs
 
-Prefer a fresh, narrowly scoped agent context (`fork_turns="none"` when that
-option is available). Supply the repository path, assigned files, applicable
+Start each review agent in a fresh, narrowly scoped context, not a fork of this
+conversation (Claude Code: a non-`fork` `subagent_type` such as
+`general-purpose`). Supply the repository path, assigned files, applicable
 shared guides, current baseline, and the concrete review question. Summarize
 relevant verified facts instead of forwarding the entire conversation. Use the
 handoff and response templates in `review-core.md`; agents read those guides
@@ -66,7 +67,8 @@ about a tool/service failure or reproduce unrelated service notices in handoffs.
 
 Before mutate/commit:
 
-1. Record `git status --short`, branch, `HEAD`.
+1. Record `git status --short`, branch, `HEAD`. Each skill's Invocation state
+   block captures these at load; use it as the record.
 2. Separate staged / unstaged / untracked baseline.
 3. Stop on merge/rebase/cherry-pick or detached HEAD unless the user resolves it.
 4. Define this invocation’s owned files/hunks; baseline stays with its author.
@@ -117,6 +119,8 @@ One issue / root cause / behavior change → one commit.
 | Rejected | material claim ruled out by code or tests (not a severity). Skip routine noise. |
 | omit | feature request, documented contract, style |
 
-`/x-review` records Open and Rejected. It does not add Won't Fix. Do not
-reclassify an entry to empty Open. Forms and severities: `review-core.md`.
-Evidence only — no dates or “last reviewed” markers.
+`/x-review` may add or prune Open, add Rejected, and move a stale Won't Fix
+back to Open or Rejected; it does not add Won't Fix. `/x-fix` and
+`/x-overhaul` may add Won't Fix during triage. Do not reclassify an entry to
+empty Open. Forms and severities: `review-core.md`. Evidence only — no dates
+or “last reviewed” markers.

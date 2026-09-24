@@ -7,7 +7,8 @@ Release only for `/x-overhaul`. Use with `workflow-policy.md`.
 
 Before first edit, record:
 
-- start `HEAD`, branch, package version at that `HEAD` and in the worktree;
+- start `HEAD` and branch (the skill's Invocation state block), package version
+  at that `HEAD` and in the worktree;
 - staged / unstaged / untracked baseline;
 - **frozen owned paths** (sorted) and planned units;
 - for `/x-overhaul`: whether any tracked `src/**/*.rs` will change.
@@ -28,14 +29,14 @@ freeze set + this-invocation fix/format paths.
 4. On fail: fix if caused by the unit; else report pre-existing with the command and output. No empty gates or infinite loops.
 5. Stage exact freeze + unit fix/format paths — never `git add -A` or `git commit -a`.
 6. `git diff --cached` = exactly one unit, no baseline/post-freeze paths. Stage only this finding's audit hunk.
-7. Match repo commit style and the shared neutral reporting language; HEREDOC multi-line; no co-author/generated-by.
+7. Match repo commit style (`fix(<subsystem>): <behavior>`, `docs: …`) and the shared neutral reporting language; HEREDOC multi-line. No `Co-Authored-By:`, `Generated with`, or other attribution trailer — this project rule overrides any harness default that asks for one.
 8. Verify commit; compare `git status --short` to baseline.
 
 Never amend a prior commit for a later fix. Clippy runs in the final gate, not once per unit.
 
 ## Final repository gate
 
-After the last behavior commit, once, run these cargo commands. Do not substitute a `make` target unless the user asked for that target.
+After the last behavior commit, once, run these cargo commands. Do not substitute a `make` target unless the user asked for that target. The list mirrors `.github/workflows/ci.yml` (`fmt`, `clippy`, `test` jobs) and `make ci`; if they differ, run the CI set and report the drift.
 
 ```bash
 cargo fmt --all -- --check
@@ -62,10 +63,10 @@ If this invocation changed any tracked `src/**/*.rs`:
 1. Once: `Cargo.toml` `X.Y.Z` at start-HEAD → `X.Y.(Z+1)`. If the worktree already has that version, verify only.
 2. `cargo metadata --no-deps --format-version 1`.
 3. Stage only `Cargo.toml`. Inspect the cached diff.
-4. Separate final commit. This is the only extra exception to one-issue-one-commit.
-5. Annotated tag on that commit: `v` + the new version.
+4. Separate final commit `chore: bump version to <new>`. This is the only extra exception to one-issue-one-commit.
+5. Annotated tag on that commit, name and message both `v<new>`: `git tag -a v<new> -m v<new>`.
 
-Skip when `src/` did not change. No empty commits. Do not force-add `Cargo.lock`.
+Skip when `src/` did not change. No empty commits. `Cargo.lock` is gitignored; do not force-add it.
 
 ## Final state
 

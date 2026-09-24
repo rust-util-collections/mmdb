@@ -1,31 +1,42 @@
 ---
 name: x-fix
-description: Resolve confirmed MMDB reliability findings sequentially, one validated local commit each. Does not bump the version or tag. Use only when the user explicitly invokes /x-fix.
+description: Resolve Open findings in docs/audit.md sequentially, one validated local commit each. Does not bump the version or tag.
 disable-model-invocation: true
 ---
 
 # Resolve MMDB Reliability Findings
 
 Clear actionable `docs/audit.md` Open, then self-review and commit. Never push,
-bump, or tag. User-invoked only. New commits only.
+bump, or tag. New commits only.
+
+## Invocation state
+
+Captured when this skill loaded. This is the preflight baseline
+(`workflow-policy.md` §1) and the ledger's start `HEAD`.
+
+!`git status --short --branch`
+
+HEAD: !`git rev-parse HEAD`
 
 ## Setup
 
+Read first:
 [workflow-policy.md](../../docs/workflow-policy.md),
-[commit-protocol.md](../../docs/commit-protocol.md), and the evidence rules in
-[review-core.md](../../docs/review-core.md).
+[commit-protocol.md](../../docs/commit-protocol.md),
+[review-core.md](../../docs/review-core.md),
+[pragmatic-engineering.md](../../docs/pragmatic-engineering.md),
+[technical-patterns.md](../../docs/technical-patterns.md),
+[false-positive-guide.md](../../docs/false-positive-guide.md).
 
-Also read `pragmatic-engineering.md`, `technical-patterns.md`, and
-`false-positive-guide.md`. Preflight and freeze paths before editing. Empty
-Open → "nothing to fix".
+Preflight and freeze paths before editing. Empty Open → "nothing to fix".
 
 ## Protocol
 
 ### 1. Triage (CRITICAL → LOW)
 
-Before editing, read the code, callers, tests, and guides (`design-patterns.md`
-if the shape is a design issue). Reproduce from current code. Dedupe root
-causes.
+Before editing, read the code, callers, tests, and guides
+([design-patterns.md](../../docs/design-patterns.md) if the shape is a design
+issue). Reproduce from current code. Dedupe root causes.
 
 - Ruled out → Rejected.
 - Confirmed, but a complete fix has disproportionate cost or regression risk →
@@ -49,15 +60,16 @@ sequential. Reads and tests may be parallel.
 
 ### 3. Self-review
 
-Review `starting_HEAD..HEAD` and the remaining owned worktree with the
-`/x-review` evidence rules. Do not reopen unrelated Open. A new confirmed
-defect in this range goes back through the same loop. Stop on no progress or
-on overlap with the baseline.
+Review `starting_HEAD..HEAD` and the remaining owned worktree with the evidence
+and verify rules in [x-review](../x-review/SKILL.md) §2–§3. Do not reopen
+unrelated Open. A new confirmed defect in this range goes back through the same
+loop. Stop on no progress or on overlap with the baseline.
 
 ### 4. Gate
 
-The cargo gate in `commit-protocol.md` once after the last behavior commit. Docs-only → skip. A remaining
-Open entry is a valid result; report the blocker. No version bump or tag.
+The cargo gate in `commit-protocol.md` once after the last behavior commit.
+Docs-only → skip. A remaining Open entry is a valid result; report the blocker.
+No version bump or tag.
 
 ## Output
 

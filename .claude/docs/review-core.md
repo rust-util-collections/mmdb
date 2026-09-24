@@ -97,10 +97,7 @@ Severities: CRITICAL, HIGH, MEDIUM, LOW. No other label.
 - **MEDIUM**: edge bug, error-policy gap, bounded leak
 - **LOW**: contract or docs drift with a real maintenance cost
 
-`/x-review` may add or prune Open, add Rejected, and move a stale Won't Fix
-back to Open or Rejected. It does not add Won't Fix. `/x-fix` and
-`/x-overhaul` may add Won't Fix during triage. Do not reclassify an entry to
-empty Open. No dates.
+Which workflow may add or move each disposition: `workflow-policy.md` §5.
 
 Open:
 
@@ -125,8 +122,9 @@ Task: Review local MMDB storage-engine reliability in the assigned files.
 Repository: <absolute path>
 Baseline and scope: <HEAD, scope, existing changes to preserve>
 Assigned files: <exact, disjoint file list>
-Read first: <absolute paths to workflow-policy.md, review-core.md,
-             false-positive-guide.md, and applicable subsystem guides>
+Read first: <absolute paths to workflow-policy.md (Task framing section),
+             review-core.md, false-positive-guide.md, and applicable
+             subsystem guides>
 Mode: Read-only investigation; no repository edits or commits.
 Question: <the behavior or invariants to check>
 Evidence already available: <relevant verified facts, or none>
