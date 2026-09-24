@@ -284,7 +284,6 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
         }
     }
 
-    let mut selected = Vec::new();
     let mut selected_numbers = HashSet::new();
     loop {
         let mut changed = false;
@@ -297,7 +296,6 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
                 .any(|extent| file_overlaps_extent(tf, extent))
             {
                 selected_numbers.insert(tf.meta.number);
-                selected.push(tf.clone());
                 if !add_file_extents(tf, &mut extents) {
                     return files.to_vec();
                 }
@@ -309,7 +307,13 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
         }
     }
 
-    selected
+    // A tombstone can pull an earlier-key file in a later pass, so return the
+    // selection in the level's own (key) order, not discovery order.
+    files
+        .iter()
+        .filter(|tf| selected_numbers.contains(&tf.meta.number))
+        .cloned()
+        .collect()
 }
 
 fn estimated_uncompressed_file_size(tf: &TableFile) -> u64 {
@@ -381,10 +385,13 @@ fn compute_split_points(task: &CompactionTask, max_subs: usize) -> Vec<Vec<u8>> 
 
     // Extract user key boundaries from target-level files (all except the last,
     // since the last file's largest_key doesn't split anything).
-    let boundaries: Vec<Vec<u8>> = next_files[..next_files.len() - 1]
+    let mut boundaries: Vec<Vec<u8>> = next_files[..next_files.len() - 1]
         .iter()
         .map(|tf| user_key(&tf.meta.largest_key).to_vec())
         .collect();
+    // Sub-job ranges `[split[i-1], split[i])` must be increasing and disjoint.
+    boundaries.sort();
+    boundaries.dedup();
 
     if boundaries.is_empty() {
         return Vec::new();
@@ -3103,6 +3110,106 @@ mod tests {
                 k == &key(150) && *seq == 10 && v == &value("source", 150)
             }),
             "covered keys must be retained when a snapshot below the tombstone needs them"
+        );
+    }
+
+    /// Regression: a range tombstone can pull an earlier-key target file in a
+    /// later closure pass. Returning targets in discovery order made
+    /// sub-compaction split points non-monotonic, so two sub-jobs emitted the
+    /// same keys and the overlapping install fail-stopped the DB.
+    #[test]
+    fn target_inputs_keep_level_order_for_split_points() {
+        use std::sync::Arc;
+
+        use super::{CompactionTask, compute_split_points, overlapping_files_for_inputs};
+        use crate::manifest::version::TableFile;
+        use crate::manifest::version_edit::FileMetaData;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::TableReader;
+        use crate::types::{InternalKey, ValueType};
+
+        fn build(
+            dir: &std::path::Path,
+            number: u64,
+            entries: &[(InternalKey, &[u8])],
+        ) -> TableFile {
+            let path = dir.join(format!("{number:06}.sst"));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    internal_keys: true,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for (key, value) in entries {
+                builder.add(key.as_bytes(), value).unwrap();
+            }
+            let result = builder.finish().unwrap();
+            TableFile {
+                meta: FileMetaData {
+                    number,
+                    file_size: result.file_size,
+                    smallest_key: result.smallest_key.unwrap(),
+                    largest_key: result.largest_key.unwrap(),
+                    has_range_deletions: result.has_range_deletions,
+                },
+                reader: Arc::new(TableReader::open(&path).unwrap()),
+            }
+        }
+        let ik = |k: &[u8], seq, vt| InternalKey::new(k, seq, vt);
+
+        let dir = tempfile::tempdir().unwrap();
+        // Target level, sorted and disjoint. g1's tombstone [a, f) reaches g3.
+        let g1 = build(
+            dir.path(),
+            1,
+            &[
+                (ik(b"a", 10, ValueType::Value), b"v"),
+                (ik(b"a", 5, ValueType::RangeDeletion), b"f"),
+                (ik(b"b", 11, ValueType::Value), b"v"),
+            ],
+        );
+        let g2 = build(
+            dir.path(),
+            2,
+            &[
+                (ik(b"c", 12, ValueType::Value), b"v"),
+                (ik(b"d", 13, ValueType::Value), b"v"),
+            ],
+        );
+        let g3 = build(
+            dir.path(),
+            3,
+            &[
+                (ik(b"e", 14, ValueType::Value), b"v"),
+                (ik(b"k", 15, ValueType::Value), b"v"),
+            ],
+        );
+        // Source input overlapping only g3 by metadata.
+        let f = build(
+            dir.path(),
+            4,
+            &[
+                (ik(b"h", 20, ValueType::Value), b"v"),
+                (ik(b"j", 21, ValueType::Value), b"v"),
+            ],
+        );
+
+        let targets = overlapping_files_for_inputs(&[g1, g2, g3], std::slice::from_ref(&f));
+        let numbers: Vec<u64> = targets.iter().map(|tf| tf.meta.number).collect();
+        assert_eq!(numbers, vec![1, 2, 3], "targets must stay in level order");
+
+        let task = CompactionTask {
+            level: 1,
+            input_files_level: vec![f],
+            input_files_next: targets,
+        };
+        let splits = compute_split_points(&task, 3);
+        assert!(
+            splits.windows(2).all(|w| w[0] < w[1]),
+            "split points must be strictly increasing: {splits:?}"
         );
     }
 }
