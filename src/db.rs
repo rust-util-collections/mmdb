@@ -418,10 +418,13 @@ pub struct DB {
 // SAFETY: the raw `*mut WriteRequest` pointers held in `write_queue` reference
 // stack frames of writer threads that remain blocked on `write_cv` (waiting for
 // `done`) for the pointers' entire lifetime. Pointers are published and drained
-// under the write_queue lock; after draining a group, the single active leader
-// holds exclusive ownership of the drained pointers — it may dereference them
-// without the lock in `write_batch_group` — until it re-acquires the lock, sets
-// `done`, and wakes the owners. No two threads ever access a request concurrently.
+// under the write_queue lock. Access is split by field: an owner reads only its
+// own `done`, and only under the write_queue lock (a wakeup meant for an
+// earlier group can make it do so while its request is in flight); the single
+// active leader reads `batch`, `sync`, and `disable_wal` and writes `result`
+// without the lock — the owner reads `result` only after `done` — and sets
+// `done` only under the lock. Unlocked, the leader therefore writes fields
+// through raw places and never forms a `&mut` to a whole request.
 // SAFETY: DB's shared mutable state is behind Arc + parking_lot locks or atomics;
 // raw request pointers are stack-local to write_queue waiters and never stored in DB.
 unsafe impl Send for DB {}
@@ -3492,9 +3495,9 @@ impl DB {
         if let Some(e) = wal_sync_err {
             self.set_bg_error(format!("WAL sync failed: {}", e));
             for &rp in batch_group {
-                // SAFETY: request pointers are still owned by this leader.
-                let rr = unsafe { &mut *rp };
-                rr.result = Some(Err(e.clone()));
+                // SAFETY: the owner is blocked until `done` and reads only
+                // `done` meanwhile; see the write_queue SAFETY note.
+                unsafe { (*rp).result = Some(Err(e.clone())) };
             }
             return Err(e);
         }
@@ -3529,13 +3532,12 @@ impl DB {
             let mut assigned_iter = assigned.iter().map(|&(p, _)| p);
             for &rp in batch_group {
                 if assigned_iter.next().is_some_and(|p| p == rp) {
-                    // SAFETY: request pointers are still owned by this leader.
-                    let rr = unsafe { &mut *rp };
-                    rr.result = Some(Ok(()));
+                    // SAFETY: the owner is blocked until `done` and reads only
+                    // `done` meanwhile; see the write_queue SAFETY note.
+                    unsafe { (*rp).result = Some(Ok(())) };
                 } else {
-                    // SAFETY: request pointers are still owned by this leader.
-                    let rr = unsafe { &mut *rp };
-                    rr.result = Some(Err(Error::io(io::Error::other(msg.clone()))));
+                    // SAFETY: as above.
+                    unsafe { (*rp).result = Some(Err(Error::io(io::Error::other(msg.clone())))) };
                 }
             }
             return Ok(false);
