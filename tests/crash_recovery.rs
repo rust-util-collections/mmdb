@@ -567,20 +567,22 @@ fn test_earlier_wal_corrupt_tail_fails_open_when_newer_wal_exists() {
     let newer_wal = path.join(format!("{:06}.wal", earlier_num + 1));
     fs::copy(&earlier_wal, &newer_wal).unwrap();
 
+    // A structural short read (a torn final append) rather than a checksum
+    // failure: only the highest non-empty WAL may tolerate a torn tail, so
+    // this must fail only because a newer WAL exists.
     {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .write(true)
             .open(&earlier_wal)
             .unwrap();
-        file.seek(SeekFrom::Start(7 + 12)).unwrap();
-        file.write_all(b"XXXX").unwrap();
+        let len = file.metadata().unwrap().len();
+        file.set_len(len - 4).unwrap();
     }
 
     let result = DB::open(make_opts(), &path);
     assert!(
         result.is_err(),
-        "open should fail when an earlier WAL has a corrupt zero-padded tail"
+        "open should fail when an earlier WAL has a torn tail"
     );
     assert!(
         earlier_wal.exists(),
