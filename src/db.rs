@@ -1006,6 +1006,10 @@ impl DB {
                                         mem::take(&mut *bg_hints.lock());
                                     if !hints.is_empty() {
                                         for hint in &hints {
+                                            // Close waits only for the job in flight.
+                                            if shutdown.load(Ordering::Acquire) {
+                                                return Ok(());
+                                            }
                                             // Phase 1: pick + pre-allocate (short lock)
                                             let pick = {
                                                 let mut inner = bg_inner.lock();
@@ -1161,6 +1165,9 @@ impl DB {
 
                                 // Run pending compactions (lock released during I/O)
                                 loop {
+                                    if shutdown.load(Ordering::Acquire) {
+                                        return Ok(());
+                                    }
                                     // Phase 1: pick + pre-allocate (short lock)
                                     let pick = {
                                         let mut inner = bg_inner.lock();
@@ -1328,7 +1335,8 @@ impl DB {
                                 // levels first so removing older copies can make
                                 // shallower copies eligible in the same pass.
                                 loop {
-                                    if !bg_dead_key_sweep.is_pending()
+                                    if shutdown.load(Ordering::Acquire)
+                                        || !bg_dead_key_sweep.is_pending()
                                         || !bg_snapshot_list.as_sorted_vec().is_empty()
                                         || !bg_dead_key_sweep.try_start()
                                     {
@@ -1338,6 +1346,10 @@ impl DB {
                                     let mut blocked_by_snapshot = false;
                                     let mut deferred_l0 = false;
                                     for level in (0..bg_options.num_levels).rev() {
+                                        if shutdown.load(Ordering::Acquire) {
+                                            bg_dead_key_sweep.finish(true);
+                                            return Ok(());
+                                        }
                                         let mut inner = bg_inner.lock();
                                         let active_snaps = bg_snapshot_list.as_sorted_vec();
                                         blocked_by_snapshot |= !active_snaps.is_empty();
@@ -4632,6 +4644,100 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: the background loops never re-checked `compaction_shutdown`,
+    /// so `close()` joined workers only after every pending compaction ran.
+    #[test]
+    fn close_stops_background_compaction_after_the_current_job() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        use crate::options::{CompactionFilter, CompactionFilterDecision};
+
+        struct BlockFirstCall {
+            armed: AtomicBool,
+            entered: Mutex<Option<mpsc::Sender<()>>>,
+            release: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl CompactionFilter for BlockFirstCall {
+            fn filter(
+                &self,
+                _level: usize,
+                _key: &[u8],
+                _value: &[u8],
+            ) -> CompactionFilterDecision {
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    self.entered.lock().take().unwrap().send(()).unwrap();
+                    self.release.lock().take().unwrap().recv().unwrap();
+                }
+                CompactionFilterDecision::Keep
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let stalled = DbOptions {
+            l0_compaction_trigger: usize::MAX,
+            l0_slowdown_trigger: usize::MAX,
+            l0_stop_trigger: usize::MAX,
+            ..Default::default()
+        };
+        {
+            let db = DB::open(stalled.clone(), dir.path()).unwrap();
+            for file in 0..3 {
+                for i in 0..50 {
+                    db.put(format!("k{file}_{i:03}").as_bytes(), &[b'v'; 100])
+                        .unwrap();
+                }
+                db.flush().unwrap();
+            }
+            db.close().unwrap();
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let filter = Arc::new(BlockFirstCall {
+            armed: AtomicBool::new(true),
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(Some(release_rx)),
+        });
+        // The inherited L0 backlog starts one job; the tiny level budget
+        // leaves more jobs queued behind it.
+        let db = Arc::new(
+            DB::open(
+                DbOptions {
+                    l0_compaction_trigger: 1,
+                    max_bytes_for_level_base: 1,
+                    target_file_size_base: 1024,
+                    compaction_filter: Some(filter),
+                    ..stalled
+                },
+                dir.path(),
+            )
+            .unwrap(),
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first compaction job never reached the filter");
+        let completed_before = db.stats.compactions_completed.load(Ordering::Relaxed);
+
+        let closer = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || db.close())
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !db.compaction_shutdown.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "close never requested shutdown");
+            thread::sleep(Duration::from_millis(1));
+        }
+        release_tx.send(()).unwrap();
+        closer.join().unwrap().unwrap();
+
+        assert_eq!(
+            db.stats.compactions_completed.load(Ordering::Relaxed),
+            completed_before + 1,
+            "close must stop after the in-flight job"
+        );
     }
 
     /// Regression: range iterators applied the lower bound entry by entry
