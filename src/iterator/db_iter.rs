@@ -263,6 +263,8 @@ impl DBIterator {
 
     /// Return the first error from any underlying source iterator, or a
     /// key-decode corruption observed while filtering entries.
+    /// A source read error ends iteration, and the error stays reported for
+    /// the iterator's lifetime; later seeks do not resume it.
     /// Use after iteration returns `None` to distinguish normal exhaustion
     /// from I/O or semantic corruption failures.
     pub fn error(&self) -> Option<String> {
@@ -964,6 +966,159 @@ mod tests {
     fn sort_lex(mut entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<(Vec<u8>, Vec<u8>)> {
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         entries
+    }
+
+    /// Build a one-entry-per-block SST from sorted `entries` and flip the
+    /// stored CRC byte of the block holding `entries[corrupt]`.
+    fn sst_with_corrupt_block(
+        path: &std::path::Path,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        corrupt: usize,
+    ) -> crate::manifest::version::TableFile {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::TableReader;
+
+        let mut builder = TableBuilder::new(
+            path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (k, v) in entries {
+            builder.add(k, v).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let handle = {
+            let reader = TableReader::open(path).unwrap();
+            let index = reader.cached_index_entries().unwrap();
+            assert_eq!(index.len(), entries.len(), "expected one block per entry");
+            index[corrupt].handle
+        };
+        let crc_byte_offset = handle.offset + handle.size + 1;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        f.seek(SeekFrom::Start(crc_byte_offset)).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).unwrap();
+        f.seek(SeekFrom::Start(crc_byte_offset)).unwrap();
+        f.write_all(&[byte[0].wrapping_add(1)]).unwrap();
+        drop(f);
+
+        crate::manifest::version::TableFile {
+            meta: crate::manifest::version_edit::FileMetaData {
+                number: 1,
+                file_size: std::fs::metadata(path).unwrap().len(),
+                smallest_key: entries[0].0.clone(),
+                largest_key: entries[entries.len() - 1].0.clone(),
+                has_range_deletions: false,
+            },
+            reader: std::sync::Arc::new(TableReader::open(path).unwrap()),
+        }
+    }
+
+    /// Regression: a source whose block read fails must end the merged scan.
+    /// Treating it as exhausted let an older value from a deeper level stand
+    /// in for the newer tombstone in the unreadable block.
+    #[test]
+    fn source_read_error_stops_merge_instead_of_exposing_older_version() {
+        use crate::sst::table_reader::TableIterator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let newer = sst_with_corrupt_block(
+            &dir.path().join("000001.sst"),
+            &[
+                make_entry(b"a", 20, ValueType::Value, b"a"),
+                make_entry(b"k", 19, ValueType::Deletion, b""),
+            ],
+            1,
+        );
+        let sources = vec![
+            IterSource::from_table_iter(TableIterator::new(newer.reader)).with_level(1),
+            IterSource::new(vec![make_entry(b"k", 5, ValueType::Value, b"old")]).with_level(2),
+        ];
+
+        let mut iter = DBIterator::from_sources(sources, 100);
+        let entries: Vec<_> = iter.by_ref().collect();
+        assert!(
+            !entries.iter().any(|(k, _)| k == b"k"),
+            "deleted key surfaced from a deeper level: {entries:?}"
+        );
+        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
+
+        let sources = vec![
+            IterSource::from_table_iter(TableIterator::new(
+                sst_with_corrupt_block(
+                    &dir.path().join("000002.sst"),
+                    &[
+                        make_entry(b"a", 20, ValueType::Value, b"a"),
+                        make_entry(b"k", 19, ValueType::Deletion, b""),
+                    ],
+                    1,
+                )
+                .reader,
+            ))
+            .with_level(1),
+            IterSource::new(vec![make_entry(b"k", 5, ValueType::Value, b"old")]).with_level(2),
+        ];
+        let mut iter = DBIterator::from_sources(sources, 100);
+        iter.seek(b"k");
+        assert!(!iter.valid(), "seek must not land on the older version");
+        assert!(iter.error().is_some());
+    }
+
+    /// Regression: `LevelIterator` clears its error on every seek, and the
+    /// direction switches DBIterator performs internally re-seek every source.
+    /// The error must survive them so exhaustion is not reported as success.
+    #[test]
+    fn source_read_error_survives_internal_reseeks() {
+        use crate::iterator::level_iter::LevelIterator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut entries: Vec<_> = (0..10)
+            .map(|i| make_entry(format!("a{i}").as_bytes(), 1 + i, ValueType::Value, b"v"))
+            .collect();
+        entries.extend(
+            (0..10).map(|i| make_entry(format!("b{i}").as_bytes(), 11 + i, ValueType::Value, b"v")),
+        );
+        let file = sst_with_corrupt_block(&dir.path().join("000001.sst"), &entries, 5);
+        let sources = vec![
+            IterSource::from_level_iter(LevelIterator::new(vec![file])).with_level(1),
+            IterSource::new(vec![make_entry(b"c1", 30, ValueType::Value, b"c")]).with_level(0),
+        ];
+
+        let mut iter = DBIterator::from_sources(sources, 100);
+        iter.seek(b"c1");
+        assert_eq!(iter.key(), Some(&b"c1"[..]));
+        // Walk backward into the unreadable block (a5), then forward again:
+        // the forward resume re-seeks every source.
+        let mut seen = Vec::new();
+        iter.prev();
+        while iter.valid() {
+            seen.push(iter.key().unwrap().to_vec());
+            iter.prev();
+        }
+        iter.advance();
+        assert!(!iter.valid(), "iteration resumed after a read error");
+        iter.advance();
+        assert!(!iter.valid(), "iteration resumed after a read error");
+        assert!(
+            iter.error().is_some_and(|e| e.contains("CRC")),
+            "read error lost after internal re-seek; yielded {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|k| k.as_slice() < b"a5".as_slice()),
+            "keys past the failed block were yielded: {seen:?}"
+        );
     }
 
     #[test]

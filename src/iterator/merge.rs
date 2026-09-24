@@ -36,6 +36,11 @@ pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
     /// Fast path: bypass heap when exactly one source exists.
     /// Models RocksDB's MergeIteratorBuilder single-source optimization.
     single_source: bool,
+    /// First source error observed. Once set the merged stream is over: a
+    /// failed source must not be treated as exhausted (older versions from
+    /// other sources would stand in for its unread entries), and later seeks
+    /// are skipped so a source's own reset cannot clear the failure.
+    error: Option<String>,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
@@ -51,6 +56,31 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             direction: Direction::Forward,
             single_source: single,
             current_key: Vec::new(),
+            error: None,
+        }
+    }
+
+    /// Record `idx`'s error, if any, now that it has no entry to offer.
+    /// Returns true once the merged stream has failed.
+    fn latch_source_error(&mut self, idx: usize) -> bool {
+        if self.error.is_none() {
+            self.error = self.sources[idx].iter_error();
+        }
+        if self.error.is_some() {
+            self.heap_size = 0;
+        }
+        self.error.is_some()
+    }
+
+    /// Drop the heap top, whose source ran out of entries.
+    fn remove_exhausted_top(&mut self, idx: usize) {
+        if self.latch_source_error(idx) {
+            return;
+        }
+        self.heap_size -= 1;
+        if self.heap_size > 0 {
+            self.heap.swap(0, self.heap_size);
+            self.sift_down(0);
         }
     }
 
@@ -80,6 +110,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         for i in 0..self.sources.len() {
             if self.sources[i].has_peeked {
                 valid.push(i);
+            } else if self.latch_source_error(i) {
+                return;
             }
         }
         self.heap = valid;
@@ -138,6 +170,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Get the next (key, value) pair from the merged stream (forward direction).
     pub fn next_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        if self.error.is_some() {
+            return None;
+        }
         // Direction check must come before single-source fast path:
         // after prev_entry() sets direction=Backward, the source is
         // backward-positioned and must be re-seeked forward.
@@ -151,12 +186,17 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 self.initialized = true;
                 let _ = self.sources[0].peek();
             }
-            return self.sources[0].take_peeked().inspect(|entry| {
+            let entry = self.sources[0].take_peeked();
+            if let Some(ref entry) = entry {
                 // Track current key for direction switching (same as multi-source path).
                 self.current_key.clear();
                 self.current_key.extend_from_slice(&entry.0);
                 let _ = self.sources[0].peek();
-            });
+            }
+            if !self.sources[0].has_peeked {
+                self.latch_source_error(0);
+            }
+            return entry;
         }
 
         self.init_heap();
@@ -179,12 +219,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             // Source still has entries — sift down to maintain heap
             self.sift_down(0);
         } else {
-            // Source exhausted — remove from heap
-            self.heap_size -= 1;
-            if self.heap_size > 0 {
-                self.heap.swap(0, self.heap_size);
-                self.sift_down(0);
-            }
+            // Source exhausted (or failed) — remove from heap
+            self.remove_exhausted_top(min_idx);
         }
 
         Some(entry)
@@ -192,6 +228,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Get the previous (key, value) pair from the merged stream (backward direction).
     pub fn prev_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        if self.error.is_some() {
+            return None;
+        }
         if self.direction != Direction::Backward {
             self.switch_to_backward();
         }
@@ -202,13 +241,18 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             // Check has_peeked directly — do NOT call take_peeked() which
             // would trigger forward advance_into_buffers when source is exhausted backward.
             if !self.sources[0].has_peeked {
+                self.latch_source_error(0);
                 return None;
             }
-            return self.sources[0].take_peeked().inspect(|entry| {
+            let entry = self.sources[0].take_peeked();
+            if let Some(ref entry) = entry {
                 self.current_key.clear();
                 self.current_key.extend_from_slice(&entry.0);
-                self.sources[0].prev_advance();
-            });
+                if !self.sources[0].prev_advance() {
+                    self.latch_source_error(0);
+                }
+            }
+            return entry;
         }
 
         self.init_heap();
@@ -229,12 +273,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             // Source still has entries backward — sift down to maintain heap
             self.sift_down(0);
         } else {
-            // Source exhausted backward — remove from heap
-            self.heap_size -= 1;
-            if self.heap_size > 0 {
-                self.heap.swap(0, self.heap_size);
-                self.sift_down(0);
-            }
+            // Source exhausted (or failed) backward — remove from heap
+            self.remove_exhausted_top(max_idx);
         }
 
         Some(entry)
@@ -292,6 +332,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Uses `seek_to` for seekable sources (O(log N) binary search)
     /// instead of forward-only linear scan.
     pub fn seek(&mut self, target: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
         self.direction = Direction::Forward;
         for source in self.sources.iter_mut() {
             source.seek_to(target, &self.compare);
@@ -311,6 +354,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// calls before falling back to a full seek.  This avoids expensive binary
     /// search + I/O when keys are nearby (e.g. sequential prefix scans).
     pub fn seek_opt(&mut self, target: &[u8], try_next: bool) {
+        if self.error.is_some() {
+            return;
+        }
         // Fast path: if we can try seek-using-next and we're already forward
         // with a known position strictly before target, attempt incremental advancement.
         if try_next
@@ -389,6 +435,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Seek all sources for prev to a target key, then rebuild the max-heap.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
         self.direction = Direction::Backward;
         for source in self.sources.iter_mut() {
             source.seek_for_prev_to(target, &self.compare);
@@ -403,6 +452,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// For the single-source fast path, this is a direct reference to the source's buffer.
     #[inline]
     pub fn peek_entry(&mut self) -> Option<(&[u8], &[u8])> {
+        if self.error.is_some() {
+            return None;
+        }
         if self.direction != Direction::Forward {
             self.switch_to_forward();
         }
@@ -410,7 +462,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if self.single_source {
             if !self.initialized {
                 self.initialized = true;
-                let _ = self.sources[0].peek();
+            }
+            if self.sources[0].peek().is_none() {
+                self.latch_source_error(0);
+                return None;
             }
             return self.sources[0].peek();
         }
@@ -432,9 +487,14 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// which re-positions independently of current_key.
     #[inline]
     pub fn advance_entry(&mut self) {
+        if self.error.is_some() {
+            return;
+        }
         if self.single_source {
             self.sources[0].skip_peeked();
-            let _ = self.sources[0].peek();
+            if self.sources[0].peek().is_none() {
+                self.latch_source_error(0);
+            }
             return;
         }
 
@@ -449,11 +509,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if self.sources[min_idx].has_peeked {
             self.sift_down(0);
         } else {
-            self.heap_size -= 1;
-            if self.heap_size > 0 {
-                self.heap.swap(0, self.heap_size);
-                self.sift_down(0);
-            }
+            self.remove_exhausted_top(min_idx);
         }
     }
 
@@ -461,11 +517,16 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Uses take_peeked (which resets buffer capacity to 0 for the source).
     /// Only call this for entries that will actually be returned to the caller.
     pub fn take_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        if self.error.is_some() {
+            return None;
+        }
         if self.single_source {
             let entry = self.sources[0].take_peeked()?;
             self.current_key.clear();
             self.current_key.extend_from_slice(&entry.0);
-            let _ = self.sources[0].peek();
+            if self.sources[0].peek().is_none() {
+                self.latch_source_error(0);
+            }
             return Some(entry);
         }
 
@@ -484,11 +545,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if self.sources[min_idx].has_peeked {
             self.sift_down(0);
         } else {
-            self.heap_size -= 1;
-            if self.heap_size > 0 {
-                self.heap.swap(0, self.heap_size);
-                self.sift_down(0);
-            }
+            self.remove_exhausted_top(min_idx);
         }
 
         Some(entry)
@@ -496,6 +553,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Seek all sources to first, rebuild the min-heap.
     pub fn seek_to_first(&mut self) {
+        if self.error.is_some() {
+            return;
+        }
         self.direction = Direction::Forward;
         for source in self.sources.iter_mut() {
             source.seek_to_first_impl();
@@ -511,6 +571,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Seek all sources to last, rebuild the max-heap.
     pub fn seek_to_last_merge(&mut self) {
+        if self.error.is_some() {
+            return;
+        }
         self.direction = Direction::Backward;
         for source in self.sources.iter_mut() {
             source.seek_to_last_impl();
@@ -541,10 +604,14 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.sources[self.heap[0]].level
     }
 
-    /// Return the first error from any source iterator.
+    /// Return the first error from any source iterator. A latched error
+    /// stays reported for the iterator's lifetime.
     /// Use after iteration returns `None` to distinguish normal exhaustion
     /// from I/O failures.
     pub fn error(&self) -> Option<String> {
+        if self.error.is_some() {
+            return self.error.clone();
+        }
         for source in &self.sources {
             if let Some(e) = source.iter_error() {
                 return Some(e);

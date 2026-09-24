@@ -275,7 +275,7 @@ impl DBIterator {
     pub fn seek_to_last(&mut self);
     pub fn prev(&mut self);
     pub fn next_prefix(&mut self, prefix_len: usize); // O(log N) jump
-    pub fn error(&self) -> Option<String>;       // I/O errors swallowed by Iterator::next
+    pub fn error(&self) -> Option<String>;       // I/O error that ended iteration (sticky)
 }
 
 impl Snapshot<'_> {
