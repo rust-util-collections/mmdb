@@ -626,7 +626,7 @@ impl DB {
 
         if !read_only && options.error_if_exists {
             let current = path.join("CURRENT");
-            if current.exists() {
+            if current.try_exists().ctx()? {
                 return Err(Error::invalid_argument(format!(
                     "DB already exists: {}",
                     path.display()
@@ -4625,6 +4625,48 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: `Path::exists()` maps every stat error to `false`, so an
+    /// unreadable `CURRENT` made open create a fresh store and delete every
+    /// SST of the existing one as orphans.
+    #[cfg(unix)]
+    #[test]
+    fn open_fails_when_current_cannot_be_inspected() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+            db.put(b"k", b"v").unwrap();
+            db.flush().unwrap();
+            db.close().unwrap();
+        }
+        let count_ssts = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".sst")
+                })
+                .count()
+        };
+        let ssts = count_ssts();
+        assert!(ssts > 0);
+        let current = dir.path().join("CURRENT");
+        let saved = fs::read(&current).unwrap();
+        fs::remove_file(&current).unwrap();
+        // A self-referential symlink makes stat fail with ELOOP.
+        std::os::unix::fs::symlink("CURRENT", &current).unwrap();
+
+        assert!(DB::open(DbOptions::default(), dir.path()).is_err());
+        assert_eq!(count_ssts(), ssts, "a failed open must not delete SSTs");
+
+        fs::remove_file(&current).unwrap();
+        fs::write(&current, saved).unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
     }
 
     /// Regression: block-property collectors are user code running inside the
