@@ -83,12 +83,21 @@ impl DeadKeySweepState {
 /// Coalesces sweep requests without losing work queued during a running pass.
 struct DeadKeySweepScheduler {
     state: AtomicU8,
+    /// Per-DB seams for scheduling real workers without affecting other tests.
+    #[cfg(test)]
+    before_deferred_finish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    completed_passes: AtomicUsize,
 }
 
 impl DeadKeySweepScheduler {
     fn new() -> Self {
         Self {
             state: AtomicU8::new(DeadKeySweepState::Idle as u8),
+            #[cfg(test)]
+            before_deferred_finish: Mutex::new(None),
+            #[cfg(test)]
+            completed_passes: AtomicUsize::new(0),
         }
     }
 
@@ -1433,11 +1442,24 @@ impl DB {
                                         );
                                         refresh_super_version(&bg_sv, &inner);
                                     }
-                                    bg_dead_key_sweep.finish(blocked_by_snapshot || deferred_l0);
-                                    // The pending flush signals compaction after
-                                    // its install; retry the sweep then instead
-                                    // of spinning while its SST write runs.
+                                    #[cfg(test)]
                                     if deferred_l0 {
+                                        let hook =
+                                            bg_dead_key_sweep.before_deferred_finish.lock().take();
+                                        if let Some(hook) = hook {
+                                            hook();
+                                        }
+                                    }
+                                    bg_dead_key_sweep.finish(blocked_by_snapshot || deferred_l0);
+                                    // Publish Pending before checking whether the
+                                    // flush is still in flight. Another worker may
+                                    // have consumed its notification while this
+                                    // sweep was Running. If it already installed,
+                                    // retry here; otherwise its install follows
+                                    // this locked check and sends a new wake.
+                                    if deferred_l0
+                                        && !bg_inner.lock().immutable_memtables.is_empty()
+                                    {
                                         break;
                                     }
                                 }
@@ -1446,7 +1468,12 @@ impl DB {
                         ));
 
                         match result {
-                            Ok(Ok(())) => {} // success
+                            Ok(Ok(())) => {
+                                #[cfg(test)]
+                                bg_dead_key_sweep
+                                    .completed_passes
+                                    .fetch_add(1, Ordering::Release);
+                            }
                             Ok(Err(msg)) => {
                                 set_error(msg);
                                 break;
@@ -5265,6 +5292,87 @@ mod tests {
             *db.compaction_notify.0.lock().unwrap(),
             "the deferred sweep must have a queued wake"
         );
+    }
+
+    /// A second worker can consume the flush notification while the sweep
+    /// owner is still Running. The owner must retry after publishing Pending
+    /// if the flush completed, or wait for the flush if it is still in flight.
+    #[test]
+    fn deferred_sweep_rechecks_flush_after_another_worker_consumes_its_wakeup() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        for flush_before_finish in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open(
+                DbOptions {
+                    max_background_compactions: 2,
+                    l0_compaction_trigger: usize::MAX,
+                    l0_slowdown_trigger: usize::MAX,
+                    l0_stop_trigger: usize::MAX,
+                    lazy_delete_compaction_threshold: 1,
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .unwrap();
+            db.put(b"k", b"v").unwrap();
+            let frozen = {
+                let mut inner = db.inner.lock();
+                db.freeze_memtable_sync(&mut inner).unwrap()
+            };
+            let complete_flush = || {
+                db.flush_and_install_frozen(&frozen).unwrap();
+                db.post_flush_cleanup(frozen.old_wal_number).unwrap();
+            };
+            let wait_for_passes = |count| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < count {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                true
+            };
+            // Open unconditionally schedules a startup pass. Let it finish
+            // before counting the two passes used by this interleaving.
+            assert!(wait_for_passes(1), "startup compaction pass did not finish");
+
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            *db.dead_key_sweep.before_deferred_finish.lock() = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+            db.lazy_delete(b"k");
+            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+            if flush_before_finish {
+                complete_flush();
+                // Worker A is parked before finish; only worker B can complete
+                // this pass, consuming the notification without starting a sweep.
+                let consumed = wait_for_passes(2);
+                let wake_queued = *db.compaction_notify.0.lock().unwrap();
+                release_tx.send(()).unwrap();
+                assert!(consumed, "second worker did not consume the notification");
+                assert!(!wake_queued, "notification was not consumed before finish");
+            } else {
+                release_tx.send(()).unwrap();
+                assert!(wait_for_passes(2), "sweep did not defer the pending flush");
+                assert!(db.dead_key_sweep.is_pending());
+                assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
+                complete_flush();
+            }
+
+            assert!(wait_for_passes(3), "deferred sweep did not complete");
+            assert_eq!(
+                db.get(b"k").unwrap(),
+                None,
+                "cleanup lost its wakeup (flush_before_finish={flush_before_finish})"
+            );
+            db.close().unwrap();
+        }
     }
 
     /// Regression: `prune_settled_dead_keys`'s absence probe is an unlocked
