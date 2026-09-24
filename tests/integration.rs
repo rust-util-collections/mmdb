@@ -1842,7 +1842,8 @@ fn test_compact_range_filters_files() {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions {
         create_if_missing: true,
-        write_buffer_size: 512,
+        // Large enough that each explicit flush makes exactly one L0 file.
+        write_buffer_size: 64 << 20,
         l0_compaction_trigger: 100, // don't auto-compact
         ..Default::default()
     };
@@ -1867,8 +1868,15 @@ fn test_compact_range_filters_files() {
     }
     db.flush().unwrap();
 
-    // compact_range only the "m" range
+    assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("3"));
+
+    // compact_range only the "m" range: the "a" and "z" files stay in L0.
     db.compact_range(Some(b"m_0000"), Some(b"m_9999")).unwrap();
+    assert_eq!(
+        db.get_property("num-files-at-level0").as_deref(),
+        Some("2"),
+        "compact_range rewrote files outside its range"
+    );
 
     // All data should still be readable
     for i in 0..50 {
