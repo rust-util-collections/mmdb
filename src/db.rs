@@ -109,6 +109,10 @@ impl DeadKeySweepScheduler {
             == DeadKeySweepState::Pending
     }
 
+    fn is_idle(&self) -> bool {
+        DeadKeySweepState::from_raw(self.state.load(Ordering::Acquire)) == DeadKeySweepState::Idle
+    }
+
     fn try_start(&self) -> bool {
         self.state
             .compare_exchange(
@@ -3695,7 +3699,9 @@ impl DB {
         }
         drop(inner);
         // A dead-key sweep that deferred L0 for this flush retries on wake.
-        if self.dead_key_sweep.is_pending() {
+        // A pass that is still running may already have deferred and only
+        // becomes Pending after this check, so wake for it too.
+        if !self.dead_key_sweep.is_idle() {
             self.signal_compaction();
         }
         Ok(())
@@ -5230,6 +5236,35 @@ mod tests {
         }
         let db = DB::open(options, dir.path()).unwrap();
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+
+    /// Regression: the explicit flush only woke a sweep already marked
+    /// Pending. A pass that deferred L0 for this flush but had not yet called
+    /// `finish` was still Running, so no wake was sent and the sweep then
+    /// stayed Pending with nothing left to trigger it.
+    #[test]
+    fn flush_install_wakes_a_sweep_still_deferring_l0() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        stop_background_workers(&db);
+        db.put(b"k", b"v").unwrap();
+        let frozen = {
+            let mut inner = db.inner.lock();
+            db.freeze_memtable_sync(&mut inner).unwrap()
+        };
+        // The pass has seen the in-flight flush and skipped L0.
+        db.dead_key_sweep.queue();
+        assert!(db.dead_key_sweep.try_start());
+        *db.compaction_notify.0.lock().unwrap() = false;
+
+        db.flush_and_install_frozen(&frozen).unwrap();
+        db.dead_key_sweep.finish(true);
+
+        assert!(db.dead_key_sweep.is_pending());
+        assert!(
+            *db.compaction_notify.0.lock().unwrap(),
+            "the deferred sweep must have a queued wake"
+        );
     }
 
     /// Regression: `prune_settled_dead_keys`'s absence probe is an unlocked
