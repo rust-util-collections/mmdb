@@ -224,6 +224,29 @@ fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
     }));
 }
 
+/// Table options for memtable flush outputs, which always land in L0.
+/// Shared by live flushes and the open-time recovery flush.
+fn l0_build_opts(options: &DbOptions) -> TableBuildOptions {
+    let compression = if !options.compression_per_level.is_empty() {
+        options.compression_per_level[0]
+    } else {
+        options.compression
+    };
+    TableBuildOptions {
+        block_size: options.block_size,
+        block_restart_interval: options.block_restart_interval,
+        bloom_bits_per_key: options.bloom_bits_per_key,
+        internal_keys: true,
+        compression,
+        prefix_len: options.prefix_len,
+        block_property_collectors: options
+            .block_property_collectors
+            .iter()
+            .map(|f| f())
+            .collect(),
+    }
+}
+
 /// Run one dead-key sweep step on `level`. Returns `false`, without merging,
 /// when L0 must wait for a pending flush.
 ///
@@ -869,19 +892,7 @@ impl DB {
             // the old WALs. This ensures the data persists even if we crash again
             // before writing to the new WAL.
             if !wal_numbers.is_empty() && active_memtable.approximate_size() > 0 {
-                let make_opts = || TableBuildOptions {
-                    block_size: options.block_size,
-                    block_restart_interval: options.block_restart_interval,
-                    bloom_bits_per_key: options.bloom_bits_per_key,
-                    internal_keys: true,
-                    compression: options.compression,
-                    prefix_len: options.prefix_len,
-                    block_property_collectors: options
-                        .block_property_collectors
-                        .iter()
-                        .map(|f| f())
-                        .collect(),
-                };
+                let make_opts = || l0_build_opts(&options);
                 let outputs = {
                     let mut alloc = || Ok(versions.new_file_number());
                     Self::write_memtable_ssts(&active_memtable, &path, &make_opts, &mut alloc)
@@ -4305,25 +4316,7 @@ impl DB {
 
     /// Build options for flush outputs (always L0).
     fn flush_build_opts(&self) -> TableBuildOptions {
-        let compression = if !self.options.compression_per_level.is_empty() {
-            self.options.compression_per_level[0]
-        } else {
-            self.options.compression
-        };
-        TableBuildOptions {
-            block_size: self.options.block_size,
-            block_restart_interval: self.options.block_restart_interval,
-            bloom_bits_per_key: self.options.bloom_bits_per_key,
-            internal_keys: true,
-            compression,
-            prefix_len: self.options.prefix_len,
-            block_property_collectors: self
-                .options
-                .block_property_collectors
-                .iter()
-                .map(|f| f())
-                .collect(),
-        }
+        l0_build_opts(&self.options)
     }
 
     /// Write a memtable to one or more SST files, splitting at user-key
@@ -4669,6 +4662,40 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: the open-time recovery flush built its own table options
+    /// with `options.compression`, ignoring `compression_per_level[0]`.
+    #[test]
+    fn recovery_flush_uses_l0_compression() {
+        use crate::sst::format::CompressionType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            compression: CompressionType::Lz4,
+            compression_per_level: vec![CompressionType::None; 7],
+            ..Default::default()
+        };
+        let db = DB::open(options.clone(), dir.path()).unwrap();
+        for i in 0..100 {
+            db.put(format!("k{i:03}").as_bytes(), &[b'v'; 256]).unwrap();
+        }
+        db.simulate_crash();
+
+        let db = DB::open(options, dir.path()).unwrap();
+        let version = db.get_super_version().version.clone();
+        let file = &version.level_files(0)[0];
+        let first_block = file.reader.cached_index_entries().unwrap()[0].handle;
+        let mut trailer_type = [0u8; 1];
+        {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut f =
+                fs::File::open(dir.path().join(format!("{:06}.sst", file.meta.number))).unwrap();
+            f.seek(SeekFrom::Start(first_block.offset + first_block.size))
+                .unwrap();
+            f.read_exact(&mut trailer_type).unwrap();
+        }
+        assert_eq!(trailer_type[0], CompressionType::None as u8);
     }
 
     /// Regression: a WAL append failure reached group members as a string
