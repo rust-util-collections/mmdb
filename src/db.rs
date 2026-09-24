@@ -4672,6 +4672,30 @@ mod tests {
         scheduler.finish(false);
     }
 
+    /// `sync: true` must fsync the WAL before acknowledging, so a failed
+    /// fsync reaches the writer; `sync: false` only flushes the WAL buffer.
+    /// A crash test cannot observe this: the page cache survives it.
+    #[test]
+    fn sync_write_fsyncs_the_wal_and_async_write_does_not() {
+        use crate::wal::writer::FAIL_NEXT_SYNC;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        FAIL_NEXT_SYNC.with(|fail| fail.set(true));
+        let unsynced = db.put(b"a", b"1");
+        let synced = db.put_with_options(
+            &WriteOptions {
+                sync: true,
+                ..Default::default()
+            },
+            b"b",
+            b"2",
+        );
+        FAIL_NEXT_SYNC.with(|fail| fail.set(false));
+        assert!(unsynced.is_ok(), "an async write must not fsync");
+        assert!(synced.is_err(), "a sync write must fsync the WAL");
+    }
+
     /// Join the compaction workers so a test drives compaction itself.
     fn stop_background_workers(db: &DB) {
         {

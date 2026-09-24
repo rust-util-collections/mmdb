@@ -901,10 +901,16 @@ fn test_sync_guarantees() {
 fn test_disable_wal_data_loss() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
+    // A large buffer rules out an auto-flush persisting the no-WAL writes.
+    let opts = || DbOptions {
+        create_if_missing: true,
+        write_buffer_size: 64 << 20,
+        ..Default::default()
+    };
 
     // Write some durable data first, then write with disable_wal, then crash
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        let db = DB::open(opts(), &path).unwrap();
 
         // Durable write
         db.put_with_options(
@@ -936,9 +942,9 @@ fn test_disable_wal_data_loss() {
         db.simulate_crash();
     }
 
-    // Recover — durable key must survive; no-WAL keys may be lost
+    // Recover — the durable key survives; the no-WAL keys were never logged
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        let db = DB::open(opts(), &path).unwrap();
 
         // The durable write must be present
         assert_eq!(
@@ -955,10 +961,9 @@ fn test_disable_wal_data_loss() {
                 survived += 1;
             }
         }
-        // With disable_wal + crash, data loss is expected behavior.
-        // We don't assert survived == 0 because an auto-flush could have
-        // persisted some to SST. But typically most/all are lost.
-        assert!(survived <= 20, "unexpected survived count: {}", survived);
+        // Nothing flushed them, so a crash loses every no-WAL write; any
+        // survivor means `disable_wal` still appended to the WAL.
+        assert_eq!(survived, 0, "no-WAL writes were recovered from the WAL");
     }
 }
 
