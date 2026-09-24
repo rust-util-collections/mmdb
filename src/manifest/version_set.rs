@@ -30,8 +30,10 @@ thread_local! {
 }
 
 fn check_manifest_poison(poisoned: &AtomicBool) -> Result<()> {
+    // A failed MANIFEST write fail-stops the engine; the on-disk state is
+    // recoverable on reopen, so this is not `Corruption`.
     if poisoned.load(Ordering::Acquire) {
-        return Err(Error::corruption(
+        return Err(Error::background(
             "MANIFEST writer poisoned by an earlier write failure; reopen the database to recover",
         ));
     }
@@ -913,7 +915,7 @@ mod tests {
                     .unwrap()
                     .unwrap_err()
                     .kind(),
-                ErrorKind::Corruption
+                ErrorKind::Background
             );
         });
     }
@@ -938,7 +940,7 @@ mod tests {
         edit.set_last_sequence(7);
         assert_eq!(
             vs.log_and_apply(edit).unwrap_err().kind(),
-            ErrorKind::Corruption
+            ErrorKind::Background
         );
         assert_eq!(vs.last_sequence(), 0);
         drop(vs);

@@ -3107,7 +3107,7 @@ impl DB {
             return Some(Error::background(msg.clone()));
         }
         if self.manifest_poisoned.load(Ordering::Acquire) {
-            return Some(Error::corruption(
+            return Some(Error::background(
                 "MANIFEST writer poisoned by an earlier write failure; \
                  reopen the database to recover"
                     .to_string(),
@@ -5600,7 +5600,9 @@ mod tests {
         db.manifest_poisoned.store(true, Ordering::Release);
 
         let err = db.close().unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Corruption);
+        // A failed MANIFEST write fail-stops a recoverable store; it is not
+        // on-disk corruption (callers quarantine on `Corruption`).
+        assert_eq!(err.kind(), ErrorKind::Background);
         assert!(err.message().contains("MANIFEST writer poisoned"));
         assert!(db.compaction_handles.lock().is_empty());
         assert!(db.lock_file.lock().is_none());
