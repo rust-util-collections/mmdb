@@ -237,9 +237,9 @@ pub struct BlockCache {
     /// fast paths — exactly the per-DB behavior of the pre-pool cache.
     pinned: Mutex<HashMap<(u64, u64), CacheValue>>,
     /// Fast-path hint: number of entries currently in `pinned`. `get()` checks
-    /// this atomic before acquiring `pinned`'s mutex so the common case (no
-    /// pinned entries at all, or a lookup for a key that isn't one) skips the
-    /// lock entirely. `Relaxed` is sufficient since this is only a hint —
+    /// this atomic before acquiring `pinned`'s mutex, so lookups skip the lock
+    /// only while nothing is pinned; with any entry pinned (the steady state
+    /// with default L0 pinning) every lookup takes it, whatever the key. `Relaxed` is sufficient since this is only a hint —
     /// `pinned` (guarded by its own mutex) remains the authoritative state and
     /// is always consulted whenever the counter reads nonzero.
     ///
@@ -269,9 +269,8 @@ impl BlockCache {
         if self.pool.disabled || self.detached.load(Ordering::Relaxed) {
             return None;
         }
-        // Fast path: `pinned` is empty for the vast majority of lookups (only
-        // one data block per L0 file is ever pinned), so skip its mutex
-        // entirely unless the hint counter says there's something to find.
+        // Fast path: skip the pin mutex while nothing is pinned. Once any L0
+        // first block is pinned, every lookup takes the lock.
         if self.pinned_count.load(Ordering::Relaxed) != 0
             && let Some(v) = self.pinned.lock().get(&(file_number, block_offset))
         {
