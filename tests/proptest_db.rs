@@ -18,8 +18,13 @@ enum Op {
     Get(Vec<u8>),
 }
 
+/// Mostly keys from a small space, so puts, overwrites, deletes, and gets
+/// hit stored keys; plus some long random keys for key-shape coverage.
 fn arb_key() -> impl Strategy<Value = Vec<u8>> {
-    vec(any::<u8>(), 1..32)
+    prop_oneof![
+        3 => (0u8..16).prop_map(|b| vec![b]),
+        1 => vec(any::<u8>(), 1..32),
+    ]
 }
 
 fn arb_value() -> impl Strategy<Value = Vec<u8>> {
