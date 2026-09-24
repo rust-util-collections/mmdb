@@ -3899,22 +3899,21 @@ impl DB {
             l0_compaction_trigger: 1,
             ..self.options.clone()
         };
+        let mut installed = false;
         loop {
-            // Phase 1: pick + pre-allocate (short lock)
+            // Phase 1: pick + pre-allocate (short lock). Only L0 work: deeper
+            // levels are left to the background workers.
             let (pick, l0_blocked) = {
                 let mut inner = self.inner.lock();
                 let version = inner.versions.current();
                 let mut claimed = self.compacting_files.lock();
-                match LeveledCompaction::pick_compaction(&version, &force_opts, &claimed) {
+                match LeveledCompaction::pick_l0_compaction(&version, &claimed) {
                     Some(task) => {
-                        let l0_inputs: Vec<u64> = if task.level == 0 {
-                            task.input_files_level
-                                .iter()
-                                .map(|f| f.meta.number)
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
+                        let l0_inputs: Vec<u64> = task
+                            .input_files_level
+                            .iter()
+                            .map(|f| f.meta.number)
+                            .collect();
                         let max_out = LeveledCompaction::max_output_files(&task, &force_opts);
                         let file_start = inner.versions.reserve_file_numbers(max_out);
                         let file_limit = file_start.saturating_add(max_out);
@@ -3949,9 +3948,8 @@ impl DB {
                             false,
                         )
                     }
-                    // With `l0_compaction_trigger: 1`, a `None` pick while L0
-                    // is non-empty means every candidate was excluded by an
-                    // in-flight claim — not that L0 is drained.
+                    // A `None` pick while L0 is non-empty means an in-flight
+                    // claim holds L0 files — not that L0 is drained.
                     None => (None, version.l0_file_count() > 0),
                 }
             }; // lock released
@@ -4048,6 +4046,11 @@ impl DB {
                 return Err(e).ctx();
             }
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
+            installed = true;
+        }
+        // The drained L0 data may have pushed L1+ over budget.
+        if installed {
+            self.signal_compaction();
         }
         Ok(())
     }
@@ -4663,6 +4666,46 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0
+    /// was empty it ran level-size compactions inline — in the stop-trigger
+    /// path while holding `write_queue`, stalling every writer.
+    #[test]
+    fn drain_l0_leaves_deeper_levels_to_background_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions {
+                l0_compaction_trigger: usize::MAX,
+                l0_slowdown_trigger: usize::MAX,
+                l0_stop_trigger: usize::MAX,
+                max_bytes_for_level_base: 1,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        {
+            let (lock, cv) = &*db.compaction_notify;
+            let _guard = lock.lock().unwrap();
+            db.compaction_shutdown.store(true, Ordering::Release);
+            cv.notify_all();
+        }
+        for handle in db.compaction_handles.lock().drain(..) {
+            handle.join().unwrap();
+        }
+        db.put(b"k", b"v").unwrap();
+        db.flush().unwrap();
+
+        db.drain_l0(false).unwrap();
+        let files_at = |level: usize| db.get_property(&format!("num-files-at-level{level}"));
+        assert_eq!(files_at(0).as_deref(), Some("0"));
+        assert_eq!(files_at(1).as_deref(), Some("1"));
+        assert_eq!(
+            files_at(2).as_deref(),
+            Some("0"),
+            "drain_l0 must not compact below L1"
+        );
     }
 
     /// Regression: open error paths closed the lock file without `LOCK_UN`.

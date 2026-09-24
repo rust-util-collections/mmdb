@@ -967,7 +967,10 @@ impl LeveledCompaction {
     /// compaction is already draining L0), while the explicit full-compaction
     /// path waits for the claim to clear and re-picks (`DB::drain_l0` with
     /// `wait_for_inflight`).
-    fn pick_l0_compaction(version: &Version, in_flight: &HashSet<u64>) -> Option<CompactionTask> {
+    pub(crate) fn pick_l0_compaction(
+        version: &Version,
+        in_flight: &HashSet<u64>,
+    ) -> Option<CompactionTask> {
         let l0_files = version.level_files(0);
         if l0_files.is_empty()
             || l0_files
