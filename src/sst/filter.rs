@@ -111,8 +111,12 @@ impl BloomFilter {
     }
 }
 
-/// Hash function for bloom filter based on MurmurHash2.
-/// Matches LevelDB/RocksDB's BloomHash for compatibility and quality.
+/// Hash function for bloom filters: MurmurHash2 (`m = 0x5bd1e995`) with
+/// LevelDB's seed. It is not LevelDB's `BloomHash`.
+///
+/// On-disk format: SST filters store no hash version, so changing this
+/// function makes every existing filter report present keys as absent. A new
+/// hash needs a new filter metaindex key or version.
 pub(crate) fn bloom_hash(key: &[u8]) -> u32 {
     let seed: u32 = 0xbc9f1d34;
     let m: u32 = 0x5bd1e995;
@@ -158,6 +162,22 @@ pub(crate) fn bloom_hash(key: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// The hash is part of the persisted filter format: filters carry no
+    /// hash version, so any change makes existing filters return false
+    /// negatives. Pin its output.
+    #[test]
+    fn bloom_hash_is_stable() {
+        let pinned: [(&[u8], u32); 5] = [
+            (b"", 0x471a8188),
+            (b"a", 0xe27a35ff),
+            (b"abcd", 0x07375115),
+            (b"hello", 0x057bea7f),
+            (b"key_000001", 0x6baf12e0),
+        ];
+        for (key, hash) in pinned {
+            assert_eq!(bloom_hash(key), hash, "key {key:?}");
+        }
+    }
     use super::*;
 
     #[test]
