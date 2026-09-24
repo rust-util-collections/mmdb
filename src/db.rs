@@ -1940,11 +1940,18 @@ impl DB {
                 db_iter.set_range_tombstones_with_levels(all_tombstones);
             }
         }
-        if effective_lower.is_some() || effective_upper.is_some() {
+        let has_lower = effective_lower.is_some();
+        if has_lower || effective_upper.is_some() {
             db_iter.set_bounds(effective_lower, effective_upper);
         }
         if let Some(ref sp) = options.skip_point {
             db_iter.set_skip_point(Arc::clone(sp));
+        }
+        // Memtable and L0 sources start at their first entry and ignore the
+        // lower bound; position at it instead of discarding every entry below
+        // it one at a time on the first `next()`.
+        if has_lower {
+            db_iter.seek_to_first();
         }
         Ok(db_iter)
     }
@@ -4625,6 +4632,62 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: range iterators applied the lower bound entry by entry
+    /// instead of seeking to it, so the first `next()` walked every memtable
+    /// and L0 entry below the bound. Reading below the bound is observable
+    /// here: the only block below it is unreadable.
+    #[test]
+    fn range_iterator_seeks_to_lower_bound() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            block_size: 256,
+            pin_l0_filter_and_index_blocks_in_cache: false,
+            l0_compaction_trigger: usize::MAX,
+            l0_slowdown_trigger: usize::MAX,
+            l0_stop_trigger: usize::MAX,
+            ..Default::default()
+        };
+        let sst = {
+            let db = DB::open(options.clone(), dir.path()).unwrap();
+            for i in 0..100 {
+                db.put(format!("a{i:03}").as_bytes(), &[b'v'; 64]).unwrap();
+            }
+            db.flush().unwrap();
+            let number = db.inner.lock().versions.current().level_files(0)[0]
+                .meta
+                .number;
+            db.close().unwrap();
+            dir.path().join(format!("{number:06}.sst"))
+        };
+        let first_block = {
+            let reader = crate::sst::table_reader::TableReader::open(&sst).unwrap();
+            let index = reader.cached_index_entries().unwrap();
+            assert!(index.len() > 2, "expected several data blocks");
+            index[0].handle
+        };
+        let crc_byte_offset = first_block.offset + first_block.size + 1;
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sst)
+            .unwrap();
+        f.seek(SeekFrom::Start(crc_byte_offset)).unwrap();
+        let mut byte = [0u8; 1];
+        f.read_exact(&mut byte).unwrap();
+        f.seek(SeekFrom::Start(crc_byte_offset)).unwrap();
+        f.write_all(&[byte[0].wrapping_add(1)]).unwrap();
+        drop(f);
+
+        let db = DB::open(options, dir.path()).unwrap();
+        let mut iter = db
+            .iter_with_range(&ReadOptions::default(), Some(b"a050"), None)
+            .unwrap();
+        assert_eq!(iter.next().map(|(k, _)| k), Some(b"a050".to_vec()));
+        assert!(iter.error().is_none(), "{:?}", iter.error());
     }
 
     /// Regression: `Path::exists()` maps every stat error to `false`, so an
