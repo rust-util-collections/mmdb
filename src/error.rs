@@ -45,8 +45,9 @@ pub enum ErrorKind {
     DbClosed,
     /// The database was opened without write capability.
     ReadOnly,
-    /// A background task (flush/compaction) failed earlier; writes are
-    /// rejected until the database is reopened.
+    /// The engine is fail-stopped: an earlier flush, compaction, WAL sync, or
+    /// MANIFEST write failed. Every operation except `close` returns this
+    /// kind until the database is reopened.
     Background,
 }
 
