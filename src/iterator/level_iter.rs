@@ -4,10 +4,10 @@
 //! and opens one file's TableIterator at a time. This reduces MergingIterator heap size
 //! from O(total_files) to O(L0_count + num_levels).
 
-use std::{cmp::Ordering, sync::Arc};
+use std::{cmp::Ordering, ops::Deref, sync::Arc};
 
 use crate::iterator::merge::SeekableIterator;
-use crate::manifest::version::TableFile;
+use crate::manifest::version::{TableFile, Version};
 use crate::options::BlockPropertyFilter;
 use crate::sst::table_reader::TableIterator;
 use crate::types::{LazyValue, compare_internal_key, user_key as user_key_from_internal};
@@ -16,6 +16,29 @@ use crate::types::{LazyValue, compare_internal_key, user_key as user_key_from_in
 ///
 /// Opens one file's `TableIterator` at a time, advancing to the next file
 /// only when the current one is exhausted.
+/// The files of one level, read in place from a pinned `Version` so creating
+/// a DB iterator copies no file metadata. Tests may supply an owned list.
+enum LevelFiles {
+    Version {
+        version: Arc<Version>,
+        level: usize,
+    },
+    #[cfg(test)]
+    Owned(Vec<TableFile>),
+}
+
+impl Deref for LevelFiles {
+    type Target = [TableFile];
+
+    fn deref(&self) -> &[TableFile] {
+        match self {
+            Self::Version { version, level } => version.level_files(*level),
+            #[cfg(test)]
+            Self::Owned(files) => files,
+        }
+    }
+}
+
 /// Result of checking one file against a `LevelIterator`'s filters.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FileFilter {
@@ -36,7 +59,7 @@ thread_local! {
 
 pub struct LevelIterator {
     /// L1+ files, sorted by smallest_key (non-overlapping).
-    files: Vec<TableFile>,
+    files: LevelFiles,
     /// Current position in `files`. files.len() = exhausted.
     file_index: usize,
     /// Lazily opened iterator for the file at file_index.
@@ -62,7 +85,17 @@ pub struct LevelIterator {
 
 impl LevelIterator {
     /// Create a new LevelIterator over non-overlapping files sorted by key range.
+    #[cfg(test)]
     pub fn new(files: Vec<TableFile>) -> Self {
+        Self::with_files(LevelFiles::Owned(files))
+    }
+
+    /// Iterate `level` of a pinned `version` without copying its file list.
+    pub fn for_level(version: Arc<Version>, level: usize) -> Self {
+        Self::with_files(LevelFiles::Version { version, level })
+    }
+
+    fn with_files(files: LevelFiles) -> Self {
         Self {
             files,
             file_index: 0,

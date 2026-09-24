@@ -1877,7 +1877,7 @@ impl DB {
                     }
                 }
             }
-            let mut level_iter = LevelIterator::new(files.to_vec())
+            let mut level_iter = LevelIterator::for_level(Arc::clone(version), level)
                 .with_fill_cache(options.fill_cache)
                 .with_range_hints(
                     lower_bound.map(|s| s.to_vec()),
@@ -2110,7 +2110,7 @@ impl DB {
                     }
                 }
             }
-            let mut level_iter = LevelIterator::new(files.to_vec())
+            let mut level_iter = LevelIterator::for_level(Arc::clone(version), level)
                 .with_fill_cache(options.fill_cache)
                 .with_prefix(prefix_owned.to_vec())
                 .with_range_hints(Some(prefix_owned.to_vec()), prefix_upper.clone());
@@ -2271,7 +2271,7 @@ impl DB {
             if files.is_empty() {
                 continue;
             }
-            let level_iter = LevelIterator::new(files.to_vec());
+            let level_iter = LevelIterator::for_level(Arc::clone(version), level);
             sources.push(IterSource::from_level_iter(level_iter).with_level(level));
         }
 
@@ -4667,6 +4667,34 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: every DB iterator cloned each L1+ `TableFile` (a reader
+    /// `Arc` bump plus two key copies) although the pinned `Version` already
+    /// holds them for the iterator's lifetime.
+    #[test]
+    fn iterators_share_the_pinned_version_file_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        for i in 0..100 {
+            db.put(format!("k{i:03}").as_bytes(), b"v").unwrap();
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+        let version = db.get_super_version().version.clone();
+        let reader = &version
+            .level_files(1)
+            .first()
+            .expect("compact() must leave data in L1")
+            .reader;
+        let before = Arc::strong_count(reader);
+        let iter = db.iter().unwrap();
+        assert_eq!(
+            Arc::strong_count(reader),
+            before,
+            "creating an iterator copied the L1 file list"
+        );
+        drop(iter);
     }
 
     /// Regression: flush cloned every memtable entry into a `Vec` before
