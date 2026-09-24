@@ -224,6 +224,33 @@ fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
     }));
 }
 
+/// Run one dead-key sweep step on `level`. Returns `false`, without merging,
+/// when L0 must wait for a pending flush.
+///
+/// A flush reserves its L0 file numbers at freeze time and installs them after
+/// an unlocked SST write. Rewriting L0 in between would give older data higher
+/// file numbers than the pending flush output; recovery orders L0 by file
+/// number, so point reads would return the older value after reopen.
+fn sweep_dead_keys_at_level(
+    ctx: &CompactionContext<'_>,
+    level: usize,
+    inner: &mut DBInner,
+    table_cache: &Arc<TableCache>,
+    block_cache: &Arc<BlockCache>,
+) -> Result<bool> {
+    if level == 0 && !inner.immutable_memtables.is_empty() {
+        return Ok(false);
+    }
+    LeveledCompaction::force_merge_level(
+        ctx,
+        level,
+        &mut inner.versions,
+        Some(table_cache),
+        Some(block_cache),
+    )?;
+    Ok(true)
+}
+
 /// File numbers claimed by in-flight compaction picks, paired with a condvar
 /// so the explicit full-compaction path can wait for in-flight picks to
 /// install or discard instead of silently skipping their input files.
@@ -1309,6 +1336,7 @@ impl DB {
                                     }
 
                                     let mut blocked_by_snapshot = false;
+                                    let mut deferred_l0 = false;
                                     for level in (0..bg_options.num_levels).rev() {
                                         let mut inner = bg_inner.lock();
                                         let active_snaps = bg_snapshot_list.as_sorted_vec();
@@ -1320,23 +1348,33 @@ impl DB {
                                             stats: Some(&bg_stats),
                                             active_snapshots: &active_snaps,
                                         };
-                                        LeveledCompaction::force_merge_level(
+                                        let swept = sweep_dead_keys_at_level(
                                             &ctx,
                                             level,
-                                            &mut inner.versions,
-                                            Some(&bg_table_cache),
-                                            Some(&bg_block_cache),
+                                            &mut inner,
+                                            &bg_table_cache,
+                                            &bg_block_cache,
                                         )
                                         .map_err(|e| {
                                             format!("dead-key sweep error at L{}: {}", level, e)
                                         })?;
+                                        if !swept {
+                                            deferred_l0 = true;
+                                            continue;
+                                        }
                                         bg_l0_count.store(
                                             inner.versions.current().l0_file_count(),
                                             Ordering::Relaxed,
                                         );
                                         refresh_super_version(&bg_sv, &inner);
                                     }
-                                    bg_dead_key_sweep.finish(blocked_by_snapshot);
+                                    bg_dead_key_sweep.finish(blocked_by_snapshot || deferred_l0);
+                                    // The pending flush signals compaction after
+                                    // its install; retry the sweep then instead
+                                    // of spinning while its SST write runs.
+                                    if deferred_l0 {
+                                        break;
+                                    }
                                 }
                                 Ok(())
                             },
@@ -3596,6 +3634,11 @@ impl DB {
             self.set_bg_error(format!("flush install failed: {}", e));
             return Err(e);
         }
+        drop(inner);
+        // A dead-key sweep that deferred L0 for this flush retries on wake.
+        if self.dead_key_sweep.is_pending() {
+            self.signal_compaction();
+        }
         Ok(())
     }
 
@@ -4560,6 +4603,65 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: a flush reserves its L0 file numbers at freeze and installs
+    /// them after an unlocked write. A sweep that rewrote L0 in between gave
+    /// older data higher file numbers, so after reopen (L0 sorted by number)
+    /// a point read returned the overwritten value.
+    #[test]
+    fn dead_key_sweep_defers_l0_while_flush_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            l0_compaction_trigger: usize::MAX,
+            l0_slowdown_trigger: usize::MAX,
+            l0_stop_trigger: usize::MAX,
+            ..Default::default()
+        };
+        {
+            let db = DB::open(options.clone(), dir.path()).unwrap();
+            // This test drives the sweep step itself.
+            {
+                let (lock, cv) = &*db.compaction_notify;
+                let _guard = lock.lock().unwrap();
+                db.compaction_shutdown.store(true, Ordering::Release);
+                cv.notify_all();
+            }
+            for handle in db.compaction_handles.lock().drain(..) {
+                handle.join().unwrap();
+            }
+            db.put(b"k", b"v1").unwrap();
+            db.flush().unwrap();
+            db.put(b"x", b"x").unwrap();
+            db.flush().unwrap();
+            db.put(b"k", b"v2").unwrap();
+
+            let frozen = {
+                let mut inner = db.inner.lock();
+                db.freeze_memtable_sync(&mut inner).unwrap()
+            };
+            let snapshots = Vec::new();
+            let ctx = CompactionContext {
+                db_path: &db.path,
+                options: &db.options,
+                rate_limiter: Some(&db.rate_limiter),
+                stats: Some(&db.stats),
+                active_snapshots: &snapshots,
+            };
+            {
+                let mut inner = db.inner.lock();
+                let swept =
+                    sweep_dead_keys_at_level(&ctx, 0, &mut inner, &db.table_cache, &db.block_cache)
+                        .unwrap();
+                assert!(!swept, "L0 sweep must wait for the in-flight flush");
+            }
+            db.flush_and_install_frozen(&frozen).unwrap();
+            db.post_flush_cleanup(frozen.old_wal_number).unwrap();
+            assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
+            db.close().unwrap();
+        }
+        let db = DB::open(options, dir.path()).unwrap();
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
     }
 
     /// Regression: `prune_settled_dead_keys`'s absence probe is an unlocked
