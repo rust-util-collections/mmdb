@@ -42,7 +42,9 @@ pub struct DbOptions {
     pub block_size: usize,
     /// Restart interval for prefix compression in data blocks.
     pub block_restart_interval: usize,
-    /// Bits per key for bloom filter. 0 disables bloom filter.
+    /// Bits per key for bloom filter. 0 disables bloom filter. A writable
+    /// open rejects a value whose filter for a single key would exceed the
+    /// maximum readable block size.
     pub bloom_bits_per_key: u32,
     /// Compression type for SST data blocks.
     pub compression: CompressionType,

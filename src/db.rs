@@ -33,6 +33,7 @@ use crate::options::{
     CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
 };
 use crate::rate_limiter::RateLimiter;
+use crate::sst::filter::BloomFilter;
 use crate::sst::table_builder::{
     META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuildResult, TableBuilder,
 };
@@ -648,6 +649,12 @@ impl DB {
                 "l0_slowdown_trigger ({}) must be <= l0_stop_trigger ({})",
                 options.l0_slowdown_trigger, options.l0_stop_trigger
             )));
+        }
+
+        // A filter too large for even one key would fail every flush after
+        // writes were acknowledged; reject it before accepting any.
+        if !read_only {
+            BloomFilter::checked_size("bloom filter", 1, options.bloom_bits_per_key).ctx()?;
         }
 
         if read_only {
@@ -4662,6 +4669,24 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: a `bloom_bits_per_key` too large for even one key was
+    /// accepted at open; writes were acknowledged and the first flush failed,
+    /// fail-stopping the DB (and a reopen failed in the recovery flush).
+    #[test]
+    fn open_rejects_bloom_bits_no_flush_can_satisfy() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = DB::open(
+            DbOptions {
+                bloom_bits_per_key: 536_838_137,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .err()
+        .expect("open must reject the filter size");
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
     }
 
     /// Regression: the open-time recovery flush built its own table options
