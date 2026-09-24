@@ -10,6 +10,9 @@ use crate::wal::record::*;
 #[cfg(test)]
 thread_local! {
     pub(crate) static FAIL_NEXT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next `add_record` on this thread fail with this I/O kind.
+    pub(crate) static FAIL_NEXT_APPEND: std::cell::Cell<Option<std::io::ErrorKind>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// WAL writer. Appends records to a file, splitting across block boundaries.
@@ -64,6 +67,10 @@ impl WalWriter {
     ///
     /// The record may be split into multiple fragments across block boundaries.
     pub fn add_record(&mut self, payload: &[u8]) -> Result<()> {
+        #[cfg(test)]
+        if let Some(kind) = FAIL_NEXT_APPEND.with(|fail| fail.take()) {
+            return Err(std::io::Error::from(kind)).ctx();
+        }
         let mut left = payload;
         let mut is_first = true;
 

@@ -3453,7 +3453,7 @@ impl DB {
         self.sequence.store(last_group_seq + 1, Ordering::Release);
 
         let mut assigned = Vec::with_capacity(batch_group.len());
-        let mut append_error: Option<String> = None;
+        let mut append_error: Option<Error> = None;
         let mut next_seq = first_group_seq;
 
         for &req_ptr in batch_group {
@@ -3468,7 +3468,7 @@ impl DB {
                 if let Some(ref mut wal) = inner.wal_writer
                     && let Err(e) = wal.add_record(&wal_record)
                 {
-                    append_error = Some(format!("WAL write failed: {}", e));
+                    append_error = Some(e.context("WAL write failed"));
                     break;
                 }
             }
@@ -3527,8 +3527,8 @@ impl DB {
             self.committed_sequence.store(last_seq, Ordering::Release);
         }
 
-        if let Some(msg) = append_error {
-            self.set_bg_error(msg.clone());
+        if let Some(e) = append_error {
+            self.set_bg_error(e.to_string());
             let mut assigned_iter = assigned.iter().map(|&(p, _)| p);
             for &rp in batch_group {
                 if assigned_iter.next().is_some_and(|p| p == rp) {
@@ -3537,7 +3537,7 @@ impl DB {
                     unsafe { (*rp).result = Some(Ok(())) };
                 } else {
                     // SAFETY: as above.
-                    unsafe { (*rp).result = Some(Err(Error::io(io::Error::other(msg.clone())))) };
+                    unsafe { (*rp).result = Some(Err(e.clone())) };
                 }
             }
             return Ok(false);
@@ -4669,6 +4669,25 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: a WAL append failure reached group members as a string
+    /// wrapped in `io::Error::other`, dropping the original `io::ErrorKind`
+    /// (for example `StorageFull`) that `Error` exists to carry.
+    #[test]
+    fn wal_append_failure_keeps_the_io_error() {
+        use std::error::Error as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        crate::wal::writer::FAIL_NEXT_APPEND
+            .with(|fail| fail.set(Some(io::ErrorKind::StorageFull)));
+        let err = db.put(b"k", b"v").unwrap_err();
+        let io_kind = err
+            .source()
+            .and_then(|source| source.downcast_ref::<io::Error>())
+            .map(io::Error::kind);
+        assert_eq!(io_kind, Some(io::ErrorKind::StorageFull), "{err}");
     }
 
     /// Regression: every DB iterator cloned each L1+ `TableFile` (a reader
