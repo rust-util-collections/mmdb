@@ -42,6 +42,7 @@ After the last behavior commit, once, run these cargo commands. Do not substitut
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --lib
+cargo test --doc
 cargo test --test crash_recovery
 cargo test --test e2e_scenarios
 cargo test --test integration

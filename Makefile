@@ -21,6 +21,7 @@ ci:
 	cargo fmt --all -- --check
 	$(MAKE) lint
 	cargo test --lib
+	cargo test --doc
 	cargo test --test crash_recovery
 	cargo test --test e2e_scenarios
 	cargo test --test integration

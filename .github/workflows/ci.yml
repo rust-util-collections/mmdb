@@ -49,6 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib
+      - run: cargo test --doc
       - run: cargo test --test crash_recovery
       - run: cargo test --test e2e_scenarios
       - run: cargo test --test integration
