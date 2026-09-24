@@ -1,9 +1,11 @@
 //! A write-serialized, read-concurrent skip list with arena allocation.
 //!
 //! The DB's group commit model guarantees a single leader writes to the memtable
-//! at any time (under write_queue lock), while reads happen concurrently via
-//! shared references.  This means:
-//! - **Single-writer**: `&self` insert, serialized externally by the DB write_queue lock
+//! at any time: the leader releases `write_queue` before applying its group and
+//! inserts while holding `DB::inner`, which `leader_active` makes exclusive to
+//! it. Recovery inserts only into a local memtable that is not yet published.
+//! Reads happen concurrently via shared references. This means:
+//! - **Single-writer**: `&self` insert, serialized externally by `DB::inner`
 //! - **Concurrent readers**: `&self` iter/get/range, lock-free via atomic pointers
 //!
 //! Nodes are arena-allocated in contiguous blocks for cache-friendly level-0
