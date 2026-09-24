@@ -4352,11 +4352,11 @@ impl DB {
         let mut pending_cut = false;
         let mut last_uk: Vec<u8> = Vec::new();
 
-        for (key, value) in mem.iter() {
-            let uk_changed = types::user_key(&key) != last_uk.as_slice();
+        for (key, value) in mem.iter_ref() {
+            let uk_changed = types::user_key(key) != last_uk.as_slice();
             if uk_changed {
                 last_uk.clear();
-                last_uk.extend_from_slice(types::user_key(&key));
+                last_uk.extend_from_slice(types::user_key(key));
             }
             if pending_cut
                 && uk_changed
@@ -4389,7 +4389,7 @@ impl DB {
                 }
             }
             let (num, b) = builder.as_mut().unwrap();
-            if let Err(e) = b.add(&key, &value).ctx() {
+            if let Err(e) = b.add(key, value).ctx() {
                 let num = *num;
                 cleanup(&results, Some(num));
                 return Err(e);
@@ -4666,6 +4666,41 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: flush cloned every memtable entry into a `Vec` before
+    /// writing the first SST, holding a memtable-sized copy while both the
+    /// frozen and the active memtable were resident.
+    #[test]
+    fn memtable_flush_streams_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = MemTable::new();
+        for i in 0..4096u64 {
+            mem.put(
+                format!("key{i:06}").as_bytes(),
+                &[b'v'; 4096],
+                i + 1,
+                ValueType::Value,
+            );
+        }
+        let make_opts = || TableBuildOptions {
+            internal_keys: true,
+            ..Default::default()
+        };
+        let mut next = 0u64;
+        let (outputs, allocations) = crate::test_alloc::measure(|| {
+            DB::write_memtable_ssts(&mem, dir.path(), &make_opts, &mut || {
+                next += 1;
+                Ok(next)
+            })
+            .unwrap()
+        });
+        assert!(!outputs.is_empty());
+        assert!(
+            allocations.peak_live < 4 << 20,
+            "flushing 16 MiB held {} bytes at once",
+            allocations.peak_live
+        );
     }
 
     /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0

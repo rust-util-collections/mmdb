@@ -113,8 +113,16 @@ impl SkipListMemTable {
     /// Iterate over all entries in internal key order (user_key ASC, seq DESC).
     /// With `OrdInternalKey`, the skip list is already in the correct order —
     /// no sorting needed.
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.map.iter().map(|(k, v)| (k.0, v))
+    }
+
+    /// Borrowing iteration in internal key order, without copying entries.
+    pub fn iter_ref(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.map
+            .iter_ref()
+            .map(|(k, v)| (k.as_bytes(), v.as_slice()))
     }
 
     /// Iterate over all entries in reverse internal key order.

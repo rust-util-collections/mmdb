@@ -14,6 +14,7 @@
 
 use std::{
     cell::UnsafeCell,
+    marker::PhantomData,
     ptr,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
@@ -353,8 +354,20 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
         None
     }
 
+    /// Borrowing iterator over all entries in key order, following the
+    /// level-0 links without copying. Entries inserted while it runs may or
+    /// may not be yielded; flush iterates frozen or unpublished tables, which
+    /// do not change.
+    pub fn iter_ref(&self) -> RefIter<'_, K, V> {
+        RefIter {
+            next: self.head[0].load(Ordering::Acquire),
+            _list: PhantomData,
+        }
+    }
+
     /// Return a snapshot iterator over all entries, sorted by key.
     /// Entries are collected at creation time (safe for concurrent modification).
+    #[cfg(test)]
     pub fn iter(&self) -> SkipListIter<K, V> {
         let entries = self.collect_all();
         let len = entries.len();
@@ -533,6 +546,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     // -- Internal helpers --
 
     /// Collect all entries at level 0 (the bottom level has all entries).
+    #[cfg(test)]
     fn collect_all(&self) -> Vec<(K, V)> {
         let mut result = Vec::new();
         let mut ptr = self.head[0].load(Ordering::Acquire);
@@ -598,7 +612,31 @@ fn cheap_random_bool() -> bool {
     })
 }
 
+/// Borrowing iterator over skip list entries in key order.
+pub struct RefIter<'a, K, V> {
+    next: *const Node<K, V>,
+    _list: PhantomData<&'a Node<K, V>>,
+}
+
+impl<'a, K, V> Iterator for RefIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next.is_null() {
+            return None;
+        }
+        // SAFETY: `next` came from an Acquire load of a published level-0
+        // link, so the node is fully initialized. Nodes live in the list's
+        // arena and are freed only when the list drops, which the `'a`
+        // borrow taken by `iter_ref` rules out while this iterator lives.
+        let node = unsafe { &*self.next };
+        self.next = node.next[0].load(Ordering::Acquire);
+        Some((&node.key, &node.value))
+    }
+}
+
 /// Snapshot iterator over skip list entries. Supports `DoubleEndedIterator`.
+#[cfg(test)]
 pub struct SkipListIter<K, V> {
     entries: Vec<(K, V)>,
     front: usize,
@@ -606,6 +644,7 @@ pub struct SkipListIter<K, V> {
     back_exclusive: usize,
 }
 
+#[cfg(test)]
 impl<K: Clone, V: Clone> Iterator for SkipListIter<K, V> {
     type Item = (K, V);
 
@@ -625,6 +664,7 @@ impl<K: Clone, V: Clone> Iterator for SkipListIter<K, V> {
     }
 }
 
+#[cfg(test)]
 impl<K: Clone, V: Clone> DoubleEndedIterator for SkipListIter<K, V> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.back_exclusive > self.front {
@@ -636,6 +676,7 @@ impl<K: Clone, V: Clone> DoubleEndedIterator for SkipListIter<K, V> {
     }
 }
 
+#[cfg(test)]
 impl<K: Clone, V: Clone> ExactSizeIterator for SkipListIter<K, V> {}
 
 #[cfg(test)]

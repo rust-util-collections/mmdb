@@ -104,8 +104,15 @@ impl MemTable {
 
     /// Return an iterator over all entries in order.
     /// Each item is (encoded_internal_key, value).
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.inner.iter()
+    }
+
+    /// Borrowing iteration over all entries in order, without copying them.
+    /// Each item is (encoded_internal_key, value).
+    pub fn iter_ref(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.inner.iter_ref()
     }
 
     /// Get a raw pointer to the underlying skiplist for cursor-based iteration.
