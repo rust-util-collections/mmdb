@@ -2401,7 +2401,8 @@ impl DB {
     ///   DB's own pinned entries) — not this DB's share of it.
     /// - `"compaction-pending"` — "1" if compaction is needed, "0" otherwise
     /// - `"stats.bytes_written"` — total user bytes written
-    /// - `"stats.bytes_read"` — total user bytes read
+    /// - `"stats.bytes_read"` — key and value bytes returned by point
+    ///   lookups (`get*`); iterator reads are not counted
     /// - `"stats.compactions_completed"` — number of compactions completed
     /// - `"stats.compaction_bytes_written"` — total bytes written during compaction
     /// - `"stats.flushes_completed"` — number of memtable flushes

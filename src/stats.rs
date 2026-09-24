@@ -9,7 +9,8 @@ pub(crate) const MAX_LEVELS: usize = 32;
 pub struct DbStats {
     /// Total bytes written by the user.
     pub bytes_written: AtomicU64,
-    /// Total bytes read by the user.
+    /// Key and value bytes returned by point lookups (`get*`); iterator
+    /// reads are not counted.
     pub bytes_read: AtomicU64,
     /// Number of compactions completed.
     pub compactions_completed: AtomicU64,
