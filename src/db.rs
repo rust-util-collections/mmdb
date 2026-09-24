@@ -3678,18 +3678,40 @@ impl DB {
         frozen: &FrozenMemtable,
     ) -> Result<Vec<(u64, TableBuildResult)>> {
         let mut numbers = frozen.sst_numbers.iter().copied();
-        let results = Self::write_memtable_ssts(
-            &frozen.old_mem,
-            &self.path,
-            &|| self.flush_build_opts(),
-            &mut || {
-                numbers.next().ok_or_else(|| {
-                    Error::invalid_argument(
-                        "reserved flush output file numbers exhausted".to_string(),
-                    )
-                })
-            },
-        )?;
+        // Block-property collectors are user code. A panic unwinding out of
+        // here would skip every caller's fail-stop arm (leaving
+        // `leader_active` set, or a frozen memtable whose WAL a later flush
+        // skips), so report it as an error instead.
+        let written = catch_unwind(AssertUnwindSafe(|| {
+            Self::write_memtable_ssts(
+                &frozen.old_mem,
+                &self.path,
+                &|| self.flush_build_opts(),
+                &mut || {
+                    numbers.next().ok_or_else(|| {
+                        Error::invalid_argument(
+                            "reserved flush output file numbers exhausted".to_string(),
+                        )
+                    })
+                },
+            )
+        }));
+        let results = match written {
+            Ok(results) => results?,
+            Err(panic_payload) => {
+                for num in &frozen.sst_numbers {
+                    let _ = fs::remove_file(self.path.join(format!("{:06}.sst", num)));
+                }
+                let msg = if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.as_str()
+                } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s
+                } else {
+                    "unknown payload"
+                };
+                return Err(Error::background(format!("flush panicked: {}", msg)));
+            }
+        };
         // Pre-warm the table cache for the new SSTs while unlocked, so
         // install_flush's log_and_apply (which opens each new file to
         // install its reader) hits a warm cache instead of parsing
@@ -4603,6 +4625,52 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: block-property collectors are user code running inside the
+    /// unlocked flush. A panic there skipped every fail-stop arm, so a later
+    /// flush advanced `log_number` past the frozen memtable's WAL and its
+    /// acknowledged writes were lost after reopen.
+    #[test]
+    fn collector_panic_during_flush_fail_stops() {
+        use crate::options::BlockPropertyCollector;
+
+        struct PanicOnBoom;
+        impl BlockPropertyCollector for PanicOnBoom {
+            fn add(&mut self, key: &[u8], _value: &[u8]) {
+                if types::user_key(key) == b"boom" {
+                    panic!("collector rejected boom");
+                }
+            }
+            fn finish_block(&mut self) -> Vec<u8> {
+                Vec::new()
+            }
+            fn name(&self) -> &str {
+                "panic-on-boom"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            block_property_collectors: vec![Arc::new(|| {
+                Box::new(PanicOnBoom) as Box<dyn BlockPropertyCollector>
+            })],
+            ..Default::default()
+        };
+        {
+            let db = DB::open(options, dir.path()).unwrap();
+            db.put(b"a", b"1").unwrap();
+            db.put(b"boom", b"2").unwrap();
+            let flushed = catch_unwind(AssertUnwindSafe(|| db.flush()));
+            assert!(
+                matches!(flushed, Ok(Err(_))),
+                "a collector panic must surface as a flush error"
+            );
+            assert!(db.put(b"c", b"3").is_err(), "engine must fail-stop");
+        }
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        assert_eq!(db.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
+        assert_eq!(db.get(b"boom").unwrap().as_deref(), Some(&b"2"[..]));
     }
 
     /// Regression: a flush reserves its L0 file numbers at freeze and installs
