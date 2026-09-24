@@ -42,13 +42,22 @@ impl WalWriter {
     /// point, then call this to discard the corrupt tail before appending.
     pub fn open_append_truncated(path: &Path, valid_len: u64) -> Result<Self> {
         let mut file = OpenOptions::new().write(true).open(path).ctx()?;
+        let discards_tail = file.metadata().ctx()?.len() > valid_len;
         file.set_len(valid_len).ctx()?;
         file.seek(SeekFrom::End(0)).ctx()?;
         let block_offset = valid_len as usize % BLOCK_SIZE;
-        Ok(Self {
+        let mut writer = Self {
             writer: BufWriter::new(file),
             block_offset,
-        })
+        };
+        // Make the truncation durable before anything is appended. If the
+        // next record's data reached disk while the size change was still
+        // pending, a crash would leave the stale tail after that record, and
+        // recovery must reject non-zero bytes after a failed record.
+        if discards_tail {
+            writer.sync().ctx()?;
+        }
+        Ok(writer)
     }
 
     /// Add a complete record (payload) to the WAL.
@@ -283,5 +292,40 @@ mod tests {
         assert_eq!(records[2], b"batch2_rec1");
         assert_eq!(records[3], b"batch3_rec1");
         assert_eq!(records[4], b"batch3_rec2");
+    }
+
+    /// Regression: the torn-tail truncation was not synced before the next
+    /// append. If the new record reached disk while the size change was still
+    /// pending, a crash left the stale tail after it, which recovery rejects.
+    #[test]
+    fn test_open_append_truncated_syncs_discarded_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST-000001");
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(b"complete").unwrap();
+            writer.sync().unwrap();
+        }
+        let valid_len = std::fs::metadata(&path).unwrap().len();
+        {
+            use std::io::Write;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(b"torn tail bytes").unwrap();
+        }
+
+        FAIL_NEXT_SYNC.with(|fail| fail.set(true));
+        assert!(
+            WalWriter::open_append_truncated(&path, valid_len).is_err(),
+            "discarding a tail must sync before the writer is returned"
+        );
+        FAIL_NEXT_SYNC.with(|fail| fail.set(false));
+
+        let mut writer = WalWriter::open_append_truncated(&path, valid_len).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_len);
+        writer.add_record(b"next").unwrap();
+        writer.sync().unwrap();
+        let mut reader = WalReader::new(&path).unwrap();
+        let records: Vec<Vec<u8>> = reader.iter().collect::<StdResult<Vec<_>, _>>().unwrap();
+        assert_eq!(records, vec![b"complete".to_vec(), b"next".to_vec()]);
     }
 }
