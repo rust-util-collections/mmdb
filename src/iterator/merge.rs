@@ -424,6 +424,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                             reached = true;
                             break;
                         }
+                    } else if self.latch_source_error(i) {
+                        // The fallback seek below would clear the failure.
+                        return;
                     } else {
                         break; // exhausted
                     }

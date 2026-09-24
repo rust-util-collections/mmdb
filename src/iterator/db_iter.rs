@@ -1121,6 +1121,32 @@ mod tests {
         );
     }
 
+    /// Regression: seek-using-next steps a source toward the target. When a
+    /// step failed, the source was treated as exhausted and fully re-seeked,
+    /// which cleared its error and skipped the unreadable block.
+    #[test]
+    fn seek_using_next_keeps_step_read_error() {
+        use crate::iterator::level_iter::LevelIterator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let entries: Vec<_> = (0..10)
+            .map(|i| make_entry(format!("a{i}").as_bytes(), 1 + i, ValueType::Value, b"v"))
+            .collect();
+        let file = sst_with_corrupt_block(&dir.path().join("000001.sst"), &entries, 2);
+        let sources = vec![
+            IterSource::from_level_iter(LevelIterator::new(vec![file])).with_level(1),
+            IterSource::new(vec![make_entry(b"z", 30, ValueType::Value, b"z")]).with_level(0),
+        ];
+
+        let mut iter = DBIterator::from_sources(sources, 100);
+        iter.seek(b"a0");
+        assert_eq!(iter.key(), Some(&b"a0"[..]));
+        // Stepping from a1 toward a5 reads the unreadable a2 block.
+        iter.seek(b"a5");
+        assert!(!iter.valid(), "seek skipped past an unreadable block");
+        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
+    }
+
     #[test]
     fn test_db_iterator_basic() {
         let source = sort_lex(vec![
