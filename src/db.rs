@@ -4671,6 +4671,35 @@ mod tests {
         scheduler.finish(false);
     }
 
+    /// Join the compaction workers so a test drives compaction itself.
+    fn stop_background_workers(db: &DB) {
+        {
+            let (lock, cv) = &*db.compaction_notify;
+            let _guard = lock.lock().unwrap();
+            db.compaction_shutdown.store(true, Ordering::Release);
+            cv.notify_all();
+        }
+        for handle in db.compaction_handles.lock().drain(..) {
+            handle.join().unwrap();
+        }
+    }
+
+    /// `max_background_compactions: 0` is documented to mean one thread; two
+    /// tests once relied on it to keep background compaction away.
+    #[test]
+    fn zero_background_compactions_still_starts_one_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions {
+                max_background_compactions: 0,
+                ..Default::default()
+            },
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(db.compaction_handles.lock().len(), 1);
+    }
+
     /// Regression: a `bloom_bits_per_key` too large for even one key was
     /// accepted at open; writes were acknowledged and the first flush failed,
     /// fail-stopping the DB (and a reopen failed in the recovery flush).
@@ -5599,11 +5628,11 @@ mod tests {
         let opts = DbOptions {
             create_if_missing: true,
             write_buffer_size: 256,
-            // Keep background out of the way so the range job does the install.
-            max_background_compactions: 0,
             ..Default::default()
         };
         let db = Arc::new(DB::open(opts, dir.path()).unwrap());
+        // Keep background out of the way so the range job does the install.
+        stop_background_workers(&db);
         for i in 0..40u32 {
             let k = format!("cr{:04}", i);
             db.put(k.as_bytes(), &[b'v'; 32]).unwrap();
@@ -5827,10 +5856,11 @@ mod tests {
             l0_compaction_trigger: 2,
             l0_slowdown_trigger: 2,
             l0_stop_trigger: 3,
-            max_background_compactions: 0,
             ..Default::default()
         };
         let db = Arc::new(DB::open(opts, dir.path()).unwrap());
+        // Only the writers' inline stop-trigger drains may relieve L0.
+        stop_background_workers(&db);
         let stop = Arc::new(AtomicBool::new(false));
         let mut writers = Vec::new();
         for t in 0..4u8 {

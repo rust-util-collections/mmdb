@@ -74,6 +74,8 @@ pub struct DbOptions {
 
     // ---- Compaction parallelism (RocksDB: increase_parallelism) ----
     /// Maximum number of background compaction threads. Default: 1.
+    /// Values below 1 are treated as 1: a writable handle always runs at
+    /// least one compaction thread.
     /// RocksDB equivalent: `max_background_compactions` / `increase_parallelism`.
     pub max_background_compactions: usize,
     /// Maximum sub-compactions per compaction job. Default: 1 (no sub-compaction).
