@@ -20,13 +20,13 @@ None.
 
 ### [MEDIUM] iterator: seek paths do not overlap cross-source I/O prefetch
 - **Where**: `src/iterator/merge.rs` (`init_heap`, seek / direction switch), `src/iterator/source.rs` (`prefetch_hint`, `seek_to`)
-- **What**: Explicit seeks and bidirectional direction switches synchronously position and decode each source before heap initialization can issue cross-source prefetch hints.
+- **What**: Explicit seeks and bidirectional direction switches position and decode each source synchronously, one after another; no cross-source readahead hint is issued before those reads.
 - **Reason**: SST index entries are already memory-resident, so a targeted pre-seek hint phase is feasible, and direction switches make the path warmer than explicit seeks alone. However, `posix_fadvise` is advisory and no controlled cold-cache multi-source benchmark demonstrates a material latency regression; changing the protocol without that evidence remains disproportionate.
 
 ### [LOW] manifest: file-number arithmetic can overflow at `u64::MAX`
 - **Where**: `src/manifest/version_set.rs` (`new_file_number`, `reserve_file_numbers`, MANIFEST rotation)
 - **What**: File allocation, reservations, and MANIFEST rotation increment `u64` counters without checked arithmetic.
-- **Reason**: Reaching exhaustion through production allocation requires roughly 1.8e19 file numbers; all reservation counts are bounded by in-memory workload sizes. The failure is mathematically real but not practically reachable. Revisit if identifiers become externally supplied or allocation jumps by unbounded amounts.
+- **Reason**: Reaching exhaustion through production allocation requires roughly 1.8e19 file numbers; all reservation counts are bounded by in-memory workload sizes. Replay takes a stored `next_file_number` without an upper bound (unlike `last_sequence`), but a value near `u64::MAX` needs a checksum-valid MANIFEST record or an on-disk file name this allocator never produced. The failure is mathematically real but not practically reachable. Revisit if identifiers become externally supplied or allocation jumps by unbounded amounts.
 
 ### [LOW] rate_limiter: `request()` f64 subtraction can stop converging for enormous values
 - **Where**: `src/rate_limiter.rs`
@@ -46,7 +46,7 @@ None.
 ### [LOW] memtable: skiplist node destructors skipped if `all_nodes.push` unwinds after `ptr::write`
 - **Where**: `src/memtable/skiplist_impl.rs`
 - **What**: If the `all_nodes` bookkeeping push unwound between `ptr::write` initializing a node and the push completing, the node's key/value heap allocations would never be dropped.
-- **Reason**: `Vec::push` aborts via `handle_alloc_error` on allocation failure, and its capacity-overflow panic requires `len > isize::MAX`; no unwinding path reaches the window on supported targets. Reordering the unsafe insert protocol to close an unreachable leak carries more regression risk than value.
+- **Reason**: `Vec::push` aborts via `handle_alloc_error` on allocation failure, and its capacity-overflow panic requires the byte capacity to exceed `isize::MAX`; no unwinding path reaches the window on supported targets. Reordering the unsafe insert protocol to close an unreachable leak carries more regression risk than value.
 
 ### [MEDIUM] API: `WriteBatch` has no entry-count or aggregate-size cap
 - **Where**: `src/types.rs` (WriteBatch), `src/db.rs` (`write_batch_inner`)
@@ -61,7 +61,7 @@ None.
 ### [LOW] options: `num_levels` accepts arbitrarily large values
 - **Where**: `src/options.rs`, `src/db.rs` (open-time validation)
 - **What**: Only `num_levels >= 2` is validated; a huge value allocates per-level `Vec` headers in every `Version` and one merge source per level in every iterator.
-- **Reason**: The cost is linear, small, and entirely self-inflicted configuration; introducing an upper bound now could refuse to open stores created with larger values. Revisit if per-level state stops being O(1).
+- **Reason**: The cost is linear and entirely self-inflicted configuration; an extreme value such as `usize::MAX` aborts inside `DB::open` while allocating per-level vectors rather than reaching a stored state. Introducing an upper bound now could refuse to open stores created with larger values. Revisit if per-level state stops being O(1).
 
 ### [LOW] API: `open_read_only` cannot open stores configured with `num_levels > 7`
 - **Where**: `src/db.rs` (`open_read_only`), `src/options.rs` (`num_levels` default = 7)
@@ -71,6 +71,11 @@ None.
 ---
 
 ## Rejected
+
+### SST: an index separator that is a range-deletion key makes point lookups miss a visible entry
+- **Where**: `src/sst/table_builder.rs:269` (`last_key` set for `RangeDeletion` entries), `src/sst/table_reader/mod.rs` (`get_internal_with_seq`)
+- **Claim**: A block separator taken from a buffered range-deletion key can exceed every data key in its block, so an index seek skips a block that holds the target.
+- **Reason**: A miss needs seek key S ≤ separator R < entry X with S and X sharing a user key, which forces R to share that user key with X.seq < R.seq ≤ S.seq, so X is always covered by R. `DB::get` folds the file's covering tombstone sequence in before any point lookup, and iterator `seek` continues into the next block.
 
 ### write path: `close`/`compact_range`/stop-drain holding `write_queue` across install can deadlock a group-commit leader
 - **Where**: `src/db.rs` (`close`, `compact_range`, `maybe_throttle_writes`, `wait_for_write_leader_idle`)
