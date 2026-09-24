@@ -1842,4 +1842,57 @@ mod tests {
              the range-tombstone block handle"
         );
     }
+
+    /// Regression: a zero metaindex size in the (unchecksummed) footer was
+    /// read as "no metadata", so open succeeded without the range-tombstone
+    /// block and the file's range deletions stopped hiding older data.
+    #[test]
+    fn test_zero_metaindex_size_fails_open() {
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write};
+
+        use crate::sst::format::FOOTER_SIZE;
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_metaindex.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"aaa", 10, ValueType::Value).as_bytes(),
+                b"val_a",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"bbb", 9, ValueType::RangeDeletion).as_bytes(),
+                b"ccc",
+            )
+            .unwrap();
+        builder.finish().unwrap();
+
+        // Footer bytes 8..16 hold the metaindex block size.
+        let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+        let file_len = f.metadata().unwrap().len();
+        f.seek(SeekFrom::Start(file_len - FOOTER_SIZE as u64 + 8))
+            .unwrap();
+        f.write_all(&[0u8; 8]).unwrap();
+        drop(f);
+
+        let err = match TableReader::open(&path) {
+            Ok(reader) => panic!(
+                "open must fail, got {} tombstones",
+                reader.get_range_tombstones().unwrap().len()
+            ),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), crate::ErrorKind::Corruption);
+    }
 }

@@ -592,13 +592,12 @@ impl TableReader {
         metaindex_handle: &BlockHandle,
         file_size: u64,
     ) -> Result<MetaIndexData> {
+        // Every writer emits a metaindex block (an empty block still carries
+        // its restart array), and the footer has no checksum: a zero size can
+        // only be corruption, and reading it as "no metadata" would drop the
+        // file's range tombstones.
         if metaindex_handle.size == 0 {
-            return Ok(MetaIndexData {
-                bloom: None,
-                prefix: None,
-                prefix_len: None,
-                range_del_handle: None,
-            });
+            return Err(Error::corruption("zero-size SST metaindex block"));
         }
 
         let metaindex_data =
