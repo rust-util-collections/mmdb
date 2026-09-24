@@ -3687,6 +3687,7 @@ impl DB {
         let new_wal_path = self.path.join(format!("{:06}.wal", new_wal_number));
         let new_wal = WalWriter::new(&new_wal_path).ctx()?;
         let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
+        old_mem.mark_immutable();
         let old_wal_number = inner.wal_number;
         inner.wal_writer = Some(new_wal);
         inner.wal_number = new_wal_number;

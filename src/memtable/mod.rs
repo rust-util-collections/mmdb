@@ -5,7 +5,12 @@ pub mod skiplist_impl;
 
 pub use skiplist::SkipListMemTable;
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use parking_lot::RwLock;
+
+use crate::iterator::range_del::FragmentedRangeTombstoneList;
 
 use crate::types::{InternalKey, SequenceNumber, ValueType};
 
@@ -28,9 +33,14 @@ pub struct MemTable {
     /// Used to skip the expensive O(N) range tombstone scan in get().
     has_range_deletions: AtomicBool,
     /// Dedicated collection of range tombstones for O(T) coverage checks
-    /// instead of O(N) full memtable scan. Protected by Mutex since writes
-    /// are single-writer (group commit model).
-    range_tombstones: parking_lot::Mutex<Vec<MemRangeTombstone>>,
+    /// instead of O(N) full memtable scan. Readers share the lock; the single
+    /// writer (group commit model) appends.
+    range_tombstones: RwLock<Vec<MemRangeTombstone>>,
+    /// Set when the memtable is frozen for flush; no puts follow.
+    immutable: AtomicBool,
+    /// Fragmented index of `range_tombstones`, built on the first coverage
+    /// check after freeze: O(log T) lookups that take no lock.
+    frozen_tombstones: OnceLock<FragmentedRangeTombstoneList>,
 }
 
 impl MemTable {
@@ -39,8 +49,16 @@ impl MemTable {
             inner: SkipListMemTable::new(),
             approximate_size: AtomicUsize::new(0),
             has_range_deletions: AtomicBool::new(false),
-            range_tombstones: parking_lot::Mutex::new(Vec::new()),
+            range_tombstones: RwLock::new(Vec::new()),
+            immutable: AtomicBool::new(false),
+            frozen_tombstones: OnceLock::new(),
         }
+    }
+
+    /// Mark the memtable immutable. Called when it is frozen for flush;
+    /// the caller must not insert into it afterwards.
+    pub fn mark_immutable(&self) {
+        self.immutable.store(true, Ordering::Release);
     }
 
     /// Insert an entry. `key` is the user key; it will be encoded as an InternalKey.
@@ -58,7 +76,7 @@ impl MemTable {
             ValueType::Deletion => Vec::new(),
             ValueType::RangeDeletion => {
                 // Add to dedicated range tombstone collection for O(T) lookup
-                self.range_tombstones.lock().push(MemRangeTombstone {
+                self.range_tombstones.write().push(MemRangeTombstone {
                     begin: key.to_vec(),
                     end: value.to_vec(),
                     seq: sequence,
@@ -132,7 +150,8 @@ impl MemTable {
 
     /// Find the highest-seq range tombstone covering `user_key` with seq <= `read_seq`.
     /// Returns 0 if no covering tombstone exists.
-    /// O(T) where T = number of range tombstones, instead of O(N) full memtable scan.
+    /// O(T) where T = number of range tombstones while active; O(log T) and
+    /// lock-free once frozen.
     pub fn max_covering_tombstone_seq(
         &self,
         user_key: &[u8],
@@ -141,7 +160,13 @@ impl MemTable {
         if !self.has_range_deletions() {
             return 0;
         }
-        let tombstones = self.range_tombstones.lock();
+        if self.immutable.load(Ordering::Acquire) {
+            return self
+                .frozen_tombstones
+                .get_or_init(|| FragmentedRangeTombstoneList::new(self.get_range_tombstones()))
+                .max_covering_tombstone_seq(user_key, read_seq);
+        }
+        let tombstones = self.range_tombstones.read();
         let mut max_seq: SequenceNumber = 0;
         for rt in tombstones.iter() {
             if rt.seq > read_seq {
@@ -160,7 +185,7 @@ impl MemTable {
         if !self.has_range_deletions() {
             return Vec::new();
         }
-        let tombstones = self.range_tombstones.lock();
+        let tombstones = self.range_tombstones.read();
         tombstones
             .iter()
             .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq))
@@ -182,6 +207,77 @@ impl Default for MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frozen memtables answer coverage checks from a fragmented index; it
+    /// must agree with the linear scan used while the memtable is active.
+    #[test]
+    fn frozen_tombstone_index_matches_linear_scan() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        let key = |n: u64| format!("k{n:03}").into_bytes();
+        let active = MemTable::new();
+        let frozen = MemTable::new();
+        for seq in 1..=200 {
+            let begin = next(100);
+            let end = begin + 1 + next(20);
+            for mem in [&active, &frozen] {
+                mem.put(&key(begin), &key(end), seq, ValueType::RangeDeletion);
+            }
+        }
+        frozen.mark_immutable();
+        for _ in 0..2000 {
+            let (k, snapshot) = (key(next(130)), next(220));
+            assert_eq!(
+                frozen.max_covering_tombstone_seq(&k, snapshot),
+                active.max_covering_tombstone_seq(&k, snapshot),
+                "key {:?} at snapshot {snapshot}",
+                String::from_utf8_lossy(&k)
+            );
+        }
+    }
+
+    /// Regression: every coverage check took one `Mutex` and scanned all
+    /// tombstones, so concurrent gets serialized. Frozen memtables now take
+    /// no lock, and active-memtable readers share it.
+    #[test]
+    fn tombstone_checks_do_not_serialize_readers() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mem = MemTable::new();
+        mem.put(b"a", b"m", 5, ValueType::RangeDeletion);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let reader = mem.range_tombstones.read();
+            scope.spawn(|| {
+                done_tx
+                    .send(mem.max_covering_tombstone_seq(b"c", 10))
+                    .unwrap()
+            });
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)), Ok(5));
+            drop(reader);
+        });
+
+        mem.mark_immutable();
+        // The first check after freeze builds the index; later ones are lock-free.
+        assert_eq!(mem.max_covering_tombstone_seq(b"c", 10), 5);
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let writer = mem.range_tombstones.write();
+            scope.spawn(|| {
+                done_tx
+                    .send(mem.max_covering_tombstone_seq(b"c", 10))
+                    .unwrap()
+            });
+            assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)), Ok(5));
+            drop(writer);
+        });
+    }
 
     /// Regression: a lookup for a key the memtable does not hold cloned the
     /// next entry's key and value before comparing user keys.
