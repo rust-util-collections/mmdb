@@ -77,6 +77,8 @@ thread_local! {
     /// Fires once on this thread right after a block's raw bytes are read.
     static AFTER_BLOCK_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Readahead hints issued on this thread.
+    pub(crate) static WILLNEED_HINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// An open, immutable SST file. On unix, block reads are positional
@@ -785,6 +787,8 @@ impl TableReader {
     /// Hint the OS to prefetch the given file range into page cache.
     /// Uses `posix_fadvise` on Linux; no-op on other platforms.
     fn advise_willneed(&self, offset: u64, len: u64) {
+        #[cfg(test)]
+        WILLNEED_HINTS.with(|hints| hints.set(hints.get() + 1));
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;

@@ -86,6 +86,17 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Build the initial heap from all non-exhausted sources.
     fn init_heap(&mut self) {
+        self.build_heap(true);
+    }
+
+    /// Rebuild the heap after `seek_to` positioned every source. Each source
+    /// already decoded its entry, so a first-block readahead hint would only
+    /// fetch a block the seek usually did not land on.
+    fn init_heap_positioned(&mut self) {
+        self.build_heap(false);
+    }
+
+    fn build_heap(&mut self, prefetch: bool) {
         if self.initialized {
             return;
         }
@@ -95,8 +106,10 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         // would reopen a source that correctly exhausted before its first key.
         if self.direction == Direction::Forward {
             // Phase 1: issue prefetch hints for all seekable sources (overlaps I/O)
-            for source in self.sources.iter_mut() {
-                source.prefetch_hint();
+            if prefetch {
+                for source in self.sources.iter_mut() {
+                    source.prefetch_hint();
+                }
             }
             // Phase 2: peek all sources (I/O should hit page cache / block cache
             // thanks to the prefetch hints issued above).
@@ -283,10 +296,12 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Switch from backward to forward direction.
     fn switch_to_forward(&mut self) {
         self.direction = Direction::Forward;
+        self.initialized = false;
         if self.current_key.is_empty() {
             for source in self.sources.iter_mut() {
                 source.seek_to_first_impl();
             }
+            self.init_heap();
         } else {
             // Re-seek ALL sources: in-heap sources hold peeked entries
             // from the backward (max-heap) direction and are not valid
@@ -294,9 +309,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             for source in self.sources.iter_mut() {
                 source.seek_to(&self.current_key, &self.compare);
             }
+            self.init_heap_positioned();
         }
-        self.initialized = false;
-        self.init_heap();
     }
 
     /// Switch from forward to backward direction.
@@ -346,7 +360,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
         // Rebuild heap
         self.initialized = false;
-        self.init_heap();
+        self.init_heap_positioned();
     }
 
     /// Optimized seek: when `try_next` is true and the current position is <=
@@ -425,7 +439,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             // Rebuild heap
             self.initialized = false;
             self.current_key.clear();
-            self.init_heap();
+            self.init_heap_positioned();
             return;
         }
 
@@ -624,6 +638,59 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: after `seek` positioned and decoded every source, the heap
+    /// rebuild still hinted readahead of data block 0 in each SST, which the
+    /// seek had usually not landed on.
+    #[test]
+    fn seek_does_not_hint_block_zero_readahead() {
+        use std::sync::Arc;
+
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::{TableIterator, TableReader, WILLNEED_HINTS};
+        use crate::types::{InternalKey, ValueType, compare_internal_key};
+
+        let dir = tempfile::tempdir().unwrap();
+        let readers: Vec<Arc<TableReader>> = (0..2)
+            .map(|file| {
+                let path = dir.path().join(format!("{file:06}.sst"));
+                let mut builder = TableBuilder::new(
+                    &path,
+                    TableBuildOptions {
+                        block_size: 1,
+                        internal_keys: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                for i in 0..8u64 {
+                    let key = format!("k{i}_{file}");
+                    let ikey = InternalKey::new(key.as_bytes(), 1, ValueType::Value);
+                    builder.add(ikey.as_bytes(), b"v").unwrap();
+                }
+                builder.finish().unwrap();
+                Arc::new(TableReader::open(&path).unwrap())
+            })
+            .collect();
+        let sources = || {
+            readers
+                .iter()
+                .map(|r| IterSource::from_table_iter(TableIterator::new(Arc::clone(r))))
+                .collect::<Vec<_>>()
+        };
+        let hints = || WILLNEED_HINTS.with(|h| h.get());
+
+        let mut merger = MergingIterator::new(sources(), compare_internal_key);
+        let before = hints();
+        merger.seek(InternalKey::new(b"k5", 10, ValueType::Value).as_bytes());
+        assert!(merger.next_entry().is_some());
+        assert_eq!(hints(), before, "seek must not hint block 0");
+
+        // The unpositioned initial build still hints each source's first block.
+        let mut fresh = MergingIterator::new(sources(), compare_internal_key);
+        assert!(fresh.next_entry().is_some());
+        assert!(hints() >= before + 2);
+    }
 
     #[test]
     fn backward_seek_keeps_exhausted_sources_out_of_heap() {
