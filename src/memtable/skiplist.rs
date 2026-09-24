@@ -78,36 +78,36 @@ impl SkipListMemTable {
     /// - `None` if no entry for this user key exists at or below the search sequence
     #[cfg(test)]
     pub fn get(&self, search_key: &[u8], user_key: &[u8]) -> Option<Option<Vec<u8>>> {
-        self.get_with_seq(search_key, user_key)
+        self.get_with_seq(search_key.to_vec(), user_key)
             .map(|(result, _seq)| result)
     }
 
     /// Like `get`, but also returns the sequence number of the found entry.
     /// Needed for range tombstone vs point entry sequence comparison.
+    /// Inspects the candidate by reference and copies only a matching value.
     pub fn get_with_seq(
         &self,
-        search_key: &[u8],
+        search_key: Vec<u8>,
         user_key: &[u8],
     ) -> Option<(Option<Vec<u8>>, crate::types::SequenceNumber)> {
-        let search = OrdInternalKey(search_key.to_vec());
-        let (k, v) = self.map.lower_bound(&search)?;
-        let kb = k.as_bytes();
-        if kb.len() < 8 {
-            return None;
-        }
-        let entry_uk = &kb[..kb.len() - 8];
-        if entry_uk == user_key {
-            let entry_ref = InternalKeyRef::new(kb);
-            let seq = entry_ref.sequence();
-            return Some((
-                match entry_ref.value_type() {
-                    ValueType::Value => Some(v),
-                    ValueType::Deletion | ValueType::RangeDeletion => None,
-                },
-                seq,
-            ));
-        }
-        None
+        let search = OrdInternalKey(search_key);
+        self.map
+            .lower_bound_with(&search, |k, v| {
+                let kb = k.as_bytes();
+                if kb.len() < 8 || &kb[..kb.len() - 8] != user_key {
+                    return None;
+                }
+                let entry_ref = InternalKeyRef::new(kb);
+                let seq = entry_ref.sequence();
+                Some((
+                    match entry_ref.value_type() {
+                        ValueType::Value => Some(v.clone()),
+                        ValueType::Deletion | ValueType::RangeDeletion => None,
+                    },
+                    seq,
+                ))
+            })
+            .flatten()
     }
 
     /// Iterate over all entries in internal key order (user_key ASC, seq DESC).

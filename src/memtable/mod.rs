@@ -94,7 +94,7 @@ impl MemTable {
         sequence: SequenceNumber,
     ) -> Option<(Option<Vec<u8>>, SequenceNumber)> {
         let search_key = InternalKey::new(key, sequence, ValueType::Value);
-        self.inner.get_with_seq(search_key.as_bytes(), key)
+        self.inner.get_with_seq(search_key.into_bytes(), key)
     }
 
     /// Approximate memory usage in bytes.
@@ -175,6 +175,17 @@ impl Default for MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a lookup for a key the memtable does not hold cloned the
+    /// next entry's key and value before comparing user keys.
+    #[test]
+    fn get_miss_does_not_copy_the_neighbouring_entry() {
+        let mem = MemTable::new();
+        mem.put(b"b", &vec![7u8; 1 << 20], 1, ValueType::Value);
+        let (result, bytes) = crate::test_alloc::count_allocated(|| mem.get_with_seq(b"a", 10));
+        assert!(result.is_none());
+        assert!(bytes < 4096, "a memtable miss allocated {bytes} bytes");
+    }
 
     #[test]
     fn test_memtable_put_get() {

@@ -50,6 +50,8 @@ mod options;
 mod rate_limiter;
 mod sst;
 mod stats;
+#[cfg(test)]
+mod test_alloc;
 mod types;
 mod wal;
 

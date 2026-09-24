@@ -304,8 +304,9 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
     }
 
     /// Find the first entry with key >= `target` using O(log N) skiplist
-    /// traversal. Returns `(key, value)` or None if no such entry exists.
-    pub fn lower_bound(&self, target: &K) -> Option<(K, V)> {
+    /// traversal and apply `f` to it by reference, so a caller that rejects
+    /// the entry copies nothing. Returns None if no such entry exists.
+    pub fn lower_bound_with<R>(&self, target: &K, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
         let max_h = self.max_height.load(Ordering::Acquire);
         let mut current: *const Node<K, V> = ptr::null();
 
@@ -344,7 +345,7 @@ impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
             // SAFETY: ptr is reached through acquired level-0 links.
             let n = unsafe { &*ptr };
             if n.key >= *target {
-                return Some((n.key.clone(), n.value.clone()));
+                return Some(f(&n.key, &n.value));
             }
             ptr = n.next[0].load(Ordering::Acquire);
         }
