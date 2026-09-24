@@ -131,11 +131,7 @@ impl WalWriter {
 
     fn emit_fragment(&mut self, record_type: RecordType, data: &[u8]) -> Result<()> {
         let length = data.len() as u16;
-        // CRC covers type + data
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&[record_type as u8]);
-        hasher.update(data);
-        let checksum = hasher.finalize();
+        let checksum = fragment_checksum(record_type, data);
 
         let mut header = [0u8; HEADER_SIZE];
         encode_header(&mut header, checksum, length, record_type);

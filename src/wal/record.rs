@@ -47,6 +47,14 @@ impl RecordType {
     }
 }
 
+/// A fragment's stored checksum: CRC32 over its type byte and payload.
+pub fn fragment_checksum(record_type: RecordType, data: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&[record_type as u8]);
+    hasher.update(data);
+    hasher.finalize()
+}
+
 /// Encode a record header into a 7-byte buffer.
 pub fn encode_header(
     buf: &mut [u8; HEADER_SIZE],

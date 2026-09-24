@@ -124,10 +124,7 @@ impl WalReader {
                 continue;
             }
             let checksum = u32::from_le_bytes(header[..4].try_into().unwrap());
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&[record_type as u8]);
-            hasher.update(&suffix[start + HEADER_SIZE..end]);
-            if hasher.finalize() == checksum {
+            if fragment_checksum(record_type, &suffix[start + HEADER_SIZE..end]) == checksum {
                 return Ok(true);
             }
         }
@@ -296,7 +293,23 @@ impl WalReader {
                 // A non-zero payload is a real record whose type byte changed,
                 // and a later fragment in this block is not a torn tail: both
                 // fail closed so recovery does not drop a committed record.
-                if data.iter().any(|&b| b != 0) || self.payload_contains_later_fragment(&data)? {
+                // A torn header's checksum covers the real type and payload,
+                // not these zeros. If it verifies the zero payload under a
+                // real type, the fragment is complete and only its type byte
+                // changed. A tear of exactly that byte on an all-zero fragment
+                // leaves the same bytes; it fails closed too.
+                let complete_under_real_type = [
+                    RecordType::Full,
+                    RecordType::First,
+                    RecordType::Middle,
+                    RecordType::Last,
+                ]
+                .into_iter()
+                .any(|real_type| fragment_checksum(real_type, &data) == checksum);
+                if data.iter().any(|&b| b != 0)
+                    || complete_under_real_type
+                    || self.payload_contains_later_fragment(&data)?
+                {
                     return self.fail_corruption("non-padding WAL zero record");
                 }
                 return self.fail_truncation("zero-extended WAL header");
@@ -305,10 +318,7 @@ impl WalReader {
             // A checksum mismatch with a zero suffix can be an interrupted
             // append, but only if no later checksum-valid fragment is hidden
             // inside the declared payload (or crosses its end).
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&[record_type as u8]);
-            hasher.update(&data);
-            let expected_checksum = hasher.finalize();
+            let expected_checksum = fragment_checksum(record_type, &data);
 
             if checksum != expected_checksum {
                 let msg = format!(
@@ -621,6 +631,33 @@ mod tests {
         assert!(
             !recoverable,
             "a zero type in front of a later record must not be a recoverable torn tail, got {err}"
+        );
+    }
+
+    /// Regression: a complete fragment with an all-zero payload whose type
+    /// byte changed to 0 was taken for a torn header, so recovery dropped a
+    /// synced record. Its checksum still verifies under the real type.
+    #[test]
+    fn test_zero_type_with_zero_payload_and_valid_checksum_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_payload.wal");
+        let payload = vec![0u8; BLOCK_SIZE + 100];
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(&payload).unwrap();
+            writer.sync().unwrap();
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = BLOCK_SIZE;
+        assert_eq!(bytes[last + 6], RecordType::Last as u8);
+        bytes[last + 6] = 0;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = WalReader::new(&path).unwrap();
+        let err = reader.read_record().unwrap_err();
+        assert!(
+            !reader.last_error_is_truncation(),
+            "a type-0 fragment whose checksum verifies must fail closed, got {err}"
         );
     }
 

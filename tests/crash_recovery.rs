@@ -401,6 +401,60 @@ fn test_crash_midlog_wal_corruption_fails_open() {
     );
 }
 
+/// Regression: a synced record whose last fragment carries only zero bytes
+/// was dropped when that fragment's type byte changed to 0. Recovery took it
+/// for a torn header, opened without the key, and deleted the WAL.
+#[test]
+fn test_zero_type_on_synced_zero_fragment_fails_open() {
+    const WAL_BLOCK_SIZE: usize = 32 * 1024;
+    const WAL_HEADER_SIZE: usize = 7;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let opts = DbOptions {
+        write_buffer_size: 64 << 20,
+        ..make_opts()
+    };
+    {
+        let db = DB::open(opts.clone(), &path).unwrap();
+        db.put_with_options(
+            &WriteOptions {
+                sync: true,
+                ..Default::default()
+            },
+            b"k",
+            &[0u8; 40_000],
+        )
+        .unwrap();
+        db.simulate_crash();
+    }
+
+    let wal_path = {
+        let mut wal_files: Vec<_> = fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        wal_files.sort();
+        wal_files.pop().unwrap()
+    };
+    let mut bytes = fs::read(&wal_path).unwrap();
+    let last = WAL_BLOCK_SIZE;
+    assert_eq!(bytes[last + 6], 4, "expected the record's Last fragment");
+    assert!(
+        bytes[last + WAL_HEADER_SIZE..].iter().all(|&b| b == 0),
+        "the Last fragment must carry only zero value bytes"
+    );
+    bytes[last + 6] = 0;
+    fs::write(&wal_path, &bytes).unwrap();
+
+    assert!(
+        DB::open(opts, &path).is_err(),
+        "open must not drop a synced record whose fragment type changed"
+    );
+    assert!(wal_path.exists(), "a failed open must keep the WAL");
+}
+
 #[test]
 fn test_crash_zeroed_midlog_wal_fragment_fails_open() {
     const WAL_HEADER_SIZE: usize = 7;
