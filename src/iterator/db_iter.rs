@@ -805,6 +805,15 @@ impl DBIterator {
                 iter_entry = self.prev_entry_with_level();
             }
 
+            // A failed source may hold newer versions of the candidate that
+            // were never read, so the best entry seen is not the visible one.
+            if self.merger.has_failed() {
+                self.current = None;
+                self.needs_advance = false;
+                self.backward_positioned = false;
+                return;
+            }
+
             match candidate_uk {
                 Some(cuk) => {
                     if best_is_deletion {
@@ -1119,6 +1128,38 @@ mod tests {
             !seen.iter().any(|k| k.as_slice() < b"a5".as_slice()),
             "keys past the failed block were yielded: {seen:?}"
         );
+    }
+
+    /// Regression: walking backward reads a key's versions oldest first. When
+    /// the block with its newer version failed, `prev` still returned the
+    /// older value it had already seen.
+    #[test]
+    fn backward_read_error_does_not_return_older_version() {
+        use crate::sst::table_reader::TableIterator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = sst_with_corrupt_block(
+            &dir.path().join("000001.sst"),
+            &[
+                make_entry(b"k", 20, ValueType::Value, b"new"),
+                make_entry(b"k", 5, ValueType::Value, b"old"),
+            ],
+            0,
+        );
+        let sources = vec![
+            IterSource::new(vec![make_entry(b"a", 30, ValueType::Value, b"a")]).with_level(0),
+            IterSource::from_table_iter(TableIterator::new(file.reader)).with_level(1),
+        ];
+
+        let mut iter = DBIterator::from_sources(sources, 100);
+        iter.seek_to_last();
+        assert_ne!(
+            iter.value(),
+            Some(&b"old"[..]),
+            "an older version stood in for the unreadable newer one"
+        );
+        assert!(!iter.valid());
+        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
     }
 
     /// Regression: seek-using-next steps a source toward the target. When a

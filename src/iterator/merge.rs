@@ -621,6 +621,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.sources[self.heap[0]].level
     }
 
+    /// True once a source failed; the merged stream then yields nothing.
+    pub fn has_failed(&self) -> bool {
+        self.error.is_some()
+    }
+
     /// Return the first error from any source iterator. A latched error
     /// stays reported for the iterator's lifetime.
     /// Use after iteration returns `None` to distinguish normal exhaustion
