@@ -1680,8 +1680,11 @@ impl LeveledCompaction {
             }
 
             if vt == ValueType::RangeDeletion {
-                range_tombstones.add(user_key.to_vec(), value.as_slice().to_vec(), entry_seq);
-                range_tombstones.reset();
+                range_tombstones.push_in_order(
+                    user_key.to_vec(),
+                    value.as_slice().to_vec(),
+                    entry_seq,
+                );
                 if let Some(ref last) = last_range_del_key
                     && last.as_slice() == ikey.as_slice()
                 {
@@ -3213,6 +3216,77 @@ mod tests {
         assert!(
             splits.windows(2).all(|w| w[0] < w[1]),
             "split points must be strictly increasing: {splits:?}"
+        );
+    }
+
+    /// Regression: the forced merge added each tombstone with `add` + `reset`,
+    /// and every reset cleared the active set, so the next check re-activated
+    /// every earlier tombstone: quadratic work while holding the DB mutex.
+    #[test]
+    fn forced_merge_activates_each_tombstone_once() {
+        use super::{CompactionContext, LeveledCompaction};
+        use crate::iterator::range_del::TRACKER_ACTIVATIONS;
+        use crate::manifest::version_edit::{FileMetaData, VersionEdit};
+        use crate::manifest::version_set::VersionSet;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        const PER_FILE: usize = 150;
+        let options = crate::options::DbOptions::default();
+        let dir = tempfile::tempdir().unwrap();
+        let mut versions = VersionSet::create(dir.path(), options.num_levels).unwrap();
+        let mut edit = VersionEdit::new();
+        for file in 0..2u64 {
+            let number = versions.new_file_number();
+            let path = dir.path().join(format!("{number:06}.sst"));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    internal_keys: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for i in 0..PER_FILE {
+                let n = file as usize * PER_FILE + i;
+                let seq = 1 + n as u64;
+                let point = InternalKey::new(format!("k{n:04}a").as_bytes(), seq, ValueType::Value);
+                builder.add(point.as_bytes(), b"v").unwrap();
+                let begin = format!("k{n:04}b");
+                let tombstone = InternalKey::new(begin.as_bytes(), seq, ValueType::RangeDeletion);
+                builder
+                    .add(tombstone.as_bytes(), format!("k{n:04}c").as_bytes())
+                    .unwrap();
+            }
+            let result = builder.finish().unwrap();
+            edit.add_file(
+                1,
+                FileMetaData {
+                    number,
+                    file_size: result.file_size,
+                    smallest_key: result.smallest_key.unwrap(),
+                    largest_key: result.largest_key.unwrap(),
+                    has_range_deletions: result.has_range_deletions,
+                },
+            );
+        }
+        edit.set_next_file_number(versions.next_file_number());
+        versions.log_and_apply(edit).unwrap();
+
+        let ctx = CompactionContext {
+            db_path: dir.path(),
+            options: &options,
+            rate_limiter: None,
+            stats: None,
+            active_snapshots: &[],
+        };
+        TRACKER_ACTIVATIONS.with(|n| n.set(0));
+        LeveledCompaction::force_merge_level(&ctx, 1, &mut versions, None, None).unwrap();
+        let activations = TRACKER_ACTIVATIONS.with(|n| n.get());
+        assert!(
+            activations <= 2 * 2 * PER_FILE,
+            "{activations} activations for {} tombstones",
+            2 * PER_FILE
         );
     }
 }

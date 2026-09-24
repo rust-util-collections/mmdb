@@ -13,6 +13,13 @@ pub(crate) struct RangeTombstone {
     pub seq: SequenceNumber,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tombstone activations performed by trackers on this thread.
+    pub(crate) static TRACKER_ACTIVATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Tracks active range tombstones for efficient forward-scan filtering.
 pub(crate) struct RangeTombstoneTracker {
     /// All tombstones collected during iteration.
@@ -39,6 +46,25 @@ impl RangeTombstoneTracker {
     pub fn add(&mut self, begin: Vec<u8>, end: Vec<u8>, seq: SequenceNumber) {
         self.tombstones.push(RangeTombstone { begin, end, seq });
         self.sorted = false;
+    }
+
+    /// Add a tombstone met while scanning in key order. When its begin key is
+    /// not below any earlier one the list stays sorted and the sweep keeps
+    /// its position: keys only grow, so pruned tombstones stay pruned and the
+    /// new one activates once the scan reaches its begin. Only an
+    /// out-of-order begin re-sorts and restarts the sweep, as `add` + `reset`.
+    pub fn push_in_order(&mut self, begin: Vec<u8>, end: Vec<u8>, seq: SequenceNumber) {
+        let in_order = self
+            .tombstones
+            .last()
+            .is_none_or(|last| last.begin.as_slice() <= begin.as_slice());
+        self.tombstones.push(RangeTombstone { begin, end, seq });
+        if !in_order {
+            self.sorted = false;
+            self.reset();
+        } else if self.tombstones.len() == 1 {
+            self.sorted = true;
+        }
     }
 
     /// Reset the sweep state (e.g., after seek or after adding new tombstones).
@@ -76,6 +102,8 @@ impl RangeTombstoneTracker {
         // Activate new tombstones whose begin <= user_key
         while self.next_idx < self.tombstones.len() {
             if self.tombstones[self.next_idx].begin.as_slice() <= user_key {
+                #[cfg(test)]
+                TRACKER_ACTIVATIONS.with(|n| n.set(n.get() + 1));
                 self.active.push(self.next_idx);
                 self.next_idx += 1;
             } else {
