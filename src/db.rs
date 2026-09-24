@@ -251,6 +251,26 @@ fn sweep_dead_keys_at_level(
     Ok(true)
 }
 
+/// The `LOCK` file holding the directory flock. Dropping it calls `LOCK_UN`
+/// before the fd closes: flock belongs to the open file description, and a
+/// plain close releases it only once every reference to that description is
+/// gone (a deferred final `fput`, or a descriptor shared with a child), so a
+/// same-process reopen could otherwise fail to lock. Every holder uses this —
+/// the open path's error returns as well as the constructed `DB`.
+struct DirLock(fs::File);
+
+impl Drop for DirLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `self.0` is open for the whole call and is the fd that
+            // acquired the flock.
+            let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 /// File numbers claimed by in-flight compaction picks, paired with a condvar
 /// so the explicit full-compaction path can wait for in-flight picks to
 /// install or discard instead of silently skipping their input files.
@@ -378,12 +398,10 @@ pub struct DB {
     snapshot_list: Arc<SnapshotList>,
     /// Directory lock (`LOCK` file): on Unix, exclusive for writable handles,
     /// shared for read-only handles, and absent for a read-only immutable
-    /// snapshot that does not contain `LOCK`. The file handle holds the flock.
-    /// Release calls `LOCK_UN` before close so a same-process reopen does not
-    /// observe a deferred `fput`. Other platforms retain the file handle but
-    /// have no `flock`-based exclusion.
+    /// snapshot that does not contain `LOCK`. Other platforms retain the file
+    /// handle but have no `flock`-based exclusion.
     /// Interior mutability lets explicit `close()` release it before `DB` drops.
-    lock_file: Mutex<Option<fs::File>>,
+    lock_file: Mutex<Option<DirLock>>,
     /// Keys registered for lazy deletion. Checked during compaction
     /// and dropped without writing tombstones.
     dead_keys: Arc<RwLock<HashSet<Vec<u8>>>>,
@@ -518,7 +536,13 @@ thread_local! {
     /// every worker actually exited instead of leaking.
     static LAST_COMPACTION_SHUTDOWN_FLAG: std::cell::RefCell<Option<Arc<AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
+    /// Runs once right after a writable open acquires the directory flock.
+    static AFTER_DIRECTORY_LOCK: std::cell::RefCell<Option<DirectoryLockHook>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+#[cfg(test)]
+type DirectoryLockHook = Box<dyn FnOnce(&fs::File)>;
 
 impl DB {
     /// Open an existing database without writing to its store directory.
@@ -658,7 +682,7 @@ impl DB {
                             )));
                         }
                     }
-                    Some(file)
+                    Some(DirLock(file))
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => return Err(e).ctx(),
@@ -686,7 +710,11 @@ impl DB {
                     )));
                 }
             }
-            Some(file)
+            #[cfg(test)]
+            if let Some(hook) = AFTER_DIRECTORY_LOCK.with(|hook| hook.borrow_mut().take()) {
+                hook(&file);
+            }
+            Some(DirLock(file))
         };
 
         // Create caches and infra
@@ -3051,16 +3079,7 @@ impl DB {
     /// `close` can defer the final `fput`, and a same-process reopen then
     /// sees `EAGAIN` even though no handle still owns the file.
     fn release_directory_lock(&self) {
-        let Some(file) = self.lock_file.lock().take() else {
-            return;
-        };
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: `file` is still open and is the fd that acquired the flock.
-            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-        }
-        drop(file);
+        drop(self.lock_file.lock().take());
     }
 
     /// Find the highest sequence number among range tombstones covering `key`
@@ -4644,6 +4663,42 @@ mod tests {
         scheduler.finish(true);
         assert!(scheduler.try_start());
         scheduler.finish(false);
+    }
+
+    /// Regression: open error paths closed the lock file without `LOCK_UN`.
+    /// flock belongs to the open file description, so while another
+    /// reference to it outlived the close, the failed open kept the lock and
+    /// a same-process retry could not open the store.
+    #[cfg(unix)]
+    #[test]
+    fn failed_open_releases_the_directory_lock() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        DB::open(DbOptions::default(), dir.path())
+            .unwrap()
+            .close()
+            .unwrap();
+
+        // A second reference to the lock's open file description, standing in
+        // for a deferred final `fput` or a descriptor shared with a child.
+        let shared: Rc<RefCell<Option<fs::File>>> = Rc::default();
+        let slot = Rc::clone(&shared);
+        AFTER_DIRECTORY_LOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |file: &fs::File| {
+                *slot.borrow_mut() = Some(file.try_clone().unwrap());
+            }));
+        });
+        FAIL_COMPACTION_SPAWN_AT.with(|f| f.set(Some(0)));
+        let result = DB::open(DbOptions::default(), dir.path());
+        FAIL_COMPACTION_SPAWN_AT.with(|f| f.set(None));
+        assert!(result.is_err(), "the injected spawn failure must fail open");
+        let shared_fd = shared.borrow_mut().take().expect("lock hook ran");
+
+        let reopened = DB::open_read_only(dir.path());
+        assert!(reopened.is_ok(), "{:?}", reopened.err());
+        drop(shared_fd);
     }
 
     /// Regression: the background loops never re-checked `compaction_shutdown`,
