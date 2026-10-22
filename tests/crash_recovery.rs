@@ -688,11 +688,12 @@ fn test_recovery_removes_orphan_sst() {
 }
 
 #[test]
-fn test_crash_during_flush() {
+fn test_missing_referenced_sst_fails_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
 
-    // Phase 1: write enough data to trigger a flush, then crash
+    // Phase 1: persist data in an SST and crash. The completed flush installs
+    // the file in the MANIFEST before the crash.
     {
         let db = DB::open(make_opts(), &path).unwrap();
         for i in 0..50 {
@@ -708,13 +709,12 @@ fn test_crash_during_flush() {
             )
             .unwrap();
         }
-        // Explicit flush to create an SST
+        // Explicit flush so the MANIFEST references an SST.
         db.flush().unwrap();
         db.simulate_crash();
     }
 
-    // Remove all SST files to simulate a crash where the SST was only
-    // partially written / never made it to disk
+    // Delete every live SST to construct the missing-referenced-file state.
     let sst_files: Vec<_> = fs::read_dir(&path)
         .unwrap()
         .filter_map(|e| e.ok())
