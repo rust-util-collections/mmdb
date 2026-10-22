@@ -87,8 +87,9 @@ fn bench_fillseq(c: &mut Criterion) {
                     for i in 0..count {
                         db.put(&make_key(i), &value).unwrap();
                     }
-                    db.close().unwrap();
-                    drop(dir);
+                    // Return ownership so close/drop runs outside the timed
+                    // section; db drops before dir.
+                    (db, dir)
                 },
             );
         });
@@ -119,8 +120,7 @@ fn bench_fillrandom(c: &mut Criterion) {
                     for key in &keys {
                         db.put(key, &value).unwrap();
                     }
-                    db.close().unwrap();
-                    drop(dir);
+                    (db, dir, keys)
                 },
             );
         });
@@ -156,8 +156,7 @@ fn bench_fillbatch(c: &mut Criterion) {
                             }
                             db.write(batch).unwrap();
                         }
-                        db.close().unwrap();
-                        drop(dir);
+                        (db, dir)
                     },
                 );
             },
@@ -185,11 +184,12 @@ fn bench_overwrite(c: &mut Criterion) {
                 }
                 (dir, db)
             },
-            |(_dir, db)| {
+            |(dir, db)| {
                 let new_value = make_value(100);
                 for i in 0..count {
                     db.put(&make_key(i), &new_value).unwrap();
                 }
+                (db, dir)
             },
         );
     });
@@ -220,10 +220,11 @@ fn bench_readrandom(c: &mut Criterion) {
                     .collect();
                 (dir, db, keys)
             },
-            |(_dir, db, keys)| {
+            |(dir, db, keys)| {
                 for key in &keys {
                     let _ = db.get(key).unwrap();
                 }
+                (db, dir, keys)
             },
         );
     });
@@ -247,10 +248,11 @@ fn bench_readrandom(c: &mut Criterion) {
                     .collect();
                 (dir, db, keys)
             },
-            |(_dir, db, keys)| {
+            |(dir, db, keys)| {
                 for key in &keys {
                     let _ = db.get(key).unwrap();
                 }
+                (db, dir, keys)
             },
         );
     });
@@ -271,10 +273,11 @@ fn bench_readrandom(c: &mut Criterion) {
                 let keys: Vec<Vec<u8>> = (0..500u64).map(|i| make_key((i * 7) % 2_000)).collect();
                 (dir, db, keys)
             },
-            |(_dir, db, keys)| {
+            |(dir, db, keys)| {
                 for key in &keys {
                     let _ = db.get(key).unwrap();
                 }
+                (db, dir, keys)
             },
         );
     });
@@ -306,9 +309,10 @@ fn bench_readseq(c: &mut Criterion) {
                         db.flush().unwrap();
                         (dir, db)
                     },
-                    |(_dir, db)| {
+                    |(dir, db)| {
                         let n = db.iter().unwrap().take(scan_count).count();
                         assert!(n > 0);
+                        (db, dir)
                     },
                 );
             },
@@ -333,9 +337,10 @@ fn bench_readseq(c: &mut Criterion) {
                         db.compact().unwrap();
                         (dir, db)
                     },
-                    |(_dir, db)| {
+                    |(dir, db)| {
                         let n = db.iter().unwrap().take(scan_count).count();
                         assert!(n > 0);
+                        (db, dir)
                     },
                 );
             },
@@ -375,13 +380,14 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 db.flush().unwrap();
                 (dir, db)
             },
-            |(_dir, db)| {
+            |(dir, db)| {
                 let n = db
                     .iter_with_prefix(b"pfx_0025", &mmdb::ReadOptions::default())
                     .unwrap()
                     .take(100)
                     .count();
                 assert!(n > 0);
+                (db, dir)
             },
         );
     });
@@ -410,13 +416,14 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 db.compact().unwrap();
                 (dir, db)
             },
-            |(_dir, db)| {
+            |(dir, db)| {
                 let n = db
                     .iter_with_prefix(b"pfx_0025", &mmdb::ReadOptions::default())
                     .unwrap()
                     .take(100)
                     .count();
                 assert!(n > 0);
+                (db, dir)
             },
         );
     });
@@ -446,12 +453,13 @@ fn bench_seek(c: &mut Criterion) {
                     .collect();
                 (dir, db, targets)
             },
-            |(_dir, db, targets)| {
+            |(dir, db, targets)| {
                 for target in &targets {
                     let mut iter = db.iter().unwrap();
                     iter.seek(target);
                     let _ = iter.next();
                 }
+                (db, dir, targets)
             },
         );
     });
@@ -477,10 +485,11 @@ fn bench_delete(c: &mut Criterion) {
                 }
                 (dir, db)
             },
-            |(_dir, db)| {
+            |(dir, db)| {
                 for i in 0..count {
                     db.delete(&make_key(i)).unwrap();
                 }
+                (db, dir)
             },
         );
     });
@@ -496,8 +505,9 @@ fn bench_delete(c: &mut Criterion) {
                 }
                 (dir, db)
             },
-            |(_dir, db)| {
+            |(dir, db)| {
                 db.delete_range(&make_key(0), &make_key(count / 2)).unwrap();
+                (db, dir)
             },
         );
     });
@@ -530,8 +540,7 @@ fn bench_value_sizes(c: &mut Criterion) {
                         for i in 0..count {
                             db.put(&make_key(i), &value).unwrap();
                         }
-                        db.close().unwrap();
-                        drop(dir);
+                        (db, dir)
                     },
                 );
             },
@@ -577,9 +586,10 @@ fn bench_compression(c: &mut Criterion) {
                         for i in 0..count {
                             db.put(&make_key(i), &value).unwrap();
                         }
+                        // Flush is the measured compression work; close/drop
+                        // happen after timing.
                         db.flush().unwrap();
-                        db.close().unwrap();
-                        drop(dir);
+                        (db, dir)
                     },
                 );
             },
@@ -612,9 +622,10 @@ fn bench_scan_large(c: &mut Criterion) {
                         db.flush().unwrap();
                         (dir, db)
                     },
-                    |(_dir, db)| {
+                    |(dir, db)| {
                         let n = db.iter().unwrap().take(scan_count).count();
                         assert!(n > 0);
+                        (db, dir)
                     },
                 );
             },
@@ -639,9 +650,10 @@ fn bench_scan_large(c: &mut Criterion) {
                         db.compact().unwrap();
                         (dir, db)
                     },
-                    |(_dir, db)| {
+                    |(dir, db)| {
                         let n = db.iter().unwrap().take(scan_count).count();
                         assert!(n > 0);
+                        (db, dir)
                     },
                 );
             },
@@ -672,7 +684,7 @@ fn bench_mixed(c: &mut Criterion) {
                 }
                 (dir, db)
             },
-            |(_dir, db)| {
+            |(dir, db)| {
                 for i in 0..ops {
                     if i % 10 == 0 {
                         db.put(&make_key(preload + i), &value).unwrap();
@@ -680,6 +692,7 @@ fn bench_mixed(c: &mut Criterion) {
                         let _ = db.get(&make_key(i % preload)).unwrap();
                     }
                 }
+                (db, dir)
             },
         );
     });
@@ -694,7 +707,7 @@ fn bench_mixed(c: &mut Criterion) {
                 }
                 (dir, db)
             },
-            |(_dir, db)| {
+            |(dir, db)| {
                 for i in 0..ops {
                     if i % 2 == 0 {
                         db.put(&make_key(preload + i), &value).unwrap();
@@ -702,6 +715,7 @@ fn bench_mixed(c: &mut Criterion) {
                         let _ = db.get(&make_key(i % preload)).unwrap();
                     }
                 }
+                (db, dir)
             },
         );
     });
