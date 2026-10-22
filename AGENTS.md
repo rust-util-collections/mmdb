@@ -14,7 +14,7 @@ Project workflows are user-invoked from `.claude/skills/`:
 - `x-review`: inspect a scope (default: latest commit) and record findings. Does not commit.
 - `x-fix`: resolve recorded findings with validated local commits. Does not release.
 - `x-commit`: review and commit the intended worktree changes. Does not release.
-- `x-overhaul`: same scopes as `x-review` (`all` for the full repo), resolve in-scope findings, then one local release if `src/` changed.
+- `x-overhaul`: same scopes as `x-review` (`all` for the full repo), resolve in-scope findings, then one local release if `src/` changed and a best-effort PR from a non-default branch.
 
 When invoked, read that workflow's `SKILL.md`. For delegated reviews, use the
 handoff and finding templates in
