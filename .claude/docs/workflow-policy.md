@@ -3,9 +3,12 @@
 Shared workflow rules for `/x-review`, `/x-commit`, `/x-fix`, `/x-overhaul`. Skills must
 not weaken it. See also `pragmatic-engineering.md`.
 
-**Hard rules:** user-invoked only · local commits only (never push) · no history
-rewrite · one independent issue per commit · version bump and tag only in
-`/x-overhaul`, once.
+**Hard rules:** user-invoked only · `/x-review`, `/x-commit`, and `/x-fix`
+never push · `/x-overhaul` may push only its non-default working branch and
+open a PR after the local release (best effort; failure does not fail the
+overhaul) · never push the default branch · no history rewrite · one
+independent issue per commit · version bump and tag only in `/x-overhaul`,
+once.
 
 ## Scope
 
@@ -75,6 +78,9 @@ Before mutate/commit:
 5. **Commit workflows:** freeze owned paths (+ planned units) before review edits.
    Stage only freeze set + this invocation’s fix/format paths — never paths that
    appeared later from concurrent work.
+6. **`/x-overhaul`:** resolve the default branch and record the working branch.
+   If HEAD is on the default branch, create `x-overhaul/<scope>-<UTC stamp>`
+   before any edit. Other workflows stay on the current branch.
 
 Dirty tree OK; clear ownership required.
 
@@ -95,7 +101,10 @@ One issue / root cause / behavior change → one commit.
 - Multiple symptoms only if same root cause.
 - No drive-by cleanup, format churn, or refactors.
 - Stage exact paths/hunks (`git add -A` forbidden). Inspect `git diff --cached` before every commit.
-- New commits only — no amend, rebase, history rewrite, or force-push. No remote push.
+- New commits only — no amend, rebase, history rewrite, or force-push. Remote
+  push is `/x-overhaul` only: the literal working branch, never the default
+  branch, tags, `HEAD`, `--all`, `--mirror`, a `src:dst` refspec, or a force
+  flag. `/x-review`, `/x-commit`, and `/x-fix` never push.
 - Do not commit a registry inventory ahead of the fixes. Each fix commit carries
   that finding's audit hunk. Remaining registry-only edits are one later commit.
 
@@ -109,6 +118,9 @@ One issue / root cause / behavior change → one commit.
 - Unit-caused failure → fix before commit. Pre-existing failure → report with evidence, never claim success.
 - Same failure repeats with no progress → stop and report.
 - A gate failure after a commit → new commit, then re-run. Do not amend.
+- `/x-overhaul` runs the remote step once after the final gate and release.
+  Push/PR failure is reported as a limitation, not a failed overhaul; keep the
+  local commits and do not retry against another ref.
 
 ## 5. Finding dispositions
 

@@ -44,7 +44,7 @@ user-invocable only.
 - `/x-review` — review a scope (default: latest commit). Updates `docs/audit.md` only
 - `/x-fix` — resolve Open findings, one validated commit each. No version bump
 - `/x-commit` — review and commit the current worktree. No version bump
-- `/x-overhaul` — same scopes as `/x-review` (`all` for the full repo), then fix in-scope findings and one local release if `src/` changed
+- `/x-overhaul` — same scopes as `/x-review` (`all` for the full repo), then fix in-scope findings, one local release if `src/` changed, and a best-effort PR from a non-default branch
 
 All four workflows follow the neutral task/report wording in
 [workflow-policy.md](.claude/docs/workflow-policy.md). Review local storage
