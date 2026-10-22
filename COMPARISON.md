@@ -41,7 +41,7 @@
 | Bloom Filter (whole-key) | Yes | Yes | Yes | Configurable bits_per_key |
 | Prefix Bloom Filter | Yes | Yes | Yes | prefix_len configurable |
 | Block compression (LZ4/Zstd) | Yes | Yes | Yes | Per-level configurable |
-| BlockCache (LRU) | Yes | Yes | Yes | moka concurrent cache + L0 pinning |
+| BlockCache (LRU) | Yes | Yes | Yes | moka concurrent SegmentedCache + L0 pinning; shareable via `BlockCachePool` |
 | Value Block separation | Partial (BlobDB/Titan) | Yes | No | LazyValue provides zero-copy within blocks |
 
 ## Compaction
@@ -73,7 +73,7 @@
 |---------|---------|--------|------|-------|
 | Point Get (multi-level lookup) | Yes | Yes | Yes | memtable -> L0 -> L1+ |
 | SuperVersion (lock-free reads) | Yes | Yes | Yes | ArcSwap\<SuperVersion\> (single atomic load, no RwLock) |
-| Prefix Iterator | Yes | Yes | Yes | Bloom filtering + prefix stop |
+| Prefix Iterator | Yes | Yes | Yes | Prefix stop; bloom pruning when `prefix_len > 0` |
 | Bidirectional Iterator | Yes | Yes | Yes | Lazy streaming, forward/backward |
 | Prefetch-based init_heap I/O | No | Partial (goroutine) | Yes | Sequential prefetch hints + page-cache-overlapped peek (not thread-parallel) |
 
@@ -100,7 +100,7 @@ parallel execution with shared `AtomicU64` file number counter and pre-populated
 **Compaction reads bypass the block cache** — compaction `TableIterator`s run
 with `fill_cache=false` (RocksDB behavior): every input block is read exactly
 once, so inserting it would only evict hot point-read blocks. Public scans can
-opt in via `ReadOptions::fill_cache = false`.
+opt out of cache population with `ReadOptions::fill_cache = false`.
 
 ### High Value
 

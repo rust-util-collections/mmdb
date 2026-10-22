@@ -30,7 +30,7 @@ MSRV: Rust 1.95 (edition 2024)
 | Read path | `src/db.rs` | Lock-free via `ArcSwap<SuperVersion>` |
 | MemTable | `src/memtable/` | Lock-free skiplist (single-writer, multi-reader) |
 | WAL | `src/wal/` | Crash recovery, block-based records with CRC32 |
-| SST | `src/sst/` | Prefix-compressed blocks, bloom filters, LZ4/Zstd |
+| SST | `src/sst/` | Prefix-compressed blocks, dedicated range-del block, bloom filters, LZ4/Zstd |
 | Iterator | `src/iterator/` | Heap merge, range tombstones, bidirectional |
 | Compaction | `src/compaction/leveled.rs` | Leveled strategy, sub-compaction parallelism |
 | Manifest | `src/manifest/` | VersionSet, atomic version edits |
@@ -70,7 +70,8 @@ Audit registry: `docs/audit.md` — maintained by `/x-review`, `/x-fix`, and `/x
 - **Prefer imports over inline paths** — avoid `std::foo::Bar::new()` inline in function bodies when the same path appears 3+ times in a file; add `use std::foo;` at file top (or `use std::foo::Bar;`) instead. Function-body `use` statements (scoped imports) are fine and don't count as inline paths. 1-2 inline uses of common `std::` items are acceptable.
 - **Grouped imports** — merge common prefixes: `use std::sync::{Arc, Mutex};`
 - **Doc-code alignment** — public API changes must update corresponding docs
-- `parking_lot` for Mutex/RwLock (non-reentrant, no poisoning)
+- `parking_lot` for Mutex/RwLock (non-reentrant, no poisoning); the
+  background-compaction wake pair uses `std::sync::{Mutex, Condvar}`
 - Typed errors: `Error`/`ErrorKind` in `src/error.rs` (hand-rolled, no thiserror/ruc); propagate with `.ctx()` / `.with_ctx(|| ..)` — each hop records `file:line:column` via `#[track_caller]`
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories

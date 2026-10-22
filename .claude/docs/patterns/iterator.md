@@ -37,7 +37,7 @@ rules if unconsumed.
   tomb. Same/shallower levels still cover (mem DeleteRange must hit deeper + same mem Put)
 - Sequential fadvise hints; deferred block read via index first_key
 - L0 first-block pin for init_heap peek; unpin when leave L0 (incl. trivial move);
-  index/bloom live on TableReader, not block_cache
+  index/bloom/range-del live on TableReader, not block_cache
 - Atomic L0 counter for write throttle
 
 ## Checklist

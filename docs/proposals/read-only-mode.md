@@ -1,7 +1,13 @@
 # Proposal: Read-Only Open Mode
 
-Status: **Implemented** · Author: ktmlm · Scope: `DB::open` family, read path,
-mutation guards, shutdown path
+Status: **Implemented** (historical design record) · Author: ktmlm · Scope:
+`DB::open` family, read path, mutation guards, shutdown path
+
+> This document preserves the approved design and implementation plan; the
+> sections below retain their original design-time wording. It is not a current
+> work item. User-facing behavior is documented in
+> [README.md](../../README.md#read-only-databases); where this plan and the
+> code differ, the code is authoritative.
 
 ## 1. Goal
 

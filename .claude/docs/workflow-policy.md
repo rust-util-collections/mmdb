@@ -5,10 +5,10 @@ not weaken it. See also `pragmatic-engineering.md`.
 
 **Hard rules:** user-invoked only · `/x-review`, `/x-commit`, and `/x-fix`
 never push · `/x-overhaul` may push only its non-default working branch and
-open a PR after the local release (best effort; failure does not fail the
-overhaul) · never push the default branch · no history rewrite · one
-independent issue per commit · version bump and tag only in `/x-overhaul`,
-once.
+open a PR after its local commits and optional release (best effort; failure
+does not fail the overhaul) · never push the default branch · no history
+rewrite · one independent issue per commit · version bump and tag only in
+`/x-overhaul`, once.
 
 ## Scope
 
@@ -118,9 +118,9 @@ One issue / root cause / behavior change → one commit.
 - Unit-caused failure → fix before commit. Pre-existing failure → report with evidence, never claim success.
 - Same failure repeats with no progress → stop and report.
 - A gate failure after a commit → new commit, then re-run. Do not amend.
-- `/x-overhaul` runs the remote step once after the final gate and release.
-  Push/PR failure is reported as a limitation, not a failed overhaul; keep the
-  local commits and do not retry against another ref.
+- `/x-overhaul` runs the remote step once after the final gate and optional
+  release. Push/PR failure is reported as a limitation, not a failed overhaul;
+  keep the local commits and do not retry against another ref.
 
 ## 5. Finding dispositions
 
@@ -131,8 +131,9 @@ One issue / root cause / behavior change → one commit.
 | Rejected | material claim ruled out by code or tests (not a severity). Skip routine noise. |
 | omit | feature request, documented contract, style |
 
-`/x-review` may add or prune Open, add Rejected, and move a stale Won't Fix
-back to Open or Rejected; it does not add Won't Fix. `/x-fix` and
-`/x-overhaul` may add Won't Fix during triage. Do not reclassify an entry to
-empty Open. Forms and severities: `review-core.md`. Evidence only — no dates
-or “last reviewed” markers.
+`/x-review` may add or prune Open, add Rejected, move a stale Won't Fix
+back to Open or Rejected, and delete an entry that a re-check shows was
+never a defect; it does not add Won't Fix. `/x-fix` and `/x-overhaul` may
+add Won't Fix during triage and likewise delete non-defects. Do not
+reclassify an entry to empty Open. Forms and severities: `review-core.md`.
+Evidence only — no dates or “last reviewed” markers.

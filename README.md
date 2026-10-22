@@ -5,7 +5,6 @@
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-250_passing-brightgreen.svg)]()
 
 A pure-Rust LSM-Tree key-value storage engine, purpose-built for
 [vsdb](https://github.com/rust-util-collections/vsdb).
@@ -37,7 +36,7 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | Bloom filters (per-key + prefix bloom) | Implemented |
 | Block cache (moka LRU) with L0 first-block pinning (insert_pinned) | Implemented |
 | Table cache (open file handles) | Implemented |
-| MANIFEST version tracking + compaction | Implemented |
+| MANIFEST version tracking with atomic version edits | Implemented |
 | Leveled compaction with trivial move | Implemented |
 | Multi-threaded background compaction | Implemented |
 | Streaming compaction (O(block) memory) | Implemented |
@@ -49,13 +48,14 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | CompactRange API (with range filtering) | Implemented |
 | Compaction filter | Implemented |
 | Rate limiter (token bucket, wired to compaction) | Implemented |
-| DB properties/statistics (wired to all paths) | Implemented |
+| DB properties/statistics (reads, writes, flushes, compaction) | Implemented |
 | Typed errors with full propagation traces | Implemented |
 
 `max_immutable_memtables` is retained as an accepted-but-unused compatibility
-option. MMDB flushes each frozen MemTable synchronously, so there is no
-immutable-MemTable queue for that value to bound; other options are wired to
-their documented behavior.
+option. The write path freezes at most one MemTable at a time and flushes it
+before the next group proceeds, so there is no multi-entry immutable-MemTable
+queue for that value to bound. Other options are wired to their documented
+behavior.
 
 ---
 
@@ -76,7 +76,7 @@ their documented behavior.
                v
           +----------+
           | MemTable |
-          | (immut.) |
+          | (frozen) |
           +----+-----+
                | flush
                v
@@ -95,15 +95,15 @@ their documented behavior.
 ### Write Path
 
 1. Encode as InternalKey (`user_key + !pack(sequence, type)` — inverted big-endian for descending sequence order)
-2. Append to WAL (group commit: leader batches multiple writers into one fsync)
+2. Append to WAL (group commit: the leader batches multiple writers into one append and one flush, using a single fsync when any grouped write requests `sync`)
 3. Insert into active MemTable (concurrent skiplist)
 4. When MemTable exceeds `write_buffer_size`, freeze and flush to L0 SST
-5. Signal background compaction threads if L0 file count exceeds threshold
+5. Signal background compaction threads so L0 is drained when it reaches `l0_compaction_trigger`
 
 ### Read Path
 
 1. Active MemTable (newest writes)
-2. Immutable MemTables (newest first)
+2. The frozen MemTable, while its flush is in progress
 3. L0 SST files (newest first, per-file bloom filter + range check)
 4. L1+ SST files (LevelIterator with lazy file opening, binary search by key range)
 
@@ -123,9 +123,9 @@ Key optimizations:
 - **Cursor-based block iteration**: Decodes entries one-at-a-time from raw block data — no per-block Vec allocation
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
 - **Sequential readahead**: `posix_fadvise(WILLNEED)` after detecting sequential block access
-- **L0 first-block pinning**: Each L0 file's first data block (smallest key) is pinned via `insert_pinned` so `init_heap`'s first `peek()` is always a cache hit; unpinned on compaction. Index and filter blocks are held directly as `TableReader` fields and never go through `block_cache`
+- **L0 first-block pinning**: Each L0 file's first data block (smallest key) is pinned via `insert_pinned` so `init_heap`'s first `peek()` is always a cache hit; unpinned on compaction. Index and filter blocks are held directly as `TableReader` fields, and range-tombstone data is cached there; none go through `block_cache`
 - **Sweep-line range tombstone tracking**: O(1) amortized per key
-- **Lazy index loading**: Index parsed on first use
+- **Lazy index loading**: Index entries are parsed on first use
 - **Atomic L0 counter**: Write-throttle checks use an atomic counter, avoiding mutex contention on writes
 
 ### SST Format
@@ -134,16 +134,27 @@ Key optimizations:
 Data Block 0: [entries with prefix compression + restart points]
 Data Block 1: ...
 ...
-Filter Block: [bloom filter bits]
-Prefix Filter Block: [prefix bloom bits]
-Metaindex Block: ["filter.bloom" -> handle, "filter.prefix" -> handle]
+Filter Block: [whole-key bloom filter bits]        (when bloom filters are enabled and the file has keys)
+Prefix Filter Block: [prefix bloom bits]           (when prefix blooms are configured and the file has keys)
+Range Del Block: [range tombstones]                (when the file contains any)
+Metaindex Block: ["filter.bloom" -> handle,
+                  "filter.hash" -> bloom hash version,
+                  "filter.prefix" -> handle,
+                  "filter.prefix_len" -> prefix length,
+                  "rangedelblock" -> handle]        (entries present only when applicable)
 Index Block: [last_key -> BlockHandle + first_key per block]
-Footer (48 bytes): [metaindex_handle, index_handle, magic]
+Footer (48 bytes): [metaindex_handle, index_handle, padding, magic]
 ```
+
+Files written before the dedicated range-deletion block may instead keep
+range tombstones inline in the data blocks; the reader supports both layouts.
 
 ---
 
 ## Source Code Structure
+
+Selected modules. Directory `mod.rs` files are listed only when they contain the
+subsystem implementation; pure re-export `mod.rs` files are omitted.
 
 ```
 src/
@@ -165,12 +176,12 @@ src/
 +-- sst/
 |   +-- block.rs            # Data block: prefix compression + restart points + seek
 |   +-- block_builder.rs    # Block construction
-|   +-- table_builder.rs    # SST writer (data + filter + index with first_key + footer)
+|   +-- table_builder.rs    # SST writer (data + filter + range-del + index + footer)
 |   +-- table_reader/
 |   |   +-- mod.rs           # SST reader: open, block read/cache, point lookup
 |   |   +-- iterator.rs      # TableIterator (cursor-based, deferred block read)
 |   +-- filter.rs            # Bloom filter (double hashing)
-|   +-- format.rs           # Footer, BlockHandle, CompressionType, IndexEntry encoding
+|   +-- format.rs           # Footer, BlockHandle, CompressionType, index-value encoding
 +-- compaction/
 |   +-- leveled.rs          # Leveled compaction: streaming merge, trivial move, filter
 +-- manifest/
@@ -178,7 +189,7 @@ src/
 |   +-- version.rs          # Version (immutable SST file set snapshot)
 |   +-- version_set.rs      # VersionSet (MANIFEST management + version chain)
 +-- cache/
-|   +-- block_cache.rs      # Block LRU cache (moka) with L0 pinning support
+|   +-- block_cache.rs      # Block cache (moka) with shared pools + L0 pinning
 |   +-- table_cache.rs      # SST reader cache
 +-- iterator/
     +-- merge.rs            # Min-heap MergingIterator with buffer reuse + prefetch
@@ -222,7 +233,8 @@ impl DB {
     ///
     /// Applies two levels of SST pruning:
     ///   1. Range pruning  — skips files whose key range doesn't overlap the prefix.
-    ///   2. Bloom filter   — skips files that don't contain the prefix (finer-grained).
+    ///   2. Bloom filter   — when `DbOptions::prefix_len > 0`, skips files whose
+    ///                       prefix bloom reports the prefix absent (finer-grained).
     ///
     /// Use this when all target keys share a common prefix (e.g. `b"orders:"`).
     /// For a sub-range within the prefix, set ReadOptions bounds.
@@ -241,11 +253,11 @@ impl DB {
     ///
     /// ## Pruning comparison
     ///
-    /// | Method               | SST range pruning | Bloom filter pruning |
-    /// |----------------------|:-----------------:|:--------------------:|
-    /// | `iter()`             | ✗                 | ✗                    |
-    /// | `iter_with_range()`  | ✓                 | ✗                    |
-    /// | `iter_with_prefix()` | ✓                 | ✓                    |
+    /// | Method               | SST range pruning | Bloom filter pruning        |
+    /// |----------------------|:-----------------:|:---------------------------:|
+    /// | `iter()`             | ✗                 | ✗                           |
+    /// | `iter_with_range()`  | ✓                 | ✗                           |
+    /// | `iter_with_prefix()` | ✓                 | ✓ (requires `prefix_len > 0`) |
     pub fn iter_with_range(&self, options: &ReadOptions, lower_bound: Option<&[u8]>, upper_bound: Option<&[u8]>) -> Result<DBIterator>;
 
     /// RAII snapshot — automatically released on drop.
@@ -429,7 +441,7 @@ See [COMPARISON.md](COMPARISON.md) for a detailed feature-by-feature comparison 
 
 ```bash
 cargo build
-cargo test               # 250+ tests (unit + integration + e2e + proptest)
+cargo test               # unit + crash-recovery + integration + e2e + proptest suites
 make all                 # fmt + lint + test
 make bench               # criterion benchmarks (warm + small-cache scenarios)
 cargo bench -- "small_cache" # small block-cache benchmarks only

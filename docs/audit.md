@@ -78,7 +78,7 @@ None.
 ## Rejected
 
 ### SST: an index separator that is a range-deletion key makes point lookups miss a visible entry
-- **Where**: `src/sst/table_builder.rs:269` (`last_key` set for `RangeDeletion` entries), `src/sst/table_reader/mod.rs` (`get_internal_with_seq`)
+- **Where**: `src/sst/table_builder.rs:281-297` (`last_key` set for `RangeDeletion` entries), `src/sst/table_reader/mod.rs` (`get_internal_with_seq`)
 - **Claim**: A block separator taken from a buffered range-deletion key can exceed every data key in its block, so an index seek skips a block that holds the target.
 - **Reason**: A miss needs seek key S ≤ separator R < entry X with S and X sharing a user key, which forces R to share that user key with X.seq < R.seq ≤ S.seq, so X is always covered by R. `DB::get` folds the file's covering tombstone sequence in before any point lookup, and iterator `seek` continues into the next block.
 
