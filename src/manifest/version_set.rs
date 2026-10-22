@@ -1,7 +1,7 @@
 //! VersionSet: manages the MANIFEST file and the chain of Versions.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -453,6 +453,42 @@ impl VersionSet {
         // polluted with an edit referencing a broken file.
         let mut new_version = (*self.current).clone();
 
+        // Deletions are applied before additions, matching recovery replay.
+        // That order defines the semantics when an edit both deletes and adds
+        // the same file number (the trivial-move shape).
+        for (level, file_number) in &edit.deleted_files {
+            let level = *level as usize;
+            if level >= self.num_levels {
+                return Err(Error::corruption(format!(
+                    "VersionEdit deletes SST {} at out-of-range level {} (num_levels {})",
+                    file_number, level, self.num_levels
+                )));
+            }
+            let before = new_version.files[level].len();
+            new_version.files[level].retain(|f| f.meta.number != *file_number);
+            if new_version.files[level].len() == before {
+                return Err(Error::corruption(format!(
+                    "VersionEdit deletes SST {} at level {} but no such live file exists there",
+                    file_number, level
+                )));
+            }
+        }
+
+        // Recovery rejects an addition whose number is already live at any
+        // level, including a duplicate within the same edit. Mirror that
+        // check: installing and fsyncing such an edit would leave a MANIFEST
+        // that the next open refuses to replay.
+        let mut live_numbers: HashSet<u64> = if edit.new_files.is_empty() {
+            HashSet::new()
+        } else {
+            new_version
+                .files
+                .iter()
+                .flatten()
+                .map(|file| file.meta.number)
+                .collect()
+        };
+
         for (level, meta) in &edit.new_files {
             let level = *level as usize;
             // An out-of-range level is an internal logic bug. Silently skipping
@@ -463,6 +499,12 @@ impl VersionSet {
                 return Err(Error::corruption(format!(
                     "VersionEdit adds SST {} at out-of-range level {} (num_levels {})",
                     meta.number, level, self.num_levels
+                )));
+            }
+            if !live_numbers.insert(meta.number) {
+                return Err(Error::corruption(format!(
+                    "VersionEdit adds SST {} at level {} but it is already live",
+                    meta.number, level
                 )));
             }
             let reader = if let Some(ref tc) = self.table_cache {
@@ -508,28 +550,6 @@ impl VersionSet {
                         e
                     )));
                 }
-            }
-        }
-
-        // Deletions must name a live file at the exact level. A miss means the
-        // edit was built against a stale version (internal logic bug); recovery
-        // replay enforces the same invariant, so persisting the edit would make
-        // the next open fail. Fail loudly before anything is written.
-        for (level, file_number) in &edit.deleted_files {
-            let level = *level as usize;
-            if level >= self.num_levels {
-                return Err(Error::corruption(format!(
-                    "VersionEdit deletes SST {} at out-of-range level {} (num_levels {})",
-                    file_number, level, self.num_levels
-                )));
-            }
-            let before = new_version.files[level].len();
-            new_version.files[level].retain(|f| f.meta.number != *file_number);
-            if new_version.files[level].len() == before {
-                return Err(Error::corruption(format!(
-                    "VersionEdit deletes SST {} at level {} but no such live file exists there",
-                    file_number, level
-                )));
             }
         }
 
@@ -1283,6 +1303,76 @@ mod tests {
         let recovered = VersionSet::recover(path, 7).unwrap();
         assert_eq!(recovered.current().total_files(), 0);
         assert_eq!(recovered.last_sequence(), 7);
+    }
+
+    /// `log_and_apply` must reject the same malformed file-number streams
+    /// that recovery rejects, or a persisted edit makes the next open fail.
+    #[test]
+    fn test_log_and_apply_matches_recovery_file_number_validation() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let build_sst = |number: u64, key: &[u8]| {
+            let mut builder = TableBuilder::new(
+                &path.join(format!("{:06}.sst", number)),
+                TableBuildOptions {
+                    internal_keys: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            builder
+                .add(
+                    InternalKey::new(key, 1, ValueType::Value).as_bytes(),
+                    b"value",
+                )
+                .unwrap();
+            let result = builder.finish().unwrap();
+            FileMetaData {
+                number,
+                file_size: result.file_size,
+                smallest_key: result.smallest_key.unwrap_or_default(),
+                largest_key: result.largest_key.unwrap_or_default(),
+                has_range_deletions: result.has_range_deletions,
+            }
+        };
+
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        let meta1 = build_sst(1, b"a");
+        let meta2 = build_sst(2, b"b");
+
+        let mut add = VersionEdit::new();
+        add.set_next_file_number(3);
+        add.add_file(0, meta1.clone());
+        vs.log_and_apply(add).unwrap();
+
+        // A number that is already live cannot be added again.
+        let mut duplicate_live = VersionEdit::new();
+        duplicate_live.add_file(0, meta1.clone());
+        let err = vs.log_and_apply(duplicate_live).unwrap_err();
+        assert!(err.to_string().contains("already live"));
+        assert_eq!(vs.current().total_files(), 1);
+        assert!(!vs.is_poisoned());
+
+        // The same number twice in one edit is rejected as well.
+        let mut duplicate_in_edit = VersionEdit::new();
+        duplicate_in_edit.add_file(0, meta2.clone());
+        duplicate_in_edit.add_file(0, meta2.clone());
+        let err = vs.log_and_apply(duplicate_in_edit).unwrap_err();
+        assert!(err.to_string().contains("already live"));
+        assert_eq!(vs.current().total_files(), 1);
+
+        // Deletions are applied first: a trivial move that removes and
+        // re-adds the same number remains valid.
+        let mut trivial_move = VersionEdit::new();
+        trivial_move.delete_file(0, 1);
+        trivial_move.add_file(1, meta1);
+        vs.log_and_apply(trivial_move).unwrap();
+        assert_eq!(vs.current().level_files(0).len(), 0);
+        assert_eq!(vs.current().level_files(1).len(), 1);
     }
 
     /// Already-poisoned writers must fail-closed on `sync_manifest` so
