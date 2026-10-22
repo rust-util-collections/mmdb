@@ -225,6 +225,12 @@ fn read_only_handles_share_lock_and_exclude_writers() {
 #[test]
 fn read_only_uses_no_store_mutating_syscalls() {
     if Command::new("strace").arg("--version").output().is_err() {
+        // The trace is the only check that no write-intent syscall reaches a
+        // read-only store. A silent skip in CI would remove that coverage.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "strace is required for the read-only syscall acceptance test in CI"
+        );
         eprintln!("skipping syscall acceptance test: strace is unavailable");
         return;
     }

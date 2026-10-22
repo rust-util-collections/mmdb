@@ -48,6 +48,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The read-only acceptance test traces syscalls; it must not skip in CI.
+      - run: sudo apt-get update && sudo apt-get install -y strace
       - run: cargo test --lib
       - run: cargo test --doc
       - run: cargo test --test crash_recovery
