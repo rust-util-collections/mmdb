@@ -15,22 +15,22 @@ rust-version = "1.95"
 exclude = [".github/"]
 
 [dependencies]
-crc32fast = "1"
-lz4_flex = "0.14"
-zstd = "0.14"
-moka = { version = "0.12", features = ["sync"] }
-parking_lot = "0.12"
-tracing = "0.1"
-arc-swap = "1.8.2"
+crc32fast = "1.5.3"
+lz4_flex = "0.14.0"
+zstd = "0.14.3"
+moka = { version = "0.12.16", features = ["sync"] }
+parking_lot = "0.13.0"
+tracing = "0.1.44"
+arc-swap = "1.9.3"
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.191"
 
 [dev-dependencies]
 mmdb = { path = ".", features = ["test-utils"] }
-tempfile = "3"
-proptest = "1"
-criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3.27.0"
+proptest = "1.12.0"
+criterion = { version = "0.8.2", features = ["html_reports"] }
 
 [[bench]]
 name = "benchmarks"
