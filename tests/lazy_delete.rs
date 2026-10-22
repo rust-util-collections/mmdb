@@ -430,7 +430,9 @@ fn lazy_delete_retries_after_snapshot_release() {
     let snapshot = db.snapshot();
     db.lazy_delete(b"k");
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    // A full compaction runs the settling prune synchronously. The live
+    // snapshot must defer the removal; no sleep-based scheduling guess.
+    db.compact().unwrap();
     assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
 
     drop(snapshot);
