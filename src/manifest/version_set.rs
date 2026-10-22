@@ -353,7 +353,7 @@ impl VersionSet {
 
         // Pass 2: Open only live files
         let mut version = Version::new(num_levels);
-        for (level, meta) in live_files.values() {
+        for (level, meta) in live_files.values_mut() {
             let reader_result = if let Some(ref tc) = table_cache {
                 tc.get_reader(meta.number)
             } else {
@@ -362,6 +362,16 @@ impl VersionSet {
             };
             match reader_result {
                 Ok(reader) => {
+                    // A tag-4 record is a range-deletion candidate: writers
+                    // before the flag stored tombstones inline in data blocks.
+                    // Resolve the flag from the file once, here. Every gated
+                    // read/compaction path then agrees on the tombstone set,
+                    // and the legacy data-block scan warms the reader cache
+                    // before the DB is live instead of running under a lock.
+                    if meta.has_range_deletions {
+                        let tombstones = reader.get_range_tombstones().ctx()?;
+                        meta.has_range_deletions = !tombstones.is_empty();
+                    }
                     version.files[*level].push(TableFile {
                         meta: meta.clone(),
                         reader,
@@ -1056,6 +1066,107 @@ mod tests {
         // Recovery should succeed for a clean (empty) DB
         let vs = VersionSet::recover(path, 7).unwrap();
         assert_eq!(vs.current().total_files(), 0);
+    }
+
+    /// Stores written before the `has_range_deletions` flag store range
+    /// tombstones inline in data blocks and encode tag-4 MANIFEST records.
+    /// Recovery must resolve the flag from the file so reads and compaction
+    /// apply those tombstones.
+    #[test]
+    fn test_recovery_resolves_legacy_inline_range_tombstones() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // File 1: legacy format with an inline tombstone covering "m".
+        let mut builder = TableBuilder::new(
+            &path.join("000001.sst"),
+            TableBuildOptions {
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder.use_legacy_inline_range_deletions();
+        builder
+            .add(
+                InternalKey::new(b"a", 1, ValueType::RangeDeletion).as_bytes(),
+                b"z",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"m", 2, ValueType::Value).as_bytes(),
+                b"value",
+            )
+            .unwrap();
+        let with_tombstone = builder.finish().unwrap();
+
+        // File 2: legacy format without tombstones.
+        let mut builder = TableBuilder::new(
+            &path.join("000002.sst"),
+            TableBuildOptions {
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder.use_legacy_inline_range_deletions();
+        builder
+            .add(
+                InternalKey::new(b"x", 1, ValueType::Value).as_bytes(),
+                b"value",
+            )
+            .unwrap();
+        let without_tombstone = builder.finish().unwrap();
+
+        {
+            let vs = VersionSet::create(path, 7).unwrap();
+            let mut record = Vec::new();
+            record.push(2u8); // next_file_number
+            record.extend_from_slice(&10u64.to_le_bytes());
+            record.push(3u8); // last_sequence
+            record.extend_from_slice(&3u64.to_le_bytes());
+            for (number, result) in [(1u64, &with_tombstone), (2u64, &without_tombstone)] {
+                record.push(4u8); // legacy new_file
+                record.extend_from_slice(&0u32.to_le_bytes());
+                record.extend_from_slice(&number.to_le_bytes());
+                record.extend_from_slice(&result.file_size.to_le_bytes());
+                let smallest = result.smallest_key.as_deref().unwrap_or_default();
+                let largest = result.largest_key.as_deref().unwrap_or_default();
+                record.extend_from_slice(&(smallest.len() as u32).to_le_bytes());
+                record.extend_from_slice(smallest);
+                record.extend_from_slice(&(largest.len() as u32).to_le_bytes());
+                record.extend_from_slice(largest);
+            }
+            let mut guard = vs.manifest_writer.lock();
+            let writer = guard.as_mut().expect("writable MANIFEST");
+            writer.add_record(&record).unwrap();
+            writer.sync().unwrap();
+        }
+
+        let recovered = VersionSet::recover(path, 7).unwrap();
+        let current = recovered.current();
+        let files = current.level_files(0);
+        assert_eq!(files.len(), 2);
+
+        let with_tombstone = files.iter().find(|f| f.meta.number == 1).unwrap();
+        assert!(
+            with_tombstone.meta.has_range_deletions,
+            "an inline tombstone must be visible after recovery"
+        );
+        assert_eq!(
+            with_tombstone.reader.get_range_tombstones().unwrap(),
+            vec![(b"a".to_vec(), b"z".to_vec(), 1)]
+        );
+
+        let without_tombstone = files.iter().find(|f| f.meta.number == 2).unwrap();
+        assert!(
+            !without_tombstone.meta.has_range_deletions,
+            "a legacy file without tombstones must not stay flagged"
+        );
     }
 
     #[test]

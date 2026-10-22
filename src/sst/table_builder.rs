@@ -125,6 +125,11 @@ pub struct TableBuilder {
     // Whether any RangeDeletion entry was added
     has_range_deletions: bool,
 
+    /// Test-only: write `RangeDeletion` entries inline in data blocks, matching
+    /// the pre-flag SST layout written by mmdb 2.0.0. Always false in
+    /// production.
+    legacy_inline_range_deletions: bool,
+
     /// Buffered range deletion entries (key, value) to write as a separate block.
     range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
 
@@ -159,12 +164,20 @@ impl TableBuilder {
             largest_key: None,
             prefix_set: HashSet::new(),
             has_range_deletions: false,
+            legacy_inline_range_deletions: false,
             range_del_entries: Vec::new(),
             index_block_projected: 0,
             range_del_projected: 0,
             block_property_collectors: collectors,
             finished: false,
         })
+    }
+
+    /// Test-only: emulate the pre-flag SST layout, where range deletions were
+    /// ordinary data-block entries instead of a dedicated range-del block.
+    #[cfg(test)]
+    pub(crate) fn use_legacy_inline_range_deletions(&mut self) {
+        self.legacy_inline_range_deletions = true;
     }
 
     /// Projected encoded size of the index block, including the entry the
@@ -250,8 +263,9 @@ impl TableBuilder {
             )));
         }
 
-        // Buffer range deletions into a separate block
-        if internal_vt == Some(ValueType::RangeDeletion) {
+        // Buffer range deletions into a separate block. The test-only legacy
+        // mode falls through to the data block, matching pre-flag files.
+        if internal_vt == Some(ValueType::RangeDeletion) && !self.legacy_inline_range_deletions {
             // All range tombstones share one block; it must stay readable.
             let projected = self
                 .range_del_projected

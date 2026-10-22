@@ -179,7 +179,12 @@ impl VersionEdit {
                         pos += 1;
                         v
                     } else {
-                        false
+                        // Tag 4 predates the flag. Those writers stored range
+                        // tombstones inline in data blocks, so the record does
+                        // not say whether this file has any. Mark it as a
+                        // candidate; recovery resolves the real flag by reading
+                        // the file (see `VersionSet::recover_with_cache_mode`).
+                        true
                     };
 
                     edit.new_files.push((
@@ -297,6 +302,32 @@ mod tests {
         assert_eq!(decoded.deleted_files.len(), 2);
         assert_eq!(decoded.deleted_files[0], (0, 5));
         assert_eq!(decoded.deleted_files[1], (1, 15));
+    }
+
+    #[test]
+    fn test_decode_legacy_new_file_marks_range_deletion_candidate() {
+        let mut data = Vec::new();
+        data.push(4u8); // legacy new_file without has_range_deletions
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&7u64.to_le_bytes());
+        data.extend_from_slice(&4096u64.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(b"aaa");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(b"zzz");
+
+        let edit = VersionEdit::decode(&data).unwrap();
+        assert_eq!(edit.new_files.len(), 1);
+        let (level, meta) = &edit.new_files[0];
+        assert_eq!(*level, 0);
+        assert_eq!(meta.number, 7);
+        assert_eq!(meta.file_size, 4096);
+        assert_eq!(meta.smallest_key, b"aaa");
+        assert_eq!(meta.largest_key, b"zzz");
+        assert!(
+            meta.has_range_deletions,
+            "a tag-4 record must be treated as a range-deletion candidate"
+        );
     }
 
     #[test]
