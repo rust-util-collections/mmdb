@@ -68,6 +68,11 @@ None.
 - **What**: `open_read_only` builds `DbOptions::default()`, so recovery refuses any store that has a live file at `level >= 7` with `ErrorKind::Corruption` ("configured with num_levels 7"), even though the store is healthy under its original `num_levels`.
 - **Reason**: `num_levels` is not persisted in MANIFEST, so the convenience method cannot infer it; the documented fallback (`DB::open_read_only_with_options` and the matching `num_levels`) already covers non-default stores, and the error message names that fix. Persisting or deriving `num_levels` is disproportionate for an unusual (>7-level) configuration.
 
+### [LOW] lazy_delete: in-flight compaction wait test uses a fixed sleep
+- **Where**: `tests/lazy_delete.rs` (`compact_waits_for_inflight_compaction_and_removes_dead_keys`, the 200 ms delay before opening the filter gate)
+- **What**: The test releases the background compaction gate after a fixed delay instead of after `compact_range` has observed the in-flight claim. An unlucky schedule can let `compact_range` start after the release, so the wait path is not exercised; the final assertion can still pass.
+- **Reason**: The final assertion catches the primary regression whenever the early-return path is taken, and the scheduler state machine has deterministic unit coverage in `src/db.rs`. Observing the wait predicate from the test needs a hook inside the production path under test, which is disproportionate for this timing-only gap. Retained as an accepted test limitation; the snapshot-deferral test no longer depends on timing.
+
 ---
 
 ## Rejected
