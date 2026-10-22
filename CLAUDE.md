@@ -20,7 +20,7 @@ cargo test --test proptest_db
 
 Agents use the cargo commands in `.claude/docs/commit-protocol.md` for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned paths with `cargo fmt -- <paths>`.
 
-MSRV: Rust 1.95 (edition 2024)
+Toolchain: official latest stable Rust (edition 2024); no MSRV floor is declared
 
 ## Architecture
 
