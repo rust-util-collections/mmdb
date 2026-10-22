@@ -23,10 +23,22 @@ fn open_with_pool(dir: &std::path::Path, pool: &Arc<BlockCachePool>) -> DB {
     .unwrap()
 }
 
-/// Flush so the data lives in SSTs, then read twice: the first get
-/// populates the shared cache, the second is served from it.
+/// Read twice without asserting where the block lives.
 fn assert_cached_value(db: &DB, key: &[u8], want: &[u8]) {
     assert_eq!(db.get(key).unwrap().unwrap(), want);
+    assert_eq!(db.get(key).unwrap().unwrap(), want);
+}
+
+/// Read after compaction (so no L0 pin can serve the block) and require the
+/// first get to populate the shared pool. A private-cache fallback leaves the
+/// pool empty and fails here.
+fn assert_shared_cached_value(db: &DB, key: &[u8], want: &[u8], pool: &BlockCachePool) {
+    assert_eq!(db.get(key).unwrap().unwrap(), want);
+    pool.run_pending_tasks();
+    assert!(
+        pool.entry_count() > 0,
+        "the first read must populate the shared pool"
+    );
     assert_eq!(db.get(key).unwrap().unwrap(), want);
 }
 
@@ -47,11 +59,15 @@ fn test_shared_pool_members_never_alias() {
     }
     db_a.flush().unwrap();
     db_b.flush().unwrap();
+    // Move the data out of L0 so a member-local pinned first block cannot
+    // satisfy the reads without touching the shared pool.
+    db_a.compact().unwrap();
+    db_b.compact().unwrap();
 
     for i in (0..200u32).step_by(17) {
         let k = format!("key-{i:04}");
-        assert_cached_value(&db_a, k.as_bytes(), format!("a-{i}").as_bytes());
-        assert_cached_value(&db_b, k.as_bytes(), format!("b-{i}").as_bytes());
+        assert_shared_cached_value(&db_a, k.as_bytes(), format!("a-{i}").as_bytes(), &pool);
+        assert_shared_cached_value(&db_b, k.as_bytes(), format!("b-{i}").as_bytes(), &pool);
     }
 }
 
@@ -67,8 +83,10 @@ fn test_shared_pool_close_isolates_members() {
     db_b.put(b"k", b"from-b").unwrap();
     db_a.flush().unwrap();
     db_b.flush().unwrap();
-    assert_cached_value(&db_a, b"k", b"from-a");
-    assert_cached_value(&db_b, b"k", b"from-b");
+    db_a.compact().unwrap();
+    db_b.compact().unwrap();
+    assert_shared_cached_value(&db_a, b"k", b"from-a", &pool);
+    assert_shared_cached_value(&db_b, b"k", b"from-b", &pool);
 
     // Closing one member sweeps its pool entries; the survivor keeps
     // working (and re-populates freely).

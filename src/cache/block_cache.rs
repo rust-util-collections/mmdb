@@ -210,6 +210,13 @@ impl BlockCachePool {
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
     }
+
+    /// Test-only: drain moka's pending maintenance so [`entry_count`](Self::entry_count)
+    /// reflects inserts made earlier in the same thread.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn run_pending_tasks(&self) {
+        self.inner.run_pending_tasks();
+    }
 }
 
 /// One DB's view of a [`BlockCachePool`]: the same five-method surface
