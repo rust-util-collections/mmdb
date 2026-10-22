@@ -111,12 +111,26 @@ impl BloomFilter {
     }
 }
 
+/// Hash used by filters written before the hash-version metaindex key
+/// existed (published mmdb <= 2.1.1). Test-only fixture support; new filters
+/// always use [`bloom_hash`].
+#[cfg(test)]
+pub(crate) fn legacy_bloom_hash(key: &[u8]) -> u32 {
+    let mut h: u32 = 0;
+    for &b in key {
+        h = h.wrapping_mul(0x5bd1e995).wrapping_add(b as u32);
+        h ^= h >> 13;
+    }
+    h
+}
+
 /// Hash function for bloom filters: MurmurHash2 (`m = 0x5bd1e995`) with
 /// LevelDB's seed. It is not LevelDB's `BloomHash`.
 ///
-/// On-disk format: SST filters store no hash version, so changing this
-/// function makes every existing filter report present keys as absent. A new
-/// hash needs a new filter metaindex key or version.
+/// The hash is recorded in the SST metaindex (`filter.hash`). Filters
+/// without that marker may have been built with the pre-MurmurHash2 function;
+/// readers must not probe them with this hash (see
+/// `TableReader::bloom_may_match`).
 pub(crate) fn bloom_hash(key: &[u8]) -> u32 {
     let seed: u32 = 0xbc9f1d34;
     let m: u32 = 0x5bd1e995;

@@ -18,8 +18,9 @@ use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::sst::block::Block;
 use crate::sst::filter::BloomFilter;
 use crate::sst::format::{
-    BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, PREFIX_FILTER_LEN_NAME,
-    RANGE_DEL_BLOCK_NAME, decode_footer, decode_index_value_with_props,
+    BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FILTER_HASH_MURMUR2, FILTER_HASH_NAME,
+    FOOTER_SIZE, PREFIX_FILTER_LEN_NAME, RANGE_DEL_BLOCK_NAME, decode_footer,
+    decode_index_value_with_props,
 };
 use crate::stats::DbStats;
 use crate::types::{SequenceNumber, ValueType, compare_internal_key, decode_internal_key};
@@ -61,6 +62,7 @@ struct MetaIndexData {
     bloom: Option<Vec<u8>>,
     prefix: Option<Vec<u8>>,
     prefix_len: Option<usize>,
+    filter_hash: Option<u8>,
     range_del_handle: Option<BlockHandle>,
 }
 
@@ -127,6 +129,9 @@ pub struct TableReader {
     filter_data: Option<Vec<u8>>,
     prefix_filter_data: Option<Vec<u8>>,
     prefix_filter_len: Option<usize>,
+    /// Hash version recorded in the metaindex. `None` for files written
+    /// before the marker existed; those filters must not be probed.
+    filter_hash: Option<u8>,
     file: SstFile,
     block_cache: Option<Arc<BlockCache>>,
     stats: Option<Arc<DbStats>>,
@@ -196,6 +201,7 @@ impl TableReader {
             filter_data: meta.bloom,
             prefix_filter_data: meta.prefix,
             prefix_filter_len: meta.prefix_len,
+            filter_hash: meta.filter_hash,
             file,
             block_cache,
             stats,
@@ -268,7 +274,7 @@ impl TableReader {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // Check bloom filter first
         if let Some(ref filter) = self.filter_data
-            && !BloomFilter::key_may_match(key, filter)
+            && !self.bloom_may_match(key, filter)
         {
             return Ok(None);
         }
@@ -305,7 +311,7 @@ impl TableReader {
 
         // Check bloom filter with user key
         if let Some(ref filter) = self.filter_data
-            && !BloomFilter::key_may_match(user_key, filter)
+            && !self.bloom_may_match(user_key, filter)
         {
             return Ok(None);
         }
@@ -361,7 +367,7 @@ impl TableReader {
 
         // Check bloom filter with user key
         if let Some(ref filter) = self.filter_data
-            && !BloomFilter::key_may_match(user_key, filter)
+            && !self.bloom_may_match(user_key, filter)
         {
             return Ok(None);
         }
@@ -642,6 +648,7 @@ impl TableReader {
         let mut bloom = None;
         let mut prefix = None;
         let mut prefix_len = None;
+        let mut filter_hash = None;
         let mut range_del_handle = None;
 
         let mut iter = metaindex.iter();
@@ -652,6 +659,11 @@ impl TableReader {
             } else if key == b"filter.prefix" {
                 let handle = BlockHandle::decode(&value).ctx()?;
                 prefix = Some(Self::read_block_data(file, &handle).ctx()?);
+            } else if key == FILTER_HASH_NAME.as_bytes() {
+                if value.len() != 1 {
+                    return Err(Error::corruption("bad filter hash metadata".to_string()));
+                }
+                filter_hash = Some(value[0]);
             } else if key == PREFIX_FILTER_LEN_NAME.as_bytes() {
                 if value.len() != 8 {
                     return Err(Error::corruption(
@@ -679,8 +691,19 @@ impl TableReader {
             bloom,
             prefix,
             prefix_len,
+            filter_hash,
             range_del_handle,
         })
+    }
+
+    /// Probe a bloom filter only when its hash version is known. Unversioned
+    /// filters predate the marker and may use the pre-MurmurHash2 hash; a
+    /// probe with the current hash would report present keys as absent.
+    fn bloom_may_match(&self, key: &[u8], filter: &[u8]) -> bool {
+        match self.filter_hash {
+            Some(FILTER_HASH_MURMUR2) => BloomFilter::key_may_match(key, filter),
+            _ => true,
+        }
     }
 
     /// Check if a prefix may exist in this SST file using the prefix bloom filter.
@@ -688,7 +711,7 @@ impl TableReader {
     pub fn prefix_may_match(&self, prefix: &[u8]) -> bool {
         match (self.prefix_filter_data.as_ref(), self.prefix_filter_len) {
             (Some(filter), Some(prefix_len)) if prefix_len > 0 && prefix.len() >= prefix_len => {
-                BloomFilter::key_may_match(&prefix[..prefix_len], filter)
+                self.bloom_may_match(&prefix[..prefix_len], filter)
             }
             _ => true, // Missing/incompatible metadata — conservatively assume present.
         }
@@ -818,7 +841,7 @@ impl TableReader {
 
 #[cfg(test)]
 mod tests {
-    use super::TableReader;
+    use super::{FILTER_HASH_MURMUR2, TableReader};
 
     /// Regression: every cache-miss read of a file held one `Mutex<File>`
     /// through the read, CRC, and decompression, so independent misses on
@@ -891,5 +914,84 @@ mod tests {
             TableReader::validate_prefix_filter_metadata(Some(&[1, 2]), None).is_ok(),
             "missing legacy metadata remains a conservative filter bypass"
         );
+    }
+
+    /// Filters written before the `filter.hash` marker may use the
+    /// pre-MurmurHash2 hash. Probing them with the current hash reports
+    /// present keys as absent, so the reader must conservatively pass.
+    #[test]
+    fn unversioned_bloom_filter_is_not_probed_with_current_hash() {
+        use crate::sst::filter::BloomFilter;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_bloom.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: 10,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder.use_legacy_bloom_hash();
+        let keys: Vec<Vec<u8>> = (0..512u32)
+            .map(|i| format!("k{i:04}").into_bytes())
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            builder
+                .add(
+                    InternalKey::new(key, i as u64 + 1, ValueType::Value).as_bytes(),
+                    b"value",
+                )
+                .unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        assert_eq!(reader.filter_hash, None, "legacy fixture has no marker");
+        let filter = reader.filter_data.as_ref().expect("bloom filter");
+        let victim = keys
+            .iter()
+            .find(|key| !BloomFilter::key_may_match(key, filter))
+            .expect("current hash must miss at least one key stored under the legacy hash");
+        assert_eq!(
+            reader
+                .get_internal(victim, crate::types::MAX_SEQUENCE_NUMBER)
+                .unwrap(),
+            Some(Some(b"value".to_vec())),
+            "an unversioned filter must not hide a present key"
+        );
+    }
+
+    #[test]
+    fn current_bloom_filter_records_hash_version() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current_bloom.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: 10,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"k", 1, ValueType::Value).as_bytes(),
+                b"value",
+            )
+            .unwrap();
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        assert_eq!(reader.filter_hash, Some(FILTER_HASH_MURMUR2));
+        assert!(reader.bloom_may_match(b"k", reader.filter_data.as_ref().unwrap()));
     }
 }

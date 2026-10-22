@@ -130,6 +130,11 @@ pub struct TableBuilder {
     /// production.
     legacy_inline_range_deletions: bool,
 
+    /// Test-only: build bloom filters with the pre-MurmurHash2 function and
+    /// omit the `filter.hash` marker, matching filters written by published
+    /// mmdb <= 2.1.1. Always false in production.
+    legacy_bloom_hash: bool,
+
     /// Buffered range deletion entries (key, value) to write as a separate block.
     range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
 
@@ -165,6 +170,7 @@ impl TableBuilder {
             prefix_set: HashSet::new(),
             has_range_deletions: false,
             legacy_inline_range_deletions: false,
+            legacy_bloom_hash: false,
             range_del_entries: Vec::new(),
             index_block_projected: 0,
             range_del_projected: 0,
@@ -178,6 +184,13 @@ impl TableBuilder {
     #[cfg(test)]
     pub(crate) fn use_legacy_inline_range_deletions(&mut self) {
         self.legacy_inline_range_deletions = true;
+    }
+
+    /// Test-only: emulate filters written before the hash-version marker,
+    /// which used the pre-MurmurHash2 hash.
+    #[cfg(test)]
+    pub(crate) fn use_legacy_bloom_hash(&mut self) {
+        self.legacy_bloom_hash = true;
     }
 
     /// Projected encoded size of the index block, including the entry the
@@ -326,7 +339,15 @@ impl TableBuilder {
                     self.options.bloom_bits_per_key,
                 )?;
             }
-            self.filter_key_hashes.push(bloom_hash(user_key_for_bloom));
+            #[cfg(test)]
+            let hash = if self.legacy_bloom_hash {
+                crate::sst::filter::legacy_bloom_hash(user_key_for_bloom)
+            } else {
+                bloom_hash(user_key_for_bloom)
+            };
+            #[cfg(not(test))]
+            let hash = bloom_hash(user_key_for_bloom);
+            self.filter_key_hashes.push(hash);
         }
 
         // Collect prefix for prefix bloom filter only when Bloom is enabled.
@@ -570,6 +591,13 @@ impl TableBuilder {
         if filter_handle.size > 0 {
             let handle_bytes = filter_handle.encode();
             builder.add(b"filter.bloom", &handle_bytes);
+        }
+
+        // Record the hash shared by the bloom and prefix filters. Files
+        // without this marker may use the pre-MurmurHash2 hash and are not
+        // safe to probe with the current one.
+        if (filter_handle.size > 0 || prefix_filter_handle.size > 0) && !self.legacy_bloom_hash {
+            builder.add(FILTER_HASH_NAME.as_bytes(), &[FILTER_HASH_MURMUR2]);
         }
 
         if prefix_filter_handle.size > 0 {

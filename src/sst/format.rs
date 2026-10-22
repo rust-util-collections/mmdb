@@ -22,6 +22,12 @@ pub const FOOTER_SIZE: usize = 48;
 pub const RANGE_DEL_BLOCK_NAME: &str = "rangedelblock";
 /// Metaindex key storing the fixed prefix length used by the prefix bloom.
 pub const PREFIX_FILTER_LEN_NAME: &str = "filter.prefix_len";
+/// Metaindex key recording the hash used by the bloom and prefix filters.
+/// Files written before this key existed may use a different hash and must
+/// not be probed with the current one.
+pub const FILTER_HASH_NAME: &str = "filter.hash";
+/// Bloom hash version: MurmurHash2 (`filter::bloom_hash`).
+pub const FILTER_HASH_MURMUR2: u8 = 1;
 
 /// A handle pointing to a block within an SST file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
