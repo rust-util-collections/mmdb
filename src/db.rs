@@ -104,7 +104,7 @@ impl DeadKeySweepScheduler {
     fn queue(&self) {
         let _ = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 match DeadKeySweepState::from_raw(current) {
                     DeadKeySweepState::Idle => Some(DeadKeySweepState::Pending as u8),
                     DeadKeySweepState::Running => Some(DeadKeySweepState::RunningPending as u8),
@@ -136,7 +136,7 @@ impl DeadKeySweepScheduler {
     fn retry_after_snapshot_release(&self) -> bool {
         match self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 match DeadKeySweepState::from_raw(current) {
                     DeadKeySweepState::Running => Some(DeadKeySweepState::RunningPending as u8),
                     DeadKeySweepState::Idle
@@ -155,7 +155,7 @@ impl DeadKeySweepScheduler {
     fn finish(&self, retry: bool) {
         let _ = self
             .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 match DeadKeySweepState::from_raw(current) {
                     DeadKeySweepState::Running if retry => Some(DeadKeySweepState::Pending as u8),
                     DeadKeySweepState::Running => Some(DeadKeySweepState::Idle as u8),
