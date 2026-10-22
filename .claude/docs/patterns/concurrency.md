@@ -16,7 +16,7 @@ Flush → write-path auto / flush() / compact_range / close
 | `Arc<MemTable>` | db | MemTable lifetime |
 | `Atomic*` | db, skiplist | Counters, links |
 | `write_cv` | db | Group-commit queue |
-| `compaction_notify` (std) | db | BG compact wake |
+| `compaction_notify` | db | BG compact wake |
 | `thread::scope` | compact | Sub-jobs |
 
 L0 backpressure uses sleep/inline drain — no condvar. Inventory live wait sites when changing sync.

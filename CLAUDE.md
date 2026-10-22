@@ -68,10 +68,10 @@ Audit registry: `docs/audit.md` — maintained by `/x-review`, `/x-fix`, and `/x
 - All clippy warnings are errors (CI enforced)
 - **No `#[allow(...)]`** — fix warnings at the source, never suppress them
 - **Prefer imports over inline paths** — avoid `std::foo::Bar::new()` inline in function bodies when the same path appears 3+ times in a file; add `use std::foo;` at file top (or `use std::foo::Bar;`) instead. Function-body `use` statements (scoped imports) are fine and don't count as inline paths. 1-2 inline uses of common `std::` items are acceptable.
-- **Grouped imports** — merge common prefixes: `use std::sync::{Arc, Mutex};`
+- **Grouped imports** — merge common prefixes: `use std::sync::{Arc, atomic::Ordering};`
 - **Doc-code alignment** — public API changes must update corresponding docs
-- `parking_lot` for Mutex/RwLock (non-reentrant, no poisoning); the
-  background-compaction wake pair uses `std::sync::{Mutex, Condvar}`
+- `parking_lot` for all Mutex/RwLock/Condvar synchronization (non-reentrant,
+  no poisoning)
 - Typed errors: `Error`/`ErrorKind` in `src/error.rs` (hand-rolled, no thiserror/ruc); propagate with `.ctx()` / `.with_ctx(|| ..)` — each hop records `file:line:column` via `#[track_caller]`
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories

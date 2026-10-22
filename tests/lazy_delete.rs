@@ -1,10 +1,11 @@
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
 
 use mmdb::{CompactionFilter, CompactionFilterDecision, DB, DbOptions};
+use parking_lot::Mutex;
 
 fn wait_until_removed(db: &DB, key: &[u8], message: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -573,8 +574,8 @@ struct GateFilter {
 impl CompactionFilter for GateFilter {
     fn filter(&self, _level: usize, _key: &[u8], _value: &[u8]) -> CompactionFilterDecision {
         // Park only the first invocation: report entry, then wait for release.
-        if let Some(release) = self.release.lock().unwrap().take() {
-            if let Some(entered) = self.entered.lock().unwrap().take() {
+        if let Some(release) = self.release.lock().take() {
+            if let Some(entered) = self.entered.lock().take() {
                 let _ = entered.send(());
             }
             let _ = release.recv_timeout(Duration::from_secs(10));

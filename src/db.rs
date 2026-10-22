@@ -7,7 +7,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar as StdCondvar, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -406,7 +406,7 @@ pub struct DB {
     /// Shutdown flag for compaction threads.
     compaction_shutdown: Arc<AtomicBool>,
     /// Notification condvar for compaction threads: (has_work, condvar).
-    compaction_notify: Arc<(StdMutex<bool>, StdCondvar)>,
+    compaction_notify: Arc<(Mutex<bool>, Condvar)>,
     /// Background compaction thread handles.
     compaction_handles: Mutex<Vec<JoinHandle<()>>>,
     /// File numbers currently claimed by an in-progress compaction pick
@@ -976,7 +976,7 @@ impl DB {
 
         // Spawn background compaction threads
         let compaction_shutdown = Arc::new(AtomicBool::new(false));
-        let compaction_notify = Arc::new((StdMutex::new(false), StdCondvar::new()));
+        let compaction_notify = Arc::new((Mutex::new(false), Condvar::new()));
         #[cfg(test)]
         LAST_COMPACTION_SHUTDOWN_FLAG
             .with(|sink| *sink.borrow_mut() = Some(compaction_shutdown.clone()));
@@ -1048,9 +1048,9 @@ impl DB {
                         // Wait for notification
                         {
                             let (lock, cvar) = &*notify;
-                            let mut has_work = lock.lock().unwrap();
+                            let mut has_work = lock.lock();
                             while !*has_work && !shutdown.load(Ordering::Acquire) {
-                                has_work = cvar.wait(has_work).unwrap();
+                                cvar.wait(&mut has_work);
                             }
                             *has_work = false; // consumed
                         }
@@ -1518,7 +1518,7 @@ impl DB {
                     // before propagating the spawn error.
                     {
                         let (lock, cvar) = &*compaction_notify;
-                        let _guard = lock.lock().unwrap();
+                        let _guard = lock.lock();
                         compaction_shutdown.store(true, Ordering::Release);
                         cvar.notify_all();
                     }
@@ -3108,16 +3108,15 @@ impl DB {
             return;
         }
         let (lock, cvar) = &*self.compaction_notify;
-        if let Ok(mut has_work) = lock.lock() {
-            *has_work = true;
-            cvar.notify_one();
-        }
+        let mut has_work = lock.lock();
+        *has_work = true;
+        cvar.notify_one();
     }
 
     fn shutdown_background_and_release_resources(&self) {
         {
             let (lock, cvar) = &*self.compaction_notify;
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.lock();
             self.compaction_shutdown.store(true, Ordering::Release);
             cvar.notify_all();
         }
@@ -4601,7 +4600,7 @@ mod tests {
             // Keep the race deterministic: this test drives compaction itself.
             {
                 let (lock, cv) = &*db.compaction_notify;
-                let _guard = lock.lock().unwrap();
+                let _guard = lock.lock();
                 db.compaction_shutdown.store(true, Ordering::Release);
                 cv.notify_all();
             }
@@ -4733,7 +4732,7 @@ mod tests {
     fn stop_background_workers(db: &DB) {
         {
             let (lock, cv) = &*db.compaction_notify;
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.lock();
             db.compaction_shutdown.store(true, Ordering::Release);
             cv.notify_all();
         }
@@ -4911,7 +4910,7 @@ mod tests {
         .unwrap();
         {
             let (lock, cv) = &*db.compaction_notify;
-            let _guard = lock.lock().unwrap();
+            let _guard = lock.lock();
             db.compaction_shutdown.store(true, Ordering::Release);
             cv.notify_all();
         }
@@ -5224,7 +5223,7 @@ mod tests {
             // This test drives the sweep step itself.
             {
                 let (lock, cv) = &*db.compaction_notify;
-                let _guard = lock.lock().unwrap();
+                let _guard = lock.lock();
                 db.compaction_shutdown.store(true, Ordering::Release);
                 cv.notify_all();
             }
@@ -5282,14 +5281,14 @@ mod tests {
         // The pass has seen the in-flight flush and skipped L0.
         db.dead_key_sweep.queue();
         assert!(db.dead_key_sweep.try_start());
-        *db.compaction_notify.0.lock().unwrap() = false;
+        *db.compaction_notify.0.lock() = false;
 
         db.flush_and_install_frozen(&frozen).unwrap();
         db.dead_key_sweep.finish(true);
 
         assert!(db.dead_key_sweep.is_pending());
         assert!(
-            *db.compaction_notify.0.lock().unwrap(),
+            *db.compaction_notify.0.lock(),
             "the deferred sweep must have a queued wake"
         );
     }
@@ -5353,7 +5352,7 @@ mod tests {
                 // Worker A is parked before finish; only worker B can complete
                 // this pass, consuming the notification without starting a sweep.
                 let consumed = wait_for_passes(2);
-                let wake_queued = *db.compaction_notify.0.lock().unwrap();
+                let wake_queued = *db.compaction_notify.0.lock();
                 release_tx.send(()).unwrap();
                 assert!(consumed, "second worker did not consume the notification");
                 assert!(!wake_queued, "notification was not consumed before finish");
