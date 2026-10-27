@@ -401,6 +401,75 @@ fn test_crash_midlog_wal_corruption_fails_open() {
     );
 }
 
+#[test]
+fn changed_synced_fragment_header_preserves_wal_on_failed_recovery() {
+    for value_len in [2, 40_000] {
+        for (replacement, length_delta) in [
+            (Some(1), 0),
+            (Some(2), 0),
+            (Some(3), 0),
+            (Some(4), 0),
+            (None, -1isize),
+            (None, 1),
+        ] {
+            let original = if value_len == 2 { 1 } else { 4 };
+            if replacement == Some(original) {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let opts = DbOptions {
+                write_buffer_size: 64 << 20,
+                ..make_opts()
+            };
+            let db = DB::open(opts.clone(), dir.path()).unwrap();
+            db.put_with_options(
+                &WriteOptions {
+                    sync: true,
+                    ..Default::default()
+                },
+                b"k",
+                &vec![0; value_len],
+            )
+            .unwrap();
+            db.simulate_crash();
+            let wal_path = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| p.extension().is_some_and(|ext| ext == "wal"))
+                .unwrap();
+            let mut bytes = fs::read(&wal_path).unwrap();
+            let offset = if value_len == 2 { 0 } else { 32 * 1024 };
+            assert_eq!(bytes[offset + 6], original);
+            if let Some(replacement) = replacement {
+                bytes[offset + 6] = replacement;
+            } else {
+                let length = u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]) as usize;
+                let changed = length.checked_add_signed(length_delta).unwrap() as u16;
+                bytes[offset + 4..offset + 6].copy_from_slice(&changed.to_le_bytes());
+            }
+            fs::write(&wal_path, &bytes).unwrap();
+            let current = fs::read(dir.path().join("CURRENT")).unwrap();
+            let manifest_path = dir
+                .path()
+                .join(std::str::from_utf8(&current).unwrap().trim());
+            let manifest = fs::read(&manifest_path).unwrap();
+            for read_only in [true, false] {
+                let result = if read_only {
+                    DB::open_read_only(dir.path())
+                } else {
+                    DB::open(opts.clone(), dir.path())
+                };
+                let err = result
+                    .err()
+                    .expect("a changed complete fragment header must fail recovery");
+                assert_eq!(err.kind(), mmdb::ErrorKind::Corruption);
+                assert_eq!(fs::read(&wal_path).unwrap(), bytes);
+                assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
+            }
+        }
+    }
+}
+
 /// Regression: a synced record whose last fragment carries only zero bytes
 /// was dropped when that fragment's type byte changed to 0. Recovery took it
 /// for a torn header, opened without the key, and deleted the WAL.

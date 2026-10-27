@@ -21,8 +21,8 @@ pub struct WalReader {
     /// Set when the most recent `read_record` failure is a structural short
     /// read (partial header/payload/trailer, Zero header, multi-fragment EOF).
     /// Zero-suffixed checksum failures are also candidates, but payload
-    /// failures first exclude later checksum-valid fragments hidden by an
-    /// invalid stored length. Recovery must still verify the unread suffix.
+    /// failures first exclude complete checksum-valid fragments whose header
+    /// changed or which an invalid length hid. Recovery must verify the suffix.
     last_error_is_truncation: bool,
 }
 
@@ -48,7 +48,7 @@ impl WalReader {
     /// True when the previous `read_record` error is a structural short-read
     /// that recovery may treat as a torn active log tail (subject to
     /// [`Self::rest_is_zero_padding`]). A zero-extended payload can also be a
-    /// candidate; any later checksum-valid fragment makes the failure fatal.
+    /// candidate; any complete checksum-valid fragment makes the failure fatal.
     pub fn last_error_is_truncation(&self) -> bool {
         self.last_error_is_truncation
     }
@@ -95,12 +95,16 @@ impl WalReader {
     }
 
     /// Check the failed payload and the rest of its physical block for a
-    /// complete checksummed fragment. An invalid length can consume a later
-    /// record, including one ending in zero or extending past our read position.
+    /// complete checksummed fragment. A changed type or length can leave the
+    /// current payload intact, or an invalid length can consume a later record.
     /// Read-ahead is bounded to this block and restores the position so recovery
     /// still checks every unread byte for zero padding. This conservative scan
     /// runs only on failed reads, never on the normal replay path.
-    fn payload_contains_later_fragment(&mut self, data: &[u8]) -> Result<bool> {
+    fn failed_payload_contains_complete_fragment(
+        &mut self,
+        checksum: u32,
+        data: &[u8],
+    ) -> Result<bool> {
         let remaining = BLOCK_SIZE - self.block_offset - HEADER_SIZE;
         let position = self.reader.stream_position().ctx()?;
         let mut suffix = data.to_vec();
@@ -109,6 +113,30 @@ impl WalReader {
             .read_to_end(&mut suffix);
         self.reader.seek(SeekFrom::Start(position)).ctx()?;
         read_result.ctx()?;
+
+        // Neither the stored type nor length is trusted after a failed read.
+        // Check every actual payload prefix under each real type, including
+        // bytes past the declared end. A match proves a complete fragment is
+        // present, even when the remainder is zero. Incremental hashing keeps
+        // this bounded to linear work in one physical block.
+        for record_type in [
+            RecordType::Full,
+            RecordType::First,
+            RecordType::Middle,
+            RecordType::Last,
+        ] {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&[record_type as u8]);
+            if hasher.clone().finalize() == checksum {
+                return Ok(true);
+            }
+            for byte in &suffix {
+                hasher.update(std::slice::from_ref(byte));
+                if hasher.clone().finalize() == checksum {
+                    return Ok(true);
+                }
+            }
+        }
 
         for start in 0..suffix.len().saturating_sub(HEADER_SIZE - 1) {
             let header = &suffix[start..start + HEADER_SIZE];
@@ -275,8 +303,11 @@ impl WalReader {
             while consumed < length {
                 match self.reader.read(&mut data[consumed..]) {
                     Ok(0) => {
-                        return if self.payload_contains_later_fragment(&data[..consumed])? {
-                            self.fail_corruption("later WAL fragment inside truncated payload")
+                        return if self.failed_payload_contains_complete_fragment(
+                            checksum,
+                            &data[..consumed],
+                        )? {
+                            self.fail_corruption("complete WAL fragment inside truncated payload")
                         } else {
                             self.fail_truncation("truncated WAL record payload")
                         };
@@ -298,17 +329,8 @@ impl WalReader {
                 // real type, the fragment is complete and only its type byte
                 // changed. A tear of exactly that byte on an all-zero fragment
                 // leaves the same bytes; it fails closed too.
-                let complete_under_real_type = [
-                    RecordType::Full,
-                    RecordType::First,
-                    RecordType::Middle,
-                    RecordType::Last,
-                ]
-                .into_iter()
-                .any(|real_type| fragment_checksum(real_type, &data) == checksum);
                 if data.iter().any(|&b| b != 0)
-                    || complete_under_real_type
-                    || self.payload_contains_later_fragment(&data)?
+                    || self.failed_payload_contains_complete_fragment(checksum, &data)?
                 {
                     return self.fail_corruption("non-padding WAL zero record");
                 }
@@ -316,8 +338,8 @@ impl WalReader {
             }
 
             // A checksum mismatch with a zero suffix can be an interrupted
-            // append, but only if no later checksum-valid fragment is hidden
-            // inside the declared payload (or crosses its end).
+            // append, but a complete fragment with a changed header, or a later
+            // fragment hidden by the declared length, must fail closed.
             let expected_checksum = fragment_checksum(record_type, &data);
 
             if checksum != expected_checksum {
@@ -326,7 +348,7 @@ impl WalReader {
                     expected_checksum, checksum
                 );
                 return if data.last().is_some_and(|&b| b == 0)
-                    && !self.payload_contains_later_fragment(&data)?
+                    && !self.failed_payload_contains_complete_fragment(checksum, &data)?
                 {
                     self.fail_truncation(msg)
                 } else {
@@ -364,6 +386,90 @@ mod tests {
     use super::*;
     use crate::wal::writer::WalWriter;
     use std::{fs::OpenOptions, io::SeekFrom};
+
+    #[test]
+    fn changed_complete_fragment_type_is_not_a_torn_tail() {
+        let real_types = [
+            RecordType::Full,
+            RecordType::First,
+            RecordType::Middle,
+            RecordType::Last,
+        ];
+        for original in real_types {
+            for replacement in [
+                RecordType::Zero,
+                RecordType::Full,
+                RecordType::First,
+                RecordType::Middle,
+                RecordType::Last,
+            ] {
+                if replacement == original {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("changed-type.wal");
+                let payload = vec![
+                    0;
+                    if original == RecordType::Full {
+                        100
+                    } else {
+                        2 * BLOCK_SIZE + 100
+                    }
+                ];
+                let mut writer = WalWriter::new(&path).unwrap();
+                writer.add_record(&payload).unwrap();
+                writer.sync().unwrap();
+                drop(writer);
+                let mut bytes = std::fs::read(&path).unwrap();
+                let offset = match original {
+                    RecordType::Full | RecordType::First => 0,
+                    RecordType::Middle => BLOCK_SIZE,
+                    RecordType::Last => 2 * BLOCK_SIZE,
+                    RecordType::Zero => unreachable!(),
+                };
+                assert_eq!(bytes[offset + 6], original as u8);
+                bytes[offset + 6] = replacement as u8;
+                std::fs::write(&path, bytes).unwrap();
+                let mut reader = WalReader::new(&path).unwrap();
+                assert_eq!(
+                    reader.read_record().unwrap_err().kind(),
+                    crate::ErrorKind::Corruption
+                );
+                assert!(
+                    !reader.last_error_is_truncation(),
+                    "{original:?} -> {replacement:?} must preserve a complete fragment"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_complete_fragment_length_is_not_a_torn_tail() {
+        for adjustment in [-1isize, 1] {
+            for padded in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("changed-length.wal");
+                let payload = b"committed\0\0";
+                let mut writer = WalWriter::new(&path).unwrap();
+                writer.add_record(payload).unwrap();
+                writer.sync().unwrap();
+                drop(writer);
+                let mut bytes = std::fs::read(&path).unwrap();
+                let length = payload.len().checked_add_signed(adjustment).unwrap();
+                bytes[4..6].copy_from_slice(&(length as u16).to_le_bytes());
+                if padded {
+                    bytes.extend_from_slice(&[0; 10]);
+                }
+                std::fs::write(&path, bytes).unwrap();
+                let mut reader = WalReader::new(&path).unwrap();
+                assert!(reader.read_record().is_err());
+                assert!(
+                    !reader.last_error_is_truncation(),
+                    "adjustment {adjustment}, padded {padded}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn enlarged_payload_preserves_later_fragments() {

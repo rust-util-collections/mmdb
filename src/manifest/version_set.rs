@@ -1013,6 +1013,42 @@ mod tests {
     }
 
     #[test]
+    fn changed_synced_edit_header_preserves_manifest_on_failed_recovery() {
+        for (replacement, length_delta) in [
+            (Some(2), 0),
+            (Some(3), 0),
+            (Some(4), 0),
+            (None, -1isize),
+            (None, 1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut vs = VersionSet::create(dir.path(), 7).unwrap();
+            let mut edit = VersionEdit::new();
+            edit.set_last_sequence(7);
+            vs.log_and_apply(edit).unwrap();
+            vs.sync_manifest().unwrap();
+            drop(vs);
+            let path = dir.path().join("MANIFEST-000001");
+            let mut bytes = fs::read(&path).unwrap();
+            let offset = 7 + u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+            assert_eq!(bytes[offset + 6], 1);
+            assert_eq!(bytes.last(), Some(&0));
+            if let Some(replacement) = replacement {
+                bytes[offset + 6] = replacement;
+            } else {
+                let length = u16::from_le_bytes([bytes[offset + 4], bytes[offset + 5]]) as usize;
+                let changed = length.checked_add_signed(length_delta).unwrap() as u16;
+                bytes[offset + 4..offset + 6].copy_from_slice(&changed.to_le_bytes());
+            }
+            fs::write(&path, &bytes).unwrap();
+            assert!(VersionSet::recover_read_only_with_cache(dir.path(), 7, None).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(VersionSet::recover(dir.path(), 7).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
     fn enlarged_payload_preserves_later_manifest_edits() {
         for adjustment in [-1isize, 0, 17] {
             let dir = tempfile::tempdir().unwrap();

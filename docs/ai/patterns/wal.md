@@ -13,6 +13,8 @@ group commit = order batches → append → one flush/fsync; recovery rebuilds M
 **W4 Recovery** — retain all complete records. An incomplete record returns a
 recovery error unless it belongs to the highest recoverable WAL and the
 remaining bytes establish an interrupted final append (possibly zero-padded).
+If the stored CRC verifies a complete payload under another real type or payload
+length, the header is corrupt; a zero suffix must not permit prefix recovery.
 An invalid earlier record, or non-zero data after the failed record, must stop
 recovery and preserve the file; only the active incomplete tail may be removed.
 **W5 Fsync** — any grouped `sync=true` ⇒ all prior WAL-enabled records durable before ack.
