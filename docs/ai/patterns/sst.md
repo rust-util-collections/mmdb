@@ -16,7 +16,8 @@ index, magic); None/LZ4/Zstd.
 **S4 Bloom** — no false negative: same hash version + probe count builder/reader.
 Filters without a recognized `filter.hash` marker are legacy and must be bypassed,
 not probed with the current hash.
-**S5 Compress round-trip** — type byte before encoded block data; matching decompress path.
+**S5 Compress round-trip** — encoded block data followed by type byte and CRC32;
+CRC covers data plus type, and the reader uses the matching decompress path.
 **S6 Magic** — validate before trusting footer handles.
 
 ## Bug patterns
