@@ -1,74 +1,54 @@
 ---
 name: x-overhaul
-description: Review an MMDB scope, resolve confirmed in-scope findings, and create atomic local commits. Default is the latest commit; pass all for the full repository. One local release if src/ changed. Never push.
+description: Review scoped changes in MMDB, fix confirmed in-scope defects, and create atomic local commits. Invoke explicitly as $x-overhaul; empty scope is the latest commit and all selects the full repository.
 ---
 
-# MMDB Review-Fix-Commit Pipeline
+# Review, fix and commit MMDB
 
-Resolve repository paths from the Git root; Markdown links are relative to
-this file. Read invocation arguments from the user prompt.
+Read [the workflow policy](../../../docs/ai/workflow-policy.md) and
+[the review guide](../../../docs/ai/review-core.md). Resolve repository paths from the Git
+root; links above are relative to this file. Read invocation arguments from
+ordinary user prompt text.
 
-Review the scope, record dispositions, fix in-scope Open, then one local
-release if `src/` changed. Keep all work local. Never push, create a pull
-request, force-push or rewrite history.
+Accept one scope (`N`, `all`, `staged`, `worktree`, commit or `A..B`). Empty
+means the latest commit; only `all` means the full repository. Reject `--fix`,
+multiple scopes and unknown options. This explicit invocation authorizes
+atomic local fix commits. `staged`/`worktree` also authorizes committing the
+intended scoped changes after review.
 
-Do not run `$x-fix` or `$x-review` as nested workflows. Read the sections of
-their skill files cited below and follow only those. Their headers (read-only,
-no commit, no bump), exit, and release rules do not apply here.
+1. Record one baseline, starting HEAD, frozen scope and ownership ledger for
+   the whole invocation. Apply the shared scope-resolution rules. For `all`,
+   inventory tracked files and record reviewed paths/invariants and coverage
+   gaps across source/tests, build/CI, tools, docs and agent instructions.
+2. Review with the repository's evidence standard and subsystem guides. Read
+   full implementations, callers, guards and tests; refute each candidate.
+   Historical scopes fix only still-present defects rooted in that diff;
+   callers provide evidence, not unrelated fix scope. Reconcile confirmed
+   findings with the audit without clearing unrelated entries.
+3. For `staged`/`worktree`, review, fix and commit the owned changes under the
+   [x-commit protocol](../x-commit/SKILL.md), using the frozen outer scope.
+   Preserve staged/unstaged boundaries and unrelated baseline. Otherwise leave
+   baseline changes uncommitted. Do not commit a known-defective unit.
+4. Recheck and resolve new findings and still-applicable in-scope Open entries
+   under the [x-fix protocol](../x-fix/SKILL.md). Work sequentially, one root
+   cause per commit with its regression, docs and audit removal. Keep blocked
+   or unverified findings Open; do not relabel them just to clear the list.
+   Continue independent safe units. Registry-only dispositions form a separate
+   documentation commit after fixes when needed.
+5. Re-review the aggregate diff and interactions. Run the final applicable
+   repository gates once on the stable code state; `all` runs the full audit
+   gate even if no fix was needed. Reuse unchanged-state results. Apply the
+   repository's documented version protocol once, only after required checks
+   pass with no in-scope Open findings or coverage gaps. Do not accept a public
+   API or persisted-format break or choose a major bump on the user's behalf.
+6. Report scope, coverage/gaps, dispositions, validation, compatibility, local
+   hashes/subjects, version outcome and preserved baseline. Keep validated
+   commits if later work is blocked. No changes and no owed version step means
+   no empty commit.
 
-## Preflight
-
-Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-review or edits. Record the staged, unstaged and untracked baseline, branch and
-starting HEAD for `workflow-policy.md` §1 and the invocation ledger.
-
-## Input
-
-Parse the user argument with the scope table in `workflow-policy.md`. Empty is
-the latest commit, same as `$x-review`. The full repository is `all`. Reject
-`--fix` and any other extra token.
-
-Unless the scope is `all`, fix only findings rooted in that diff, re-review
-only files this run changed, and leave other Open entries untouched.
-
-## Setup
-
-Read first:
-[workflow-policy.md](../../../docs/ai/workflow-policy.md),
-[commit-protocol.md](../../../docs/ai/commit-protocol.md),
-[review-core.md](../../../docs/ai/review-core.md),
-[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
-[technical-patterns.md](../../../docs/ai/technical-patterns.md),
-[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
-Design-shaped or multi-subsystem → also
-[design-patterns.md](../../../docs/ai/design-patterns.md).
-
-Preflight and ledger before any edit.
-
-## 1. Review
-
-Follow [x-review](../x-review/SKILL.md) Protocol §1–§5 (Scope through
-Registry). Do not commit yet. `all` re-checks every Won't Fix entry. A narrow
-scope must not drop an unrelated Open entry unless the code shows the defect is
-gone.
-
-## 2. Resolve
-
-Triage and fix in-scope Open with [x-fix](../x-fix/SKILL.md) Protocol §1–§2:
-severity order, one root cause per commit, sequential edits, targeted tests. A
-finding ends as a fix, Won't Fix, or Rejected. Do not relabel Open to clear the
-list. No release and no final gate in this phase.
-
-## 3. Gate and local release
-
-The cargo gate in `commit-protocol.md` once if behavior changed. Docs-only →
-skip. Then the local release step in `commit-protocol.md`, once. Nothing to
-commit → no empty commit, bump or tag.
-
-Preserve validated local commits if a later unit or check is blocked, and
-report what remains. No remote step belongs to this workflow.
-
-## Output
-
-Scope, coverage, dispositions, validations, hashes and subjects, local version
-and tag if any, remaining findings, and the baseline left alone.
+This composes review/fix/commit procedures under one invocation and ledger;
+do not launch nested standalone workflows or repeat their finalization.
+Standalone read-only/no-commit rules do not suppress this invocation's fixes
+or commits. Language-specific validation and version rules stay in the linked
+repository policy. Never automatically create a branch, tag, push, open a PR,
+publish, deploy or rewrite history.

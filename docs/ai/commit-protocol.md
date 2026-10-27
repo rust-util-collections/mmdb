@@ -1,7 +1,7 @@
 # Atomic Commit Protocol
 
 Validate → commit for `$x-commit`, `$x-fix`, and `$x-overhaul`.
-Release only for `$x-overhaul`. Use with `workflow-policy.md`.
+Version finalization only for `$x-overhaul`; no automatic tags. Use with `workflow-policy.md`.
 
 ## Invocation ledger
 
@@ -11,7 +11,8 @@ Before first edit, record:
   at that `HEAD` and in the worktree;
 - staged / unstaged / untracked baseline;
 - **frozen owned paths** (sorted) and planned units;
-- for `$x-overhaul`: whether any tracked `src/**/*.rs` will change.
+- for `$x-overhaul`: whether tracked `.rs` changes since the last version commit
+  make a version bump owed, including intended Rust changes in this invocation.
 
 Keep the ledger across commits (`git diff HEAD` loses earlier units). Stage only
 freeze set + this-invocation fix/format paths.
@@ -36,6 +37,10 @@ Never amend a prior commit for a later fix. Clippy runs in the final gate, not o
 
 ## Final repository gate
 
+Use the official latest stable Rust under the toolchain policy in `AGENTS.md`.
+Update/select stable before Rust checks; do not define or validate a minimum
+compiler or compatible version range.
+
 After the last behavior commit, once, run these cargo commands. Do not substitute a `make` target unless the user asked for that target. The list mirrors `.github/workflows/ci.yml` (`fmt`, `clippy`, `test` jobs) and `make ci`; if they differ, run the CI set and report the drift.
 
 ```bash
@@ -53,21 +58,40 @@ cargo test --test shared_cache
 cargo test --test read_only
 ```
 
-No `scale_profile`. No `--release`. Regression → new atomic commit, then re-run. Docs-only: skip.
+No `scale_profile`. No `--release`. Regression → new atomic commit, then re-run. Docs-only: skip unless this is a full `all` audit or an owed version bump needs
+validation. A full audit runs this gate even without fixes.
 
-## Release (`$x-overhaul` only)
+## Version (`$x-overhaul` only; no tag)
 
-`$x-commit` and `$x-fix` do not bump or tag. Do not backfill missing tags.
+`$x-commit` and `$x-fix` do not bump or tag. An overhaul completes one owed
+patch bump after the required gate passes with no in-scope Open findings or
+coverage gaps. Tracked `.rs` changes since the latest commit that changed the
+crate's `version = ` in `Cargo.toml` make a bump owed, including intended Rust
+changes committed by this invocation:
 
-If this invocation changed any tracked `src/**/*.rs`:
+```sh
+base=$(git log -1 --format=%H -G'^version = ' -- Cargo.toml)
+git diff --name-only "$base" HEAD -- '*.rs'
+```
 
-1. Once: `Cargo.toml` `X.Y.Z` at start-HEAD → `X.Y.(Z+1)`. If the worktree already has that version, verify only.
-2. `cargo metadata --no-deps --format-version 1`.
-3. Stage only `Cargo.toml`. Inspect the cached diff.
-4. Separate final commit `chore: bump version to <new>`. This is the only extra exception to one-issue-one-commit.
-5. Annotated tag on that commit, name and message both `v<new>`: `git tag -a v<new> -m v<new>`.
+Recheck after the last behavior commit; do not lose earlier units by looking
+only at `git diff HEAD`. A blocked run keeps validated commits and leaves the
+bump detectable for a later overhaul, even with no new fixes. Docs-only work
+does not create an owed bump.
 
-Skip when `src/` did not change. No empty commits. `Cargo.lock` is gitignored; do not force-add it.
+1. Compatible changes: increment the current agreed `X.Y.Z` to `X.Y.(Z+1)` once.
+   Verify the starting and current manifest versions; do not overwrite divergent
+   versions or unowned manifest edits.
+2. `cargo metadata --no-deps --format-version 1` verifies the package version.
+3. Stage only `Cargo.toml` and inspect the candidate diff.
+4. Make one separate final commit `chore: bump version to <new>`. This is the
+   version-only exception to one-root-cause-per-commit. No empty commit.
+
+An agent cannot accept a public API or persisted-format break on the user's
+behalf. An unaccepted break remains Open and uncommitted; an explicitly accepted
+break requires a major increment and documented migration instead of a patch.
+Never automatically create a tag, push, open a PR or publish. Do not backfill
+missing tags. `Cargo.lock` is ignored; never force-add it.
 
 ## Final state
 

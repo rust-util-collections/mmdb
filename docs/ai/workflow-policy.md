@@ -4,8 +4,8 @@ Shared workflow rules for `$x-review`, `$x-commit`, `$x-fix`, `$x-overhaul`. Ski
 not weaken it. See also `pragmatic-engineering.md`.
 
 **Hard rules:** user-invoked only · local commits only (never push or open a
-PR) · no history rewrite · one independent issue per commit · version bump
-and local tag only in `$x-overhaul`, once.
+PR) · no history rewrite · one independent issue per commit · no auto tag ·
+one owed version bump only in `$x-overhaul`.
 
 ## Skill discovery and invocation
 
@@ -34,6 +34,14 @@ Reject unknown input. Do not guess. Do not accept `--fix`.
 | `all` | Full repository |
 | `<rev>` | One commit. `git rev-parse --verify <rev>` must succeed |
 | `<rev1>..<rev2>` | Verify both commits; `git log <rev1>..<rev2>` and endpoint diff `git diff <rev1> <rev2>`. Not three-dot |
+
+Freeze resolved commits at invocation start. Verify with
+`git rev-parse --verify --quiet '<revision>^{commit}'`; treat arguments as data,
+quote revisions, reject option-like tokens and put pathspecs after `--`.
+One commit (including the empty default) is compared with its first parent;
+a root commit is compared with the empty tree. Validate `HEAD~N` for counts.
+An all-digit token that also resolves as a commit is ambiguous; clarify it.
+Reject invalid/count-too-large scopes rather than broadening the review.
 
 Historical scope: only defects still present at HEAD. Empty is never the full
 repository. Full repository requires `all`.
@@ -108,7 +116,7 @@ One issue / root cause / behavior change → one commit.
 - No drive-by cleanup, format churn, or refactors.
 - Stage exact paths/hunks; no broad `git add -A`, `-u`, `.`, or `git commit -a`. Inspect `git diff --cached` before every commit.
 - New commits only — no amend, rebase, history rewrite, or force-push.
-  All four skills keep commits and any release tag local; never push or open a PR.
+  All four skills keep commits local; never automatically tag, push or open a PR.
 - Do not commit a registry inventory ahead of the fixes. Each fix commit carries
   that finding's audit hunk. Remaining registry-only edits are one later commit.
 

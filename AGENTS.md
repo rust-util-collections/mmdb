@@ -23,7 +23,11 @@ cargo test --test proptest_db
 
 Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned paths with `cargo fmt -- <paths>`.
 
-Toolchain: official latest stable Rust (edition 2024); no MSRV floor is declared
+Toolchain: official latest stable Rust (edition 2024) for development, CI and
+releases. Update with `rustup update stable` and select it with
+`RUSTUP_TOOLCHAIN=stable` or `cargo +stable`. Define no compatible Rust version
+range or minimum compiler; do not add `rust-version`, numeric toolchain pins,
+minimum-version CI jobs or older-compiler compatibility shims.
 
 ## Architecture
 
@@ -50,7 +54,7 @@ selection with `allow_implicit_invocation: false`.
 - [`$x-review`](.agents/skills/x-review/SKILL.md) — review a scope (default: latest commit). Updates `docs/audit.md` only
 - [`$x-fix`](.agents/skills/x-fix/SKILL.md) — resolve Open findings, one validated commit each. No version bump
 - [`$x-commit`](.agents/skills/x-commit/SKILL.md) — review and commit the current worktree. No version bump
-- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (`all` for the full repo), then fix in-scope findings and make local commits, with one local release if `src/` changed. Never push or open a PR
+- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (empty = latest commit; `all` = full repo), then review, fix and create atomic local commits, with one owed Rust version bump. Never tag, push or open a PR
 
 All four workflows follow the neutral task/report wording in
 [workflow-policy.md](docs/ai/workflow-policy.md). Review local storage
@@ -65,7 +69,7 @@ Supporting docs (`docs/ai/`):
 - [technical-patterns.md](docs/ai/technical-patterns.md) / [design-patterns.md](docs/ai/design-patterns.md) — LSM bugs + D-\* design lens
 - [review-core.md](docs/ai/review-core.md) — evidence/report templates + Subsystem Map
 - [false-positive-guide.md](docs/ai/false-positive-guide.md) — check existing guarantees before recording findings
-- [commit-protocol.md](docs/ai/commit-protocol.md) — validate → commit → version/tag
+- [commit-protocol.md](docs/ai/commit-protocol.md) — validate → commit → version (no tag)
 - `patterns/*` — per-subsystem checklists
 
 Audit registry: `docs/audit.md` — maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim.
