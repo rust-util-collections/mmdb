@@ -5,7 +5,7 @@
 **Arch:** DBIterator = dedupe + snapshot + tombstone + prefix. MergingIterator =
 heap merge (+ single-source fast path). IterSource = peeked adapter. LevelIterator =
 lazy L1+. Bidi = direction + heap rebuild. FragmentedRangeTombstoneList =
-immutable non-overlapping intervals, O(log T) (compact still uses sweep tracker).
+immutable segment tree with per-level sequence searches (compact still uses sweep tracker).
 
 ## Invariants
 

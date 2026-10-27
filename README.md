@@ -196,7 +196,7 @@ src/
     +-- source.rs           # IterSource (peeked-entry adapter) + SeekableIterator trait
     +-- db_iter.rs          # DBIterator: dedup, snapshot, tombstone/range-del filtering
     +-- level_iter.rs       # LevelIterator: lazy two-level iterator for L1+
-    +-- range_del.rs        # FragmentedRangeTombstoneList (O(log T) lookup) + sweep-line RangeTombstoneTracker
+    +-- range_del.rs        # FragmentedRangeTombstoneList (per-level sequence searches) + sweep-line RangeTombstoneTracker
     +-- bidi_iter.rs        # BidiIterator: bidirectional iteration
 ```
 

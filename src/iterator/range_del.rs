@@ -18,6 +18,9 @@ thread_local! {
     /// Tombstone activations performed by trackers on this thread.
     pub(crate) static TRACKER_ACTIVATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Sequence predicates evaluated by immutable coverage queries.
+    static QUERY_SEQUENCE_COMPARISONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Tracks active range tombstones for efficient forward-scan filtering.
@@ -163,10 +166,9 @@ impl RangeTombstoneTracker {
 //     seq8/lvl0  covers leaf [1,2) only: assigned directly to that leaf.
 //
 // A point query for a key inside leaf 1 (`[d,f)`) walks root -> leaf,
-// visiting the O(log N) ancestor nodes on that path and checking each one's
-// (small) list for the best entry passing the caller's snapshot/level
-// filters — it never scans a per-leaf list that duplicated every tombstone
-// active there.
+// visiting the O(log N) ancestor nodes on that path. Each node groups
+// sequences by level and binary-searches each eligible level's descending
+// sequence list, so invisible versions do not require a linear scan.
 
 /// Elementary-interval boundaries for the query index: `bounds[i]` is the
 /// begin key of interval `i`; `bounds[i + 1]` is its (exclusive) end.
@@ -182,7 +184,7 @@ type Bounds = Vec<Vec<u8>>;
 /// is what keeps total node-list size O(T log T) rather than the O(T^2) that
 /// results from attaching a copy of every tombstone active at each
 /// elementary interval to that interval directly.
-type Tree = Vec<Vec<(SequenceNumber, usize)>>;
+type Tree = Vec<Vec<(usize, Vec<SequenceNumber>)>>;
 
 /// A safe upper bound on node count for a recursive 1-indexed segment tree
 /// over `n` leaves, split via `mid = lo + (hi - lo) / 2`. Standard bound.
@@ -221,7 +223,12 @@ fn tree_insert_rec(
         return; // disjoint
     }
     if lo <= node_lo && node_hi <= hi {
-        tree[node].push(val); // this node is a canonical piece of [lo, hi)
+        let (seq, level) = val;
+        if let Some((_, sequences)) = tree[node].iter_mut().find(|(l, _)| *l == level) {
+            sequences.push(seq);
+        } else {
+            tree[node].push((level, vec![seq]));
+        }
         return;
     }
     // A unit-length node can never reach here: for integer bounds, any
@@ -247,21 +254,19 @@ fn tree_query(
     let mut node_hi = num_intervals;
     let mut best: SequenceNumber = 0;
     loop {
-        // Entries are sorted (seq desc, level asc): the first one passing
-        // both filters is this node's own best contribution.
-        for &(seq, level) in &tree[node] {
-            if seq > snapshot {
-                continue;
+        let groups = &tree[node];
+        let eligible = source_level.map_or(groups.len(), |src| {
+            groups.partition_point(|(level, _)| *level <= src)
+        });
+        for (_, sequences) in &groups[..eligible] {
+            let visible = sequences.partition_point(|seq| {
+                #[cfg(test)]
+                QUERY_SEQUENCE_COMPARISONS.with(|count| count.set(count.get() + 1));
+                *seq > snapshot
+            });
+            if let Some(&seq) = sequences.get(visible) {
+                best = best.max(seq);
             }
-            if let Some(src_lvl) = source_level
-                && level > src_lvl
-            {
-                continue;
-            }
-            if seq > best {
-                best = seq;
-            }
-            break;
         }
         if node_hi - node_lo <= 1 {
             break;
@@ -280,8 +285,9 @@ fn tree_query(
 
 /// Pre-fragmented, immutable range tombstone index.
 ///
-/// Supports O(log T)-ish binary search + ancestor-walk lookup for any user
-/// key, replacing both the sweep-line tracker and a linear-scan fallback,
+/// Supports binary search + ancestor-walk lookup for any user key. Each
+/// ancestor binary-searches sequences at eligible levels, bounding lookup
+/// work by O(L log² T) for L levels and T tombstones, replacing a linear scan
 /// without materializing the full active-tombstone set at every elementary
 /// interval (which would be O(T) per interval and O(T^2) overall for deeply
 /// nested/overlapping input — see the module-level diagram above).
@@ -349,12 +355,11 @@ impl FragmentedRangeTombstoneList {
         }
 
         for node in &mut tree {
-            // Descending seq so the first entry passing the caller's
-            // snapshot/level filters is the answer. Level ascending breaks
-            // ties among equal seqs (possible once compaction zeroes several
-            // bottommost tombstones' sequence numbers together), trying the
-            // most permissive (shallowest) level first.
-            node.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            node.sort_unstable_by_key(|(level, _)| *level);
+            for (_, sequences) in node {
+                sequences.sort_unstable_by(|a, b| b.cmp(a));
+                sequences.dedup();
+            }
         }
 
         Self { raw, bounds, tree }
@@ -669,7 +674,12 @@ mod tests {
         // per-fragment clone would produce (>= n^2/4 = 1,000,000 for
         // n=2000, since at least half the elementary intervals are covered
         // by at least n/2 tombstones simultaneously).
-        let total_entries: usize = list.tree.iter().map(|node| node.len()).sum();
+        let total_entries: usize = list
+            .tree
+            .iter()
+            .flatten()
+            .map(|(_, sequences)| sequences.len())
+            .sum();
         assert!(
             total_entries < n * 40,
             "expected roughly O(n log n) (n*40 = {}) but stored {total_entries} \
@@ -697,6 +707,42 @@ mod tests {
         );
         // A snapshot older than every seq must see no coverage at all.
         assert_eq!(list.max_covering_tombstone_seq(&center, 0), 0);
+    }
+
+    #[test]
+    fn fragmented_snapshot_and_level_queries_have_bounded_comparisons() {
+        let count = 4096usize;
+        let mut raw = Vec::new();
+        for level in 1..=3 {
+            raw.push((b"a".to_vec(), b"z".to_vec(), level as u64, level));
+            for seq in 10..10 + count as u64 {
+                raw.push((b"a".to_vec(), b"z".to_vec(), seq, level));
+            }
+        }
+        let list = FragmentedRangeTombstoneList::new_with_levels(raw.clone());
+        for snapshot in [0, 2, count as u64 + 10] {
+            for source_level in [None, Some(0), Some(1), Some(2), Some(3)] {
+                let expected = raw
+                    .iter()
+                    .filter(|(_, _, seq, level)| {
+                        *seq <= snapshot && source_level.is_none_or(|src| *level <= src)
+                    })
+                    .map(|(_, _, seq, _)| *seq)
+                    .max()
+                    .unwrap_or(0);
+                QUERY_SEQUENCE_COMPARISONS.with(|checks| checks.set(0));
+                assert_eq!(
+                    list.max_covering_tombstone_seq_for_level(b"m", snapshot, source_level),
+                    expected
+                );
+                let comparisons = QUERY_SEQUENCE_COMPARISONS.with(|checks| checks.get());
+                let eligible_levels = source_level.unwrap_or(3).min(3);
+                assert!(
+                    comparisons <= eligible_levels * (count.ilog2() as usize + 3),
+                    "snapshot {snapshot}, source {source_level:?}: {comparisons} comparisons"
+                );
+            }
+        }
     }
 
     /// Exhaustive differential check against a brute-force oracle over a
