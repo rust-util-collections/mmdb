@@ -3,6 +3,8 @@
 **The Storage Engine Behind [vsdb](https://github.com/rust-util-collections/vsdb).**
 
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/mmdb.svg)](https://crates.io/crates/mmdb)
+[![Docs.rs](https://docs.rs/mmdb/badge.svg)](https://docs.rs/mmdb)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 
