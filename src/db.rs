@@ -427,7 +427,8 @@ pub struct DB {
     /// Readers do a single atomic load. Writers swap atomically after
     /// memtable/version changes — no RwLock contention.
     super_version: Arc<ArcSwap<SuperVersion>>,
-    /// Read-triggered compaction hints accumulated from the get path.
+    /// Read-triggered compaction hints accumulated from the get path, with
+    /// at most one pending hint per sampled level while workers are busy.
     read_compaction_hints: Arc<Mutex<Vec<CompactionHint>>>,
     /// Counter for periodic read-compaction checks.
     read_counter: AtomicU64,
@@ -3217,7 +3218,7 @@ impl DB {
         let samples = self.stats.take_read_level_samples();
         let mut hints = self.read_compaction_hints.lock();
         for (level, &count) in samples.iter().enumerate() {
-            if count > 0 && level >= 2 {
+            if count > 0 && level >= 2 && !hints.iter().any(|hint| hint.level == level) {
                 hints.push(CompactionHint { level });
             }
         }
@@ -4739,6 +4740,49 @@ mod tests {
         for handle in db.compaction_handles.lock().drain(..) {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn repeated_reads_coalesce_pending_compaction_hints_by_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        stop_background_workers(&db);
+        for (key, level) in [(b"a", 2), (b"m", 3)] {
+            db.put(key, b"value").unwrap();
+            db.flush().unwrap();
+            let mut inner = db.inner.lock();
+            let file = inner.versions.current().level_files(0)[0].meta.clone();
+            let mut edit = VersionEdit::new();
+            edit.delete_file(0, file.number);
+            edit.add_file(level, file);
+            inner.versions.log_and_apply(edit).unwrap();
+            db.install_super_version(&inner);
+        }
+        // While a worker is occupied, repeated samples of the same levels
+        // must retain only the work still needed, regardless of read volume.
+        for _ in 0..64 {
+            for key in [b"a", b"m"] {
+                for _ in 0..1024 {
+                    assert_eq!(db.get(key).unwrap().as_deref(), Some(b"value".as_slice()));
+                }
+            }
+        }
+        // Publish the samples after the last periodic poll before draining.
+        db.check_read_compaction();
+        let pending = mem::take(&mut *db.read_compaction_hints.lock());
+        assert_eq!(
+            pending.len(),
+            2,
+            "duplicate hints retained for the same levels"
+        );
+        assert!(pending.iter().any(|hint| hint.level == 2));
+        assert!(pending.iter().any(|hint| hint.level == 3));
+        for _ in 0..1024 {
+            db.get(b"a").unwrap();
+        }
+        let pending = db.read_compaction_hints.lock();
+        assert_eq!(pending.len(), 1, "new samples must requeue a drained level");
+        assert_eq!(pending[0].level, 2);
     }
 
     /// `max_background_compactions: 0` is documented to mean one thread; two
