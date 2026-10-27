@@ -1,0 +1,5 @@
+interface:
+  display_name: "MMDB Overhaul"
+  short_description: "Review and resolve scoped MMDB findings"
+policy:
+  allow_implicit_invocation: false

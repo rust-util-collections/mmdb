@@ -1,10 +1,10 @@
 # Storage-Engine Review Findings
 
-> Maintained by `/x-review`, `/x-fix`, and `/x-overhaul`. Forms and severities: `.claude/docs/review-core.md`.
+> Maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Forms and severities: `docs/ai/review-core.md`.
 >
 > Severities: CRITICAL, HIGH, MEDIUM, LOW.
 >
-> **Won't Fix** is a confirmed defect whose complete fix has disproportionate cost or regression risk. Not a feature request or a documented contract. `/x-review` does not add these. Re-check one when a review touches its code, callers, assumptions, or subsystem; a full audit re-checks every entry.
+> **Won't Fix** is a confirmed defect whose complete fix has disproportionate cost or regression risk. Not a feature request or a documented contract. `$x-review` does not add these. Re-check one when a review touches its code, callers, assumptions, or subsystem; a full audit re-checks every entry.
 >
 > **Rejected** is a disproven claim, not a deferred defect. Re-check it only when its cited code or invariant changes.
 >

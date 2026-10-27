@@ -1,33 +1,31 @@
 ---
 name: x-fix
 description: Resolve Open findings in docs/audit.md sequentially, one validated local commit each. Does not bump the version or tag.
-disable-model-invocation: true
-allowed-tools: Bash(git add *) Bash(git commit *)
 ---
 
 # Resolve MMDB Reliability Findings
 
+Resolve repository paths from the Git root; Markdown links are relative to
+this file. Read invocation arguments from the user prompt.
+
 Clear actionable `docs/audit.md` Open, then self-review and commit. Never push,
 bump, or tag. New commits only.
 
-## Invocation state
+## Preflight
 
-Captured when this skill loaded. This is the preflight baseline
-(`workflow-policy.md` §1) and the ledger's start `HEAD`.
-
-!`git status --short --branch`
-
-HEAD: !`git rev-parse HEAD`
+Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
+review or edits. Record the staged, unstaged and untracked baseline, branch and
+starting HEAD for `workflow-policy.md` §1 and the invocation ledger.
 
 ## Setup
 
 Read first:
-[workflow-policy.md](../../docs/workflow-policy.md),
-[commit-protocol.md](../../docs/commit-protocol.md),
-[review-core.md](../../docs/review-core.md),
-[pragmatic-engineering.md](../../docs/pragmatic-engineering.md),
-[technical-patterns.md](../../docs/technical-patterns.md),
-[false-positive-guide.md](../../docs/false-positive-guide.md).
+[workflow-policy.md](../../../docs/ai/workflow-policy.md),
+[commit-protocol.md](../../../docs/ai/commit-protocol.md),
+[review-core.md](../../../docs/ai/review-core.md),
+[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
+[technical-patterns.md](../../../docs/ai/technical-patterns.md),
+[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 
 Preflight and freeze paths before editing. Empty Open → "nothing to fix".
 
@@ -36,7 +34,7 @@ Preflight and freeze paths before editing. Empty Open → "nothing to fix".
 ### 1. Triage (CRITICAL → LOW)
 
 Before editing, read the code, callers, tests, and guides
-([design-patterns.md](../../docs/design-patterns.md) if the shape is a design
+([design-patterns.md](../../../docs/ai/design-patterns.md) if the shape is a design
 issue). Reproduce from current code. Dedupe root causes.
 
 - Ruled out → Rejected.

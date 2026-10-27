@@ -1,0 +1,5 @@
+interface:
+  display_name: "MMDB Review"
+  short_description: "Review MMDB correctness and compatibility"
+policy:
+  allow_implicit_invocation: false

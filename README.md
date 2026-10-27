@@ -456,6 +456,13 @@ runtime reasonable.
 
 ---
 
+## AI maintenance
+
+[AGENTS.md](AGENTS.md) contains the shared project guide and links to the four
+explicit `.agents/skills/` workflows. Their
+[workflow policy](docs/ai/workflow-policy.md) defines review scope, worktree
+ownership and local commit rules; subsystem guides live in `docs/ai/`.
+
 ## License
 
 MIT

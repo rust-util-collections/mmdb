@@ -1,34 +1,32 @@
 ---
 name: x-review
 description: Review correctness, recovery, and resource behavior in an MMDB scope and update docs/audit.md. Default is the latest commit.
-argument-hint: "[N | all | staged | worktree | <rev> | <rev1>..<rev2>]"
-disable-model-invocation: true
 ---
 
 # MMDB Storage-Engine Reliability Review
 
+Resolve repository paths from the Git root; Markdown links are relative to
+this file. Read invocation arguments from the user prompt.
+
 High-signal review. Code is read-only. May update only `docs/audit.md`. Never
-commit, push, bump, or tag. Fixes belong to `/x-fix` or `/x-overhaul`.
+commit, push, bump, or tag. Fixes belong to `$x-fix` or `$x-overhaul`.
 
-## Invocation state
+## Preflight
 
-Captured when this skill loaded. This is the worktree baseline
-(`workflow-policy.md` §1).
-
-!`git status --short --branch`
-
-HEAD: !`git rev-parse HEAD`
+Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
+review or edits. Record the staged, unstaged and untracked baseline, branch and
+starting HEAD for `workflow-policy.md` §1 and the invocation ledger.
 
 ## Setup
 
 Read first:
-[workflow-policy.md](../../docs/workflow-policy.md),
-[pragmatic-engineering.md](../../docs/pragmatic-engineering.md),
-[technical-patterns.md](../../docs/technical-patterns.md),
-[review-core.md](../../docs/review-core.md),
-[false-positive-guide.md](../../docs/false-positive-guide.md).
+[workflow-policy.md](../../../docs/ai/workflow-policy.md),
+[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
+[technical-patterns.md](../../../docs/ai/technical-patterns.md),
+[review-core.md](../../../docs/ai/review-core.md),
+[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 Design-shaped or multi-subsystem → also
-[design-patterns.md](../../docs/design-patterns.md).
+[design-patterns.md](../../../docs/ai/design-patterns.md).
 
 Task/report wording follows `workflow-policy.md`. Review agents use the
 handoff in `review-core.md`.
@@ -42,10 +40,10 @@ anything else, including `--fix`.
 
 ### 1. Scope
 
-1. Worktree baseline: the invocation state above.
+1. Worktree baseline: the recorded preflight above.
 2. Changed files, full diff, callers, tests. `worktree` includes untracked
    (`git status --short`). `all` → ledger of `src/`, `tests/`, `benches/`,
-   build/CI, public docs, `.claude/`.
+   build/CI, public docs, `.agents/` and `docs/ai/`.
 3. Map via the Subsystem Map. Load concurrency/unsafe guides when relevant.
 4. Mark generated, vendored, and out-of-scope rows. Do not silent-drop them.
 

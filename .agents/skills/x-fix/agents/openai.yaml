@@ -1,0 +1,5 @@
+interface:
+  display_name: "MMDB Fix"
+  short_description: "Fix recorded MMDB findings in local commits"
+policy:
+  allow_implicit_invocation: false

@@ -3931,7 +3931,7 @@ impl DB {
     /// Drain L0 down below its compaction trigger. Follows the same
     /// short-lock pick → unlocked I/O → short-lock install → unlocked sync
     /// pattern used by the background compaction thread pool
-    /// (`.claude/docs/patterns/concurrency.md` INV-CC4), so this does not
+    /// (`docs/ai/patterns/concurrency.md` INV-CC4), so this does not
     /// stall other `db_mutex` consumers (writers, other compactions, admin
     /// calls) for the duration of the merge I/O — unlike the previous
     /// `do_compaction`, which held the lock for its entire run. Used by the

@@ -1,34 +1,32 @@
 ---
 name: x-commit
 description: Check MMDB worktree changes for correctness, fix confirmed issues, validate, and create atomic local commits. Does not bump the version or tag.
-disable-model-invocation: true
-allowed-tools: Bash(git add *) Bash(git commit *)
 ---
 
 # Self-Reviewing Commit for MMDB
 
+Resolve repository paths from the Git root; Markdown links are relative to
+this file. Read invocation arguments from the user prompt.
+
 Review owned worktree changes, fix confirmed defects, validate, and commit.
 Never push, bump, or tag. New commits only.
 
-## Invocation state
+## Preflight
 
-Captured when this skill loaded. This is the preflight baseline
-(`workflow-policy.md` §1) and the ledger's start `HEAD`.
-
-!`git status --short --branch`
-
-HEAD: !`git rev-parse HEAD`
+Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
+review or edits. Record the staged, unstaged and untracked baseline, branch and
+starting HEAD for `workflow-policy.md` §1 and the invocation ledger.
 
 ## Setup
 
 Read first:
-[workflow-policy.md](../../docs/workflow-policy.md),
-[commit-protocol.md](../../docs/commit-protocol.md),
-[review-core.md](../../docs/review-core.md) (evidence rules),
-[pragmatic-engineering.md](../../docs/pragmatic-engineering.md),
-[technical-patterns.md](../../docs/technical-patterns.md),
-[false-positive-guide.md](../../docs/false-positive-guide.md).
-Design-shaped → also [design-patterns.md](../../docs/design-patterns.md).
+[workflow-policy.md](../../../docs/ai/workflow-policy.md),
+[commit-protocol.md](../../../docs/ai/commit-protocol.md),
+[review-core.md](../../../docs/ai/review-core.md) (evidence rules),
+[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
+[technical-patterns.md](../../../docs/ai/technical-patterns.md),
+[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
+Design-shaped → also [design-patterns.md](../../../docs/ai/design-patterns.md).
 
 Preflight, then freeze owned paths.
 

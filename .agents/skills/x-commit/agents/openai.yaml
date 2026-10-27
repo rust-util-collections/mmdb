@@ -1,0 +1,5 @@
+interface:
+  display_name: "MMDB Commit"
+  short_description: "Review and commit intended MMDB changes"
+policy:
+  allow_implicit_invocation: false

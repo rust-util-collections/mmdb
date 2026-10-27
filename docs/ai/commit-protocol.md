@@ -1,17 +1,17 @@
 # Atomic Commit Protocol
 
-Validate → commit for `/x-commit`, `/x-fix`, and `/x-overhaul`.
-Release only for `/x-overhaul`. Use with `workflow-policy.md`.
+Validate → commit for `$x-commit`, `$x-fix`, and `$x-overhaul`.
+Release only for `$x-overhaul`. Use with `workflow-policy.md`.
 
 ## Invocation ledger
 
 Before first edit, record:
 
-- start `HEAD` and branch (the skill's Invocation state block), package version
+- start `HEAD` and branch (from the explicit preflight), package version
   at that `HEAD` and in the worktree;
 - staged / unstaged / untracked baseline;
 - **frozen owned paths** (sorted) and planned units;
-- for `/x-overhaul`: whether any tracked `src/**/*.rs` will change.
+- for `$x-overhaul`: whether any tracked `src/**/*.rs` will change.
 
 Keep the ledger across commits (`git diff HEAD` loses earlier units). Stage only
 freeze set + this-invocation fix/format paths.
@@ -55,9 +55,9 @@ cargo test --test read_only
 
 No `scale_profile`. No `--release`. Regression → new atomic commit, then re-run. Docs-only: skip.
 
-## Release (`/x-overhaul` only)
+## Release (`$x-overhaul` only)
 
-`/x-commit` and `/x-fix` do not bump or tag. Do not backfill missing tags.
+`$x-commit` and `$x-fix` do not bump or tag. Do not backfill missing tags.
 
 If this invocation changed any tracked `src/**/*.rs`:
 
@@ -71,5 +71,5 @@ Skip when `src/` did not change. No empty commits. `Cargo.lock` is gitignored; d
 
 ## Final state
 
-Report every new hash/subject and, for `/x-overhaul`, the version result.
+Report every new hash/subject and, for `$x-overhaul`, the version result.
 Owned changes committed; unrelated baseline untouched. A clean worktree is not required.

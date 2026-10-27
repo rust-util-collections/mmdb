@@ -29,7 +29,7 @@ One primary row per Rust file. Concurrency/unsafe are overlays.
 | cache | `src/cache/**` | `patterns/cache.md`, `concurrency.md` |
 | types/API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` |
 
-Guides under `.claude/docs/patterns/`. Tests/benches/CI/docs/`.claude` → map to
+Guides under `docs/ai/patterns/`. Tests/benches/CI/docs/`.agents` and `docs/ai` → map to
 the subsystem they cover; check alignment.
 
 ## 2. Review priority (effort, not a finding)
