@@ -18,40 +18,15 @@ None.
 
 ## Won't Fix
 
-### [MEDIUM] iterator: seek paths do not overlap cross-source I/O prefetch
-- **Where**: `src/iterator/merge.rs` (`init_heap`, seek / direction switch), `src/iterator/source.rs` (`prefetch_hint`, `seek_to`)
-- **What**: Explicit seeks and bidirectional direction switches position and decode each source synchronously, one after another; no cross-source readahead hint is issued before those reads.
-- **Reason**: SST index entries are already memory-resident, so a targeted pre-seek hint phase is feasible, and direction switches make the path warmer than explicit seeks alone. However, `posix_fadvise` is advisory and no controlled cold-cache multi-source benchmark demonstrates a material latency regression; changing the protocol without that evidence remains disproportionate.
-
 ### [LOW] manifest: file-number arithmetic can overflow at `u64::MAX`
 - **Where**: `src/manifest/version_set.rs` (`new_file_number`, `reserve_file_numbers`, MANIFEST rotation)
 - **What**: File allocation, reservations, and MANIFEST rotation increment `u64` counters without checked arithmetic.
 - **Reason**: Reaching exhaustion through production allocation requires roughly 1.8e19 file numbers; all reservation counts are bounded by in-memory workload sizes. Replay takes a stored `next_file_number` without an upper bound (unlike `last_sequence`), but a value near `u64::MAX` needs a checksum-valid MANIFEST record or an on-disk file name this allocator never produced. The failure is mathematically real but not practically reachable. Revisit if identifiers become externally supplied or allocation jumps by unbounded amounts.
 
-### [LOW] rate_limiter: `request()` f64 subtraction can stop converging for enormous values
-- **Where**: `src/rate_limiter.rs`
-- **What**: For a single request around hundreds of petabytes, `chunk` can fall below half an ULP of `remaining`, making `remaining -= chunk` a no-op and the loop non-terminating.
-- **Reason**: Every production call passes one entry's encoded size, bounded by the 64 MiB write-entry limit and allocatable memory. The private API cannot receive the theoretical trigger.
-
-### [LOW] compaction: near-duplicate merge-loop logic
-- **Where**: `src/compaction/leveled.rs` (normal sub-compaction vs `force_merge_level`)
-- **What**: Normal and forced compaction independently implement closely related tombstone, snapshot, deduplication, filter, and sequence-zeroing logic.
-- **Reason**: Both paths are currently consistent, while extracting one shared state machine across their different sub-range and streaming protocols would carry disproportionate regression risk. Revisit when a correctness change must touch either loop.
-
 ### [LOW] SST: restart-count validation can overflow `usize` on 32-bit targets
 - **Where**: `src/sst/block.rs`
 - **What**: `(num_restarts as usize) * 4 + 4` can overflow on a 32-bit target for corrupted input.
 - **Reason**: The supported and CI target is 64-bit Linux; no 32-bit support is declared. Revisit if 32-bit targets are added.
-
-### [LOW] memtable: skiplist node destructors skipped if `all_nodes.push` unwinds after `ptr::write`
-- **Where**: `src/memtable/skiplist_impl.rs`
-- **What**: If the `all_nodes` bookkeeping push unwound between `ptr::write` initializing a node and the push completing, the node's key/value heap allocations would never be dropped.
-- **Reason**: `Vec::push` aborts via `handle_alloc_error` on allocation failure, and its capacity-overflow panic requires the byte capacity to exceed `isize::MAX`; no unwinding path reaches the window on supported targets. Reordering the unsafe insert protocol to close an unreachable leak carries more regression risk than value.
-
-### [MEDIUM] API: `WriteBatch` has no entry-count or aggregate-size cap
-- **Where**: `src/types.rs` (WriteBatch), `src/db.rs` (`write_batch_inner`)
-- **What**: A caller can assemble arbitrarily large batches; the write path encodes the whole batch as one WAL record and applies it under the write lock.
-- **Reason**: Batch memory is allocated by the caller before `write()` is ever reached, so an engine-side cap cannot protect the process — it only adds config surface. The per-entry caps and WAL u32 entry-count guard bound individual encodings; the transient WAL-encode duplication is bounded by the caller's own batch size. Per-user-key SST metadata accumulation is a separate limitation recorded below.
 
 ### [MEDIUM] SST: metadata for one user key can exceed a single-file limit
 - **Where**: `src/db.rs` (`write_memtable_ssts`), `src/sst/table_builder.rs` (`projected_index_size`, range-deletion accounting)
@@ -62,11 +37,6 @@ None.
 - **Where**: `src/options.rs`, `src/db.rs` (open-time validation)
 - **What**: Only `num_levels >= 2` is validated; a huge value allocates per-level `Vec` headers in every `Version` and one merge source per level in every iterator.
 - **Reason**: The cost is linear and entirely self-inflicted configuration; an extreme value such as `usize::MAX` aborts inside `DB::open` while allocating per-level vectors rather than reaching a stored state. Introducing an upper bound now could refuse to open stores created with larger values. Revisit if per-level state stops being O(1).
-
-### [LOW] API: `open_read_only` cannot open stores configured with `num_levels > 7`
-- **Where**: `src/db.rs` (`open_read_only`), `src/options.rs` (`num_levels` default = 7)
-- **What**: `open_read_only` builds `DbOptions::default()`, so recovery refuses any store that has a live file at `level >= 7` with `ErrorKind::Corruption` ("configured with num_levels 7"), even though the store is healthy under its original `num_levels`.
-- **Reason**: `num_levels` is not persisted in MANIFEST, so the convenience method cannot infer it; the documented fallback (`DB::open_read_only_with_options` and the matching `num_levels`) already covers non-default stores, and the error message names that fix. Persisting or deriving `num_levels` is disproportionate for an unusual (>7-level) configuration.
 
 ### [LOW] lazy_delete: in-flight compaction wait test uses a fixed sleep
 - **Where**: `tests/lazy_delete.rs` (`compact_waits_for_inflight_compaction_and_removes_dead_keys`, the 200 ms delay before opening the filter gate)
