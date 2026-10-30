@@ -5830,6 +5830,109 @@ mod tests {
         );
     }
 
+    /// `close` must not release the directory lock while a group-commit leader
+    /// is still inside auto-flush. The concurrent close tests join that leader
+    /// before they reopen, so they still pass if `wait_for_write_leader_idle`
+    /// is removed. This parks the flush itself and requires `close` to stay
+    /// blocked until the flush returns.
+    #[test]
+    fn close_stays_blocked_while_auto_flush_holds_the_leader() {
+        use crate::options::BlockPropertyCollector;
+
+        struct FlushGate {
+            entered: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+            release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+        }
+        impl BlockPropertyCollector for FlushGate {
+            fn add(&mut self, key: &[u8], _value: &[u8]) {
+                if types::user_key(key) != b"gate" {
+                    return;
+                }
+                let Some(release) = self.release.lock().take() else {
+                    return;
+                };
+                if let Some(entered) = self.entered.lock().take() {
+                    let _ = entered.send(());
+                }
+                let _ = release.recv_timeout(Duration::from_secs(10));
+            }
+            fn finish_block(&mut self) -> Vec<u8> {
+                Vec::new()
+            }
+            fn name(&self) -> &str {
+                "close-flush-gate"
+            }
+        }
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DB::open(
+                DbOptions {
+                    create_if_missing: true,
+                    write_buffer_size: 1024,
+                    block_property_collectors: vec![Arc::new({
+                        let entered = Arc::clone(&entered);
+                        let release = Arc::clone(&release);
+                        move || {
+                            Box::new(FlushGate {
+                                entered: Arc::clone(&entered),
+                                release: Arc::clone(&release),
+                            }) as Box<dyn BlockPropertyCollector>
+                        }
+                    })],
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .unwrap(),
+        );
+        stop_background_workers(&db);
+
+        let writer = Arc::clone(&db);
+        let put_done = Arc::new(AtomicBool::new(false));
+        let put_flag = Arc::clone(&put_done);
+        let put = thread::spawn(move || {
+            writer.put(b"gate", &[b'v'; 2048]).unwrap();
+            put_flag.store(true, Ordering::Release);
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("auto-flush never reached the collector");
+        assert!(
+            !put_done.load(Ordering::Acquire),
+            "put returned before its auto-flush left the collector"
+        );
+
+        let close_done = Arc::new(AtomicBool::new(false));
+        let close_flag = Arc::clone(&close_done);
+        let closing = Arc::clone(&db);
+        let close = thread::spawn(move || {
+            closing.close().unwrap();
+            close_flag.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !close_done.load(Ordering::Acquire),
+            "close returned while auto-flush still held the group-commit leader"
+        );
+
+        release_tx.send(()).unwrap();
+        put.join().unwrap();
+        close.join().unwrap();
+        assert!(close_done.load(Ordering::Acquire));
+        assert!(db.lock_file.lock().is_none());
+
+        let reopened = open_test_db(dir.path());
+        assert_eq!(
+            reopened.get(b"gate").unwrap().as_deref(),
+            Some([b'v'; 2048].as_slice())
+        );
+    }
+
     #[test]
     fn test_close_serializes_with_compact_range() {
         // compact_range holds write_queue across flush+install. Concurrent close
