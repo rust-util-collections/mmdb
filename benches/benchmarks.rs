@@ -386,15 +386,15 @@ fn bench_prefix_scan(c: &mut Criterion) {
                     .unwrap()
                     .take(100)
                     .count();
-                assert!(n > 0);
+                assert_eq!(n, 100);
                 (db, dir)
             },
         );
     });
 
-    // Small cache: prefix scan over 3K entries
-    group.throughput(Throughput::Elements(100));
-    group.bench_function("small_cache/100", |b| {
+    // Small cache: 3K entries across 50 prefixes leave 60 per prefix.
+    group.throughput(Throughput::Elements(60));
+    group.bench_function("small_cache/60", |b| {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
@@ -420,9 +420,9 @@ fn bench_prefix_scan(c: &mut Criterion) {
                 let n = db
                     .iter_with_prefix(b"pfx_0025", &mmdb::ReadOptions::default())
                     .unwrap()
-                    .take(100)
+                    .take(60)
                     .count();
-                assert!(n > 0);
+                assert_eq!(n, 60);
                 (db, dir)
             },
         );
