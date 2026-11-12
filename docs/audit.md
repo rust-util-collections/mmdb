@@ -47,6 +47,11 @@ None.
 
 ## Rejected
 
+### iterator: backward-to-forward switching skips remaining keys after a saved overshoot
+- **Where**: `src/iterator/bidi_iter.rs` (`lazy`, first backward call and forward resumption), `src/iterator/db_iter.rs` (`prev`, `next_lazy`)
+- **Claim**: With keys `a,b,c,d,e`, passing an iterator positioned by `seek_to_last(); prev()` to `BidiIterator::lazy`, consuming `e,d` through `next_back()`, then calling `next()` should return `c,b,a` rather than `None`.
+- **Reason**: `lazy` preserves the input iterator's remaining forward entries. After this positioning, the current key is `d` and direct forward collection returns `d,e`. Consuming both from the back exhausts that range; `c,b,a` are outside it. For an unpositioned iterator, consuming `e,d` from the back leaves `a,b,c` in forward order. Public integration tests `test_bidi_reverse_primed_preserves_remaining_entries` and `test_bidi_backward_then_forward_reads_remaining_in_order` cover both cases; the reverse-primed case checks every two-read direction combination against the directly collected sequence in memtable and flushed/compacted storage.
+
 ### SST: an index separator that is a range-deletion key makes point lookups miss a visible entry
 - **Where**: `src/sst/table_builder.rs:281-297` (`last_key` set for `RangeDeletion` entries), `src/sst/table_reader/mod.rs` (`get_internal_with_seq`)
 - **Claim**: A block separator taken from a buffered range-deletion key can exceed every data key in its block, so an index seek skips a block that holds the target.

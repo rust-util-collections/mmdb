@@ -1294,6 +1294,79 @@ fn test_bidi_iterator_interleaved() {
 }
 
 #[test]
+fn test_bidi_reverse_primed_preserves_remaining_entries() {
+    use std::collections::VecDeque;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    for key in [b"a", b"b", b"c", b"d", b"e"] {
+        db.put(key, key).unwrap();
+    }
+
+    for flushed in [false, true] {
+        if flushed {
+            db.flush().unwrap();
+            db.compact().unwrap();
+        }
+        let reverse_primed = || {
+            let mut inner = db.iter().unwrap();
+            inner.seek_to_last();
+            inner.prev();
+            inner
+        };
+        // A reverse seek positions the forward iterator at d; its remaining
+        // entries are d,e, regardless of the backward resolver's overshoot.
+        let mut direct = reverse_primed();
+        assert_eq!(direct.key(), Some(b"d".as_slice()));
+        let expected: VecDeque<_> = direct.collect();
+        assert_eq!(
+            expected,
+            VecDeque::from([
+                (b"d".to_vec(), b"d".to_vec()),
+                (b"e".to_vec(), b"e".to_vec()),
+            ])
+        );
+
+        for directions in [[true, true], [true, false], [false, true], [false, false]] {
+            let mut remaining = expected.clone();
+            let mut iter = mmdb::BidiIterator::lazy(reverse_primed());
+            for backward in directions {
+                let (actual, expected) = if backward {
+                    (iter.next_back(), remaining.pop_back())
+                } else {
+                    (iter.next(), remaining.pop_front())
+                };
+                assert_eq!(
+                    actual, expected,
+                    "flushed={flushed}, directions={directions:?}"
+                );
+            }
+            assert!(iter.next().is_none());
+            assert!(iter.next_back().is_none());
+            assert!(iter.error().is_none());
+        }
+    }
+}
+
+#[test]
+fn test_bidi_backward_then_forward_reads_remaining_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    for key in [b"a", b"b", b"c", b"d", b"e"] {
+        db.put(key, key).unwrap();
+    }
+    let mut iter = mmdb::BidiIterator::lazy(db.iter().unwrap());
+    assert_eq!(iter.next_back().unwrap().0, b"e");
+    assert_eq!(iter.next_back().unwrap().0, b"d");
+    assert_eq!(iter.next().unwrap().0, b"a");
+    assert_eq!(iter.next().unwrap().0, b"b");
+    assert_eq!(iter.next().unwrap().0, b"c");
+    assert!(iter.next().is_none());
+    assert!(iter.next_back().is_none());
+    assert!(iter.error().is_none());
+}
+
+#[test]
 fn test_bidi_range_reverse() {
     let dir = tempfile::tempdir().unwrap();
     let db = make_db(dir.path());
