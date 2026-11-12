@@ -1715,6 +1715,11 @@ impl DB {
             }
         }
         for tf in l0_files {
+            if key < types::user_key(&tf.meta.smallest_key)
+                || key > types::user_key(&tf.meta.largest_key)
+            {
+                continue;
+            }
             if let Some((result, entry_seq)) = tf
                 .reader
                 .get_internal_with_seq(key, seq, options.fill_cache)
