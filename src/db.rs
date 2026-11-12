@@ -195,6 +195,10 @@ impl SnapshotList {
         v.sort_unstable();
         v
     }
+
+    fn is_empty(&self) -> bool {
+        self.snapshots.lock().is_empty()
+    }
 }
 
 /// A pending write request for group commit.
@@ -1185,9 +1189,7 @@ impl DB {
                                                             Some(&bg_block_cache),
                                                             &bg_path,
                                                             Some(&bg_stats),
-                                                            !bg_snapshot_list
-                                                                .as_sorted_vec()
-                                                                .is_empty(),
+                                                            !bg_snapshot_list.is_empty(),
                                                         )
                                                         .map_err(|e| {
                                                             format!(
@@ -1347,7 +1349,7 @@ impl DB {
                                             Some(&bg_block_cache),
                                             &bg_path,
                                             Some(&bg_stats),
-                                            !bg_snapshot_list.as_sorted_vec().is_empty(),
+                                            !bg_snapshot_list.is_empty(),
                                         )
                                         .map_err(|e| format!("compaction install error: {}", e))?;
                                         // Unpin L0 inputs that actually left L0.
@@ -1400,7 +1402,7 @@ impl DB {
                                 loop {
                                     if shutdown.load(Ordering::Acquire)
                                         || !bg_dead_key_sweep.is_pending()
-                                        || !bg_snapshot_list.as_sorted_vec().is_empty()
+                                        || !bg_snapshot_list.is_empty()
                                         || !bg_dead_key_sweep.try_start()
                                     {
                                         break;
@@ -2738,7 +2740,7 @@ impl DB {
                     Some(&self.block_cache),
                     &self.path,
                     Some(&self.stats),
-                    !self.snapshot_list.as_sorted_vec().is_empty(),
+                    !self.snapshot_list.is_empty(),
                 )
                 .ctx()?;
                 // Unpin L0 inputs that actually left L0 — a trivial move
@@ -4062,7 +4064,7 @@ impl DB {
                     Some(&self.block_cache),
                     &self.path,
                     Some(&self.stats),
-                    !self.snapshot_list.as_sorted_vec().is_empty(),
+                    !self.snapshot_list.is_empty(),
                 )
                 .ctx()?;
                 // Unpin L0 inputs that actually left L0. Covers both a
