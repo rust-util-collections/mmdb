@@ -26,7 +26,7 @@ cargo test --test e2e_scenarios
 cargo test --test proptest_db
 ```
 
-Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned paths with `cargo fmt -- <paths>`.
+Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
 
 Toolchain: official latest stable Rust (edition 2024) for development, CI and
 releases. Update with `rustup update stable` and select it with

@@ -22,7 +22,7 @@ freeze set + this-invocation fix/format paths.
 1. One issue/root cause/behavior change + its tests/docs/audit only.
 2. Format:
    - Docs/config only: `git diff --check`. Skip Rust gates.
-   - Rust: `cargo fmt --all -- --check`. If an owned file fails, `cargo fmt -- <those paths>` and inspect the diff. If another file fails, report it; do not format it. Do not run `make fmt` or bare `cargo fmt` unless the user asked for that.
+   - Rust: `cargo fmt --all -- --check`. If an owned file fails, use `rustfmt +stable --edition 2024 --config skip_children=true <those paths>` and inspect the diff. Direct rustfmt with `skip_children=true` limits formatting to the listed files; `cargo fmt -- <paths>` also formats Cargo-discovered targets. If another file fails, report it; do not format it. Do not run `make fmt` or bare `cargo fmt` unless the user asked for that.
 3. Smallest proving tests. Not `tests/scale_profile.rs`, not `cargo test --release`, not the full suite:
    - docs-only → none;
    - one subsystem → its filter, plus the integration binary that covers a behavior change;
