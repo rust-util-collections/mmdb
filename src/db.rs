@@ -541,6 +541,23 @@ fn collect_tombstones_overlapping_bounds<K: AsRef<[u8]> + Into<Vec<u8>>>(
     }
 }
 
+/// Intersect query bounds before constructing or prefetching any source.
+fn intersect_iter_bounds<'a>(
+    options: &'a ReadOptions,
+    lower: Option<&'a [u8]>,
+    upper: Option<&'a [u8]>,
+) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    let lower = match (options.iterate_lower_bound.as_deref(), lower) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    let upper = match (options.iterate_upper_bound.as_deref(), upper) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    (lower, upper)
+}
+
 #[cfg(test)]
 thread_local! {
     static BEFORE_READ_VIEW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -1819,12 +1836,9 @@ impl DB {
     /// Create a forward iterator over the entire database with options.
     ///
     /// Uses streaming `TableIterator`s for SST files (O(1 block) memory per SST).
-    /// No SST pruning is applied; all files are visited.
-    ///
     /// Use `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to restrict
-    /// the key range returned, but note that SST files are still opened for the
-    /// full scan. For query-time SST pruning use `iter_with_range()` or
-    /// `iter_with_prefix()`.
+    /// the scan and prune SST point sources outside those bounds. Range
+    /// tombstones that can cover in-range keys are retained independently.
     pub fn iter_with_options(&self, options: &ReadOptions) -> Result<DBIterator> {
         self.iter_with_range(options, None, None)
     }
@@ -1866,10 +1880,18 @@ impl DB {
     ) -> Result<DBIterator> {
         self.check_usable().ctx()?;
 
+        let (lower_bound, upper_bound) = intersect_iter_bounds(options, lower_bound, upper_bound);
+
         // Pin the files/memtables before selecting visibility: compaction
         // may otherwise remove the captured sequence before we retain its data.
         let sv = self.get_super_version();
         let seq = self.resolve_read_sequence(options.snapshot);
+        if lower_bound
+            .zip(upper_bound)
+            .is_some_and(|(lo, hi)| lo >= hi)
+        {
+            return Ok(DBIterator::from_sources(Vec::new(), seq));
+        }
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
@@ -1913,7 +1935,7 @@ impl DB {
                 continue;
             }
             if let Some(hi) = upper_bound
-                && types::user_key(&tf.meta.smallest_key) > hi
+                && types::user_key(&tf.meta.smallest_key) >= hi
             {
                 continue;
             }
@@ -1951,23 +1973,6 @@ impl DB {
 
         let mut db_iter = DBIterator::from_sources(sources, seq);
 
-        // Apply bounds: merge explicit parameters with ReadOptions bounds, using tighter of the two.
-        let effective_lower = match (&options.iterate_lower_bound, lower_bound) {
-            (Some(opt_lo), Some(param_lo)) => {
-                Some(std::cmp::max(opt_lo.as_slice(), param_lo).to_vec())
-            }
-            (Some(opt_lo), None) => Some(opt_lo.clone()),
-            (None, Some(param_lo)) => Some(param_lo.to_vec()),
-            (None, None) => None,
-        };
-        let effective_upper = match (&options.iterate_upper_bound, upper_bound) {
-            (Some(opt_hi), Some(param_hi)) => {
-                Some(std::cmp::min(opt_hi.as_slice(), param_hi).to_vec())
-            }
-            (Some(opt_hi), None) => Some(opt_hi.clone()),
-            (None, Some(param_hi)) => Some(param_hi.to_vec()),
-            (None, None) => None,
-        };
         // Collect all range tombstones upfront from per-source caches.
         // This enables O(log T) binary search for any key in any direction,
         // replacing the old inline-collection + full-scan preload approach.
@@ -1975,8 +1980,8 @@ impl DB {
         // are dropped here, so the retained set scales with the scan range
         // rather than with every range deletion in the database.
         if any_range_deletions {
-            let bounds_lo = effective_lower.as_deref();
-            let bounds_hi = effective_upper.as_deref();
+            let bounds_lo = lower_bound;
+            let bounds_hi = upper_bound;
             // Collect tombstones with level info for cross-level pruning.
             // A tombstone from level L may cover keys at level L or deeper;
             // one strictly deeper than a key's source level never covers it.
@@ -2022,7 +2027,7 @@ impl DB {
                         // to skip because range tombstones can extend past the
                         // file's largest_key.
                         if let Some(hi) = upper_bound
-                            && types::user_key(&tf.meta.smallest_key) > hi
+                            && types::user_key(&tf.meta.smallest_key) >= hi
                         {
                             continue;
                         }
@@ -2040,9 +2045,12 @@ impl DB {
                 db_iter.set_range_tombstones_with_levels(all_tombstones);
             }
         }
-        let has_lower = effective_lower.is_some();
-        if has_lower || effective_upper.is_some() {
-            db_iter.set_bounds(effective_lower, effective_upper);
+        let has_lower = lower_bound.is_some();
+        if has_lower || upper_bound.is_some() {
+            db_iter.set_bounds(
+                lower_bound.map(<[u8]>::to_vec),
+                upper_bound.map(<[u8]>::to_vec),
+            );
         }
         if let Some(ref sp) = options.skip_point {
             db_iter.set_skip_point(Arc::clone(sp));
@@ -2084,6 +2092,32 @@ impl DB {
 
         let sv = self.get_super_version();
         let seq = self.resolve_read_sequence(options.snapshot);
+        // Compute prefix upper bound once, share across all uses.
+        let prefix_owned: Arc<[u8]> = Arc::from(prefix);
+        let prefix_upper = {
+            let mut upper = prefix.to_vec();
+            let mut carry = true;
+            for byte in upper.iter_mut().rev() {
+                if carry {
+                    if *byte == 0xFF {
+                        *byte = 0x00;
+                    } else {
+                        *byte += 1;
+                        carry = false;
+                    }
+                }
+            }
+            if carry { None } else { Some(upper) }
+        };
+
+        let (lower_bound, upper_bound) =
+            intersect_iter_bounds(options, Some(prefix), prefix_upper.as_deref());
+        if lower_bound
+            .zip(upper_bound)
+            .is_some_and(|(lo, hi)| lo >= hi)
+        {
+            return Ok(DBIterator::from_sources(Vec::new(), seq));
+        }
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
 
@@ -2110,24 +2144,6 @@ impl DB {
             sources.push(IterSource::from_memtable(cursor).with_level(0));
         }
 
-        // Compute prefix upper bound once, share across all uses.
-        let prefix_owned: Arc<[u8]> = Arc::from(prefix);
-        let prefix_upper = {
-            let mut upper = prefix.to_vec();
-            let mut carry = true;
-            for byte in upper.iter_mut().rev() {
-                if carry {
-                    if *byte == 0xFF {
-                        *byte = 0x00;
-                    } else {
-                        *byte += 1;
-                        carry = false;
-                    }
-                }
-            }
-            if carry { None } else { Some(upper) }
-        };
-
         // SST files — skip files via range pruning + prefix bloom.
         // L0: per-file filtering (files may overlap).
         for tf in version.level_files(0) {
@@ -2138,11 +2154,11 @@ impl DB {
             if tf.meta.has_range_deletions {
                 any_range_deletions = true;
             }
-            if types::user_key(&tf.meta.largest_key) < prefix {
+            if lower_bound.is_some_and(|lo| types::user_key(&tf.meta.largest_key) < lo) {
                 continue;
             }
-            if let Some(ref pu) = prefix_upper
-                && types::user_key(&tf.meta.smallest_key) >= pu.as_slice()
+            if let Some(hi) = upper_bound
+                && types::user_key(&tf.meta.smallest_key) >= hi
             {
                 continue;
             }
@@ -2173,7 +2189,10 @@ impl DB {
             let mut level_iter = LevelIterator::for_level(Arc::clone(version), level)
                 .with_fill_cache(options.fill_cache)
                 .with_prefix(prefix_owned.to_vec())
-                .with_range_hints(Some(prefix_owned.to_vec()), prefix_upper.clone());
+                .with_range_hints(
+                    lower_bound.map(<[u8]>::to_vec),
+                    upper_bound.map(<[u8]>::to_vec),
+                );
             if !options.block_property_filters.is_empty() {
                 level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
             }
@@ -2186,8 +2205,8 @@ impl DB {
         // The iterator only yields keys within [prefix, prefix_upper), so
         // tombstones that cannot cover that range are dropped here.
         if any_range_deletions {
-            let bounds_lo = Some(prefix);
-            let bounds_hi = prefix_upper.as_deref();
+            let bounds_lo = lower_bound;
+            let bounds_hi = upper_bound;
             let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
             if active_mem.has_range_deletions() {
                 collect_tombstones_overlapping_bounds(
@@ -2227,8 +2246,8 @@ impl DB {
                         // upper bound.  We cannot use largest_key < prefix
                         // to skip because range tombstones can extend past
                         // the file's largest_key.
-                        if let Some(ref pu) = prefix_upper
-                            && types::user_key(&tf.meta.smallest_key) >= pu.as_slice()
+                        if let Some(hi) = upper_bound
+                            && types::user_key(&tf.meta.smallest_key) >= hi
                         {
                             continue;
                         }
@@ -2247,23 +2266,17 @@ impl DB {
             }
         }
 
-        // Apply ReadOptions bounds if set.
-        if options.iterate_lower_bound.is_some() || options.iterate_upper_bound.is_some() {
-            iter.set_bounds(
-                options.iterate_lower_bound.clone(),
-                options.iterate_upper_bound.clone(),
-            );
-        }
+        iter.set_bounds(
+            lower_bound.map(<[u8]>::to_vec),
+            upper_bound.map(<[u8]>::to_vec),
+        );
 
         if let Some(ref sp) = options.skip_point {
             iter.set_skip_point(Arc::clone(sp));
         }
 
-        // Seek to the prefix start (or lower bound if tighter)
-        match &options.iterate_lower_bound {
-            Some(lb) if lb.as_slice() > prefix => iter.seek(lb),
-            _ => iter.seek(prefix),
-        }
+        // Seek to the prefix start or the tighter options lower bound.
+        iter.seek(lower_bound.unwrap_or(prefix));
 
         Ok(iter)
     }
@@ -4515,6 +4528,116 @@ impl Drop for Snapshot<'_> {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+
+    #[test]
+    fn options_upper_bound_prunes_unrelated_l0_prefetch() {
+        use crate::sst::table_reader::WILLNEED_HINTS;
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            pin_l0_filter_and_index_blocks_in_cache: false,
+            l0_compaction_trigger: usize::MAX,
+            l0_slowdown_trigger: usize::MAX,
+            l0_stop_trigger: usize::MAX,
+            ..Default::default()
+        };
+        let db = DB::open(options, dir.path()).unwrap();
+        for key in [b"a", b"p", b"z"] {
+            db.put(key, b"v").unwrap();
+            db.flush().unwrap();
+        }
+        let options = ReadOptions {
+            iterate_upper_bound: Some(b"p".to_vec()),
+            ..Default::default()
+        };
+        WILLNEED_HINTS.with(|count| count.set(0));
+        let keys: Vec<_> = db
+            .iter_with_options(&options)
+            .unwrap()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, vec![b"a".to_vec()]);
+        assert_eq!(WILLNEED_HINTS.with(|count| count.get()), 1);
+    }
+
+    #[test]
+    fn effective_bounds_preserve_cross_file_tombstones_and_empty_seeks() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            pin_l0_filter_and_index_blocks_in_cache: false,
+            l0_compaction_trigger: usize::MAX,
+            l0_slowdown_trigger: usize::MAX,
+            l0_stop_trigger: usize::MAX,
+            ..Default::default()
+        };
+        let db = DB::open(options, dir.path()).unwrap();
+        for key in [b"p:1", b"p:2", b"p:3", b"p:4"] {
+            db.put(key, b"v").unwrap();
+        }
+        db.flush().unwrap();
+        let snapshot = db.snapshot();
+        // This file's only key is 'a'; pruning its point source must still
+        // retain the deletion reaching into the p: range in the older file.
+        db.delete_range(b"a", b"p:3").unwrap();
+        db.flush().unwrap();
+        let options = ReadOptions {
+            iterate_lower_bound: Some(b"p:2".to_vec()),
+            iterate_upper_bound: Some(b"p:4".to_vec()),
+            ..Default::default()
+        };
+        let collect = |iter: DBIterator| iter.map(|(key, _)| key).collect::<Vec<_>>();
+        assert_eq!(
+            collect(db.iter_with_options(&options).unwrap()),
+            vec![b"p:3".to_vec()]
+        );
+        assert_eq!(
+            collect(db.iter_with_prefix(b"p:", &options).unwrap()),
+            vec![b"p:3".to_vec()]
+        );
+        assert_eq!(
+            collect(
+                db.iter_with_range(&options, Some(b"p:1"), Some(b"p:3"))
+                    .unwrap()
+            ),
+            Vec::<Vec<u8>>::new()
+        );
+        let old_options = ReadOptions {
+            snapshot: Some(snapshot.sequence()),
+            ..options.clone()
+        };
+        assert_eq!(
+            collect(db.iter_with_prefix(b"p:", &old_options).unwrap()),
+            vec![b"p:2".to_vec(), b"p:3".to_vec()]
+        );
+        assert_eq!(db.get(b"p:2").unwrap(), None);
+
+        let misses = db.stats.block_cache_misses.load(Ordering::Relaxed);
+        for (prefix, lower, upper) in [
+            (b"p:".as_slice(), b"z".as_slice(), b"zz".as_slice()),
+            (b"p:", b"", b"a"),
+            (b"p:", b"p:2", b"p:2"),
+            (b"", b"z", b"a"),
+            (b"\xff", b"", b"\xff"),
+        ] {
+            let options = ReadOptions {
+                iterate_lower_bound: Some(lower.to_vec()),
+                iterate_upper_bound: Some(upper.to_vec()),
+                ..Default::default()
+            };
+            let mut iter = db.iter_with_prefix(prefix, &options).unwrap();
+            assert!(iter.next().is_none());
+            iter.seek_to_first();
+            assert!(!iter.valid());
+            iter.seek_to_last();
+            assert!(!iter.valid());
+            iter.seek(b"p:2");
+            assert!(!iter.valid());
+            iter.seek_for_prev(b"p:4");
+            assert!(!iter.valid());
+            assert!(iter.error().is_none());
+        }
+        assert_eq!(db.stats.block_cache_misses.load(Ordering::Relaxed), misses);
+    }
 
     #[test]
     fn oversized_range_delete_rejects_batch_before_wal_and_sequence() {

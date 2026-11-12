@@ -228,6 +228,8 @@ impl DB {
     pub fn write(&self, batch: WriteBatch) -> Result<()>;
     pub fn write_with_options(&self, options: &WriteOptions, batch: WriteBatch) -> Result<()>;
     pub fn iter(&self) -> Result<DBIterator>;
+    /// ReadOptions bounds prune SST point sources before iteration starts;
+    /// range tombstones that can cover the scan are retained independently.
     pub fn iter_with_options(&self, options: &ReadOptions) -> Result<DBIterator>;
     pub fn iter_with_batch(&self, batch: &WriteBatchWithIndex) -> Result<DBIterator>;
 
