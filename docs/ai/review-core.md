@@ -118,6 +118,8 @@ contracts are not entries.
 Use this compact handoff, filling only the relevant fields:
 
 ```text
+Project: MMDB is an embedded Rust key-value storage engine operating on local
+database files in the caller's process; it exposes no network service.
 Task: Review local MMDB storage-engine reliability in the assigned files.
 Repository: <absolute path>
 Baseline and scope: <HEAD, scope, existing changes to preserve>
@@ -127,11 +129,19 @@ Read first: <absolute paths to workflow-policy.md (Task framing section),
              subsystem guides>
 Mode: Read-only investigation; no repository edits or commits.
 Question: <the behavior or invariants to check>
+Test setup: <temporary database, generated data and local operations;
+             or code tracing only if no experiment is assigned>
 Evidence already available: <relevant verified facts, or none>
 Return: Files actually reviewed; registry-ready entries from section 5;
-test command and result if one was executed; existing checks that ruled
-candidates out; work still incomplete.
+operation/input and relevant state; expected and observed results; test command
+if executed; existing checks that ruled candidates out; work still incomplete.
 ```
+
+Include the project context in every delegated review. Describe the actual test
+setup rather than assuming isolation or execution that has not been established.
+Establish expected behavior from the API contract or an independent reference
+model before treating a result as incorrect; include seek position, bounds and
+snapshot visibility where relevant.
 
 For a test result, state the setup, operation sequence, expected output, actual
 output, and command run. Distinguish executed tests from code tracing and

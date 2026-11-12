@@ -7,6 +7,11 @@ concrete operations and expected/observed results.
 
 MMDB is a pure-Rust LSM-Tree key-value storage engine, optimized as the backend for [vsdb](https://github.com/rust-util-collections/vsdb). It implements leveled compaction, WAL-based crash recovery, MVCC snapshots, and lock-free reads via `ArcSwap<SuperVersion>`.
 
+The engine runs in the caller's process on local database files; it exposes no
+network service. Use temporary databases and generated test data for reliability
+regressions. Cargo dependency downloads and Git operations are tooling actions
+with their own access requirements, separate from the engine's runtime behavior.
+
 ## Build & Test
 
 ```bash

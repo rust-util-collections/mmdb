@@ -53,6 +53,13 @@ engine. Include that context in agent handoffs. Ask agents to return neutral,
 concrete engineering descriptions: operation/input, relevant state or ordering,
 expected behavior, observed behavior, existing checks, and a regression test.
 
+Identify the actual test boundary: temporary database directories, generated
+records, public API calls, and local file operations. For WAL/SST/MANIFEST
+recovery tests, describe the write, truncation, byte change, or interrupted
+operation and the expected recovery/error result. MMDB exposes no network
+service; dependency downloads and Git operations remain separate tooling actions
+subject to the existing authorization rules.
+
 Use the same language in progress updates, findings, and commit descriptions.
 For example, describe an "invalid stored length", "interrupted WAL append",
 "recovery omits a completed record", or "reverse seek skips an available key".
@@ -73,8 +80,11 @@ scoped context rather than inheriting the entire conversation. Supply the
 repository path, assigned files, applicable
 shared guides, current baseline, and the concrete review question. Summarize
 relevant verified facts instead of forwarding the entire conversation. Use the
-handoff and response templates in `review-core.md`; agents read those guides
-before reviewing their assigned files.
+handoff and response templates in `review-core.md`, including the project context
+and actual test setup; agents read those guides before reviewing their assigned
+files. For `all`, divide assignments by subsystem while retaining the complete
+coverage ledger in the coordinating agent; smaller handoffs do not narrow the
+user's requested overall scope.
 
 A new session derives scope and status from the current checkout and
 `docs/audit.md`, not from another session's completion claims. A failed or
@@ -130,6 +140,17 @@ One issue / root cause / behavior change → one commit.
 - Unit-caused failure → fix before commit. Pre-existing failure → report with evidence, never claim success.
 - Same failure repeats with no progress → stop and report.
 - A gate failure after a commit → new commit, then re-run. Do not amend.
+
+### Interrupted steps
+
+If a step is blocked, preserve the failed operation, the exact returned message,
+any available request/session identifier, and the checks left incomplete. Classify
+it as a content restriction, task pause, approval denial, sandbox restriction, or
+technical failure only when the returned evidence supports that classification.
+Follow any pause or stop notice; continue independent permitted work only when
+the runtime allows it. Preserve validated work and report the remaining scope
+separately from source-code findings; a blocked check proves neither a defect
+nor a passing result.
 
 ## 5. Finding dispositions
 

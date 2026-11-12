@@ -22,6 +22,10 @@ intended scoped changes after review.
    gaps across source/tests, build/CI, tools, docs and agent instructions.
 2. Review with the repository's evidence standard and subsystem guides. Read
    full implementations, callers, guards and tests; refute each candidate.
+   For delegated reviews, use the
+   [scoped handoff](../../../docs/ai/review-core.md#agent-handoff-and-response)
+   with the local-engine context and actual test setup. Keep the full coverage
+   ledger in the coordinating agent.
    Historical scopes fix only still-present defects rooted in that diff;
    callers provide evidence, not unrelated fix scope. Reconcile confirmed
    findings with the audit without clearing unrelated entries.
@@ -44,7 +48,8 @@ intended scoped changes after review.
 6. Report scope, coverage/gaps, dispositions, validation, compatibility, local
    hashes/subjects, version outcome and preserved baseline. Keep validated
    commits if later work is blocked. No changes and no owed version step means
-   no empty commit.
+   no empty commit. Handle interrupted steps under the shared workflow policy;
+   report failed operations and missing checks separately from code findings.
 
 This composes review/fix/commit procedures under one invocation and ledger;
 do not launch nested standalone workflows or repeat their finalization.
