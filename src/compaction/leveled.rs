@@ -604,9 +604,12 @@ fn execute_sub_compaction_io(
 
     let mut merger = MergingIterator::new(sources, compare_internal_key);
 
-    // If lower_bound is set, seek past it
+    // If lower_bound is set, seek to the first internal key of that user
+    // key. RangeDeletion sorts before Value at the same sequence, so a
+    // tombstone at MAX_SEQUENCE_NUMBER is included. The previous sub-job
+    // already stopped at this user key and did not emit it.
     if let Some(ref lo) = sub.lower_bound {
-        let seek_key = InternalKey::new(lo, MAX_SEQUENCE_NUMBER, ValueType::Value)
+        let seek_key = InternalKey::new(lo, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion)
             .as_bytes()
             .to_vec();
         merger.seek(&seek_key);
@@ -2596,6 +2599,88 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// A range tombstone whose sequence is `MAX_SEQUENCE_NUMBER` and whose
+    /// begin key is a sub-compaction split must be written by the sub-job
+    /// that owns that user key. Seeking that job at `(user, MAX, Value)`
+    /// skips the tombstone, and the previous job already stopped before it.
+    #[test]
+    fn max_sequence_range_tombstone_at_split_is_written() {
+        use std::sync::Arc;
+
+        use crate::manifest::version::TableFile;
+        use crate::manifest::version_edit::FileMetaData;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::TableReader;
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = TableBuildOptions {
+            internal_keys: true,
+            ..TableBuildOptions::default()
+        };
+
+        let write = |number: u64, key: &[u8], seq: u64, vt: ValueType, value: &[u8]| {
+            let path = dir.path().join(format!("{number:06}.sst"));
+            let mut builder = TableBuilder::new(&path, opts.clone()).unwrap();
+            let ikey = InternalKey::new(key, seq, vt);
+            builder.add(ikey.as_bytes(), value).unwrap();
+            let result = builder.finish().unwrap();
+            let reader = Arc::new(TableReader::open(&path).unwrap());
+            TableFile {
+                meta: FileMetaData {
+                    number,
+                    file_size: result.file_size,
+                    smallest_key: result.smallest_key.unwrap(),
+                    largest_key: result.largest_key.unwrap(),
+                    has_range_deletions: result.has_range_deletions,
+                },
+                reader,
+            }
+        };
+
+        // L1 tombstone [m, z) at the maximum sequence. Two L2 files make the
+        // split point `m`, so the tombstone belongs only to the second job.
+        let l1 = write(
+            1,
+            b"m",
+            crate::types::MAX_SEQUENCE_NUMBER,
+            ValueType::RangeDeletion,
+            b"z",
+        );
+        let l2_left = write(2, b"m", 1, ValueType::Value, b"left");
+        let l2_right = write(3, b"z", 1, ValueType::Value, b"right");
+        let task = super::CompactionTask {
+            level: 1,
+            input_files_level: vec![l1],
+            input_files_next: vec![l2_left, l2_right],
+        };
+        let splits = super::compute_split_points(&task, 2);
+        assert_eq!(splits, vec![b"m".to_vec()]);
+
+        let options = DbOptions {
+            max_subcompactions: 2,
+            ..DbOptions::default()
+        };
+        let ctx = super::CompactionContext {
+            db_path: dir.path(),
+            options: &options,
+            rate_limiter: None,
+            stats: None,
+            active_snapshots: &[],
+        };
+        let output =
+            super::LeveledCompaction::execute_compaction_io(&ctx, &task, 10, 20, false).unwrap();
+        let kept = output
+            .output_tombstones
+            .values()
+            .flatten()
+            .any(|(begin, end)| begin.as_slice() == b"m" && end.as_slice() == b"z");
+        assert!(
+            kept,
+            "range tombstone at the split key and MAX_SEQUENCE_NUMBER must be written"
+        );
     }
 
     #[test]
