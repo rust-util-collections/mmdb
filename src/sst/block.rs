@@ -148,11 +148,27 @@ impl Block {
     /// Returns `Ok(Some((key, value)))` for the first key where `compare(key, target) >= Equal`,
     /// `Ok(None)` if all keys are less than target, or `Err` if a block entry is
     /// malformed (corrupted data — never a legitimate outcome of a well-formed block).
+    #[cfg(test)]
     pub fn seek_by<F: Fn(&[u8], &[u8]) -> Ordering>(
         &self,
         target: &[u8],
         compare: F,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut key = Vec::new();
+        Ok(self
+            .seek_by_reuse(target, compare, &mut key)?
+            .map(|value| (key, value.to_vec())))
+    }
+
+    /// Find the first key >= target, keeping it in `key` and borrowing its
+    /// value from the block. Probes and skipped entries never copy values.
+    pub fn seek_by_reuse<F: Fn(&[u8], &[u8]) -> Ordering>(
+        &self,
+        target: &[u8],
+        compare: F,
+        key: &mut Vec<u8>,
+    ) -> Result<Option<&[u8]>> {
+        key.clear();
         if self.restart_offset == 0 {
             return Ok(None);
         }
@@ -164,8 +180,9 @@ impl Block {
             let mid = left + (right - left) / 2;
             let rp = self.restart_point(mid) as usize;
 
-            let (key, _, _) = decode_entry_at(self.entry_data(), rp, &[])?;
-            if compare(&key, target) == Ordering::Less {
+            key.clear();
+            decode_entry_reuse(self.entry_data(), rp, key)?;
+            if compare(key, target) == Ordering::Less {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -180,14 +197,16 @@ impl Block {
         };
 
         let mut offset = start;
-        let mut current_key = Vec::new();
+        key.clear();
 
         while offset < self.restart_offset {
-            let (key, value, next_off) = decode_entry_at(self.entry_data(), offset, &current_key)?;
-            if compare(&key, target) != Ordering::Less {
-                return Ok(Some((key, value)));
+            let (value_start, value_len, next_off) =
+                decode_entry_reuse(self.entry_data(), offset, key)?;
+            if compare(key, target) != Ordering::Less {
+                return Ok(Some(
+                    &self.entry_data()[value_start..value_start + value_len],
+                ));
             }
-            current_key = key;
             offset = next_off;
         }
 

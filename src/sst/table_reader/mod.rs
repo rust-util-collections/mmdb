@@ -3,6 +3,7 @@ mod iterator;
 pub use iterator::TableIterator;
 
 use std::{
+    cmp::Ordering,
     fs::File,
     io,
     path::Path,
@@ -280,7 +281,7 @@ impl TableReader {
         }
 
         // Search index block for the data block that might contain the key
-        let block_handle = match self.find_data_block(key).ctx()? {
+        let block_handle = match self.find_data_block(key, |a, b| a.cmp(b)).ctx()? {
             Some(h) => h,
             None => return Ok(None),
         };
@@ -307,51 +308,9 @@ impl TableReader {
         user_key: &[u8],
         sequence: SequenceNumber,
     ) -> Result<Option<Option<Vec<u8>>>> {
-        use crate::types::InternalKey;
-
-        // Check bloom filter with user key
-        if let Some(ref filter) = self.filter_data
-            && !self.bloom_may_match(user_key, filter)
-        {
-            return Ok(None);
-        }
-
-        // Construct a seek key: (user_key, sequence, Value).
-        // With inverted-BE encoding, lex order = logical order, so seeking to this
-        // key in the index block finds the right data block via binary search.
-        let seek_key = InternalKey::new(user_key, sequence, ValueType::Value);
-
-        // Use index block seek to find the data block that may contain our key.
-        let handle = match self
-            .index_block
-            .seek_by(seek_key.as_bytes(), compare_internal_key)
-            .ctx()?
-        {
-            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).ctx()?,
-            None => return Ok(None),
-        };
-
-        let block_data = self.read_block_cached(&handle).ctx()?;
-        let block = Block::new(block_data).ctx()?;
-
-        // Seek within the data block. The first entry >= seek_key with matching user_key
-        // is our answer (because entries are sorted user_key ASC, seq DESC).
-        match block
-            .seek_by(seek_key.as_bytes(), compare_internal_key)
-            .ctx()?
-        {
-            Some((encoded_ikey, value)) => {
-                let (uk, _, vt) = decode_internal_key(&encoded_ikey).ctx()?;
-                if uk == user_key {
-                    return Ok(Some(match vt {
-                        ValueType::Value => Some(value),
-                        ValueType::Deletion | ValueType::RangeDeletion => None,
-                    }));
-                }
-                Ok(None)
-            }
-            None => Ok(None),
-        }
+        Ok(self
+            .get_internal_with_seq(user_key, sequence, true)?
+            .map(|(value, _)| value))
     }
 
     /// Like `get_internal` but also returns the sequence number of the found entry.
@@ -375,27 +334,27 @@ impl TableReader {
         let seek_key = InternalKey::new(user_key, sequence, ValueType::Value);
 
         let handle = match self
-            .index_block
-            .seek_by(seek_key.as_bytes(), compare_internal_key)
+            .find_data_block(seek_key.as_bytes(), compare_internal_key)
             .ctx()?
         {
-            Some((_idx_key, handle_bytes)) => BlockHandle::decode(&handle_bytes).ctx()?,
+            Some(handle) => handle,
             None => return Ok(None),
         };
 
         let block_data = self.read_block_cached_opt(&handle, fill_cache).ctx()?;
         let block = Block::new(block_data).ctx()?;
 
+        let mut encoded_ikey = Vec::with_capacity(seek_key.as_bytes().len());
         match block
-            .seek_by(seek_key.as_bytes(), compare_internal_key)
+            .seek_by_reuse(seek_key.as_bytes(), compare_internal_key, &mut encoded_ikey)
             .ctx()?
         {
-            Some((encoded_ikey, value)) => {
+            Some(value) => {
                 let (uk, entry_seq, vt) = decode_internal_key(&encoded_ikey).ctx()?;
                 if uk == user_key {
                     return Ok(Some((
                         match vt {
-                            ValueType::Value => Some(value),
+                            ValueType::Value => Some(value.to_vec()),
                             ValueType::Deletion | ValueType::RangeDeletion => None,
                         },
                         entry_seq,
@@ -513,15 +472,15 @@ impl TableReader {
     }
 
     /// Find the data block handle that might contain the given key.
-    #[cfg(test)]
-    fn find_data_block(&self, key: &[u8]) -> Result<Option<BlockHandle>> {
-        match self.index_block.seek(key) {
-            Some((_idx_key, handle_bytes)) => {
-                let handle = BlockHandle::decode(&handle_bytes).ctx()?;
-                Ok(Some(handle))
-            }
-            None => Ok(None),
-        }
+    fn find_data_block<F: Fn(&[u8], &[u8]) -> Ordering>(
+        &self,
+        key: &[u8],
+        compare: F,
+    ) -> Result<Option<BlockHandle>> {
+        let entries = self.cached_index_entries().ctx()?;
+        let index =
+            entries.partition_point(|entry| compare(&entry.separator_key, key) == Ordering::Less);
+        Ok(entries.get(index).map(|entry| entry.handle))
     }
 
     fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
@@ -842,6 +801,117 @@ impl TableReader {
 #[cfg(test)]
 mod tests {
     use super::{FILTER_HASH_MURMUR2, TableReader};
+
+    #[test]
+    fn warm_point_get_allocates_only_the_matching_value() {
+        use std::sync::Arc;
+
+        use crate::cache::block_cache::BlockCache;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("point.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 2 * 1024 * 1024,
+                internal_keys: true,
+                bloom_bits_per_key: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let value = vec![7; 16 * 1024];
+        for i in 0..64 {
+            let key = InternalKey::new(format!("key{i:04}").as_bytes(), 1, ValueType::Value);
+            builder.add(key.as_bytes(), &value).unwrap();
+        }
+        builder.finish().unwrap();
+        let cache = Arc::new(BlockCache::new(4 * 1024 * 1024));
+        let reader = TableReader::open_with_all(&path, 1, Some(cache), None).unwrap();
+        reader.get_internal_with_seq(b"key0047", 1, true).unwrap();
+
+        let (result, allocated) = crate::test_alloc::count_allocated(|| {
+            reader.get_internal_with_seq(b"key0047", 1, true).unwrap()
+        });
+        assert_eq!(result, Some((Some(value.clone()), 1)));
+        eprintln!("warm point hit allocated {allocated} bytes");
+        assert!(
+            allocated < value.len() + 1024,
+            "allocated {allocated} bytes"
+        );
+
+        let (result, allocated) = crate::test_alloc::count_allocated(|| {
+            reader
+                .get_internal_with_seq(b"key0047-missing", 1, true)
+                .unwrap()
+        });
+        assert_eq!(result, None);
+        assert!(allocated < 1024, "miss allocated {allocated} bytes");
+    }
+
+    #[test]
+    fn point_get_preserves_snapshot_versions_across_blocks() {
+        use crate::sst::format::CompressionType;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        for compression in [
+            CompressionType::None,
+            CompressionType::Lz4,
+            CompressionType::Zstd,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("versions.sst");
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    block_size: 256,
+                    block_restart_interval: 2,
+                    internal_keys: true,
+                    compression,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for user_key in [b"a".as_slice(), b"a\0", b"aa"] {
+                for seq in (1..=100).rev() {
+                    let vt = if seq == 50 {
+                        ValueType::Deletion
+                    } else {
+                        ValueType::Value
+                    };
+                    let key = InternalKey::new(user_key, seq, vt);
+                    let value = [seq as u8; 80];
+                    builder
+                        .add(key.as_bytes(), if seq == 50 { &[] } else { &value })
+                        .unwrap();
+                }
+            }
+            builder.finish().unwrap();
+            let reader = TableReader::open(&path).unwrap();
+            for user_key in [b"a".as_slice(), b"a\0", b"aa"] {
+                for seq in 0..=101 {
+                    let expected = match seq {
+                        0 => None,
+                        50 => Some((None, 50)),
+                        _ => Some((Some(vec![seq.min(100) as u8; 80]), seq.min(100))),
+                    };
+                    assert_eq!(
+                        reader.get_internal_with_seq(user_key, seq, false).unwrap(),
+                        expected
+                    );
+                }
+            }
+            for missing in [b"".as_slice(), b"a\0x", b"ab", b"z"] {
+                assert_eq!(
+                    reader.get_internal_with_seq(missing, 100, false).unwrap(),
+                    None
+                );
+            }
+        }
+    }
 
     /// Regression: every cache-miss read of a file held one `Mutex<File>`
     /// through the read, CRC, and decompression, so independent misses on
