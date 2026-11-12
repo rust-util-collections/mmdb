@@ -222,6 +222,76 @@ fn read_only_handles_share_lock_and_exclude_writers() {
 }
 
 #[cfg(target_os = "linux")]
+fn store_mutating_syscall(line: &str, store: &str) -> bool {
+    let Some((prefix, args)) = line.split_once('(') else {
+        return false;
+    };
+    let syscall = prefix.split_whitespace().last().unwrap_or("");
+    let writable_open = matches!(syscall, "open" | "openat")
+        && ["O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND"]
+            .iter()
+            .any(|flag| args.contains(flag));
+    let store_path_mutation = args.contains(store)
+        && (writable_open
+            || matches!(
+                syscall,
+                "creat"
+                    | "truncate"
+                    | "rename"
+                    | "renameat"
+                    | "renameat2"
+                    | "unlink"
+                    | "unlinkat"
+                    | "mkdir"
+                    | "mkdirat"
+                    | "rmdir"
+            ));
+    // -yy annotates the descriptor itself, so a log message mentioning the
+    // store does not look like a write to a database file.
+    let descriptor = args.split(',').next().unwrap_or("");
+    let target = descriptor
+        .split_once('<')
+        .and_then(|(_, path)| path.strip_suffix('>'));
+    let store_fd_write = matches!(syscall, "write" | "pwrite64")
+        && target.is_some_and(|path| {
+            path == store
+                || path
+                    .strip_prefix(store)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+    let forbidden_fd_mutation = matches!(syscall, "ftruncate" | "fsync" | "fdatasync");
+    store_path_mutation || store_fd_write || forbidden_fd_mutation
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_trace_rejects_descriptor_write_intent() {
+    let store = "/tmp/mmdb-store";
+    for line in [
+        r#"123 write(3</tmp/mmdb-store/000001.wal>, "x", 1) = -1 EBADF (Bad file descriptor)"#,
+        r#"123 pwrite64(3</tmp/mmdb-store/000001.sst>, "x", 1, 0) = -1 EBADF (Bad file descriptor)"#,
+        r#"123 openat(AT_FDCWD, "/tmp/mmdb-store/LOCK", O_WRONLY) = -1 EACCES (Permission denied)"#,
+        "123 fsync(3</tmp/mmdb-store/000001.wal>) = 0",
+    ] {
+        assert!(
+            store_mutating_syscall(line, store),
+            "missed write intent: {line}"
+        );
+    }
+    for line in [
+        r#"123 openat(AT_FDCWD, "/tmp/mmdb-store/LOCK", O_RDONLY) = 3</tmp/mmdb-store/LOCK>"#,
+        r#"123 write(1<pipe:[123]>, "/tmp/mmdb-store", 15) = 15"#,
+        r#"123 write(2</dev/pts/0>, "probe passed", 12) = 12"#,
+        r#"123 write(3</tmp/mmdb-store-other/log>, "x", 1) = 1"#,
+    ] {
+        assert!(
+            !store_mutating_syscall(line, store),
+            "unrelated syscall: {line}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn read_only_uses_no_store_mutating_syscalls() {
     if Command::new("strace").arg("--version").output().is_err() {
@@ -245,6 +315,7 @@ fn read_only_uses_no_store_mutating_syscalls() {
     let output = Command::new("strace")
         .args([
             "-f",
+            "-yy",
             "-e",
             "trace=open,openat,creat,write,pwrite64,truncate,ftruncate,rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,rmdir,fsync,fdatasync",
             "-o",
@@ -270,22 +341,8 @@ fn read_only_uses_no_store_mutating_syscalls() {
     let trace = fs::read_to_string(trace_file.path()).unwrap();
     let store = path.to_string_lossy();
     for line in trace.lines() {
-        let store_path_mutation = line.contains(store.as_ref())
-            && (line.contains("O_WRONLY")
-                || line.contains("O_RDWR")
-                || line.contains("O_CREAT")
-                || line.contains("O_TRUNC")
-                || line.contains("O_APPEND")
-                || line.contains("creat(")
-                || line.contains("truncate(")
-                || line.contains("rename")
-                || line.contains("unlink")
-                || line.contains("mkdir")
-                || line.contains("rmdir"));
-        let forbidden_fd_mutation =
-            line.contains("ftruncate(") || line.contains("fsync(") || line.contains("fdatasync(");
         assert!(
-            !store_path_mutation && !forbidden_fd_mutation,
+            !store_mutating_syscall(line, &store),
             "read-only probe issued a mutating syscall: {line}"
         );
     }
