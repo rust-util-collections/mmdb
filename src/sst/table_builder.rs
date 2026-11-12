@@ -106,9 +106,13 @@ pub struct TableBuilder {
     index_entries: Vec<PendingIndexEntry>,
     // First key of the current (not-yet-flushed) data block
     pending_first_key: Option<Vec<u8>>,
-    // Precomputed bloom_hash of every key added, for bloom filter
-    // construction. 4 bytes per key instead of a full key copy.
+    // One bloom hash per distinct user key. Point lookup probes the user
+    // key once, so extra versions must not grow the filter.
     filter_key_hashes: Vec<u32>,
+    /// User key of the last hash in `filter_key_hashes`. `None` until the
+    /// first point key is hashed. Empty is a real user key, so this is not
+    /// a bare `Vec`.
+    bloom_user_key: Option<Vec<u8>>,
 
     // Current file offset
     offset: u64,
@@ -163,6 +167,7 @@ impl TableBuilder {
             index_entries: Vec::new(),
             pending_first_key: None,
             filter_key_hashes: Vec::new(),
+            bloom_user_key: None,
             offset: 0,
             last_key: Vec::new(),
             smallest_key: None,
@@ -320,7 +325,11 @@ impl TableBuilder {
         } else {
             key
         };
-        if self.options.bloom_bits_per_key > 0 {
+        // Versions of one user key are adjacent. Lookup hashes that user key
+        // once, so only the first version contributes a filter entry.
+        if self.options.bloom_bits_per_key > 0
+            && self.bloom_user_key.as_deref() != Some(user_key_for_bloom)
+        {
             BloomFilter::checked_size(
                 "bloom filter",
                 self.filter_key_hashes.len().saturating_add(1),
@@ -348,6 +357,7 @@ impl TableBuilder {
             #[cfg(not(test))]
             let hash = bloom_hash(user_key_for_bloom);
             self.filter_key_hashes.push(hash);
+            self.bloom_user_key = Some(user_key_for_bloom.to_vec());
         }
 
         // Collect prefix for prefix bloom filter only when Bloom is enabled.
@@ -962,6 +972,79 @@ mod tests {
         bad.extend_from_slice(&(!packed).to_be_bytes());
         let err = builder.add(&bad, b"v").unwrap_err();
         assert!(err.to_string().contains("invalid value_type"));
+    }
+
+    /// One user key is hashed once. A bits-per-key setting that open accepts
+    /// for a single key must still accept every version of that key. Two
+    /// distinct keys at this size still exceed the filter block limit.
+    #[test]
+    fn repeated_user_key_versions_share_one_bloom_entry() {
+        use crate::sst::filter::BloomFilter;
+        use crate::types::{InternalKey, MAX_SEQUENCE_NUMBER, ValueType};
+
+        // One key fits. Two distinct keys are one byte over the block limit.
+        // `(HARD - 1) * 4` lands exactly on the limit for two keys, which is
+        // still accepted (`projected > limit` is the rejection).
+        let bits_per_key = ((META_BLOCK_HARD_LIMIT - 1) * 4 + 8) as u32;
+        assert!(BloomFilter::checked_size("bloom filter", 1, bits_per_key).is_ok());
+        assert!(BloomFilter::checked_size("bloom filter", 2, bits_per_key).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("same_user_key.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: bits_per_key,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"k", MAX_SEQUENCE_NUMBER, ValueType::Value).as_bytes(),
+                b"new",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"k", 1, ValueType::Value).as_bytes(),
+                b"old",
+            )
+            .unwrap();
+        assert_eq!(builder.filter_key_hashes.len(), 1);
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        let found = reader
+            .get_internal(b"k", MAX_SEQUENCE_NUMBER)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found, Some(b"new".to_vec()));
+
+        let path = dir.path().join("two_user_keys.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                bloom_bits_per_key: bits_per_key,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"a", 1, ValueType::Value).as_bytes(),
+                b"va",
+            )
+            .unwrap();
+        let err = builder
+            .add(
+                InternalKey::new(b"b", 1, ValueType::Value).as_bytes(),
+                b"vb",
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument);
     }
 
     #[test]
