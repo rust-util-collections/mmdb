@@ -325,14 +325,17 @@ impl SeekableIterator for MemTableCursorIter {
         // seek_le_raw: find last entry <= target
         let ptr = self.sl().seek_le_raw(&search);
         if ptr.is_null() {
+            // Nothing is <= target, so this is the before-first state, same
+            // as `prev()` walking off the front. A null cursor with the flag
+            // clear means "just past the end", and the next `prev()` would
+            // load the tail.
             self.cursor = std::ptr::null();
+            self.exhausted_backward = true;
         } else {
             // Position on this entry — next call to next() returns it
             self.cursor = ptr;
+            self.exhausted_backward = false;
         }
-        // Repositioned by an explicit seek — no longer in the "exhausted
-        // backward" state (if we were even in it).
-        self.exhausted_backward = false;
     }
 
     fn seek_to_first(&mut self) {
@@ -593,5 +596,13 @@ mod tests {
         let search = InternalKey::new(b"\0", 1, ValueType::Value);
         iter.seek_for_prev(search.as_bytes());
         assert!(iter.current().is_none());
+        // The cursor is before the first key, not past the end. Another
+        // prev() must not wrap to the tail, and next() resumes at `a`.
+        assert!(iter.prev().is_none());
+        assert!(iter.prev().is_none());
+        let extract = |e: Option<(Vec<u8>, Vec<u8>)>| {
+            e.map(|(k, _)| InternalKeyRef::new(&k).user_key().to_vec())
+        };
+        assert_eq!(extract(Iterator::next(&mut iter)), Some(b"a".to_vec()));
     }
 }
