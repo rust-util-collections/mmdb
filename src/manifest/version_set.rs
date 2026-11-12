@@ -372,7 +372,7 @@ impl VersionSet {
                         let tombstones = reader.get_range_tombstones().ctx()?;
                         meta.has_range_deletions = !tombstones.is_empty();
                     }
-                    version.files[*level].push(TableFile {
+                    Arc::make_mut(&mut version.files[*level]).push(TableFile {
                         meta: meta.clone(),
                         reader,
                     });
@@ -387,10 +387,11 @@ impl VersionSet {
         }
 
         // Sort L0 by file number descending (newest first)
-        version.files[0].sort_by_key(|file| std::cmp::Reverse(file.meta.number));
+        Arc::make_mut(&mut version.files[0])
+            .sort_by_key(|file| std::cmp::Reverse(file.meta.number));
         // Sort L1+ by smallest key
         for level in 1..num_levels {
-            version.files[level]
+            Arc::make_mut(&mut version.files[level])
                 .sort_by(|a, b| compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key));
         }
         // The replayed record stream passed per-record checksums, but the
@@ -465,7 +466,7 @@ impl VersionSet {
                 )));
             }
             let before = new_version.files[level].len();
-            new_version.files[level].retain(|f| f.meta.number != *file_number);
+            Arc::make_mut(&mut new_version.files[level]).retain(|f| f.meta.number != *file_number);
             if new_version.files[level].len() == before {
                 return Err(Error::corruption(format!(
                     "VersionEdit deletes SST {} at level {} but no such live file exists there",
@@ -484,7 +485,7 @@ impl VersionSet {
             new_version
                 .files
                 .iter()
-                .flatten()
+                .flat_map(|files| files.iter())
                 .map(|file| file.meta.number)
                 .collect()
         };
@@ -517,7 +518,7 @@ impl VersionSet {
                 Ok(reader) => {
                     if level == 0 {
                         // L0: insert at front (newest first)
-                        new_version.files[level].insert(
+                        Arc::make_mut(&mut new_version.files[level]).insert(
                             0,
                             TableFile {
                                 meta: meta.clone(),
@@ -525,14 +526,20 @@ impl VersionSet {
                             },
                         );
                     } else {
-                        new_version.files[level].push(TableFile {
-                            meta: meta.clone(),
-                            reader,
+                        // The existing level is already sorted. Insert at its
+                        // key boundary instead of sorting the whole level.
+                        let files = Arc::make_mut(&mut new_version.files[level]);
+                        let index = files.partition_point(|file| {
+                            compare_internal_key(&file.meta.smallest_key, &meta.smallest_key)
+                                == std::cmp::Ordering::Less
                         });
-                        // Keep levels 1+ sorted by smallest key (using logical ordering)
-                        new_version.files[level].sort_by(|a, b| {
-                            compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key)
-                        });
+                        files.insert(
+                            index,
+                            TableFile {
+                                meta: meta.clone(),
+                                reader,
+                            },
+                        );
                     }
                 }
                 Err(e) => {
@@ -898,6 +905,76 @@ impl VersionSet {
 mod tests {
     use super::*;
     use crate::ErrorKind;
+
+    #[test]
+    fn install_shares_untouched_levels_and_preserves_pinned_versions() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let build = |number, user_key: &[u8]| {
+            let mut builder = TableBuilder::new(
+                &dir.path().join(format!("{number:06}.sst")),
+                TableBuildOptions {
+                    internal_keys: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            builder
+                .add(
+                    InternalKey::new(user_key, 1, ValueType::Value).as_bytes(),
+                    b"v",
+                )
+                .unwrap();
+            let result = builder.finish().unwrap();
+            FileMetaData {
+                number,
+                file_size: result.file_size,
+                smallest_key: result.smallest_key.unwrap(),
+                largest_key: result.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+        let long_key = vec![b'z'; 64 * 1024];
+        let large = build(10, &long_key);
+        let small = build(11, b"a");
+        let mut vs = VersionSet::create(dir.path(), 7).unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_next_file_number(12);
+        edit.add_file(2, large);
+        vs.log_and_apply(edit).unwrap();
+        let before = vs.current();
+
+        let mut edit = VersionEdit::new();
+        edit.add_file(0, small.clone());
+        let (_, allocated) = crate::test_alloc::count_allocated(|| vs.log_and_apply(edit).unwrap());
+        eprintln!(
+            "small Version install with 128KiB untouched endpoints allocated {allocated} bytes"
+        );
+        assert!(
+            allocated < 64 * 1024,
+            "untouched endpoints were copied: {allocated}"
+        );
+        let after = vs.current();
+        assert!(Arc::ptr_eq(&before.files[2], &after.files[2]));
+        assert!(before.level_files(0).is_empty());
+        assert_eq!(after.level_files(0)[0].meta.number, 11);
+
+        let mut edit = VersionEdit::new();
+        edit.delete_file(0, 11);
+        edit.add_file(1, small);
+        vs.log_and_apply(edit).unwrap();
+        assert_eq!(after.level_files(0)[0].meta.number, 11);
+        assert!(after.level_files(1).is_empty());
+        assert_eq!(vs.current().level_files(1)[0].meta.number, 11);
+        vs.sync_manifest().unwrap();
+        drop(vs);
+        let recovered = VersionSet::recover(dir.path(), 7).unwrap();
+        assert!(recovered.current().level_files(0).is_empty());
+        assert_eq!(recovered.current().level_files(1)[0].meta.number, 11);
+        assert_eq!(recovered.current().level_files(2)[0].meta.number, 10);
+    }
 
     #[test]
     fn manifest_sync_failure_blocks_following_confirmation() {

@@ -21,7 +21,9 @@ pub struct TableFile {
 pub struct Version {
     /// Files at each level. Level 0 is sorted newest-first.
     /// Levels 1+ are sorted by key range (no overlap within a level).
-    pub files: Vec<Vec<TableFile>>,
+    /// Unchanged levels are shared between versions. Mutation uses
+    /// `Arc::make_mut`, preserving every version already pinned by readers.
+    pub files: Vec<Arc<Vec<TableFile>>>,
     /// Number of levels.
     pub num_levels: usize,
 }
@@ -30,7 +32,7 @@ impl Version {
     /// Create an empty version with the given number of levels.
     pub fn new(num_levels: usize) -> Self {
         Self {
-            files: vec![Vec::new(); num_levels],
+            files: (0..num_levels).map(|_| Arc::new(Vec::new())).collect(),
             num_levels,
         }
     }

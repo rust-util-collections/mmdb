@@ -234,7 +234,7 @@ impl VersionEdit {
         edit.set_last_sequence(last_sequence);
 
         for (level, files) in version.files.iter().enumerate() {
-            for tf in files {
+            for tf in files.iter() {
                 edit.add_file(level as u32, tf.meta.clone());
             }
         }
