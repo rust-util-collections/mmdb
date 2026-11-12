@@ -52,7 +52,8 @@ impl BlockBuilder {
         self.buffer.extend_from_slice(&key[shared..]);
         self.buffer.extend_from_slice(value);
 
-        self.last_key = key.to_vec();
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
         self.counter += 1;
     }
 

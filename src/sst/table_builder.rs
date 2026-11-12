@@ -1,6 +1,7 @@
 //! SST table builder: constructs a complete SST file from sorted key-value pairs.
 
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::HashSet,
     fs::File,
@@ -119,9 +120,8 @@ pub struct TableBuilder {
     // Last key added (for ordering check)
     last_key: Vec<u8>,
 
-    // Smallest and largest keys in the table
+    // Smallest key in the table; last_key supplies the largest at finish.
     smallest_key: Option<Vec<u8>>,
-    largest_key: Option<Vec<u8>>,
 
     // Prefix bloom: collected unique prefixes
     prefix_set: HashSet<Vec<u8>>,
@@ -171,7 +171,6 @@ impl TableBuilder {
             offset: 0,
             last_key: Vec::new(),
             smallest_key: None,
-            largest_key: None,
             prefix_set: HashSet::new(),
             has_range_deletions: false,
             legacy_inline_range_deletions: false,
@@ -264,7 +263,6 @@ impl TableBuilder {
         if self.smallest_key.is_none() {
             self.smallest_key = Some(key.to_vec());
         }
-        self.largest_key = Some(key.to_vec());
 
         // A single entry (plus block framing) must fit within the reader's maximum
         // decompressed block size; otherwise the SST written here would be rejected
@@ -298,7 +296,8 @@ impl TableBuilder {
             self.range_del_projected = projected;
             self.has_range_deletions = true;
             self.range_del_entries.push((key.to_vec(), value.to_vec()));
-            self.last_key = key.to_vec();
+            self.last_key.clear();
+            self.last_key.extend_from_slice(key);
             return Ok(());
         }
 
@@ -385,7 +384,8 @@ impl TableBuilder {
         }
 
         self.data_block.add(key, value);
-        self.last_key = key.to_vec();
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
 
         for collector in &mut self.block_property_collectors {
             collector.add(key, value);
@@ -435,10 +435,11 @@ impl TableBuilder {
             .map(|(key, end)| (user_key(key).to_vec(), end.clone()))
             .collect();
 
+        let largest_key = self.smallest_key.as_ref().map(|_| self.last_key);
         Ok(TableBuildResult {
             file_size: self.offset,
             smallest_key: self.smallest_key,
-            largest_key: self.largest_key,
+            largest_key,
             has_range_deletions: self.has_range_deletions,
             range_tombstones,
         })
@@ -507,20 +508,21 @@ impl TableBuilder {
                 let compressed = lz4_flex::compress_prepend_size(data);
                 // Only use compression if it actually saves space
                 if compressed.len() < data.len() {
-                    (compressed, CompressionType::Lz4)
+                    (Cow::Owned(compressed), CompressionType::Lz4)
                 } else {
-                    (data.to_vec(), CompressionType::None)
+                    (Cow::Borrowed(data), CompressionType::None)
                 }
             }
             CompressionType::Zstd => {
-                let compressed = zstd::bulk::compress(data, 3).unwrap_or_else(|_| data.to_vec());
-                if compressed.len() < data.len() {
-                    (compressed, CompressionType::Zstd)
+                if let Ok(compressed) = zstd::bulk::compress(data, 3)
+                    && compressed.len() < data.len()
+                {
+                    (Cow::Owned(compressed), CompressionType::Zstd)
                 } else {
-                    (data.to_vec(), CompressionType::None)
+                    (Cow::Borrowed(data), CompressionType::None)
                 }
             }
-            CompressionType::None => (data.to_vec(), CompressionType::None),
+            CompressionType::None => (Cow::Borrowed(data), CompressionType::None),
         };
 
         let handle = BlockHandle::new(self.offset, block_data.len() as u64);
@@ -682,6 +684,69 @@ mod tests {
         fn name(&self) -> &str {
             &self.0
         }
+    }
+
+    #[test]
+    fn uncompressed_block_write_does_not_copy_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.sst");
+        let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
+        let data = vec![42; 16 * 1024];
+        let (handle, allocated) =
+            crate::test_alloc::count_allocated(|| builder.write_raw_block(&data).unwrap());
+        assert_eq!(allocated, 0, "raw write allocated {allocated} bytes");
+        builder.writer.flush().unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(handle.size, data.len() as u64);
+        assert_eq!(&bytes[..data.len()], data);
+        assert_eq!(bytes[data.len()], CompressionType::None as u8);
+        let crc = crc32fast::hash(&bytes[..data.len() + 1]);
+        assert_eq!(&bytes[data.len() + 1..], crc.to_le_bytes());
+    }
+
+    #[test]
+    fn builder_reuses_key_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 4 * 1024 * 1024,
+                bloom_bits_per_key: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut key = vec![b'a'; 1024];
+        let (_, allocated) = crate::test_alloc::count_allocated(|| {
+            for i in 0..1000u64 {
+                key[1016..].copy_from_slice(&i.to_be_bytes());
+                builder.add(&key, b"v").unwrap();
+            }
+        });
+        eprintln!("1000 1KiB builder keys allocated {allocated} bytes");
+        assert!(allocated < 512 * 1024, "allocated {allocated} bytes");
+        let result = builder.finish().unwrap();
+        assert_eq!(result.largest_key.as_deref(), Some(key.as_slice()));
+        assert_eq!(
+            TableReader::open(&path).unwrap().get(&key).unwrap(),
+            Some(b"v".to_vec())
+        );
+    }
+
+    #[test]
+    fn empty_user_key_has_present_table_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty-key.sst");
+        let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
+        builder.add(b"", b"value").unwrap();
+        let result = builder.finish().unwrap();
+        assert_eq!(result.smallest_key, Some(Vec::new()));
+        assert_eq!(result.largest_key, Some(Vec::new()));
+        assert_eq!(
+            TableReader::open(&path).unwrap().get(b"").unwrap(),
+            Some(b"value".to_vec())
+        );
     }
 
     #[test]
