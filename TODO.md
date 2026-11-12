@@ -65,7 +65,7 @@ cargo +stable test --test shared_cache
 cargo +stable test --test read_only
 ```
 
-All 13 commands passed: 457 tests passed, including 66 integration tests and
+All 13 commands passed: 459 tests passed, including 67 integration tests and
 327 library tests. The read-only helper is intentionally ignored by the normal
 test runner and invoked by the passing `strace` acceptance test.
 
