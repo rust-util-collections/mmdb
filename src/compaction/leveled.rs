@@ -915,9 +915,20 @@ impl LeveledCompaction {
             .input_files_level
             .len()
             .saturating_add(task.input_files_next.len()) as u64;
+        // L0 runs serially. Other levels split only at target-file
+        // boundaries, so the configured limit cannot create more jobs than
+        // there are target files (or the single unsplit job).
+        let max_subs = if task.level == 0 {
+            1
+        } else {
+            options
+                .max_subcompactions
+                .max(1)
+                .min(task.input_files_next.len().max(1))
+        };
         size_outputs
             .saturating_add(input_count)
-            .saturating_add(options.max_subcompactions.max(1) as u64)
+            .saturating_add(max_subs as u64)
             .saturating_add(16)
             .max(1)
     }
@@ -2932,9 +2943,20 @@ mod tests {
         };
 
         let options = DbOptions {
-            max_subcompactions: 4,
+            max_subcompactions: usize::MAX,
             ..Default::default()
         };
+        // Raising the configured limit beyond the available target-file
+        // boundaries cannot create more sub-jobs or need more file numbers.
+        let reservation = LeveledCompaction::max_output_files(&task, &options);
+        let feasible_options = DbOptions {
+            max_subcompactions: task.input_files_next.len(),
+            ..options.clone()
+        };
+        assert_eq!(
+            reservation,
+            LeveledCompaction::max_output_files(&task, &feasible_options)
+        );
         let ctx = CompactionContext {
             db_path: dir.path(),
             options: &options,
@@ -2945,14 +2967,15 @@ mod tests {
 
         let before = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
         let output =
-            LeveledCompaction::execute_compaction_io(&ctx, &task, 100, u64::MAX, true).unwrap();
+            LeveledCompaction::execute_compaction_io(&ctx, &task, 100, 100 + reservation, true)
+                .unwrap();
         let after = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
 
         assert!(
             after > before,
             "execute_compaction_io should have taken the parallel (actual_subs > 1) \
              path given 3 disjoint target-level files and \
-             max_subcompactions=4, but the counter did not increment — the \
+             max_subcompactions=usize::MAX, but the counter did not increment — the \
              parallel branch has zero test coverage otherwise"
         );
 

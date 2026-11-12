@@ -81,8 +81,8 @@ pub struct DbOptions {
     /// Maximum sub-compactions per compaction job. Default: 1 (no sub-compaction).
     /// RocksDB equivalent: `max_subcompactions`.
     /// When > 1, a single compaction is split into parallel sub-tasks by key range
-    /// using target-level file boundaries as split points. Effective only when the
-    /// target level has enough files to split on.
+    /// using target-level file boundaries as split points. The actual count is
+    /// bounded by those boundaries; L0 compactions run serially.
     pub max_subcompactions: usize,
 
     // ---- Cache behavior ----

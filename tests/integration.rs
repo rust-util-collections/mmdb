@@ -1583,6 +1583,29 @@ fn test_prefix_scan_across_levels() {
 // ── New options fields are respected ────────────────────────────────────
 
 #[test]
+fn test_compaction_with_large_subcompaction_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = DbOptions {
+        max_subcompactions: usize::MAX,
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(options.clone(), dir.path()).unwrap();
+    db.put(b"k", b"value").unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"value".as_slice()));
+    db.close().unwrap();
+    drop(db);
+
+    let reopened = DB::open(options, dir.path()).unwrap();
+    assert_eq!(
+        reopened.get(b"k").unwrap().as_deref(),
+        Some(b"value".as_slice())
+    );
+}
+
+#[test]
 fn test_new_options_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(

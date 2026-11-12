@@ -21,7 +21,7 @@ None.
 ### [LOW] manifest: file-number arithmetic can overflow at `u64::MAX`
 - **Where**: `src/manifest/version_set.rs` (`new_file_number`, `reserve_file_numbers`, MANIFEST rotation)
 - **What**: File allocation, reservations, and MANIFEST rotation increment `u64` counters without checked arithmetic.
-- **Reason**: Reaching exhaustion through production allocation requires roughly 1.8e19 file numbers; all reservation counts are bounded by in-memory workload sizes. Replay takes a stored `next_file_number` without an upper bound (unlike `last_sequence`), but a value near `u64::MAX` needs a checksum-valid MANIFEST record or an on-disk file name this allocator never produced. The failure is mathematically real but not practically reachable. Revisit if identifiers become externally supplied or allocation jumps by unbounded amounts.
+- **Reason**: Reaching exhaustion through production allocation requires roughly 1.8e19 file numbers; reservation counts are bounded by in-memory workload sizes. Compaction caps the `max_subcompactions` contribution at the feasible target-file count (one for L0), so even `usize::MAX` cannot inflate a small job's reservation. Replay takes a stored `next_file_number` without an upper bound (unlike `last_sequence`), but a value near `u64::MAX` needs a checksum-valid MANIFEST record or an on-disk file name this allocator never produced. The failure is mathematically real but not practically reachable. Revisit if identifiers become externally supplied or allocation jumps by unbounded amounts.
 
 ### [LOW] SST: restart-count validation can overflow `usize` on 32-bit targets
 - **Where**: `src/sst/block.rs`
