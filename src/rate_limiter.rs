@@ -21,12 +21,12 @@ const MAX_SLEEP_SECS: f64 = 60.0;
 /// Controls the rate at which bytes can be written during compaction
 /// to reduce impact on foreground read/write operations.
 pub struct RateLimiter {
+    /// Immutable after construction, so disabled requests need no lock.
+    rate_bytes_per_sec: u64,
     inner: Mutex<RateLimiterInner>,
 }
 
 struct RateLimiterInner {
-    /// Maximum bytes per second.
-    rate_bytes_per_sec: u64,
     /// Available tokens (bytes). May go negative to represent accumulated
     /// debt: a chunk's full cost is always debited immediately, even when
     /// it can't be slept off in one `max_sleep_secs`-capped sleep. Under
@@ -111,8 +111,8 @@ impl RateLimiter {
     /// If `rate_bytes_per_sec` is 0, the limiter is effectively disabled.
     pub fn new(rate_bytes_per_sec: u64) -> Self {
         Self {
+            rate_bytes_per_sec,
             inner: Mutex::new(RateLimiterInner {
-                rate_bytes_per_sec,
                 available: rate_bytes_per_sec as f64,
                 last_refill: Instant::now(),
                 max_sleep_secs: MAX_SLEEP_SECS,
@@ -143,24 +143,24 @@ impl RateLimiter {
     ///
     /// Returns immediately if the rate limiter is disabled (rate = 0).
     pub fn request(&self, bytes: usize) {
+        if self.rate_bytes_per_sec == 0 {
+            return;
+        }
         let mut remaining = bytes as f64;
         while remaining > 0.0 {
             let mut inner = self.inner.lock();
-            if inner.rate_bytes_per_sec == 0 {
-                return;
-            }
 
             // Refill tokens.
             let now = Instant::now();
             let elapsed = now.duration_since(inner.last_refill).as_secs_f64();
-            inner.available += elapsed * inner.rate_bytes_per_sec as f64;
-            inner.available = inner.available.min(inner.rate_bytes_per_sec as f64 * 2.0); // cap at 2x burst
+            inner.available += elapsed * self.rate_bytes_per_sec as f64;
+            inner.available = inner.available.min(self.rate_bytes_per_sec as f64 * 2.0); // cap at 2x burst
             inner.last_refill = now;
 
             let (chunk, plan) = next_chunk(
                 inner.available,
                 remaining,
-                inner.rate_bytes_per_sec,
+                self.rate_bytes_per_sec,
                 inner.max_sleep_secs,
             );
             inner.available = plan.new_available;
@@ -182,7 +182,7 @@ impl RateLimiter {
     /// Whether a rate limit is configured (test helper).
     #[cfg(test)]
     pub(crate) fn is_enabled(&self) -> bool {
-        self.inner.lock().rate_bytes_per_sec > 0
+        self.rate_bytes_per_sec > 0
     }
 }
 
@@ -200,8 +200,8 @@ mod tests {
     /// a chunk is measured against, not the accounting logic under test.
     fn rate_limiter_for_test(rate_bytes_per_sec: u64, max_sleep_secs: f64) -> RateLimiter {
         RateLimiter {
+            rate_bytes_per_sec,
             inner: Mutex::new(RateLimiterInner {
-                rate_bytes_per_sec,
                 available: rate_bytes_per_sec as f64,
                 last_refill: Instant::now(),
                 max_sleep_secs,
