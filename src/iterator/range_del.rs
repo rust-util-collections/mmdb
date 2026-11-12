@@ -424,10 +424,17 @@ impl FragmentedRangeTombstoneList {
     /// the fragmented query index, which could otherwise multiply out an
     /// aggregate re-fragmentation downstream).
     pub fn tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
+        self.iter_tombstones()
+            .map(|(b, e, s)| (b.to_vec(), e.to_vec(), s))
+            .collect()
+    }
+
+    /// Borrow raw endpoints for filtering and overlap checks. The immutable
+    /// index owns them; only retained output needs endpoint copies.
+    pub fn iter_tombstones(&self) -> impl Iterator<Item = (&[u8], &[u8], SequenceNumber)> {
         self.raw
             .iter()
-            .map(|(b, e, s, _)| (b.clone(), e.clone(), *s))
-            .collect()
+            .map(|(b, e, s, _)| (b.as_slice(), e.as_slice(), *s))
     }
 }
 

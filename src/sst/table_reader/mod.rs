@@ -395,7 +395,7 @@ impl TableReader {
     /// Get cached range tombstones as a pre-indexed structure (O(log T)-ish
     /// point lookup via a segment tree over elementary key intervals — see
     /// `FragmentedRangeTombstoneList`). Populated once on first access.
-    fn cached_range_tombstones(&self) -> Result<Arc<FragmentedRangeTombstoneList>> {
+    pub(crate) fn cached_range_tombstones(&self) -> Result<Arc<FragmentedRangeTombstoneList>> {
         if let Some(cached) = self.range_tombstone_cache.get() {
             return Ok(cached.clone());
         }

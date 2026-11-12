@@ -154,9 +154,9 @@ fn file_overlaps_compact_bounds(
     if !tf.meta.has_range_deletions {
         return false;
     }
-    match tf.reader.get_range_tombstones() {
+    match tf.reader.cached_range_tombstones() {
         Ok(tombstones) => tombstones
-            .iter()
+            .iter_tombstones()
             .any(|(begin, end, _)| tombstone_overlaps_bounds(begin, end, lower, upper)),
         Err(e) => {
             tracing::warn!(
@@ -230,9 +230,9 @@ fn file_overlaps_extent(tf: &TableFile, extent: &UserKeyRange) -> bool {
     if !tf.meta.has_range_deletions {
         return false;
     }
-    match tf.reader.get_range_tombstones() {
+    match tf.reader.cached_range_tombstones() {
         Ok(tombstones) => tombstones
-            .iter()
+            .iter_tombstones()
             .any(|(begin, end, _)| tombstone_overlaps_extent(begin, end, extent)),
         Err(e) => {
             tracing::warn!(

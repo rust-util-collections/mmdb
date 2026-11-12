@@ -527,16 +527,16 @@ impl CompactionFilter for LazyDeleteFilter {
 /// `[lower, upper)` window to `dst`, tagged with their source `level`.
 /// Shared by every bounded iterator constructor so a future tombstone source
 /// cannot miss the bounds filter.
-fn collect_tombstones_overlapping_bounds(
+fn collect_tombstones_overlapping_bounds<K: AsRef<[u8]> + Into<Vec<u8>>>(
     dst: &mut Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
-    src: impl IntoIterator<Item = (Vec<u8>, Vec<u8>, SequenceNumber)>,
+    src: impl IntoIterator<Item = (K, K, SequenceNumber)>,
     level: usize,
     lower: Option<&[u8]>,
     upper: Option<&[u8]>,
 ) {
     for (b, e, s) in src {
-        if tombstone_overlaps_bounds(&b, &e, lower, upper) {
-            dst.push((b, e, s, level));
+        if tombstone_overlaps_bounds(b.as_ref(), e.as_ref(), lower, upper) {
+            dst.push((b.into(), e.into(), s, level));
         }
     }
 }
@@ -2002,7 +2002,7 @@ impl DB {
                 if tf.meta.has_range_deletions {
                     collect_tombstones_overlapping_bounds(
                         &mut all_tombstones,
-                        tf.reader.get_range_tombstones().ctx()?,
+                        tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
                         0,
                         bounds_lo,
                         bounds_hi,
@@ -2023,7 +2023,7 @@ impl DB {
                         }
                         collect_tombstones_overlapping_bounds(
                             &mut all_tombstones,
-                            tf.reader.get_range_tombstones().ctx()?,
+                            tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
                             level,
                             bounds_lo,
                             bounds_hi,
@@ -2208,7 +2208,7 @@ impl DB {
                 if tf.meta.has_range_deletions {
                     collect_tombstones_overlapping_bounds(
                         &mut all_tombstones,
-                        tf.reader.get_range_tombstones().ctx()?,
+                        tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
                         0,
                         bounds_lo,
                         bounds_hi,
@@ -2229,7 +2229,7 @@ impl DB {
                         }
                         collect_tombstones_overlapping_bounds(
                             &mut all_tombstones,
-                            tf.reader.get_range_tombstones().ctx()?,
+                            tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
                             level,
                             bounds_lo,
                             bounds_hi,
