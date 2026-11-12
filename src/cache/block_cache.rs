@@ -16,10 +16,11 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
+use arc_swap::ArcSwap;
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
 
@@ -28,6 +29,13 @@ type CacheKey = (u64, u64, u64);
 
 /// Cached block data.
 type CacheValue = Arc<Vec<u8>>;
+
+/// Immutable member-local pins, published together with their byte total.
+#[derive(Clone, Default)]
+struct PinnedBlocks {
+    entries: HashMap<(u64, u64), CacheValue>,
+    bytes: u64,
+}
 
 /// Number of shards in the reverse index. Must be a power of two.
 ///
@@ -199,9 +207,8 @@ impl BlockCachePool {
             pool: self.clone(),
             member: self.next_member.fetch_add(1, Ordering::Relaxed),
             detached: AtomicBool::new(false),
-            pinned: Mutex::new(HashMap::new()),
-            pinned_count: AtomicUsize::new(0),
-            pinned_bytes: AtomicU64::new(0),
+            pinned: ArcSwap::from_pointee(PinnedBlocks::default()),
+            pin_updates: Mutex::new(()),
         }
     }
 
@@ -235,32 +242,19 @@ pub struct BlockCache {
     /// the detach sweep may leave a transient orphan entry, which LRU
     /// reclaims like any cold block (its member id is retired, so it
     /// can never be read again). Pinned inserts cannot race the sweep:
-    /// both sides serialize on the `pinned` mutex.
+    /// both sides serialize on the `pin_updates` mutex.
     detached: AtomicBool,
     /// Pinned entries — never evicted by LRU. **Member-local** (keyed
     /// `(file_number, block_offset)`): pins are never shared, never
     /// weighed against the pool's capacity, and keeping them here means
     /// one member's pins add zero lock traffic to other members' `get`
     /// fast paths — exactly the per-DB behavior of the pre-pool cache.
-    pinned: Mutex<HashMap<(u64, u64), CacheValue>>,
-    /// Fast-path hint: number of entries currently in `pinned`. `get()` checks
-    /// this atomic before acquiring `pinned`'s mutex, so lookups skip the lock
-    /// only while nothing is pinned; with any entry pinned (the steady state
-    /// with default L0 pinning) every lookup takes it, whatever the key. `Relaxed` is sufficient since this is only a hint —
-    /// `pinned` (guarded by its own mutex) remains the authoritative state and
-    /// is always consulted whenever the counter reads nonzero.
-    ///
-    /// Ordering invariant: the counter is incremented *before* a new entry is
-    /// inserted (both under the `pinned` mutex) and decremented only while
-    /// holding the mutex after removal. A reader that observes 0 therefore
-    /// sees a correct miss ("insert not yet complete"); a reader that observes
-    /// nonzero takes the mutex and blocks until the in-flight insert finishes.
-    /// Incrementing *after* the insert would leave a window where a concurrent
-    /// `get()` skips the map even though the entry is already present.
-    pinned_count: AtomicUsize,
-    /// Bytes currently pinned by this member (observability; pinning is
-    /// structurally small — one block per L0 file).
-    pinned_bytes: AtomicU64,
+    /// Readers retain an immutable snapshot without taking the update lock.
+    /// Removed blocks stay valid for in-flight readers through their Arcs.
+    pinned: ArcSwap<PinnedBlocks>,
+    /// Serializes snapshot updates, including detach, so concurrent writers
+    /// cannot overwrite each other's pins or restore a retired snapshot.
+    pin_updates: Mutex<()>,
 }
 
 impl BlockCache {
@@ -276,11 +270,8 @@ impl BlockCache {
         if self.pool.disabled || self.detached.load(Ordering::Relaxed) {
             return None;
         }
-        // Fast path: skip the pin mutex while nothing is pinned. Once any L0
-        // first block is pinned, every lookup takes the lock.
-        if self.pinned_count.load(Ordering::Relaxed) != 0
-            && let Some(v) = self.pinned.lock().get(&(file_number, block_offset))
-        {
+        // The snapshot load never acquires the pin-update mutex.
+        if let Some(v) = self.pinned.load().entries.get(&(file_number, block_offset)) {
             return Some(v.clone());
         }
         self.pool
@@ -332,36 +323,22 @@ impl BlockCache {
             return arc;
         }
         {
-            let mut pinned = self.pinned.lock();
+            let _update = self.pin_updates.lock();
             // Re-checked under the mutex: `detach` sweeps this map under the
             // same lock, so a pin can never slip in after the sweep (an
             // unremovable leak); see the `detached` field docs.
             if self.detached.load(Ordering::Relaxed) {
                 return arc;
             }
-            match pinned.get(&(file_number, block_offset)) {
-                Some(old) => {
-                    // Replacement: adjust the byte counter by the delta.
-                    let (old_len, new_len) = (old.len() as u64, arc.len() as u64);
-                    if new_len >= old_len {
-                        self.pinned_bytes
-                            .fetch_add(new_len - old_len, Ordering::Relaxed);
-                    } else {
-                        self.pinned_bytes
-                            .fetch_sub(old_len - new_len, Ordering::Relaxed);
-                    }
-                }
-                None => {
-                    // Increment BEFORE inserting a new key (see `pinned_count`
-                    // invariant): the lock-free reader in `get()` never takes
-                    // this mutex when it reads 0, so counting after the insert
-                    // would let it miss an entry that is already in the map.
-                    self.pinned_count.fetch_add(1, Ordering::Relaxed);
-                    self.pinned_bytes
-                        .fetch_add(arc.len() as u64, Ordering::Relaxed);
-                }
+            let mut pinned = (**self.pinned.load()).clone();
+            if let Some(old) = pinned
+                .entries
+                .insert((file_number, block_offset), arc.clone())
+            {
+                pinned.bytes -= old.len() as u64;
             }
-            pinned.insert((file_number, block_offset), arc.clone());
+            pinned.bytes += arc.len() as u64;
+            self.pinned.store(Arc::new(pinned));
         }
         arc
     }
@@ -371,23 +348,23 @@ impl BlockCache {
         if self.detached.load(Ordering::Relaxed) {
             return;
         }
-        let mut pinned = self.pinned.lock();
-        let mut removed = 0usize;
+        let _update = self.pin_updates.lock();
+        let current = self.pinned.load();
+        if !current.entries.keys().any(|&(f, _)| f == file_number) {
+            return;
+        }
+        let mut pinned = (**current).clone();
         let mut removed_bytes = 0u64;
-        pinned.retain(|&(f, _), v| {
+        pinned.entries.retain(|&(f, _), v| {
             if f == file_number {
-                removed += 1;
                 removed_bytes += v.len() as u64;
                 false
             } else {
                 true
             }
         });
-        if removed != 0 {
-            self.pinned_count.fetch_sub(removed, Ordering::Relaxed);
-            self.pinned_bytes
-                .fetch_sub(removed_bytes, Ordering::Relaxed);
-        }
+        pinned.bytes -= removed_bytes;
+        self.pinned.store(Arc::new(pinned));
     }
 
     /// Invalidate all cached blocks this member holds for a specific file.
@@ -423,17 +400,12 @@ impl BlockCache {
         if self.detached.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Pinned sweep — under the pinned mutex, which excludes racing
+        // Pinned sweep — under the update mutex, which excludes racing
         // `insert_pinned` calls (they re-check the flag under the lock).
         {
-            let mut pinned = self.pinned.lock();
-            let removed = pinned.len();
-            pinned.clear();
-            if removed != 0 {
-                self.pinned_count.fetch_sub(removed, Ordering::Relaxed);
-            }
+            let _update = self.pin_updates.lock();
+            self.pinned.store(Arc::new(PinnedBlocks::default()));
         }
-        self.pinned_bytes.store(0, Ordering::Relaxed);
         // Unpinned sweep: batch every invalidation, then run the pool's
         // maintenance ONCE (per-file `run_pending_tasks` would drain the
         // whole pool's queue repeatedly).
@@ -454,7 +426,7 @@ impl BlockCache {
 
     /// Bytes currently pinned by this member.
     pub fn pinned_bytes(&self) -> u64 {
-        self.pinned_bytes.load(Ordering::Relaxed)
+        self.pinned.load().bytes
     }
 
     /// Current approximate entry count: the underlying pool's LRU store
@@ -465,13 +437,14 @@ impl BlockCache {
         if self.detached.load(Ordering::Relaxed) {
             return 0;
         }
-        self.pool.entry_count() + self.pinned.lock().len() as u64
+        self.pool.entry_count() + self.pinned.load().entries.len() as u64
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     #[test]
     fn eviction_during_insert_prunes_reverse_offsets() {
@@ -541,31 +514,101 @@ mod tests {
     fn test_block_cache_pinned_fast_path() {
         let cache = BlockCache::new(1024 * 1024);
 
-        // Nothing pinned yet: the hint counter is zero, so get() must take the
-        // fast path (skip `pinned`'s mutex) and still miss cleanly.
-        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 0);
+        // An empty pin snapshot still misses cleanly.
+        assert_eq!(cache.pinned.load().entries.len(), 0);
         assert!(cache.get(1, 0).is_none());
 
-        // Pinning bumps the counter and is immediately visible via get().
+        // Publishing a pin makes it immediately visible via get().
         cache.insert_pinned(1, 0, vec![9, 9, 9]);
-        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.pinned.load().entries.len(), 1);
         assert_eq!(*cache.get(1, 0).unwrap(), vec![9, 9, 9]);
 
         // Re-pinning the same key must not double-count.
         cache.insert_pinned(1, 0, vec![9, 9, 9]);
-        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.pinned.load().entries.len(), 1);
 
-        // A normal (non-pinned) insert for another key doesn't touch the counter,
+        // A normal (non-pinned) insert for another key does not change the pins,
         // and is still reachable once the fast path falls through to moka.
         cache.insert(2, 0, vec![1, 2, 3]);
-        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.pinned.load().entries.len(), 1);
         assert_eq!(*cache.get(2, 0).unwrap(), vec![1, 2, 3]);
 
-        // Unpinning drops the counter back to zero; pinned entries are never
+        // Unpinning publishes an empty snapshot; pinned entries are never
         // mirrored into the moka-backed store, so the lookup now misses entirely.
         cache.unpin_file(1);
-        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.pinned.load().entries.len(), 0);
         assert!(cache.get(1, 0).is_none());
+    }
+
+    #[test]
+    fn pinned_and_lru_reads_do_not_wait_for_pin_updates() {
+        use std::{sync::mpsc, time::Duration};
+
+        let cache = BlockCache::new(1024 * 1024);
+        cache.insert_pinned(1, 0, vec![1]);
+        cache.insert(2, 0, vec![2]);
+        let update = cache.pin_updates.lock();
+        thread::scope(|scope| {
+            let (tx, rx) = mpsc::channel();
+            let cache = &cache;
+            scope.spawn(move || {
+                let result = (cache.get(1, 0), cache.get(2, 0));
+                tx.send(result).unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            // Release before asserting so a regression cannot hang scope join.
+            drop(update);
+            let (pinned, lru) = result.expect("read waited for pin update lock");
+            assert_eq!(pinned.as_deref(), Some(&vec![1]));
+            assert_eq!(lru.as_deref(), Some(&vec![2]));
+        });
+    }
+
+    #[test]
+    fn concurrent_pin_updates_preserve_other_files_and_retired_blocks() {
+        use std::sync::Barrier;
+
+        let cache = BlockCache::new(1024 * 1024);
+        cache.insert_pinned(0, 0, vec![0]);
+        let retired = cache.pinned.load_full();
+        let barrier = Barrier::new(9);
+        thread::scope(|scope| {
+            for file in 1..=8 {
+                let (cache, barrier) = (&cache, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    cache.insert_pinned(file, 0, vec![file as u8; file as usize]);
+                });
+            }
+            barrier.wait();
+            cache.unpin_file(0);
+        });
+        assert!(cache.get(0, 0).is_none());
+        assert_eq!(retired.entries.get(&(0, 0)).unwrap().as_slice(), &[0]);
+        for file in 1..=8 {
+            assert_eq!(
+                cache.get(file, 0).unwrap().as_slice(),
+                vec![file as u8; file as usize]
+            );
+        }
+        assert_eq!(cache.pinned.load().entries.len(), 8);
+        assert_eq!(cache.pinned_bytes(), 36);
+
+        let barrier = Barrier::new(9);
+        thread::scope(|scope| {
+            for file in 1..=8 {
+                let (cache, barrier) = (&cache, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    cache.insert_pinned(file, 0, vec![9]);
+                    cache.unpin_file(file);
+                });
+            }
+            barrier.wait();
+            cache.detach();
+        });
+        assert!(cache.pinned.load().entries.is_empty());
+        assert_eq!(cache.pinned_bytes(), 0);
     }
 
     #[test]
@@ -574,12 +617,12 @@ mod tests {
         cache.insert_pinned(1, 0, vec![1]);
         cache.insert_pinned(1, 4096, vec![2]);
         cache.insert_pinned(2, 0, vec![3]);
-        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 3);
+        assert_eq!(cache.pinned.load().entries.len(), 3);
 
         // Unpinning one file must decrement by exactly the number of entries
         // removed for that file, leaving other files' pinned entries intact.
         cache.unpin_file(1);
-        assert_eq!(cache.pinned_count.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.pinned.load().entries.len(), 1);
         assert!(cache.get(1, 0).is_none());
         assert!(cache.get(1, 4096).is_none());
         assert_eq!(*cache.get(2, 0).unwrap(), vec![3]);
@@ -637,7 +680,7 @@ mod tests {
         // `b` is untouched.
         assert_eq!(*b.get(1, 0).unwrap(), vec![9]);
         assert_eq!(*b.get(3, 0).unwrap(), vec![8]);
-        assert_eq!(b.pinned_count.load(Ordering::Relaxed), 1);
+        assert_eq!(b.pinned.load().entries.len(), 1);
 
         // The detached view is a permanent cache-bypass.
         let arc = a.insert(4, 0, vec![4]);
@@ -646,7 +689,7 @@ mod tests {
         let arc = a.insert_pinned(5, 0, vec![5]);
         assert_eq!(*arc, vec![5]);
         assert!(a.get(5, 0).is_none());
-        assert_eq!(a.pinned_count.load(Ordering::Relaxed), 0); // no leak
+        assert_eq!(a.pinned.load().entries.len(), 0); // no leak
 
         // Idempotent.
         a.detach();

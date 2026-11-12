@@ -13,17 +13,18 @@ Keys always carry member_id; IDs monotonic, never reused after `detach()`.
 
 **CA2 Pin lifecycle** — every L0 pin ends when SST leaves Version or member
 detaches. `unpin_file`/`invalidate_file` only after MANIFEST install succeeds.
-Replacement pins must not double-count `pinned_*`.
+Replacement pins must not double-count entries or bytes.
 
-**CA3 Pin fast path** — `get()` skips pin mutex only if `pinned_count == 0`.
-Inc count before map insert under mutex; dec after delete under mutex. `Relaxed`
-OK — map is truth.
+**CA3 Pin snapshots** — `get()` loads immutable pins through `ArcSwap` without
+the update mutex. Insert, unpin and detach serialize on `pin_updates`; load
+the latest state only after locking and publish entries and byte total together.
+Readers may finish using removed blocks through their retained Arcs.
 
 **CA4 Reverse index** — prune on moka evict + bulk invalidate. Same `shard_for`
 for add/remove/take_file; `take_member` walks all shards.
 
 **CA5 Detach** — idempotent; own member only; clear pins; permanent bypass.
-Re-check `detached` under pin mutex on insert. In-flight unpinned insert may
+Re-check `detached` under `pin_updates` on insert. In-flight unpinned insert may
 remain as unreachable LRU-bounded data only — never another member's bytes.
 
 **CA6 TableReader life** — eviction must not invalidate Version/iter Arcs.
