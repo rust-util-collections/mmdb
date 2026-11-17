@@ -166,6 +166,13 @@ impl TableIterator {
         self.backward_block_index = usize::MAX;
     }
 
+    fn exhaust_at_upper_bound(&mut self) {
+        self.reset_positioning_state();
+        if let Some(ref index_entries) = self.index_entries {
+            self.index_pos = index_entries.len();
+        }
+    }
+
     fn block_properties_should_skip(&self, entry: &IndexEntry) -> bool {
         if self.block_property_filters.is_empty() {
             return false;
@@ -235,6 +242,7 @@ impl TableIterator {
         if let Some(ref ub) = self.upper_bound
             && user_key(&self.block_cursor_key) >= ub.as_slice()
         {
+            self.exhaust_at_upper_bound();
             return None;
         }
         self.block_cursor_offset = next_offset;
@@ -800,6 +808,12 @@ impl Iterator for TableIterator {
             }
             // Try materialized entries (backward iteration positioned us here)
             if self.block_pos < self.current_block_entries.len() {
+                if let Some(ref ub) = self.upper_bound
+                    && user_key(&self.current_block_entries[self.block_pos].0) >= ub.as_slice()
+                {
+                    self.exhaust_at_upper_bound();
+                    return None;
+                }
                 let entry = self.current_block_entries[self.block_pos].clone();
                 self.block_pos += 1;
                 return Some(entry);
@@ -924,6 +938,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                         if let Some(ref ub) = self.upper_bound
                             && user_key(&self.block_cursor_key) >= ub.as_slice()
                         {
+                            self.exhaust_at_upper_bound();
                             return false;
                         }
                         self.block_cursor_offset = next;
@@ -946,6 +961,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 if let Some(ref ub) = self.upper_bound
                     && user_key(k) >= ub.as_slice()
                 {
+                    self.exhaust_at_upper_bound();
                     return false;
                 }
                 key_buf.clear();
@@ -1010,6 +1026,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                         if let Some(ref ub) = self.upper_bound
                             && user_key(&self.block_cursor_key) >= ub.as_slice()
                         {
+                            self.exhaust_at_upper_bound();
                             return None;
                         }
                         self.block_cursor_offset = next_offset;
@@ -1033,6 +1050,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 if let Some(ref ub) = self.upper_bound
                     && user_key(k) >= ub.as_slice()
                 {
+                    self.exhaust_at_upper_bound();
                     return None;
                 }
                 key_buf.clear();
@@ -2006,5 +2024,108 @@ mod tests {
         SeekableIterator::seek_to_last(&mut iter);
         assert!(iter.current().is_none());
         assert!(iter.iter_error().is_some());
+    }
+
+    #[test]
+    fn test_iterator_next_enforces_upper_bound_and_stops_scanning_blocks() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        use crate::iterator::merge::SeekableIterator;
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upper_bound_next.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 4096,
+                block_restart_interval: 16,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in [b"k1", b"k2", b"k3", b"k4"] {
+            let ik = InternalKey::new(key, 10, ValueType::Value);
+            builder.add(ik.as_bytes(), key).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let mut iter = TableIterator::new(Arc::clone(&reader));
+        SeekableIterator::set_bounds(&mut iter, None, Some(b"k3"));
+        let seek_k1 = InternalKey::new(b"k1", 0, ValueType::Deletion);
+        iter.seek_for_prev(seek_k1.as_bytes());
+        let yielded: Vec<Vec<u8>> = (&mut iter)
+            .map(|(k, _)| InternalKeyRef::new(&k).user_key().to_vec())
+            .collect();
+        assert_eq!(
+            yielded,
+            vec![b"k1".to_vec(), b"k2".to_vec()],
+            "Iterator::next after seek_for_prev must stop at upper_bound"
+        );
+
+        // Multi-block table without first_key metadata: hitting upper_bound in
+        // block 0 must exhaust immediately rather than reading block 1.
+        let multi_path = dir.path().join("upper_bound_blocks.sst");
+        let mut builder = TableBuilder::new(
+            &multi_path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in [b"a", b"m", b"z"] {
+            let ik = InternalKey::new(key, 10, ValueType::Value);
+            builder.add(ik.as_bytes(), b"val").unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&multi_path).unwrap();
+        let cached = reader.cached_index_entries().unwrap();
+        assert_eq!(cached.len(), 3);
+        let block2_crc = cached[2].handle.offset + cached[2].handle.size + 1;
+        let legacy_entries: Vec<IndexEntry> = cached
+            .iter()
+            .map(|e| IndexEntry {
+                separator_key: e.separator_key.clone(),
+                handle: e.handle,
+                first_key: None,
+                properties: e.properties.clone(),
+            })
+            .collect();
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&multi_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(block2_crc)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            f.seek(SeekFrom::Start(block2_crc)).unwrap();
+            f.write_all(&[b[0].wrapping_add(1)]).unwrap();
+        }
+
+        let reader = Arc::new(TableReader::open(&multi_path).unwrap());
+        let mut iter = TableIterator::new(reader);
+        iter.index_entries = Some(Arc::new(legacy_entries));
+        SeekableIterator::set_bounds(&mut iter, None, Some(b"m"));
+        assert_eq!(
+            iter.next()
+                .map(|(k, _)| InternalKeyRef::new(&k).user_key().to_vec()),
+            Some(b"a".to_vec())
+        );
+        assert!(iter.next().is_none());
+        assert!(
+            iter.iter_error().is_none(),
+            "reaching upper_bound in block 1 must not read out-of-bound block 2: {:?}",
+            iter.iter_error()
+        );
     }
 }
