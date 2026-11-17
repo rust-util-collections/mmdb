@@ -252,6 +252,10 @@ impl DBIterator {
         self.merger
             .set_bounds(self.iterate_lower_bound.as_deref(), Some(&bound));
         self.iterate_upper_bound = Some(bound);
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         // Invalidate any buffered entry — it may now be beyond the new bound.
         self.current = None;
         self.needs_advance = true;
@@ -264,10 +268,27 @@ impl DBIterator {
         self.merger.set_bounds(lower.as_deref(), upper.as_deref());
         self.iterate_lower_bound = lower;
         self.iterate_upper_bound = upper;
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         self.current = None;
         self.needs_advance = true;
         self.prev_overshoot = None;
         self.prefix_exhausted = false;
+    }
+
+    #[inline]
+    fn has_failed(&self) -> bool {
+        self.key_decode_error.is_some() || self.merger.has_failed()
+    }
+
+    #[inline]
+    fn halt_on_error(&mut self) {
+        self.current = None;
+        self.needs_advance = false;
+        self.prev_overshoot = None;
+        self.backward_positioned = false;
     }
 
     /// Return the first error from any underlying source iterator, or a
@@ -341,6 +362,10 @@ impl DBIterator {
     /// Uses peek_entry/advance_entry/take_entry to avoid heap allocations for
     /// skipped entries. Only the one returned entry pays the allocation cost.
     fn next_visible(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        if self.has_failed() {
+            self.halt_on_error();
+            return None;
+        }
         // After a backward operation (prev/seek_to_last), the merger is in backward mode.
         // Re-seek forward past the last user key so forward iteration resumes correctly.
         if self.backward_positioned {
@@ -376,6 +401,7 @@ impl DBIterator {
                 match decode_internal_key(ikey_ref) {
                     Err(e) => {
                         self.key_decode_error = Some(e.to_string());
+                        self.halt_on_error();
                         return None;
                     }
                     Ok((_, seq, vt)) => {
@@ -489,6 +515,10 @@ impl DBIterator {
     /// tombstone checks, and skip_point callback dispatch.
     #[inline(always)]
     fn next_visible_clean(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        if self.has_failed() {
+            self.halt_on_error();
+            return None;
+        }
         if self.backward_positioned {
             self.backward_positioned = false;
             self.prev_overshoot = None;
@@ -507,6 +537,7 @@ impl DBIterator {
             let (seq, vt) = match decode_internal_key(ikey_ref) {
                 Err(e) => {
                     self.key_decode_error = Some(e.to_string());
+                    self.halt_on_error();
                     return None;
                 }
                 Ok((_, seq, vt)) => (seq, vt),
@@ -570,6 +601,10 @@ impl DBIterator {
 
     /// Ensure current is populated. Returns whether there's a valid entry.
     fn ensure_current(&mut self) -> bool {
+        if self.has_failed() {
+            self.halt_on_error();
+            return false;
+        }
         if self.prefix_exhausted {
             return false;
         }
@@ -599,7 +634,7 @@ impl DBIterator {
     }
 
     pub fn advance(&mut self) {
-        if self.prefix_exhausted {
+        if self.has_failed() || self.prefix_exhausted {
             return;
         }
         self.needs_advance = true;
@@ -609,6 +644,10 @@ impl DBIterator {
     /// Seek to the first key >= target.
     pub fn seek(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         self.prefix_exhausted = false;
         let target = self.effective_forward_target(target);
         // Seek the merger to a synthetic internal key with max sequence
@@ -629,6 +668,10 @@ impl DBIterator {
     }
 
     pub fn seek_to_first(&mut self) {
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         self.prefix_exhausted = false;
         if self.prefix.is_some() || self.iterate_lower_bound.is_some() {
             self.seek(b"");
@@ -665,6 +708,10 @@ impl DBIterator {
     /// Uses a single backward seek + inline resolution. No redundant forward seek.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         self.prefix_exhausted = false;
 
         let upper_clamps_target = self
@@ -727,6 +774,10 @@ impl DBIterator {
     /// entries for the same user_key appear in seq ascending order (low→high).
     /// The LAST entry with seq <= snapshot is the newest visible version.
     fn resolve_prev_user_key(&mut self, skip_bound: Option<&[u8]>) {
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         let mut current_bound: Option<Vec<u8>> = skip_bound.map(|b| b.to_vec());
 
         loop {
@@ -756,7 +807,7 @@ impl DBIterator {
                 let (uk_owned, seq, vt) = match decode_internal_key(&ikey) {
                     Err(e) => {
                         self.key_decode_error = Some(e.to_string());
-                        self.current = None;
+                        self.halt_on_error();
                         return;
                     }
                     Ok((uk, seq, vt)) => (uk.to_vec(), seq, vt),
@@ -924,6 +975,10 @@ impl DBIterator {
     /// then resolves visibility inline (no forward re-seek).
     pub fn seek_to_last(&mut self) {
         use crate::types::InternalKey;
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         self.prefix_exhausted = false;
 
         // Determine the effective upper bound for backward seek.
@@ -1956,5 +2011,51 @@ mod tests {
         // Explicit seek clears prefix exhaustion.
         iter.seek_to_first();
         assert_eq!(iter.key(), Some(b"aaa_1".as_slice()));
+    }
+
+    #[test]
+    fn test_key_decode_error_latches_across_seeks_and_direction_switches() {
+        use crate::iterator::bidi_iter::BidiIterator;
+
+        // 1. A short damaged key in a newer source must latch DBIterator shut
+        //    so a subsequent seek(b"k") cannot expose a shadowed older value.
+        let s_newer = vec![(b"k".to_vec(), b"".to_vec())];
+        let s_older = vec![make_entry(b"k", 5, ValueType::Value, b"old")];
+        let mut iter = DBIterator::new(vec![s_newer, s_older], 100);
+        assert!(iter.next().is_none());
+        assert!(iter.error().is_some());
+        iter.seek(b"k");
+        assert!(!iter.valid(), "seek must not resume after key_decode_error");
+        assert!(iter.next().is_none());
+        assert!(iter.error().is_some());
+
+        // 2. A backward decode error must prevent advance() and BidiIterator::next()
+        //    from resuming forward iteration on surrounding entries.
+        let packed = (7u64 << 8) | 0xEE;
+        let mut bad_m = b"m".to_vec();
+        bad_m.extend_from_slice(&(!packed).to_be_bytes());
+        let entries = vec![
+            make_entry(b"a", 10, ValueType::Value, b"va"),
+            (bad_m, b"vm".to_vec()),
+            make_entry(b"z", 5, ValueType::Value, b"vz"),
+        ];
+
+        let mut db_iter = DBIterator::new(vec![entries.clone()], 100);
+        db_iter.seek_to_last();
+        assert!(!db_iter.valid());
+        assert!(db_iter.error().is_some());
+        db_iter.advance();
+        assert!(!db_iter.valid());
+        db_iter.seek_to_first();
+        assert!(!db_iter.valid());
+
+        let mut bidi = BidiIterator::lazy(DBIterator::new(vec![entries], 100));
+        assert!(bidi.next_back().is_none());
+        assert!(bidi.error().is_some());
+        assert!(
+            bidi.next().is_none(),
+            "BidiIterator::next must not resume after next_back hit key_decode_error"
+        );
+        assert!(bidi.error().is_some());
     }
 }
