@@ -254,8 +254,15 @@ impl TableIterator {
 
     /// Seek to the first entry >= target using the index block for O(log N) lookup.
     pub fn seek(&mut self, target: &[u8]) {
+        if self.err.is_some() {
+            self.reset_positioning_state();
+            return;
+        }
         self.ensure_index();
         self.reset_positioning_state();
+        if self.err.is_some() {
+            return;
+        }
         let index_entries = self.index_entries.as_ref().unwrap();
 
         // Quick check: if target > file's largest key, mark exhausted.
@@ -350,6 +357,7 @@ impl TableIterator {
                     }
                 }
                 Err(e) => {
+                    self.reset_positioning_state();
                     self.err = Some(format!("block entry decode error in seek: {e}"));
                     return;
                 }
@@ -391,6 +399,7 @@ impl TableIterator {
                     offset = next_off;
                 }
                 Err(e) => {
+                    self.reset_positioning_state();
                     self.err = Some(format!("block entry decode error in seek: {e}"));
                     return;
                 }
@@ -410,8 +419,15 @@ impl TableIterator {
     /// Uses windowed segment decoding: only decodes the restart segment containing
     /// the target entry, not the entire block.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
+        if self.err.is_some() {
+            self.reset_positioning_state();
+            return;
+        }
         self.ensure_index();
         self.reset_positioning_state();
+        if self.err.is_some() {
+            return;
+        }
         let index_entries = self.index_entries.as_ref().unwrap();
 
         let idx = index_entries.partition_point(|entry| {
@@ -556,6 +572,9 @@ impl TableIterator {
     /// Uses windowed segment decoding: when crossing restart segment boundaries,
     /// only loads the previous segment (not the entire block).
     pub fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.err.is_some() {
+            return None;
+        }
         // If we have a previous entry in the current segment, just decrement
         if self.block_pos > 0 {
             self.block_pos -= 1;
@@ -576,6 +595,7 @@ impl TableIterator {
                     }
                 }
                 Err(e) => {
+                    self.reset_positioning_state();
                     self.err = Some(format!("block entry decode error in prev: {e}"));
                     return None;
                 }
@@ -596,6 +616,10 @@ impl TableIterator {
         }
 
         self.ensure_index();
+        if self.err.is_some() {
+            self.reset_positioning_state();
+            return None;
+        }
         let index_entries = self.index_entries.as_ref().unwrap();
         let mut prev_block_index = current_block_index - 1;
 
@@ -621,6 +645,7 @@ impl TableIterator {
                                 self.current_block_entries = entries;
                             }
                             Err(e) => {
+                                self.reset_positioning_state();
                                 self.err = Some(format!("block entry decode error in prev: {e}"));
                                 return None;
                             }
@@ -640,10 +665,12 @@ impl TableIterator {
                         return Some(self.current_block_entries[self.block_pos].clone());
                     }
                     Err(e) => {
+                        self.reset_positioning_state();
                         self.err = Some(format!("block decode error in prev: {e}"));
                     }
                 },
                 Err(e) => {
+                    self.reset_positioning_state();
                     self.err = Some(format!("block read error in prev: {e}"));
                 }
             }
@@ -654,6 +681,9 @@ impl TableIterator {
 
     /// Return the current entry without advancing, or None if not positioned.
     pub fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if self.err.is_some() {
+            return None;
+        }
         if self.block_pos < self.current_block_entries.len() {
             Some(self.current_block_entries[self.block_pos].clone())
         } else {
@@ -800,6 +830,10 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     }
 
     fn seek_to_first(&mut self) {
+        if self.err.is_some() {
+            self.reset_positioning_state();
+            return;
+        }
         // Reset to the beginning of the table
         self.ensure_index();
         self.reset_positioning_state();
@@ -807,8 +841,15 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     }
 
     fn seek_to_last(&mut self) {
+        if self.err.is_some() {
+            self.reset_positioning_state();
+            return;
+        }
         self.ensure_index();
         self.reset_positioning_state();
+        if self.err.is_some() {
+            return;
+        }
         let index_entries = self.index_entries.as_ref().unwrap();
         if index_entries.is_empty() {
             return;
@@ -1894,5 +1935,76 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), crate::ErrorKind::Corruption);
+    }
+
+    #[test]
+    fn test_latched_error_stops_prev_current_and_reseeks() {
+        use crate::iterator::merge::SeekableIterator;
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prev_error_latch.sst");
+
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 4096,
+                block_restart_interval: 1,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..3usize {
+            let ik = InternalKey::new(
+                format!("key_{i:04}").as_bytes(),
+                (10 - i) as u64,
+                ValueType::Value,
+            );
+            builder
+                .add(ik.as_bytes(), format!("val_{i}").as_bytes())
+                .unwrap();
+        }
+        builder.finish().unwrap();
+
+        let entries = TableReader::open(&path)
+            .unwrap()
+            .cached_index_entries()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "all 3 entries must share one data block");
+        let block_handle = entries[0].handle;
+        let rel = restart_entry_offset(&path, block_handle.offset, block_handle.size, 1);
+        corrupt_block_byte_recompute_crc(&path, block_handle.offset, block_handle.size, rel);
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let mut iter = TableIterator::new(reader);
+        SeekableIterator::seek_to_last(&mut iter);
+        assert!(iter.current().is_some(), "segment 2 decodes cleanly");
+
+        // Stepping backward into segment 1 hits the damaged entry and latches err.
+        assert!(iter.prev().is_none());
+        assert!(iter.iter_error().is_some());
+        assert!(
+            iter.current().is_none(),
+            "current() must clear once prev() latches an error"
+        );
+        assert!(
+            iter.prev().is_none(),
+            "a second prev() must not skip past segment 1 and yield segment 0"
+        );
+
+        let target0 = InternalKey::new(b"key_0000", 10, ValueType::Value);
+        let target2 = InternalKey::new(b"key_0002", 0, ValueType::Deletion);
+        iter.seek(target0.as_bytes());
+        assert!(iter.next().is_none());
+        iter.seek_for_prev(target2.as_bytes());
+        assert!(iter.current().is_none());
+        assert!(iter.prev().is_none());
+        SeekableIterator::seek_to_first(&mut iter);
+        assert!(iter.next().is_none());
+        SeekableIterator::seek_to_last(&mut iter);
+        assert!(iter.current().is_none());
+        assert!(iter.iter_error().is_some());
     }
 }
