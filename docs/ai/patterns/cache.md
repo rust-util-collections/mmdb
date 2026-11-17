@@ -23,9 +23,10 @@ Readers may finish using removed blocks through their retained Arcs.
 **CA4 Reverse index** — prune on moka evict + bulk invalidate. Same `shard_for`
 for add/remove/take_file; `take_member` walks all shards.
 
-**CA5 Detach** — idempotent; own member only; clear pins; permanent bypass.
-Re-check `detached` under `pin_updates` on insert. In-flight unpinned insert may
-remain as unreachable LRU-bounded data only — never another member's bytes.
+**CA5 Detach** — idempotent; own member only; clear pins; permanently disabled
+view (uncached pass-through). Re-check `detached` under `pin_updates` on insert.
+In-flight unpinned insert may remain as unreachable LRU-bounded data only —
+never another member's bytes.
 
 **CA6 TableReader life** — eviction must not invalidate Version/iter Arcs.
 Prewarm best-effort; authoritative open errors in `log_and_apply`. Delete →
@@ -44,5 +45,5 @@ OK while IDs never reuse and retention stays capacity-bounded.
 - [ ] Pin counters exact under replace/unpin/detach
 - [ ] Shard selection + eviction pruning consistent
 - [ ] Detach idempotent; siblings unaffected
-- [ ] Capacity 0 bypasses all caching
+- [ ] Capacity 0 disables caching cleanly
 - [ ] TableReader Arc outlives cache eviction

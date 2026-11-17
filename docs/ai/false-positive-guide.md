@@ -5,9 +5,9 @@ cover, or explain why the guarantee does not cover the described conditions.
 
 ## FP-1: Safe Rust ownership
 
-**Skip:** Freed-storage access, repeated deallocation, or invalid references
-claimed in safe Rust without an `unsafe`/raw-pointer path.
-**Keep:** Stale logical positions (e.g. an index into a Vec after mutation).
+**Skip:** Lifetime or aliasing failures claimed in 100% safe Rust without an
+`unsafe` or raw-pointer path.
+**Keep:** Stale logical indices or cached offsets after collection mutation.
 
 ## FP-2: Continuous lock
 

@@ -42,7 +42,7 @@ drop lock for SST write. `close`/freeze_and_flush may hold lock (shutdown).
 (from flush post-trigger and `maybe_throttle_writes` stop). `force_merge_level`
 may hold lock for admin merge I/O — never from ordinary write path.
 
-`drain_l0` errors: flush post-trigger non-fatal unless fail-stop/poison (durability already done); stop-trigger → fail-stop; in-drain MANIFEST sync fail → set BG error then propagate.
+`drain_l0` errors: flush post-trigger non-fatal unless fail-stop (`VersionSet::poisoned`) — durability is already complete; stop-trigger → fail-stop; in-drain MANIFEST sync fail → set BG error then propagate.
 
 **CC5 L0 backpressure** — atomic L0 count, no condvar. Slowdown = progressive sleep;
 stop = inline `drain_l0` unlocked merge; fail-stop on compact error (no silent admit).

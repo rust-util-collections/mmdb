@@ -29,9 +29,9 @@ use crate::types::{SequenceNumber, ValueType, compare_internal_key, decode_inter
 /// A range tombstone: (begin_key, end_key, sequence_number).
 type RangeTombstoneEntry = (Vec<u8>, Vec<u8>, SequenceNumber);
 
-/// Maximum allowed decompressed block size. Used by readers to reject
-/// allocation bombs and by compaction to reserve enough output file numbers
-/// when compacting compressed inputs.
+/// Maximum allowed decompressed block size. Used by readers to cap
+/// block buffer allocations from damaged length headers and by compaction to
+/// reserve enough output file numbers when compacting compressed inputs.
 pub(crate) const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
 /// Parsed index entry: separator key + block handle + optional first key + block properties.
@@ -532,7 +532,7 @@ impl TableReader {
             )));
         }
 
-        // Decompress if needed (with size bound to prevent allocation bombs)
+        // Decompress if needed, enforcing MAX_DECOMPRESSED_BLOCK_SIZE.
         let data = match compression_type {
             CompressionType::Lz4 => {
                 if data.len() < 4 {
@@ -562,8 +562,8 @@ impl TableReader {
                 // unstable "experimental" cargo feature, which is not enabled).
                 // The claimed size is still bounded against
                 // MAX_DECOMPRESSED_BLOCK_SIZE before use, exactly like the LZ4
-                // path above, since a corrupted/adversarial frame header could
-                // otherwise claim an oversized value.
+                // path above, since a damaged frame header could otherwise
+                // report an oversized length.
                 let capacity = match zstd::zstd_safe::get_frame_content_size(&data) {
                     Ok(Some(size)) => {
                         let size = size as usize;

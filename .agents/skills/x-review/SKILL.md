@@ -5,17 +5,21 @@ description: Review correctness, recovery, and resource behavior in an MMDB scop
 
 # MMDB Storage-Engine Reliability Review
 
+MMDB is an in-process embedded Rust LSM key-value library operating on
+caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
+Review data-structure, MVCC, persistence, and concurrency invariants.
+
 Resolve repository paths from the Git root; Markdown links are relative to
 this file. Read invocation arguments from the user prompt.
 
-High-signal review. Code is read-only. May update only `docs/audit.md`. Never
-commit, push, bump, or tag. Fixes belong to `$x-fix` or `$x-overhaul`.
+High-signal review. Source code is read-only; update only `docs/audit.md`.
+Never commit, push, bump, or tag. Fixes belong to `$x-fix` or `$x-overhaul`.
 
 ## Preflight
 
 Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-review or edits. Record the staged, unstaged and untracked baseline, branch and
-starting HEAD for `workflow-policy.md` §1 and the invocation ledger.
+review or edits. Record the staged, unstaged, and untracked baseline, branch,
+and starting `HEAD` for `workflow-policy.md` §1 and the invocation ledger.
 
 ## Setup
 
@@ -28,9 +32,6 @@ Read first:
 Design-shaped or multi-subsystem → also
 [design-patterns.md](../../../docs/ai/design-patterns.md).
 
-Task/report wording follows `workflow-policy.md`. Review agents use the
-handoff in `review-core.md`.
-
 ## Input
 
 Parse the user argument with the scope table in `workflow-policy.md`. Reject
@@ -41,50 +42,59 @@ anything else, including `--fix`.
 ### 1. Scope
 
 1. Worktree baseline: the recorded preflight above.
-2. Changed files, full diff, callers, tests. `worktree` includes untracked
-   (`git status --short`). `all` → ledger of `src/`, `tests/`, `benches/`,
-   build/CI, public docs, `.agents/` and `docs/ai/`.
-3. Map via the Subsystem Map. Load concurrency/unsafe guides when relevant.
-4. Mark generated, vendored, and out-of-scope rows. Do not silent-drop them.
+2. Changed files, full diff, callers, tests. `worktree` includes intended
+   untracked source/test files (`git status --short`). `all` → ledger of `src/`,
+   `tests/`, `benches/`, `examples/`, build/CI, public docs, `.agents/`, and
+   `docs/ai/`.
+3. Map via the Subsystem Map. Load concurrency/`unsafe` guides when relevant.
+4. Mark generated, vendored, and out-of-scope rows explicitly in the ledger.
 
 ### 2. Evidence
 
-Small single-subsystem → review directly. Use a read-only agent only when a
-fresh context split helps. `all`: disjoint batches, each Rust file one owner.
-fmt/compile/clippy are tools, not agents.
+Small or single-subsystem scope → review directly in the current session.
+Delegate read-only subagents only when splitting large context helps (`all` or
+multi-subsystem diffs), using the
+[scoped handoff](../../../docs/ai/review-core.md#agent-handoff-and-response)
+with concrete storage-invariant questions. For `all`, assign disjoint subsystem
+batches; large files (`src/db.rs`, `src/compaction/leveled.rs`) may be split
+into disjoint line-range sections so every line has one owner in the ledger.
+`fmt`, compile, and `clippy` are Cargo tools, not subagent tasks.
 
-Cover what the diff actually touches: correctness, crash, concurrency, unsafe,
-design shape, public API, quantified hot-path cost.
+Cover what the scope touches: key/value ordering, MVCC visibility,
+interrupted-write recovery, thread synchronization, `unsafe` preconditions,
+design shape, public API contract, and quantified hot-path cost.
 
-Each candidate needs a location, invariant, concrete conditions, expected and
-observed results, existing checks, a minimal correction, and a regression test.
-Drop style, speculation, feature requests, documented contracts, and anything
-an existing check already covers.
+Each candidate needs a location, invariant, concrete inputs/ordering, expected
+and observed results, existing checks, a minimal correction, and a regression
+test. Drop style, speculation, feature requests, documented contracts, and
+anything an existing check already guarantees.
 
 ### 3. Verify
 
-Re-read the cited code. Keep only code-demonstrable items. One extra reader
-only if the result is still ambiguous. Agreement is not proof. Merge one root
-cause into one finding.
+Re-read the cited code and callers. Keep only code-demonstrable defects. Use at
+most one extra reader if a path remains genuinely ambiguous; agreement alone is
+not proof. Merge symptoms of one root cause into one finding.
 
 ### 4. Completeness
 
-Diff scope: every changed file, public contract, failure path, and relevant
-test. `all`: compare the ledger with the results; review only uncovered files
-or invariants. No rework.
+Diff scope: every changed file, public contract, error/recovery path, and
+relevant test. `all`: compare the ledger with reviewed files/sections and
+complete any uncovered items before updating the registry.
 
 ### 5. Registry
 
-Update `docs/audit.md` from current code, using the forms in `review-core.md`.
+Update `docs/audit.md` from current code, using the forms in `review-core.md`:
 
-1. Prune fixed or obsolete in-scope Open.
-2. Add confirmed Open. Dedupe. Sort CRITICAL → LOW.
-3. Re-check intersecting Won't Fix (`all` → all). A stale reason becomes Open
-   or Rejected. Do not add Won't Fix.
-4. A material disproven claim becomes Rejected. Drop noise and non-defects.
+1. Prune fixed or obsolete in-scope `Open` entries.
+2. Add confirmed `Open` entries, deduped and sorted `CRITICAL` → `LOW`.
+3. Re-check intersecting `Won't Fix` entries (`all` → all). Move stale entries
+   to `Open` or `Rejected`; do not add new `Won't Fix` here.
+4. Record material disproven claims as `Rejected`; omit routine noise and
+   non-defects.
 5. No dates.
 
 ### 6. Report
 
-Scope, coverage, and findings: severity, location, conditions, expected and
-observed results, correction. Zero findings → say so, and say what was covered.
+Report scope, ledger coverage, and findings (severity, location, concrete
+conditions, expected vs observed results, minimal correction). Zero findings →
+state that explicitly along with the files and invariants covered.

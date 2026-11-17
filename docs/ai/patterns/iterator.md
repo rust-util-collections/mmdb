@@ -29,7 +29,11 @@ rules if unconsumed.
 ## Optimizations to preserve
 
 - `next_into` buffer reuse — no alias live MemTable/SST bytes
-- init_heap multi-source `posix_fadvise(WILLNEED)`
+- `intersect_iter_bounds` merges `ReadOptions`, explicit range, and prefix bounds
+  **before** selecting SST point sources or issuing `init_heap` `posix_fadvise(WILLNEED)`
+  prefetch hints, while retaining covering cross-file range tombstones independently
+- L0 point lookups prune by `[smallest_key, largest_key]` only after folding
+  covering range tombstones from every L0 file
 - SetBounds → Level/Table iters; upper bound file skip
 - SkipPoint without skipping past matches
 - Cross-level tombstone: timestamp from L only covers L and deeper

@@ -657,7 +657,7 @@ mod tests {
     }
 
     /// N tombstones nested inside one another (tombstone `i` covers
-    /// `[i, 2N-i)` at seq `i+1`) is the adversarial case that made the old
+    /// `[i, 2N-i)` at seq `i+1`) is the nested-interval worst case that made the old
     /// per-fragment representation clone and sort every active tombstone
     /// into every one of the ~2N elementary intervals it overlapped —
     /// O(N) work and memory attached to each of O(N) intervals, O(N^2)

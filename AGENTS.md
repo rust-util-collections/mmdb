@@ -1,16 +1,22 @@
 # Working on MMDB
 
-Describe correctness, persistence, concurrency and resource behavior using
-concrete operations and expected/observed results.
+MMDB is an in-process embedded Rust LSM-Tree key-value library, built as the
+local storage backend for [vsdb](https://github.com/rust-util-collections/vsdb).
+Describe storage correctness, persistence, concurrency, and resource behavior in
+terms of concrete API/file operations, invariants, and expected vs observed
+results.
 
 ## What is this project?
 
-MMDB is a pure-Rust LSM-Tree key-value storage engine, optimized as the backend for [vsdb](https://github.com/rust-util-collections/vsdb). It implements leveled compaction, WAL-based crash recovery, MVCC snapshots, and lock-free reads via `ArcSwap<SuperVersion>`.
+MMDB implements leveled compaction, WAL-based recovery across interrupted
+writes, MVCC snapshots, and lock-free reads via `ArcSwap<SuperVersion>`.
 
-The engine runs in the caller's process on local database files; it exposes no
-network service. Use temporary databases and generated test data for reliability
-regressions. Cargo dependency downloads and Git operations are tooling actions
-with their own access requirements, separate from the engine's runtime behavior.
+The library runs entirely inside the caller's process on local database files
+(`CURRENT`, `MANIFEST-*`, `*.wal`, `*.sst`, `LOCK`); it opens no network
+sockets, exposes no RPC or daemon, and enforces no multi-tenant privilege
+boundary. Reliability tests operate on isolated `tempfile` directories and
+deterministic generated records. Cargo dependency downloads and Git operations
+are separate developer-tooling actions with their own runtime controls.
 
 ## Build & Test
 
@@ -28,11 +34,12 @@ cargo test --test proptest_db
 
 Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
 
-Toolchain: official latest stable Rust (edition 2024) for development, CI and
-releases. Update with `rustup update stable` and select it with
-`RUSTUP_TOOLCHAIN=stable` or `cargo +stable`. Define no compatible Rust version
-range or minimum compiler; do not add `rust-version`, numeric toolchain pins,
-minimum-version CI jobs or older-compiler compatibility shims.
+Toolchain: official latest stable Rust (edition 2024) for development, CI, and
+releases, selected via `RUSTUP_TOOLCHAIN=stable` or `cargo +stable`. Do not run
+`rustup update stable` automatically during agent workflows unless the user asks
+for a toolchain update. Define no compatible Rust version range or minimum
+compiler; do not add `rust-version`, numeric toolchain pins, minimum-version CI
+jobs, or older-compiler compatibility shims.
 
 ## Architecture
 
@@ -59,17 +66,17 @@ selection with `allow_implicit_invocation: false`.
 - [`$x-review`](.agents/skills/x-review/SKILL.md) — review a scope (default: latest commit). Updates `docs/audit.md` only
 - [`$x-fix`](.agents/skills/x-fix/SKILL.md) — resolve Open findings, one validated commit each. No version bump
 - [`$x-commit`](.agents/skills/x-commit/SKILL.md) — review and commit the current worktree. No version bump
-- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (empty = latest commit; `all` = full repo), then review, fix and create atomic local commits, with one owed Rust version bump. Never tag, push or open a PR
+- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (empty = latest commit; `all` = full repo), then review, fix, and create atomic local commits, plus at most one eligible patch bump when shipped library inputs changed. Never tag, push, or open a PR
 
-All four workflows follow the neutral task/report wording in
-[workflow-policy.md](docs/ai/workflow-policy.md). Review local storage
-operations and expected/observed results. Use the scoped agent handoff in
-[review-core.md](docs/ai/review-core.md); pass only relevant repository
-context, and preserve precise Rust/API terms and finding severity.
+All four workflows follow [workflow-policy.md](docs/ai/workflow-policy.md):
+specify local storage operations, invariants, and expected vs observed results,
+and use the scoped handoff in [review-core.md](docs/ai/review-core.md) when
+delegating read-only subsystem checks while preserving exact Rust/API
+identifiers and finding severities.
 
 Supporting docs (`docs/ai/`):
 
-- [workflow-policy.md](docs/ai/workflow-policy.md) — neutral task framing, scoped handoffs, worktree ownership, atomic commits
+- [workflow-policy.md](docs/ai/workflow-policy.md) — scope resolution, embedded-storage specification, scoped handoffs, worktree ownership, atomic commits
 - [pragmatic-engineering.md](docs/ai/pragmatic-engineering.md) — root goal, low variance
 - [technical-patterns.md](docs/ai/technical-patterns.md) / [design-patterns.md](docs/ai/design-patterns.md) — LSM bugs + D-\* design lens
 - [review-core.md](docs/ai/review-core.md) — evidence/report templates + Subsystem Map
@@ -92,6 +99,6 @@ Audit registry: `docs/audit.md` — maintained by `$x-review`, `$x-fix`, and `$x
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
-- Unsafe code is concentrated in the skiplist, group-commit/file-lock paths, and the SST readahead syscall; derive the live inventory and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
+- Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes
 - **No Co-Authored-By in commits** — never add `Co-Authored-By:` or similar trailers to commit messages; project commits are authored only by the human contributor

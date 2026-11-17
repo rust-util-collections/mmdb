@@ -5,17 +5,20 @@ description: Check MMDB worktree changes for correctness, fix confirmed issues, 
 
 # Self-Reviewing Commit for MMDB
 
+MMDB is an in-process embedded Rust LSM key-value library operating on
+caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
+
 Resolve repository paths from the Git root; Markdown links are relative to
 this file. Read invocation arguments from the user prompt.
 
-Review owned worktree changes, fix confirmed defects, validate, and commit.
-Never push, bump, or tag. New commits only.
+Review owned worktree changes, fix confirmed defects, validate, and create
+atomic local commits. Never push, bump, or tag. New commits only.
 
 ## Preflight
 
 Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-review or edits. Record the staged, unstaged and untracked baseline, branch and
-starting HEAD for `workflow-policy.md` §1 and the invocation ledger.
+review or edits. Record the staged, unstaged, and untracked baseline, branch,
+and starting `HEAD` for `workflow-policy.md` §1 and the invocation ledger.
 
 ## Setup
 
@@ -28,40 +31,51 @@ Read first:
 [false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 Design-shaped → also [design-patterns.md](../../../docs/ai/design-patterns.md).
 
-Preflight, then freeze owned paths.
+Preflight, then freeze owned paths before editing.
 
 ## Protocol
 
 ### 1. Scope
 
-1. `git status --short`, full diffs, and intended untracked files. `git diff HEAD` misses untracked files.
-2. Nothing intended → "nothing to commit", then stop.
-3. Freeze owned paths before edits. Later, stage only that set plus this invocation's fix and format paths.
-4. Split units by issue, root cause, or behavior. Tests, docs, and audit stay with the unit. Keep a pre-staged boundary unless the user changes it.
-5. Unrelated overlap in the same hunk → stop. No stash, revert, or absorb.
-6. If unrelated dirty files would change the result, stop and report.
+1. Inspect `git status --short`, full diffs, and user-intended untracked
+   source/test files (`git diff HEAD` misses untracked files). Leave untracked
+   design drafts or scratch notes (such as `docs/proposals/*`) untouched unless
+   the user asked to commit them.
+2. Nothing intended → report "nothing to commit" and stop.
+3. Freeze owned paths before edits. Stage only that set plus this invocation's
+   in-unit fix and rustfmt paths.
+4. Split units by independent issue, root cause, or behavior change; keep
+   matching tests, docs, and any resolved `docs/audit.md` hunk with the unit.
+   Preserve a pre-staged boundary unless the user asks to reorganize it.
+5. Unrelated baseline overlap in the same hunk, or unstaged edits on a staged
+   file that invalidate worktree Cargo checks → stop and report without
+   `stash`, `restore`, or absorbing unowned lines.
 
 ### 2. Review and fix (per unit)
 
-Read the full functions, callers, errors, and tests. Check invariants, crash,
-concurrency, unsafe, quantified hot-path cost, design shape, placeholders, and
-the public API. Apply `false-positive-guide.md`. Fix the unit completely and
-add a regression. Re-review until clean. No progress → stop and report. Do not
-edit an unowned caller; report it.
+Read full functions, callers, error paths, and tests. Check data-structure
+invariants, interrupted-write recovery, concurrency, `unsafe` preconditions,
+quantified hot-path cost, design shape, unfinished placeholders, and the public
+API in `src/lib.rs`. Apply `false-positive-guide.md`. Fix confirmed defects in
+the owned unit completely, add a focused regression test, and re-check until
+clean. Stop and report on no progress or when a fix requires editing an unowned
+baseline file.
 
-Reads may be parallel. Edits and commits are sequential.
+Reads may run in parallel; edits and commits are strictly sequential.
 
 ### 3. Validate and commit
 
-Follow `commit-protocol.md` for each unit. Never amend.
+Follow `commit-protocol.md` per-unit validation and staging for each unit.
+Never amend prior commits.
 
 ### 4. Gate
 
-After the last behavior commit, run the cargo gate in `commit-protocol.md`
-once. Docs-only → skip. A later regression is a new commit, then re-run the
-gate. No version bump or tag.
+After the last behavior commit, run the Final repository gate in
+`commit-protocol.md` once (skip for docs-only commits). Fix any gate regression
+in a new atomic commit and re-run the gate. No version bump or tag.
 
 ## Output
 
-Files and subsystems, fixes, validations, hashes and subjects, and the
-untouched baseline.
+Report committed files and subsystems, defects fixed during review, executed
+validation commands, new commit hashes and subjects, and untouched baseline
+paths.

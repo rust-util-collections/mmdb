@@ -50,8 +50,8 @@ Skip documented single-writer + intentional snapshot reads unless a multi-writer
 - **1** Durability side effect dropped after log/catch while reporting success.
 - **2** Partial success returned as full success.
 - **3** Incorrect success result (checksum not checked; unreadable table returned as empty).
-- **4** Distinct failures collapsed (retry vs fatal unclear).
-- **5** Crash mid-protocol → unrecoverable or lying on-disk state.
+- **4** Distinct failures collapsed (recoverable vs fail-stop unclear).
+- **5** Interrupted multi-step write leaves inconsistent or unrecoverable on-disk state.
 
 ## D-API
 

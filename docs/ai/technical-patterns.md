@@ -45,10 +45,10 @@ Latest-state paths must revalidate under DB lock before install (e.g. `install_c
 **Check:** Round-trip; `!` symmetric.
 
 ### 2.3 CRC scope
-**Pattern:** CRC misses type byte, or compressbound vs verify-after-decompress mismatch.
-**Where:** `wal/record|writer|reader`.
-**Impact:** Recovery accepts a record with inconsistent stored bytes.
-**Check:** `crc32(type || payload)` writer=reader.
+**Pattern:** CRC omits the record/block type byte, or writer and reader compute checksums over different slices.
+**Where:** `wal/record|writer|reader`, `sst/table_builder|table_reader`.
+**Impact:** Reader accepts damaged bytes without returning `ErrorKind::Corruption`.
+**Check:** `crc32(type || data)` matches between writer and reader.
 
 ### 2.4 Block prefix compression
 **Pattern:** Bad restart offset → wrong base key.
@@ -128,7 +128,7 @@ Latest-state paths must revalidate under DB lock before install (e.g. `install_c
 
 ## 6. Unsafe
 
-Live set: skiplist, group-commit/file lock, SST fadvise — inventory via search; see `patterns/unsafe-audit.md`.
+Live set: skiplist, group-commit/file lock, SST `posix_fadvise`, and `#[cfg(test)]` `test_alloc` — derive via search; see `patterns/unsafe-audit.md`.
 
 ### 6.1 Skiplist node lifetime
 Raw nexts live while readers hold pointers → need arena (no free while live) or epoch.

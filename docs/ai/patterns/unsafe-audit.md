@@ -1,63 +1,80 @@
-# Rust Pointer and Concurrency Review
+# Rust Soundness Invariants for Internal `unsafe` Blocks
 
-## Live concentration
+MMDB is an in-process embedded Rust LSM key-value library. Its `unsafe` blocks
+are small, self-contained internal primitives; none are exposed as `pub unsafe`
+in `src/lib.rs`.
 
-- `skiplist_impl.rs` — nodes, layout
-- `skiplist.rs` — cursor deref, `Send`
-- `db.rs` — DB Send/Sync, flock, group-commit request pointers
-- `table_reader/mod.rs` — `posix_fadvise`
+## Live inventory
 
-Inventory via search; do not document counts (drift is the signal).
-Safe parsing in `block`/`format`/`types` is ordinary review unless new unsafe appears.
+Derive the current list via search (`rg '\bunsafe\b' src`) rather than relying
+on static line counts:
 
-## Protocol (add/change/remove unsafe)
+- `src/memtable/skiplist_impl.rs` — arena-allocated node storage and atomic
+  tower links (`ConcurrentSkipList` `Send`/`Sync`)
+- `src/memtable/skiplist.rs` — level-0 cursor node reads and `Send` impl on
+  `MemTableCursorIter`
+- `src/db.rs` — `DB` `Send`/`Sync` markers, cooperative `libc::flock` calls on
+  open `LOCK` descriptors, and stack-allocated `WriteRequest` pointers inside
+  the group-commit queue
+- `src/sst/table_reader/mod.rs` — advisory `libc::posix_fadvise` hint on an open
+  SST `File` descriptor
+- `src/test_alloc.rs` (`#[cfg(test)]` only) — `GlobalAlloc` wrapper forwarding
+  to `std::alloc::System` while updating allocation-free thread-local `Cell`
+  counters
 
-### 1. SAFETY comment
-- Present and specific (prereqs named)
-- Prereqs checkable from nearby code
+Safe byte-slice parsing in `src/sst/block.rs`, `src/sst/format.rs`, and
+`src/types.rs` uses checked indexing and `from_le_bytes` rather than `unsafe`.
 
-### 2. Pointer validity checklist (undefined behavior / UB)
+## Verification checklist (when adding, changing, or reviewing `unsafe`)
 
-| | Check |
-|-|-------|
-| Null | pointer non-null |
-| Dangle | referent outlives use |
-| Align | type alignment |
-| Race | atomic or mutex |
-| Validity | type bit patterns legal |
-| Alias | no simultaneous &mut + & |
-| Uninit | no read before init |
+### 1. `// SAFETY:` documentation
 
-### 3. Skiplist
-- Alloc size = node + key + value
-- Link store Release / load Acquire
-- height ≤ MAX_HEIGHT
-- No free while readers may hold (arena today; epoch/HP if individual free)
-- `node_kv` / `node_next0` crate-private but widely call-site paths — keep contracts
-- Cursor `Send`: arena never frees nodes; Arc keeps arena
+- Every `unsafe` block and `unsafe impl` carries a specific `// SAFETY:` comment
+  naming its exact preconditions.
+- Every stated precondition holds locally from surrounding types, locks, or
+  atomic orderings.
 
-### 4. SST
-- Only fadvise unsafe: live owning File·fd. Bad offset/len = robustness, not mem unsafety (advisory).
-- Blocks are `Arc<Vec<u8>>` safe code — no cast audit unless new unsafe.
+### 2. Rust soundness invariants
 
-### 5. DB
-- `*mut WriteRequest` = stack of blocked writers under write_queue lock; no deref after `done`; no store into DB fields
-- `Send`/`Sync`: shared mut only via locks/atomics
-- `flock`: valid fd; lock file outlives DB
+| Property | Invariant to verify |
+|----------|---------------------|
+| Non-null & initialized | Pointer comes from a completed allocation and initialized fields before publication |
+| Lifetime | Backing arena, `Arc`, stack frame, or `File` descriptor outlives every read |
+| Alignment | Allocation layout matches `std::alloc::Layout` of the target type |
+| Synchronization | Cross-thread visibility goes through `Release`/`Acquire` atomics or a `parking_lot` lock |
+| Aliasing | No `&mut T` coexists with shared `&T` references to the same allocation |
 
-### 6. Transmute / cast
-- No transmute in tree today — any new one is high scrutiny
-- Same size/validity/align/lifetime if added
+### 3. Subsystem invariants
+
+- **Arena skiplist (`skiplist_impl.rs`, `skiplist.rs`)**:
+  - Single-writer inserts are serialized externally; arena chunks are never
+    moved or freed until the `ConcurrentSkipList` drops.
+  - Node fields are fully initialized before level links publish the pointer
+    with `Ordering::Release`; readers load links with `Ordering::Acquire` and
+    keep `height <= MAX_HEIGHT`.
+  - `MemTableCursorIter` retains `Arc<MemTable>`, keeping the skiplist and its
+    arena alive for the cursor's entire lifetime across thread moves (`Send`).
+- **Group commit & file lock (`db.rs`)**:
+  - Each `*mut WriteRequest` points to a writer thread's local stack frame that
+    remains parked on `write_cv` under `write_queue` until `done == true`; the
+    leader never touches the pointer after setting `done` and releasing the
+    queue lock, and no pointer is stored outside the queue.
+  - `flock` borrows a live `File` descriptor owned by `DirectoryLock`, and drops
+    release the lock before closing the handle.
+- **SST readahead (`sst/table_reader/mod.rs`)**:
+  - `posix_fadvise` passes `self.file.as_raw_fd()` while `TableReader` owns the
+    open `File`; data blocks themselves are safe `Arc<Vec<u8>>` buffers.
+- **Test counting allocator (`test_alloc.rs`, `#[cfg(test)]`)**:
+  - Forwards exact `(ptr, layout, new_size)` arguments to `System`; `try_with`
+    touches only `const`-initialized `Cell` thread-locals so teardown never
+    panics or recurses into allocation.
 
 ## Review priority
 
-| Location | Priority | Why |
-|----------|------|-----|
-| skiplist_impl | CRITICAL | concurrent raw layout |
-| skiplist | HIGH | deref + Send |
-| db | HIGH | pointer protocol, Send/Sync, lock |
-| table_reader | LOW | advisory fadvise |
-
-## Conditions requiring detailed review
-No SAFETY · transmute size mismatch · unchecked `from_raw_parts` · Relaxed pointer
-publish without another edge · `Box::from_raw` on possibly freed · public unsafe without `# Safety`.
+| File | Priority | Focus |
+|------|----------|-------|
+| `src/memtable/skiplist_impl.rs` | CRITICAL | Arena layout, single-writer precondition, `Release`/`Acquire` publication |
+| `src/memtable/skiplist.rs` | HIGH | `Arc<MemTable>` lifetime anchoring raw cursor pointers + `Send` |
+| `src/db.rs` | HIGH | Stack `WriteRequest` wait barrier, `Send`/`Sync`, `flock` lifetime |
+| `src/test_alloc.rs` | MEDIUM | Exact `Layout` forwarding and non-allocating TLS access in tests |
+| `src/sst/table_reader/mod.rs` | LOW | Open `File` lifetime around advisory `posix_fadvise` |

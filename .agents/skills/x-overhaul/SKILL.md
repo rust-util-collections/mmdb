@@ -3,57 +3,124 @@ name: x-overhaul
 description: Review scoped changes in MMDB, fix confirmed in-scope defects, and create atomic local commits. Invoke explicitly as $x-overhaul; empty scope is the latest commit and all selects the full repository.
 ---
 
-# Review, fix and commit MMDB
+# MMDB Scoped Review, Fix, and Local Commit
 
-Read [the workflow policy](../../../docs/ai/workflow-policy.md) and
-[the review guide](../../../docs/ai/review-core.md). Resolve repository paths from the Git
-root; links above are relative to this file. Read invocation arguments from
-ordinary user prompt text.
+MMDB is an in-process embedded Rust LSM key-value library operating on
+caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
+This workflow checks data-structure, MVCC, persistence, and concurrency
+invariants, fixes confirmed in-scope defects as sequential atomic local commits,
+and finalizes at most one eligible patch version bump.
 
-Accept one scope (`N`, `all`, `staged`, `worktree`, commit or `A..B`). Empty
-means the latest commit; only `all` means the full repository. Reject `--fix`,
-multiple scopes and unknown options. This explicit invocation authorizes
-atomic local fix commits. `staged`/`worktree` also authorizes committing the
-intended scoped changes after review.
+Resolve repository paths from the Git root; Markdown links below are relative
+to this file. Read invocation arguments from user prompt text. Never create a
+branch, tag, push, open a PR, publish, or rewrite history.
 
-1. Record one baseline, starting HEAD, frozen scope and ownership ledger for
-   the whole invocation. Apply the shared scope-resolution rules. For `all`,
-   inventory tracked files and record reviewed paths/invariants and coverage
-   gaps across source/tests, build/CI, tools, docs and agent instructions.
-2. Review with the repository's evidence standard and subsystem guides. Read
-   full implementations, callers, guards and tests; refute each candidate.
-   For delegated reviews, use the
-   [scoped handoff](../../../docs/ai/review-core.md#agent-handoff-and-response)
-   with the local-engine context and actual test setup. Keep the full coverage
-   ledger in the coordinating agent.
-   Historical scopes fix only still-present defects rooted in that diff;
-   callers provide evidence, not unrelated fix scope. Reconcile confirmed
-   findings with the audit without clearing unrelated entries.
-3. For `staged`/`worktree`, review, fix and commit the owned changes under the
-   [x-commit protocol](../x-commit/SKILL.md), using the frozen outer scope.
-   Preserve staged/unstaged boundaries and unrelated baseline. Otherwise leave
-   baseline changes uncommitted. Do not commit a known-defective unit.
-4. Recheck and resolve new findings and still-applicable in-scope Open entries
-   under the [x-fix protocol](../x-fix/SKILL.md). Work sequentially, one root
-   cause per commit with its regression, docs and audit removal. Keep blocked
-   or unverified findings Open; do not relabel them just to clear the list.
-   Continue independent safe units. Registry-only dispositions form a separate
-   documentation commit after fixes when needed.
-5. Re-review the aggregate diff and interactions. Run the final applicable
-   repository gates once on the stable code state; `all` runs the full audit
-   gate even if no fix was needed. Reuse unchanged-state results. Apply the
-   repository's documented version protocol once, only after required checks
-   pass with no in-scope Open findings or coverage gaps. Do not accept a public
-   API or persisted-format break or choose a major bump on the user's behalf.
-6. Report scope, coverage/gaps, dispositions, validation, compatibility, local
-   hashes/subjects, version outcome and preserved baseline. Keep validated
-   commits if later work is blocked. No changes and no owed version step means
-   no empty commit. Handle interrupted steps under the shared workflow policy;
-   report failed operations and missing checks separately from code findings.
+## Preflight
 
-This composes review/fix/commit procedures under one invocation and ledger;
-do not launch nested standalone workflows or repeat their finalization.
-Standalone read-only/no-commit rules do not suppress this invocation's fixes
-or commits. Language-specific validation and version rules stay in the linked
-repository policy. Never automatically create a branch, tag, push, open a PR,
-publish, deploy or rewrite history.
+Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
+reviewing or editing. Record the branch, starting `HEAD`, package version in
+`Cargo.toml` (at `HEAD` and in the worktree), and the staged, unstaged, and
+untracked baseline for the invocation ledger in
+[commit-protocol.md](../../../docs/ai/commit-protocol.md#invocation-ledger).
+
+## Setup
+
+Read first:
+[workflow-policy.md](../../../docs/ai/workflow-policy.md),
+[commit-protocol.md](../../../docs/ai/commit-protocol.md),
+[review-core.md](../../../docs/ai/review-core.md),
+[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
+[technical-patterns.md](../../../docs/ai/technical-patterns.md),
+[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
+Multi-subsystem or design-shaped scope → also
+[design-patterns.md](../../../docs/ai/design-patterns.md).
+
+Compose the cited sections of `x-review`, `x-commit`, and `x-fix` under this
+single invocation ledger; do not launch them as nested standalone workflows or
+apply their standalone read-only, final-gate, or no-version rules.
+
+## Input
+
+Parse one optional scope with the table in
+[workflow-policy.md](../../../docs/ai/workflow-policy.md#scope) (`empty` =
+latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
+`<rev1>..<rev2>`). Reject `--fix`, multiple scopes, and unknown tokens.
+
+## Protocol
+
+### 1. Scope and ledger
+
+1. Freeze resolved commits and owned paths before any edit.
+2. `staged`: owns pre-staged paths/hunks only. Because `cargo` checks compile
+   and test the working tree rather than the Git index, stop and report before
+   editing if any staged file also has unstaged changes that affect validation.
+3. `worktree`: owns tracked staged/unstaged changes and only user-intended
+   untracked source/test files. Leave untracked design drafts or scratch notes
+   (such as `docs/proposals/*`) untouched unless the user asked to include them.
+4. Committed scopes (`empty`, `N`, `<rev>`, `<rev1>..<rev2>`, `all`): leave all
+   baseline worktree changes uncommitted and untouched; stop and report if an
+   in-scope fix overlaps dirty baseline lines.
+5. `all`: build a complete tracked-file ledger across `src/`, `tests/`,
+   `benches/`, `examples/`, `Cargo.toml`/`Makefile`/`.github/`, public docs
+   (`README.md`, `COMPARISON.md`), `.agents/`, and `docs/ai/`. Large files
+   (`src/db.rs`, `src/compaction/leveled.rs`) may be partitioned into disjoint
+   line-range sections so each section has a single review owner in the ledger.
+
+### 2. Review (or commit owned worktree)
+
+- **`staged` / `worktree`**: follow [x-commit](../x-commit/SKILL.md) Protocol
+  §1–§3 directly on the frozen units (review full functions/callers/tests, fix
+  confirmed defects in place with focused regressions, run per-unit validation,
+  and create sequential atomic commits while preserving staged/unstaged
+  boundaries). Skip `x-commit` §4 here; run the repository gate once in Step 4.
+  Do not write fixable findings into `docs/audit.md` ahead of fixing them.
+- **Committed scopes**: execute [x-review](../x-review/SKILL.md) Protocol §1–§4
+  (`Scope`, `Evidence`, `Verify`, `Completeness`), holding `docs/audit.md`
+  updates until Step 3. Review small or single-subsystem diffs directly in the
+  current session. Delegate read-only subagents only when splitting large
+  context helps (`all` or multi-subsystem ranges), using the
+  [scoped handoff](../../../docs/ai/review-core.md#agent-handoff-and-response)
+  with concrete storage-invariant questions while keeping the coverage ledger
+  in the coordinating session.
+
+### 3. Resolve in-scope findings
+
+1. Historical diff scopes fix only defects rooted in that diff that remain
+   present at `HEAD` (callers supply evidence, not unrelated fix scope), plus
+   any pre-existing `docs/audit.md` `Open` entry directly inside the frozen
+   scope. `all` resolves all confirmed new and existing `Open` entries and
+   re-checks every `Won't Fix` entry.
+2. Follow [x-fix](../x-fix/SKILL.md) Protocol §1–§2 sequentially (`CRITICAL` →
+   `LOW`): one root cause per commit with its focused regression test, matching
+   doc updates, and removal of any pre-existing `Open` entry for that issue,
+   validated per [commit-protocol.md](../../../docs/ai/commit-protocol.md#per-unit-validate-and-commit).
+3. Do not write newly discovered fixable issues to `docs/audit.md` only to
+   remove them in the same run. Keep blocked or unaccepted breaking findings
+   `Open` without relabeling them to clear the list. Write `docs/audit.md` in
+   one separate documentation commit after code fixes only when needed for
+   unresolved `Open` blockers, `Won't Fix` / material `Rejected` dispositions,
+   or stale-entry cleanup.
+
+### 4. Aggregate check, final gate, and version
+
+1. If commits were added (`starting_HEAD..HEAD`), review the aggregate diff
+   once ([x-fix](../x-fix/SKILL.md) Protocol §3) for cross-commit interactions.
+2. Run the [Final repository gate](../../../docs/ai/commit-protocol.md#final-repository-gate)
+   once when Rust or build files changed, when the scope is `all`, or before
+   committing an eligible version bump. Reuse passing results when the tree
+   state has not changed. Report pre-existing out-of-scope failures separately
+   from regressions introduced by this run.
+3. Apply [Version](../../../docs/ai/commit-protocol.md#version-x-overhaul-only-no-tag)
+   once only when all required checks pass with no in-scope `Open` findings, no
+   unreviewed ledger gaps, and no dirty baseline in `Cargo.toml`. Never accept
+   a public API or on-disk format break or choose a major bump on the user's
+   behalf. No changes and no eligible version bump → no empty commit.
+
+## Output
+
+Report the resolved scope, ledger coverage and any remaining gaps, finding
+dispositions, executed validation commands (including any optional host tool not
+present locally), new commit hashes and subjects, version outcome, and preserved
+baseline paths. Handle failed or incomplete steps per
+[workflow-policy.md](../../../docs/ai/workflow-policy.md#4-validation-and-failure),
+keeping validated local commits intact.

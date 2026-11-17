@@ -1,154 +1,170 @@
 # MMDB Review Core
 
-Evidence standard and subsystem map. Apply `pragmatic-engineering.md`: only
-findings/process that remove a concrete failure mode.
-Use `workflow-policy.md`'s neutral task framing in every agent request and
-returned finding. Report the storage operation and expected/actual results;
-do not substitute a different scenario for the code path being reviewed.
+Evidence standard, subsystem map, and subagent handoff rules. Apply
+`pragmatic-engineering.md`: keep only findings and steps that eliminate a
+concrete storage failure mode. Specify the exact local API/file operation,
+invariant, and expected vs observed result on MMDB's embedded data structures
+and local files.
 
 ## 1. Context
 
-1. Full diff + surrounding functions.
-2. Map each changed code file via Subsystem Map; load guides, callers, tests.
-3. Design-shaped / multi-subsystem diffs → also `design-patterns.md`.
-4. Full audit → tracked-file ledger first (no static/size guesses).
+1. Read the full diff and surrounding functions, callers, error paths, and tests.
+2. Map each Rust file via the Subsystem Map and load the corresponding guides.
+3. Multi-subsystem or design-shaped diffs → also load `design-patterns.md`.
+4. Full `all` review → build a complete tracked-file ledger first across `src/`,
+   `tests/`, `benches/`, `examples/`, build/CI configs, public docs, `.agents/`,
+   and `docs/ai/` (no size guesses or silent omissions).
 
 ### Subsystem Map
 
-One primary row per Rust file. Concurrency/unsafe are overlays.
+One primary row per Rust file; concurrency and `unsafe` guides apply as overlays
+where relevant. In `all` scope, large files (`src/db.rs`,
+`src/compaction/leveled.rs`) may be partitioned into disjoint line-range
+sections in the coordinator's ledger so each section has one read-only reviewer.
 
 | Subsystem | Files | Guides |
 |-----------|-------|--------|
-| write/read | `src/db.rs`, `options.rs`, `error.rs`, `stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `unsafe-audit.md` (`db.rs`) |
-| memtable | `src/memtable/**` | `patterns/memtable.md`, `unsafe-audit.md` |
+| write/read | `src/db.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/unsafe-audit.md` (`db.rs`) |
+| memtable | `src/memtable/**` | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
 | WAL | `src/wal/**` | `patterns/wal.md` |
-| SST | `src/sst/**` | `patterns/sst.md`, `unsafe-audit.md` if `unsafe` |
+| SST | `src/sst/**` | `patterns/sst.md`, `patterns/unsafe-audit.md` (`table_reader/mod.rs`) |
 | iterator | `src/iterator/**` | `patterns/iterator.md` |
 | compaction | `src/compaction/**` | `patterns/compaction.md` |
-| manifest | `src/manifest/**` | `patterns/manifest.md`, `concurrency.md` |
-| cache | `src/cache/**` | `patterns/cache.md`, `concurrency.md` |
+| manifest | `src/manifest/**` | `patterns/manifest.md`, `patterns/concurrency.md` |
+| cache | `src/cache/**` | `patterns/cache.md`, `patterns/concurrency.md` |
 | types/API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` |
+| test allocator | `src/test_alloc.rs` (`#[cfg(test)]`) | `patterns/unsafe-audit.md` |
 
-Guides under `docs/ai/patterns/`. Tests/benches/CI/docs/`.agents` and `docs/ai` → map to
-the subsystem they cover; check alignment.
+Guides live under `docs/ai/patterns/`. Map `tests/**`, `benches/**`,
+`examples/**`, CI/Makefile, public docs, `.agents/**`, and `docs/ai/**` to the
+subsystems they exercise or document and verify contract alignment.
 
-## 2. Review priority (effort, not a finding)
+## 2. Review priority (effort allocation, not automatic severity)
 
-| Class | Examples | Default |
-|-------|----------|---------|
-| Conc/unsafe | atomics, raw ptr, lock order, threads | CRITICAL |
-| Durability | WAL, MANIFEST, SST, checksums | HIGH |
-| Control/resource | branches, open/close, cleanup | HIGH |
-| API/behavior | exports, defaults, iterator | HIGH |
-| Errors | propagate, fail-stop, retry | MEDIUM |
-| Perf | hot/warm complexity, locks, I/O | context |
-| Tests/docs/config | coverage/alignment | LOW unless wrong |
+| Class | Focus | Default |
+|-------|-------|---------|
+| Concurrency / `unsafe` | atomics, arena/queue raw pointers, lock order, worker lifecycle | CRITICAL |
+| Durability | WAL, MANIFEST, SST fsync/dir-sync order, CRC32 framing | HIGH |
+| Control / resources | open/read-only/close paths, error propagation, cache/file cleanup | HIGH |
+| API / semantics | `src/lib.rs` exports, `DbOptions` defaults, MVCC & iterator bounds | HIGH |
+| Error handling | fail-stop latch (`VersionSet::poisoned`), typed `ErrorKind` | MEDIUM |
+| Performance | quantified hot/warm-path allocations, lock contention, extra I/O | context |
+| Tests / docs / build | regression coverage, doc-code alignment, CI/gate parity | LOW unless broken |
 
 ## 3. Evidence
 
-For each change requiring detailed review:
+For every candidate defect:
 
-1. Name the invariant (mapped guide).
-2. Describe concrete conditions (input, operation order, interrupted write, invalid stored field).
-3. Trace full path (callers, cleanup, existing guards).
-4. State the observed result: incorrect value, missing persisted data, unreadable record, panic, retained resource, blocked operation, or **quantified** hot-path cost.
-5. Note smallest regression test that would fail pre-fix.
+1. Name the storage invariant (citing the mapped guide).
+2. State concrete local conditions: API call sequence, key/sequence ordering,
+   interrupted write / file truncation, or invalid stored length/checksum field.
+3. Trace the full execution path through callers, cleanup, and existing guards.
+4. State the observable result: wrong value/visibility, lost acknowledged data,
+   unhandled decode error or panic, leaked resource/pin, deadlock/stall, or
+   **quantified** hot/warm-path cost.
+5. Specify the smallest deterministic regression test (in a `tempfile` DB) that
+   fails before the fix.
 
-**Boundaries:** empty/single entry, first/last block keys, restarts, L0 limits,
-snapshots, invalid stored fields, max sizes, partial I/O errors.
+**Boundaries:** empty/single-entry blocks, first/last keys, restart intervals,
+half-open `[start, end)` ranges, L0 count triggers, MVCC snapshot stripes, max
+key/entry constants, truncated records, partial I/O errors.
 
-**Concurrency:** Build lock/atomic protocol from code. Cycles, guard lifetime,
-publication, wait predicates, shutdown. `Relaxed` OK for counter/hints; Acquire/Release only when a happens-before edge is required.
+**Concurrency:** derive the lock and atomic graph from live code (`inner` mutex,
+`write_queue`, `manifest_writer`, `pin_updates`, `snapshots`, condvars). Verify
+acyclic lock order, guard lifetimes across disk I/O, `Release`/`Acquire`
+publication edges, loop-rechecked wait predicates, and clean worker shutdown.
 
-**Crash:** Crash points on write/sync/dir-sync/MANIFEST/CURRENT/delete.
-MANIFEST append ≠ CURRENT replace (`patterns/manifest.md`).
+**Durability:** check state transitions across write, file sync, directory sync,
+MANIFEST append, `CURRENT` rename, and obsolete-file unlink (`patterns/manifest.md`).
 
-**Perf:** Hot/warm only; quantify cost and path class. Cold micro-opts are not findings.
+**Performance:** report hot/warm-path regressions only with path class and
+concrete allocation, lock, or I/O cost; skip cold-path micro-optimizations.
 
-**Design:** Locks, ownership, queues/fan-out, multi-step install, degrade, exports
-→ applicable D-\* in `design-patterns.md`; skip empty families.
+**Design:** walk applicable `D-*` checks in `design-patterns.md` for locks,
+resource lifecycles, bounded queues/memory, multi-step state transitions, error
+visibility, and public exports.
 
-**Placeholder (CRITICAL in non-test prod when it ships behavior):**
-`todo!` / `unimplemented!` / stand-in `unreachable!`; dummy returns where real
-work is required; `// TODO|FIXME|HACK` for unfinished required behavior;
-`if false` / `#[cfg(any())]` around incomplete required paths. Grep before
-calling dead code. Cleanup-only → LOW/skip.
+**Placeholders (CRITICAL in shipped paths when required behavior is missing):**
+`todo!`, `unimplemented!`, stand-in `unreachable!`, stub returns, or unfinished
+`TODO`/`FIXME` on active code paths. Search callers before labeling code dead.
 
-**API:** Only `src/lib.rs` re-exports are public. Align behavior, defaults,
-errors, docs, tests when they change.
+**Public API:** only items re-exported in `src/lib.rs` are public. Keep code,
+defaults, typed errors, doc comments, `README.md`, and tests aligned.
 
-## 4. Deterministic / style
+## 4. Deterministic checks vs review findings
 
-fmt, compile, and clippy are tools, not findings. Import order, naming, and
-formatting are not findings.
+`rustfmt`, `cargo check`, and `cargo clippy -- -D warnings` are automated gates,
+not audit registry findings. Import style, naming, and formatting are never
+registry entries.
 
-Record only what those tools will not see:
+Record static-inspection findings only for rules automated tools cannot check:
 
-- `#[allow(...)]` in production code
-- public behavior, defaults, errors, or docs that disagree
-- `// SAFETY:` missing, vague, or false
+- `#[allow(...)]` attributes added to suppress warnings instead of fixing them
+- public behavior, defaults, `ErrorKind`, or docs that disagree with the code
+- missing, vague, or inaccurate `// SAFETY:` preconditions on `unsafe` blocks
 
 ## 5. Findings registry (`docs/audit.md`)
 
-Severities: CRITICAL, HIGH, MEDIUM, LOW. No other label.
+Severities: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW` only.
 
-- **CRITICAL**: loss, corruption, UB, memory safety, unrecoverable durability
-- **HIGH**: wrong results, deadlock, realistic crash, exhaustion, material hot-path hit
-- **MEDIUM**: edge bug, error-policy gap, bounded leak
-- **LOW**: contract or docs drift with a real maintenance cost
+- **CRITICAL**: silent data loss, wrong stored/returned bytes, broken Rust
+  `unsafe` precondition, or unrecoverable on-disk state after an interrupted write
+- **HIGH**: wrong query/iterator results, deadlock, realistic recovery failure,
+  unbounded memory/FD growth, or material hot-path regression
+- **MEDIUM**: boundary-case bug, error-propagation gap, or bounded resource leak
+- **LOW**: contract, test, or documentation drift with concrete maintenance cost
 
-Which workflow may add or move each disposition: `workflow-policy.md` §5.
+Disposition permissions follow `workflow-policy.md` §5.
 
-Open:
+`Open` entry format:
 
 ```markdown
 ### [SEVERITY] subsystem: summary
 - **Where**: file:line_range
 - **What**: expected behavior and observed result
-- **Why**: conditions, invariant, and why existing checks miss
-- **Fix**: minimal correction
+- **Why**: concrete conditions, invariant, and why existing guards miss it
+- **Fix**: minimal root-cause correction
 ```
 
-Won't Fix uses Where, What, and Reason. Rejected uses Where, Claim, and Reason,
-with no severity. Observations, style, feature requests, and documented
-contracts are not entries.
+`Won't Fix` uses `Where`, `What`, and `Reason`. `Rejected` uses `Where`,
+`Claim`, and `Reason` (no severity). Omit feature requests, documented
+contracts, and style notes.
 
 ## Agent handoff and response
 
-Use this compact handoff, filling only the relevant fields:
+Prefer direct in-session review for small or single-subsystem scopes. When
+delegating read-only subsystem batches (`all` or large multi-subsystem diffs),
+pass this self-contained handoff with a concrete storage-invariant question:
 
 ```text
-Project: MMDB is an embedded Rust key-value storage engine operating on local
-database files in the caller's process; it exposes no network service.
-Task: Review local MMDB storage-engine reliability in the assigned files.
+Context: MMDB is an in-process embedded Rust LSM key-value library (vsdb storage
+backend) operating only on caller-owned local database files; there is no
+network service, daemon, IPC endpoint, or external privilege boundary.
+Task: Verify MMDB storage-engine invariants in the assigned files/line ranges.
 Repository: <absolute path>
-Baseline and scope: <HEAD, scope, existing changes to preserve>
-Assigned files: <exact, disjoint file list>
-Read first: <absolute paths to workflow-policy.md (Task framing section),
-             review-core.md, false-positive-guide.md, and applicable
-             subsystem guides>
-Mode: Read-only investigation; no repository edits or commits.
-Question: <the behavior or invariants to check>
-Test setup: <temporary database, generated data and local operations;
-             or code tracing only if no experiment is assigned>
-Evidence already available: <relevant verified facts, or none>
-Return: Files actually reviewed; registry-ready entries from section 5;
-operation/input and relevant state; expected and observed results; test command
-if executed; existing checks that ruled candidates out; work still incomplete.
+Baseline and scope: <HEAD, frozen scope, dirty baseline paths to leave untouched>
+Assigned files: <disjoint file list, or file:line_range sections for large files>
+Read first: <absolute paths to workflow-policy.md, review-core.md,
+             false-positive-guide.md, and mapped subsystem guides>
+Mode: Read-only code inspection; do not edit files or run git commit/reset.
+Invariants to check: <concrete storage invariants, e.g., MVCC sequence cutoff,
+                      prefix-block restart decoding, WAL/MANIFEST record replay,
+                      or lock acquisition order>
+Test context: <isolated tempfile::TempDir and deterministic local API/file ops,
+               or static code tracing only when test execution is not assigned>
+Verified context: <relevant facts already established, or none>
+Return: Reviewed files/line ranges; confirmed section-5 entries (if any) with
+exact operation/input, state, expected vs observed result, and existing guards
+checked; test command + output if executed; any assigned scope left unreviewed.
 ```
 
-Include the project context in every delegated review. Describe the actual test
-setup rather than assuming isolation or execution that has not been established.
-Establish expected behavior from the API contract or an independent reference
-model before treating a result as incorrect; include seek position, bounds and
-snapshot visibility where relevant.
-
-For a test result, state the setup, operation sequence, expected output, actual
-output, and command run. Distinguish executed tests from code tracing and
-proposed tests. Do not use speculative intent or a dramatic narrative to
-explain an ordinary concurrency, decoding, or recovery case.
+Establish expected behavior from MMDB's API contract or a reference model
+(including seek position, half-open `[lower, upper)` bounds, and snapshot
+visibility) before classifying behavior as a defect. Distinguish executed test
+runs from static code tracing.
 
 ## Quality gate
 
-Concrete conditions and expected/observed results only. Check each finding
-against `false-positive-guide.md`. Agent agreement and pattern IDs are not proof.
+Every kept finding must cite concrete local conditions, verified code paths, and
+expected vs observed results, and must survive `false-positive-guide.md`.
+Subagent consensus or pattern labels alone are never proof.

@@ -5,17 +5,20 @@ description: Resolve Open findings in docs/audit.md sequentially, one validated 
 
 # Resolve MMDB Reliability Findings
 
+MMDB is an in-process embedded Rust LSM key-value library operating on
+caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
+
 Resolve repository paths from the Git root; Markdown links are relative to
 this file. Read invocation arguments from the user prompt.
 
-Clear actionable `docs/audit.md` Open, then self-review and commit. Never push,
-bump, or tag. New commits only.
+Clear actionable `docs/audit.md` `Open` entries sequentially, self-review, and
+create atomic local commits. Never push, bump, or tag. New commits only.
 
 ## Preflight
 
 Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-review or edits. Record the staged, unstaged and untracked baseline, branch and
-starting HEAD for `workflow-policy.md` §1 and the invocation ledger.
+review or edits. Record the staged, unstaged, and untracked baseline, branch,
+and starting `HEAD` for `workflow-policy.md` §1 and the invocation ledger.
 
 ## Setup
 
@@ -27,50 +30,53 @@ Read first:
 [technical-patterns.md](../../../docs/ai/technical-patterns.md),
 [false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 
-Preflight and freeze paths before editing. Empty Open → "nothing to fix".
+Preflight and freeze owned paths before editing. Empty `Open` → report
+"nothing to fix" and stop.
 
 ## Protocol
 
 ### 1. Triage (CRITICAL → LOW)
 
-Before editing, read the code, callers, tests, and guides
-([design-patterns.md](../../../docs/ai/design-patterns.md) if the shape is a design
-issue). Reproduce from current code. Dedupe root causes.
+Before editing, read the full implementation, callers, tests, and mapped guides
+([design-patterns.md](../../../docs/ai/design-patterns.md) when design-shaped).
+Verify each finding against current code and dedupe shared root causes:
 
-- Ruled out → Rejected.
-- Confirmed, but a complete fix has disproportionate cost or regression risk →
-  Won't Fix + reason.
-- Feature request or documented contract → delete the entry. Do not keep it as
-  Won't Fix.
-- Do not reclassify an entry just to empty Open.
+- Ruled out by code or tests → `Rejected`.
+- Confirmed defect whose complete fix has disproportionate cost or regression
+  risk → `Won't Fix` + concrete reason.
+- Feature request or documented contract → delete the entry (never `Won't Fix`).
+- Do not reclassify a valid defect just to empty `Open`.
 
 ### 2. One finding → one commit
 
-1. Root-cause fix and a focused regression.
-2. Trace the error, crash, concurrency, and cleanup paths.
-3. Drop that Open entry in the same commit.
-4. Per-unit validation in `commit-protocol.md`.
-5. Stage the freeze set plus this fix. Inspect the cached diff. Commit before
-   the next finding.
+1. Implement the root-cause fix and a focused regression test in a temporary DB.
+2. Trace error propagation, interrupted-write recovery, concurrency, and
+   resource cleanup paths.
+3. Remove that finding's `Open` entry in the same commit.
+4. Run per-unit validation in `commit-protocol.md`.
+5. Stage only the unit's owned fix/test/doc/audit paths, inspect
+   `git diff --cached`, and commit before starting the next finding.
 
-A registry-only disposition is one unit. Batch several of those into one commit
-at the end. The same root cause may batch symptoms. Edits and commits are
-sequential. Reads and tests may be parallel.
+Batch registry-only dispositions (`Rejected`, `Won't Fix`, non-defect removals)
+into one separate documentation commit after code fixes. Multiple symptoms of
+the same root cause share one commit. Edits and commits are sequential;
+read-only checks may run in parallel.
 
 ### 3. Self-review
 
-Review `starting_HEAD..HEAD` and the remaining owned worktree with the evidence
-and verify rules in [x-review](../x-review/SKILL.md) §2–§3. Do not reopen
-unrelated Open. A new confirmed defect in this range goes back through the same
-loop. Stop on no progress or on overlap with the baseline.
+Review `starting_HEAD..HEAD` and any remaining owned worktree changes with the
+evidence and verification rules in [x-review](../x-review/SKILL.md) §2–§3. Do
+not reopen unrelated entries. Route any newly introduced defect in this range
+through Step 2 as a new commit. Stop on no progress or baseline overlap.
 
 ### 4. Gate
 
-The cargo gate in `commit-protocol.md` once after the last behavior commit.
-Docs-only → skip. A remaining Open entry is a valid result; report the blocker.
-No version bump or tag.
+Run the Final repository gate in `commit-protocol.md` once after the last
+behavior commit (skip for docs-only commits). Remaining blocked `Open` entries
+are valid outcomes — report the blocker clearly. No version bump or tag.
 
 ## Output
 
-Dispositions, fixes, Rejected and Won't Fix, validations, hashes and subjects,
-and the baseline left alone.
+Report dispositions, root-cause fixes, `Rejected` and `Won't Fix` updates,
+executed validation commands, new commit hashes and subjects, and untouched
+baseline paths.

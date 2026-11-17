@@ -4472,7 +4472,7 @@ impl DB {
 #[cfg(any(test, feature = "test-utils"))]
 impl DB {
     /// Simulate a crash: shut down background threads without flushing memtable.
-    /// Useful for testing WAL recovery without zombie compaction threads.
+    /// Useful for testing WAL recovery without lingering background compaction threads.
     pub fn simulate_crash(self) {
         self.closed.store(true, Ordering::Release);
         self.shutdown_background_and_release_resources();

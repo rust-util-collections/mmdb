@@ -40,7 +40,8 @@ normal and forced.
 
 **Deleted key reappears (tech 4.1):** tombstone removed above bottommost while an older value remains deeper.
 **Stall:** compact holds `db_mutex` waiting on work that needs it — release before I/O.
-**Rate limiter:** burst + no indefinite block.
+**Rate limiter:** `rate_bytes_per_sec == 0` returns without locking; enabled limiter handles burst + concurrent debt without unbounded stall.
+**Reservation bound:** output file-number reservation caps `max_subcompactions` by feasible target-level split boundaries (1 for L0).
 **Bottommost range:** union of **all** input extents (`add_file_extents`), not per-file only.
 
 ## Checklist
