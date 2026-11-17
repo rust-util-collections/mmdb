@@ -522,9 +522,10 @@ fn bench_value_sizes(c: &mut Criterion) {
 
     let count = 1_000u64;
 
+    let key_len = make_key(0).len();
     for &vsize in &[16usize, 100, 1024, 65536] {
         let value = make_value(vsize);
-        let bytes_per_op = (24 + vsize) as u64;
+        let bytes_per_op = (key_len + vsize) as u64;
         group.throughput(Throughput::Bytes(count * bytes_per_op));
         group.bench_with_input(
             BenchmarkId::new("write", format!("{}B", vsize)),
