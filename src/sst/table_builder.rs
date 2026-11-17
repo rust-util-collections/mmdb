@@ -356,7 +356,9 @@ impl TableBuilder {
             #[cfg(not(test))]
             let hash = bloom_hash(user_key_for_bloom);
             self.filter_key_hashes.push(hash);
-            self.bloom_user_key = Some(user_key_for_bloom.to_vec());
+            let bloom_key = self.bloom_user_key.get_or_insert_with(Vec::new);
+            bloom_key.clear();
+            bloom_key.extend_from_slice(user_key_for_bloom);
         }
 
         // Collect prefix for prefix bloom filter only when Bloom is enabled.
@@ -706,32 +708,39 @@ mod tests {
 
     #[test]
     fn builder_reuses_key_storage() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keys.sst");
-        let mut builder = TableBuilder::new(
-            &path,
-            TableBuildOptions {
-                block_size: 4 * 1024 * 1024,
-                bloom_bits_per_key: 0,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let mut key = vec![b'a'; 1024];
-        let (_, allocated) = crate::test_alloc::count_allocated(|| {
-            for i in 0..1000u64 {
-                key[1016..].copy_from_slice(&i.to_be_bytes());
-                builder.add(&key, b"v").unwrap();
-            }
-        });
-        eprintln!("1000 1KiB builder keys allocated {allocated} bytes");
-        assert!(allocated < 512 * 1024, "allocated {allocated} bytes");
-        let result = builder.finish().unwrap();
-        assert_eq!(result.largest_key.as_deref(), Some(key.as_slice()));
-        assert_eq!(
-            TableReader::open(&path).unwrap().get(&key).unwrap(),
-            Some(b"v".to_vec())
-        );
+        for bloom_bits_per_key in [0, 10] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("keys.sst");
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    block_size: 4 * 1024 * 1024,
+                    bloom_bits_per_key,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut key = vec![b'a'; 1024];
+            let (_, allocated) = crate::test_alloc::count_allocated(|| {
+                for i in 0..1000u64 {
+                    key[1016..].copy_from_slice(&i.to_be_bytes());
+                    builder.add(&key, b"v").unwrap();
+                }
+            });
+            eprintln!(
+                "1000 1KiB builder keys (bloom_bits_per_key={bloom_bits_per_key}) allocated {allocated} bytes"
+            );
+            assert!(
+                allocated < 512 * 1024,
+                "bloom_bits_per_key={bloom_bits_per_key} allocated {allocated} bytes"
+            );
+            let result = builder.finish().unwrap();
+            assert_eq!(result.largest_key.as_deref(), Some(key.as_slice()));
+            assert_eq!(
+                TableReader::open(&path).unwrap().get(&key).unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
     }
 
     #[test]
