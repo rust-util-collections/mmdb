@@ -434,17 +434,16 @@ mod tests {
         assert_eq!(decoded.new_files.len(), 50);
         assert_eq!(decoded.deleted_files.len(), 20);
 
-        // Spot-check a few entries
-        for i in 0..50 {
-            let (level, ref meta) = decoded.new_files[i];
-            assert_eq!(level, (i % 7) as u32);
+        // Spot-check all entries
+        for (i, (level, meta)) in decoded.new_files.iter().enumerate() {
+            assert_eq!(*level, (i % 7) as u32);
             assert_eq!(meta.number, i as u64 + 100);
             assert_eq!(meta.file_size, (i as u64 + 1) * 4096);
             assert_eq!(meta.smallest_key, format!("s_{:04}", i).into_bytes());
             assert_eq!(meta.largest_key, format!("l_{:04}", i).into_bytes());
         }
-        for i in 0..20 {
-            assert_eq!(decoded.deleted_files[i], ((i % 7) as u32, i as u64));
+        for (i, entry) in decoded.deleted_files.iter().enumerate() {
+            assert_eq!(*entry, ((i % 7) as u32, i as u64));
         }
 
         // Encode-decode again to verify stability

@@ -390,8 +390,8 @@ impl VersionSet {
         Arc::make_mut(&mut version.files[0])
             .sort_by_key(|file| std::cmp::Reverse(file.meta.number));
         // Sort L1+ by smallest key
-        for level in 1..num_levels {
-            Arc::make_mut(&mut version.files[level])
+        for files in version.files.iter_mut().take(num_levels).skip(1) {
+            Arc::make_mut(files)
                 .sort_by(|a, b| compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key));
         }
         // The replayed record stream passed per-record checksums, but the
