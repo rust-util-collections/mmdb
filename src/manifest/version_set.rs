@@ -161,6 +161,7 @@ impl VersionSet {
         num_levels: usize,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
+        let current = Arc::new(Version::new(num_levels));
         let manifest_number = 1;
         let manifest_path = db_path.join(format!("MANIFEST-{:06}", manifest_number));
         let manifest_writer = WalWriter::new(&manifest_path).ctx()?;
@@ -171,7 +172,7 @@ impl VersionSet {
         let mut vs = Self {
             db_path: db_path.to_path_buf(),
             num_levels,
-            current: Arc::new(Version::new(num_levels)),
+            current,
             next_file_number: 2, // 1 is used by MANIFEST
             log_number: 0,
             last_sequence: 0,

@@ -33,10 +33,10 @@ None.
 - **What**: Output splitting waits for a user-key boundary. Four versions of one 8 MiB key under the default 4 KiB block size can exceed the index budget while remaining below the default memtable threshold. Multiple large range tombstones sharing one begin key can similarly exceed their metadata block budget. Writes can be acknowledged before flush and writable recovery reject the oversized metadata.
 - **Reason**: WAL data remains intact, and read-only recovery can inspect it. Larger `block_size` can recover the point-version case; ordinary small vsdb keys do not approach it. A general fix requires per-key admission accounting across writes/recovery or a format and lookup change permitting same-key metadata to span files. Those changes are disproportionate for this unusual key/endpoint workload; single-range admission now reserves framing and split headroom, but repeated begin keys can still exceed the aggregate budget.
 
-### [LOW] options: `num_levels` accepts arbitrarily large values
+### [LOW] options: `num_levels` accepts large finite values up to the MANIFEST `u32` ceiling
 - **Where**: `src/options.rs`, `src/db.rs` (open-time validation)
-- **What**: Only `num_levels >= 2` is validated; a huge value allocates per-level `Vec` headers in every `Version` and one merge source per level in every iterator.
-- **Reason**: The cost is linear and entirely self-inflicted configuration; an extreme value such as `usize::MAX` aborts inside `DB::open` while allocating per-level vectors rather than reaching a stored state. Introducing an upper bound now could refuse to open stores created with larger values. Revisit if per-level state stops being O(1).
+- **What**: Open validates `num_levels >= 2` and `u32::try_from(num_levels - 1).is_ok()`, but any large finite value below that ceiling allocates `num_levels` `Arc<Vec<TableFile>>` entries in `Version::new` and `num_levels` `IterSource` capacity slots in each `DB` iterator.
+- **Reason**: Values outside `2..=u32::MAX + 1` (such as `usize::MAX`) are rejected with `ErrorKind::InvalidArgument` before creating any database files. Within the representable `u32` range, the cost is linear and self-inflicted configuration; imposing a tighter cap now could refuse to open stores created with larger custom values. Revisit if per-level state stops being O(1).
 
 ### [LOW] lazy_delete: in-flight compaction wait test uses a fixed sleep
 - **Where**: `tests/lazy_delete.rs` (`compact_waits_for_inflight_compaction_and_removes_dead_keys`, the 200 ms delay before opening the filter gate)
@@ -53,7 +53,7 @@ None.
 - **Reason**: `lazy` preserves the input iterator's remaining forward entries. After this positioning, the current key is `d` and direct forward collection returns `d,e`. Consuming both from the back exhausts that range; `c,b,a` are outside it. For an unpositioned iterator, consuming `e,d` from the back leaves `a,b,c` in forward order. Public integration tests `test_bidi_reverse_primed_preserves_remaining_entries` and `test_bidi_backward_then_forward_reads_remaining_in_order` cover both cases; the reverse-primed case checks every two-read direction combination against the directly collected sequence in memtable and flushed/compacted storage.
 
 ### SST: an index separator that is a range-deletion key makes point lookups miss a visible entry
-- **Where**: `src/sst/table_builder.rs:281-297` (`last_key` set for `RangeDeletion` entries), `src/sst/table_reader/mod.rs` (`get_internal_with_seq`)
+- **Where**: `src/sst/table_builder.rs:284-302` (`last_key` set for `RangeDeletion` entries), `src/sst/table_reader/mod.rs` (`get_internal_with_seq`)
 - **Claim**: A block separator taken from a buffered range-deletion key can exceed every data key in its block, so an index seek skips a block that holds the target.
 - **Reason**: A miss needs seek key S ≤ separator R < entry X with S and X sharing a user key, which forces R to share that user key with X.seq < R.seq ≤ S.seq, so X is always covered by R. `DB::get` folds the file's covering tombstone sequence in before any point lookup, and iterator `seek` continues into the next block.
 

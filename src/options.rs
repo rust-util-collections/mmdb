@@ -36,7 +36,8 @@ pub struct DbOptions {
     pub max_bytes_for_level_base: u64,
     /// Multiplier between levels.
     pub max_bytes_for_level_multiplier: f64,
-    /// Maximum number of levels (including L0).
+    /// Maximum number of levels (including L0). Must be >= 2 and fit in
+    /// MANIFEST `u32` level indices.
     pub num_levels: usize,
     /// Block size for SST data blocks.
     pub block_size: usize,

@@ -665,11 +665,20 @@ impl DB {
         let mut options = options;
         let path = path.as_ref().to_path_buf();
 
-        // A leveled LSM needs at least L0 plus one lower level; `num_levels < 2`
-        // would panic during L0 counting / L0→L1 compaction.
-        if options.num_levels < 2 {
+        // A leveled LSM needs at least L0 plus one lower level (`num_levels >= 2`),
+        // and VersionEdit encodes level numbers as `u32` (`0..num_levels`).
+        // Rejecting out-of-range values here returns `InvalidArgument` before
+        // creating directories, LOCK, MANIFEST, or CURRENT.
+        let alloc_bytes_ok = options
+            .num_levels
+            .checked_mul(mem::size_of::<Arc<Vec<crate::manifest::version::TableFile>>>())
+            .is_some_and(|bytes| bytes <= isize::MAX as usize);
+        if options.num_levels < 2
+            || u32::try_from(options.num_levels - 1).is_err()
+            || !alloc_bytes_ok
+        {
             return Err(Error::invalid_argument(format!(
-                "num_levels must be >= 2, got {}",
+                "num_levels must be >= 2 and fit in u32 level indices, got {}",
                 options.num_levels
             )));
         }

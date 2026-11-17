@@ -2387,18 +2387,43 @@ fn test_empty_range_deletion_does_not_grow_wal() {
 
 #[test]
 fn test_num_levels_validation() {
-    let dir = tempfile::tempdir().unwrap();
-    for bad in [0usize, 1] {
-        let res = DB::open(
+    let mut bad_values = vec![0usize, 1, usize::MAX];
+    #[cfg(target_pointer_width = "64")]
+    bad_values.push(u32::MAX as usize + 2);
+
+    for bad in bad_values {
+        let empty = tempfile::tempdir().unwrap();
+        let err = match DB::open(
             DbOptions {
                 create_if_missing: true,
                 num_levels: bad,
                 ..Default::default()
             },
-            dir.path(),
+            empty.path(),
+        ) {
+            Ok(_) => panic!("num_levels={bad} should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidArgument, "num_levels={bad}");
+        assert!(
+            std::fs::read_dir(empty.path()).unwrap().next().is_none(),
+            "rejected num_levels={bad} must not create LOCK, CURRENT, or MANIFEST"
         );
-        assert!(res.is_err(), "num_levels={} should be rejected", bad);
     }
+
+    let existing = tempfile::tempdir().unwrap();
+    make_db(existing.path()).close().unwrap();
+    let ro_err = match DB::open_read_only_with_options(
+        DbOptions {
+            num_levels: usize::MAX,
+            ..Default::default()
+        },
+        existing.path(),
+    ) {
+        Ok(_) => panic!("read-only open must reject num_levels=usize::MAX"),
+        Err(err) => err,
+    };
+    assert_eq!(ro_err.kind(), ErrorKind::InvalidArgument);
 }
 
 #[test]
