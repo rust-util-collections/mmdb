@@ -70,6 +70,10 @@ pub struct DBIterator {
     /// unknown type). Surfaced via [`Self::error`] so callers do not treat it
     /// as normal exhaustion.
     key_decode_error: Option<String>,
+    /// Set when `next_prefix` jumps past a prefix that has no lexicographic
+    /// successor (all `0xFF`, or `prefix_len == 0`). Keeps later `advance()`
+    /// and `next_prefix()` calls exhausted until an explicit seek repositions.
+    prefix_exhausted: bool,
 }
 
 fn ikey_compare(a: &[u8], b: &[u8]) -> Ordering {
@@ -103,6 +107,7 @@ impl DBIterator {
             last_seek_key: None,
             clean_read: true,
             key_decode_error: None,
+            prefix_exhausted: false,
         }
     }
 
@@ -128,6 +133,7 @@ impl DBIterator {
             last_seek_key: None,
             clean_read: true,
             key_decode_error: None,
+            prefix_exhausted: false,
         }
     }
 
@@ -158,6 +164,7 @@ impl DBIterator {
             last_seek_key: None,
             clean_read: true,
             key_decode_error: None,
+            prefix_exhausted: false,
         }
     }
 
@@ -249,6 +256,7 @@ impl DBIterator {
         self.current = None;
         self.needs_advance = true;
         self.prev_overshoot = None;
+        self.prefix_exhausted = false;
     }
 
     /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
@@ -259,6 +267,7 @@ impl DBIterator {
         self.current = None;
         self.needs_advance = true;
         self.prev_overshoot = None;
+        self.prefix_exhausted = false;
     }
 
     /// Return the first error from any underlying source iterator, or a
@@ -284,41 +293,47 @@ impl DBIterator {
     /// under the current prefix in O(log N) instead of O(keys_in_prefix).
     /// `prefix_len` is the number of bytes that define a prefix.
     pub fn next_prefix(&mut self, prefix_len: usize) {
-        // Compute the successor prefix: increment the first `prefix_len` bytes.
-        if let Some((ref key, _)) = self.current {
-            // `current` already holds a user key (internal key was truncated
-            // in next_visible), so do NOT call user_key() again.
-            let user_key = key.as_slice();
-            if user_key.len() >= prefix_len {
-                let mut succ = user_key[..prefix_len].to_vec();
-                // Increment: find rightmost byte < 0xFF and increment it
-                let mut i = succ.len();
-                while i > 0 {
-                    i -= 1;
-                    if succ[i] < 0xFF {
-                        succ[i] += 1;
-                        succ.truncate(i + 1);
-                        // Use seek_opt with try_next=true since succ > current
-                        use crate::types::InternalKey;
-                        let seek_key =
-                            InternalKey::new(&succ, MAX_SEQUENCE_NUMBER, ValueType::Value);
-                        self.merger.seek_opt(seek_key.as_bytes(), true);
-                        self.has_last_key = false;
-                        self.needs_advance = true;
-                        self.current = None;
-                        self.prev_overshoot = None;
-                        self.backward_positioned = false;
-                        return;
-                    }
-                }
-                // All bytes were 0xFF — no next prefix possible, exhaust iterator
+        if !self.ensure_current() {
+            return;
+        }
+        let Some((ref key, _)) = self.current else {
+            return;
+        };
+        // `current` already holds a user key (internal key was truncated
+        // in next_visible), so do NOT call user_key() again.
+        if key.len() < prefix_len {
+            self.advance();
+            return;
+        }
+        let mut succ = key[..prefix_len].to_vec();
+        // Increment: find rightmost byte < 0xFF and increment it.
+        let mut i = succ.len();
+        while i > 0 {
+            i -= 1;
+            if succ[i] < 0xFF {
+                succ[i] += 1;
+                succ.truncate(i + 1);
+                let target = self.effective_forward_target(&succ);
+                // Use seek_opt with try_next=true since target > current.
+                use crate::types::InternalKey;
+                let seek_key = InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::Value);
+                self.merger.seek_opt(seek_key.as_bytes(), true);
+                self.last_seek_key = Some(target);
+                self.has_last_key = false;
+                self.needs_advance = true;
                 self.current = None;
-                self.needs_advance = false;
+                self.prev_overshoot = None;
+                self.backward_positioned = false;
                 return;
             }
         }
-        // No current entry — advance normally
-        self.needs_advance = true;
+        // All `prefix_len` bytes were 0xFF (or `prefix_len == 0`) — no next
+        // prefix exists, so exhaust forward iteration until an explicit seek.
+        self.prefix_exhausted = true;
+        self.current = None;
+        self.needs_advance = false;
+        self.prev_overshoot = None;
+        self.backward_positioned = false;
     }
 
     /// Advance the streaming iterator to the next visible (user_key, value) pair.
@@ -555,6 +570,9 @@ impl DBIterator {
 
     /// Ensure current is populated. Returns whether there's a valid entry.
     fn ensure_current(&mut self) -> bool {
+        if self.prefix_exhausted {
+            return false;
+        }
         if self.needs_advance {
             self.current = if self.clean_read {
                 self.next_visible_clean()
@@ -581,6 +599,9 @@ impl DBIterator {
     }
 
     pub fn advance(&mut self) {
+        if self.prefix_exhausted {
+            return;
+        }
         self.needs_advance = true;
         self.current = None;
     }
@@ -588,6 +609,7 @@ impl DBIterator {
     /// Seek to the first key >= target.
     pub fn seek(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
+        self.prefix_exhausted = false;
         let target = self.effective_forward_target(target);
         // Seek the merger to a synthetic internal key with max sequence
         let seek_key = InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::Value);
@@ -607,6 +629,7 @@ impl DBIterator {
     }
 
     pub fn seek_to_first(&mut self) {
+        self.prefix_exhausted = false;
         if self.prefix.is_some() || self.iterate_lower_bound.is_some() {
             self.seek(b"");
             return;
@@ -642,6 +665,7 @@ impl DBIterator {
     /// Uses a single backward seek + inline resolution. No redundant forward seek.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
+        self.prefix_exhausted = false;
 
         let upper_clamps_target = self
             .iterate_upper_bound
@@ -900,6 +924,7 @@ impl DBIterator {
     /// then resolves visibility inline (no forward re-seek).
     pub fn seek_to_last(&mut self) {
         use crate::types::InternalKey;
+        self.prefix_exhausted = false;
 
         // Determine the effective upper bound for backward seek.
         let mut resolve_bound = self.iterate_upper_bound.clone();
@@ -1876,5 +1901,60 @@ mod tests {
         assert!(iter.next().is_none());
         let err = iter.error().expect("type error");
         assert!(err.contains("invalid value_type"), "got {err}");
+    }
+
+    #[test]
+    fn test_next_prefix_handles_lazy_cursor_and_max_prefix_exhaustion() {
+        let source = sort_lex(vec![
+            make_entry(b"ab", 1, ValueType::Value, b"short"),
+            make_entry(b"aaa_1", 2, ValueType::Value, b"a1"),
+            make_entry(b"aaa_2", 3, ValueType::Value, b"a2"),
+            make_entry(b"bbb_1", 4, ValueType::Value, b"b1"),
+            make_entry(b"bbb_2", 5, ValueType::Value, b"b2"),
+            make_entry(b"ccc_1", 6, ValueType::Value, b"c1"),
+            make_entry(b"\xff\xff_1", 7, ValueType::Value, b"f1"),
+            make_entry(b"\xff\xff_2", 8, ValueType::Value, b"f2"),
+        ]);
+
+        // Fresh unmaterialized iterator: jumps past aaa_* -> ab, then short key
+        // (< prefix_len) advances one step -> bbb_1, and lazy cursor after
+        // seek/advance still jumps past the whole prefix.
+        let mut iter = DBIterator::new(vec![source], 100);
+        iter.next_prefix(4);
+        assert_eq!(iter.key(), Some(b"ab".as_slice()));
+        iter.next_prefix(4);
+        assert_eq!(iter.key(), Some(b"bbb_1".as_slice()));
+
+        // Lazy cursor immediately after seek(): must skip aaa_1/aaa_2 -> ab.
+        iter.seek(b"aaa_1");
+        iter.next_prefix(4);
+        assert_eq!(iter.key(), Some(b"ab".as_slice()));
+
+        // Lazy cursor immediately after advance(): must skip bbb_1/bbb_2 -> ccc_1.
+        iter.advance();
+        iter.next_prefix(4);
+        assert_eq!(iter.key(), Some(b"ccc_1".as_slice()));
+
+        // prefix_len == 0 has no successor prefix and exhausts forward iteration.
+        iter.next_prefix(0);
+        assert!(!iter.valid());
+        iter.advance();
+        assert!(!iter.valid());
+
+        // Jumping past an all-0xFF prefix must exhaust and stay exhausted
+        // across repeated next_prefix() and advance() calls until re-seeked.
+        iter.seek(b"\xff\xff_1");
+        assert_eq!(iter.key(), Some(b"\xff\xff_1".as_slice()));
+        iter.next_prefix(2);
+        assert!(!iter.valid());
+        iter.next_prefix(2);
+        assert!(!iter.valid());
+        iter.advance();
+        assert!(!iter.valid());
+        assert!(iter.next().is_none());
+
+        // Explicit seek clears prefix exhaustion.
+        iter.seek_to_first();
+        assert_eq!(iter.key(), Some(b"aaa_1".as_slice()));
     }
 }
