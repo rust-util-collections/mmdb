@@ -634,11 +634,7 @@ impl DBIterator {
     }
 
     pub fn advance(&mut self) {
-        if self.has_failed() || self.prefix_exhausted {
-            return;
-        }
-        self.needs_advance = true;
-        self.current = None;
+        self.next_lazy();
     }
 
     /// Seek to the first key >= target.
@@ -1695,6 +1691,19 @@ mod tests {
 
         iter.advance();
         assert!(!iter.valid());
+
+        for reverse_seek in [false, true] {
+            if reverse_seek {
+                iter.seek_for_prev(b"a");
+            } else {
+                iter.seek(b"a");
+            }
+            iter.advance();
+            iter.advance();
+            assert_eq!(iter.key(), Some(b"c".as_slice()));
+            iter.advance();
+            assert!(!iter.valid());
+        }
     }
 
     #[test]
