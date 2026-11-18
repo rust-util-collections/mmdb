@@ -821,9 +821,24 @@ impl DB {
                 Some(table_cache.clone()),
             )
             .ctx()?
-        } else {
-            VersionSet::open_with_cache(&path, options.num_levels, Some(table_cache.clone()))
+        } else if path.join("CURRENT").try_exists().ctx()? {
+            // A competing creator may have finished between preflight and LOCK.
+            if options.error_if_exists {
+                return Err(Error::invalid_argument(format!(
+                    "DB already exists: {}",
+                    path.display()
+                )));
+            }
+            VersionSet::recover_with_cache(&path, options.num_levels, Some(table_cache.clone()))
                 .ctx()?
+        } else if options.create_if_missing {
+            VersionSet::create_with_cache(&path, options.num_levels, Some(table_cache.clone()))
+                .ctx()?
+        } else {
+            return Err(Error::invalid_argument(format!(
+                "DB does not exist: {}",
+                path.display()
+            )));
         };
         let mut max_sequence = versions.last_sequence();
 
@@ -5060,6 +5075,33 @@ mod tests {
             files_at(2).as_deref(),
             Some("0"),
             "drain_l0 must not compact below L1"
+        );
+    }
+
+    #[test]
+    fn create_only_open_checks_current_under_directory_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.put(b"key", b"value").unwrap();
+        db.close().unwrap();
+        let current = dir.path().join("CURRENT");
+        let saved = dir.path().join("saved");
+        fs::rename(&current, &saved).unwrap();
+        // Model another opener finishing creation after our preflight.
+        AFTER_DIRECTORY_LOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| fs::rename(saved, current).unwrap()));
+        });
+        let result = DB::open(
+            DbOptions {
+                error_if_exists: true,
+                ..Default::default()
+            },
+            dir.path(),
+        );
+        assert_eq!(result.err().unwrap().kind(), ErrorKind::InvalidArgument);
+        assert_eq!(
+            DB::open_read_only(dir.path()).unwrap().get(b"key").unwrap(),
+            Some(b"value".to_vec())
         );
     }
 

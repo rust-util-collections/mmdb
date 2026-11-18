@@ -424,22 +424,6 @@ impl VersionSet {
         })
     }
 
-    /// Open or create a VersionSet with an optional table cache.
-    pub fn open_with_cache(
-        db_path: &Path,
-        num_levels: usize,
-        table_cache: Option<Arc<TableCache>>,
-    ) -> Result<Self> {
-        // `try_exists`, not `exists`: any stat failure other than NotFound
-        // must fail the open, never reinitialize an existing store.
-        let current_path = db_path.join("CURRENT");
-        if current_path.try_exists().ctx()? {
-            Self::recover_with_cache(db_path, num_levels, table_cache)
-        } else {
-            Self::create_with_cache(db_path, num_levels, table_cache)
-        }
-    }
-
     /// Apply a VersionEdit: write to MANIFEST and install a new Version.
     ///
     /// Error contract: `Err` means the edit was **not** applied — neither in
