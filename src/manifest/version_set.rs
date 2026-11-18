@@ -13,6 +13,7 @@ use std::{
 
 use crate::cache::table_cache::TableCache;
 use crate::error::{Error, Result, ResultExt};
+use crate::manifest::file_numbers::FileNumbers;
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::sst::table_reader::TableReader;
@@ -70,7 +71,7 @@ pub struct VersionSet {
     current: Arc<Version>,
 
     /// Next file number to allocate.
-    next_file_number: u64,
+    pub(crate) file_numbers: Arc<FileNumbers>,
     /// Current WAL log number.
     log_number: u64,
     /// Last sequence number used.
@@ -173,7 +174,7 @@ impl VersionSet {
             db_path: db_path.to_path_buf(),
             num_levels,
             current,
-            next_file_number: 2, // 1 is used by MANIFEST
+            file_numbers: Arc::new(FileNumbers::new(2)), // 1 is used by MANIFEST
             log_number: 0,
             last_sequence: 0,
             manifest_number,
@@ -185,7 +186,7 @@ impl VersionSet {
 
         // Write initial snapshot edit
         let mut edit = VersionEdit::new();
-        edit.set_next_file_number(vs.next_file_number);
+        edit.set_next_file_number(vs.next_file_number());
         edit.set_last_sequence(vs.last_sequence);
         vs.log_and_apply(edit).ctx()?;
         vs.sync_manifest().ctx()?;
@@ -412,7 +413,7 @@ impl VersionSet {
             db_path: db_path.to_path_buf(),
             num_levels,
             current: Arc::new(version),
-            next_file_number,
+            file_numbers: Arc::new(FileNumbers::new(next_file_number)),
             log_number,
             last_sequence,
             manifest_number,
@@ -619,7 +620,7 @@ impl VersionSet {
         // the allocator backwards — a regression would re-issue numbers of
         // files that may still exist on disk or be referenced by the version.
         if let Some(n) = edit.next_file_number {
-            self.next_file_number = self.next_file_number.max(n);
+            self.file_numbers.advance_to(n);
         }
         if let Some(n) = edit.log_number {
             self.log_number = n;
@@ -660,37 +661,13 @@ impl VersionSet {
         Arc::clone(&self.manifest_writer)
     }
 
-    /// Allocate a new file number.
-    pub fn new_file_number(&mut self) -> u64 {
-        let n = self.next_file_number;
-        self.next_file_number += 1;
-        n
-    }
-
-    /// Reserve `count` consecutive file numbers. Returns the first number.
-    /// Used to pre-allocate file numbers before releasing the lock for I/O.
-    pub fn reserve_file_numbers(&mut self, count: u64) -> u64 {
-        let start = self.next_file_number;
-        self.next_file_number += count;
-        start
-    }
-
     /// Get the current version.
     pub fn current(&self) -> Arc<Version> {
         self.current.clone()
     }
 
     pub fn next_file_number(&self) -> u64 {
-        self.next_file_number
-    }
-
-    /// Ensure `next_file_number` is at least `min_next`.
-    /// Used after sub-compaction to guarantee no collision with numbers
-    /// consumed by the atomic counter during parallel I/O.
-    pub fn ensure_file_number_at_least(&mut self, min_next: u64) {
-        if min_next > self.next_file_number {
-            self.next_file_number = min_next;
-        }
+        self.file_numbers.next()
     }
 
     pub fn log_number(&self) -> u64 {
@@ -747,13 +724,15 @@ impl VersionSet {
 
         // Allocate new manifest number BEFORE taking the snapshot,
         // so the snapshot's next_file_number accounts for the manifest file.
-        let new_manifest_number = self.next_file_number;
-        self.next_file_number += 1;
+        let Ok(new_manifest_number) = self.file_numbers.allocate() else {
+            tracing::warn!("MANIFEST rotation deferred: database file numbers exhausted");
+            return;
+        };
 
         let snapshot_edit = VersionEdit::from_version_snapshot(
             &self.current,
             self.log_number,
-            self.next_file_number,
+            self.next_file_number(),
             self.last_sequence,
         );
 
@@ -1522,15 +1501,14 @@ mod tests {
         let path = dir.path();
 
         let mut vs = VersionSet::create(path, 7).unwrap();
-        let reserved = vs.reserve_file_numbers(100);
-        assert!(vs.next_file_number() >= reserved + 100);
+        let reserved = vs.file_numbers.allocate().unwrap();
 
         let mut stale_edit = VersionEdit::new();
         stale_edit.set_next_file_number(reserved); // stale: lower than current
         vs.log_and_apply(stale_edit).unwrap();
         assert_eq!(
             vs.next_file_number(),
-            reserved + 100,
+            reserved + 1,
             "stale edit must not regress the allocator"
         );
     }
@@ -1586,11 +1564,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
 
-        let mut vs = VersionSet::create(path, 7).unwrap();
+        let vs = VersionSet::create(path, 7).unwrap();
 
         // Allocate file numbers
-        let n1 = vs.new_file_number();
-        let n2 = vs.new_file_number();
+        let n1 = vs.file_numbers.allocate().unwrap();
+        let n2 = vs.file_numbers.allocate().unwrap();
         assert!(n1 < n2);
 
         let mut edit = VersionEdit::new();

@@ -1606,6 +1606,42 @@ fn test_compaction_with_large_subcompaction_limit() {
 }
 
 #[test]
+fn compaction_allocates_outputs_for_expanded_values() {
+    struct Expand;
+    impl mmdb::CompactionFilter for Expand {
+        fn filter(&self, _: usize, _: &[u8], _: &[u8]) -> mmdb::CompactionFilterDecision {
+            mmdb::CompactionFilterDecision::ChangeValue(vec![42; 1 << 20])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions {
+            compaction_filter: Some(std::sync::Arc::new(Expand)),
+            compression: mmdb::CompressionType::Lz4,
+            target_file_size_base: 1 << 20,
+            l0_compaction_trigger: usize::MAX,
+            ..Default::default()
+        },
+        dir.path(),
+    )
+    .unwrap();
+    for key in 0..100 {
+        db.put(&[key], b"v").unwrap();
+    }
+    db.flush().unwrap();
+    db.compact_range(Some(&[0]), None).unwrap();
+    db.close().unwrap();
+    let reader = DB::open_read_only(dir.path()).unwrap();
+    let expected = vec![42; 1 << 20];
+    for key in 0..100 {
+        assert_eq!(
+            reader.get(&[key]).unwrap().as_deref(),
+            Some(expected.as_slice())
+        );
+    }
+}
+
+#[test]
 fn test_new_options_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(

@@ -25,6 +25,7 @@ use crate::error::{Error, Result, ResultExt};
 use crate::iterator::db_iter::DBIterator;
 use crate::iterator::level_iter::LevelIterator;
 use crate::iterator::merge::IterSource;
+use crate::manifest::file_numbers::{FileNumbers, PendingSsts};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::{VersionSet, confirm_manifest_durable};
 use crate::memtable::MemTable;
@@ -222,11 +223,7 @@ struct WriteQueueState {
 /// after releasing the lock.
 struct FrozenMemtable {
     old_mem: Arc<MemTable>,
-    /// Pre-reserved SST file numbers for the flush outputs. The flush may
-    /// split the memtable into multiple SSTs (cut at user-key boundaries)
-    /// when projected single-block metadata grows large; numbers are
-    /// consumed in order and unused ones are simply never materialized.
-    sst_numbers: Vec<u64>,
+    file_numbers: Arc<FileNumbers>,
     old_wal_number: u64,
     new_wal_number: u64,
 }
@@ -268,7 +265,7 @@ fn l0_build_opts(options: &DbOptions) -> TableBuildOptions {
 /// Run one dead-key sweep step on `level`. Returns `false`, without merging,
 /// when L0 must wait for a pending flush.
 ///
-/// A flush reserves its L0 file numbers at freeze time and installs them after
+/// A flush allocates L0 file numbers during the build and installs them after
 /// an unlocked SST write. Rewriting L0 in between would give older data higher
 /// file numbers than the pending flush output; recovery orders L0 by file
 /// number, so point reads would return the older value after reopen.
@@ -867,7 +864,9 @@ impl DB {
         // the MANIFEST; if recovery reused that number for the fresh WAL and
         // then deleted the old WALs, it would unlink the live active WAL and
         // lose subsequently-acknowledged writes.
-        versions.ensure_file_number_at_least(max_disk_file_number + 1);
+        versions
+            .file_numbers
+            .advance_to(max_disk_file_number.saturating_add(1));
 
         let recoverable_tail_wal_num = wal_numbers.iter().rev().copied().find(|wal_num| {
             let wal_path = path.join(format!("{:06}.wal", wal_num));
@@ -945,7 +944,7 @@ impl DB {
             // SAME MANIFEST edit that installs the recovered SST. Otherwise a crash
             // between installing the SST and advancing `log_number` would replay the
             // same WALs again and create a duplicate L0 file with identical keys.
-            let wal_number = versions.new_file_number();
+            let wal_number = versions.file_numbers.allocate().ctx()?;
             let wal_path = path.join(format!("{:06}.wal", wal_number));
             let wal_writer = WalWriter::new(&wal_path).ctx()?;
 
@@ -954,11 +953,13 @@ impl DB {
             // before writing to the new WAL.
             if !wal_numbers.is_empty() && active_memtable.approximate_size() > 0 {
                 let make_opts = || l0_build_opts(&options);
-                let outputs = {
-                    let mut alloc = || Ok(versions.new_file_number());
-                    Self::write_memtable_ssts(&active_memtable, &path, &make_opts, &mut alloc)
-                        .ctx()?
-                };
+                let outputs = Self::write_memtable_ssts(
+                    &active_memtable,
+                    &path,
+                    &make_opts,
+                    &versions.file_numbers,
+                )
+                .ctx()?;
 
                 let mut edit = VersionEdit::new();
                 edit.set_log_number(wal_number);
@@ -1113,25 +1114,17 @@ impl DB {
                                             if shutdown.load(Ordering::Acquire) {
                                                 return Ok(());
                                             }
-                                            // Phase 1: pick + pre-allocate (short lock)
+                                            // Phase 1: pick and claim (short lock)
                                             let pick = {
-                                                let mut inner = bg_inner.lock();
+                                                let inner = bg_inner.lock();
                                                 let version = inner.versions.current();
                                                 let mut claimed = bg_compacting_files.lock();
                                                 LeveledCompaction::pick_compaction_for_hint(
                                                     &version, hint, &claimed,
                                                 )
                                                 .map(|task| {
-                                                    let max_out =
-                                                        LeveledCompaction::max_output_files(
-                                                            &task,
-                                                            &bg_options,
-                                                        );
-                                                    let file_start = inner
-                                                        .versions
-                                                        .reserve_file_numbers(max_out);
-                                                    let file_limit =
-                                                        file_start.saturating_add(max_out);
+                                                    let file_numbers =
+                                                        inner.versions.file_numbers.clone();
                                                     let all_inputs: Vec<_> = task
                                                         .input_files_level
                                                         .iter()
@@ -1156,8 +1149,7 @@ impl DB {
                                                         bg_snapshot_list.as_sorted_vec();
                                                     (
                                                         task,
-                                                        file_start,
-                                                        file_limit,
+                                                        file_numbers,
                                                         is_bottom,
                                                         active_snaps,
                                                         claimed_numbers,
@@ -1167,8 +1159,7 @@ impl DB {
 
                                             if let Some((
                                                 task,
-                                                file_start,
-                                                file_limit,
+                                                file_numbers,
                                                 is_bottom,
                                                 active_snaps,
                                                 claimed_numbers,
@@ -1190,7 +1181,9 @@ impl DB {
                                                 };
                                                 let output =
                                                     LeveledCompaction::execute_compaction_io(
-                                                        &ctx, &task, file_start, file_limit,
+                                                        &ctx,
+                                                        &task,
+                                                        &file_numbers,
                                                         is_bottom,
                                                     )
                                                     .map_err(|e| {
@@ -1269,9 +1262,9 @@ impl DB {
                                     if shutdown.load(Ordering::Acquire) {
                                         return Ok(());
                                     }
-                                    // Phase 1: pick + pre-allocate (short lock)
+                                    // Phase 1: pick and claim (short lock)
                                     let pick = {
-                                        let mut inner = bg_inner.lock();
+                                        let inner = bg_inner.lock();
                                         let version = inner.versions.current();
                                         let mut claimed = bg_compacting_files.lock();
                                         match LeveledCompaction::pick_compaction(
@@ -1288,13 +1281,8 @@ impl DB {
                                                 } else {
                                                     Vec::new()
                                                 };
-                                                let max_out = LeveledCompaction::max_output_files(
-                                                    &task,
-                                                    &bg_options,
-                                                );
-                                                let file_start =
-                                                    inner.versions.reserve_file_numbers(max_out);
-                                                let file_limit = file_start.saturating_add(max_out);
+                                                let file_numbers =
+                                                    inner.versions.file_numbers.clone();
                                                 let all_inputs: Vec<_> = task
                                                     .input_files_level
                                                     .iter()
@@ -1322,8 +1310,7 @@ impl DB {
                                                 let active_snaps = bg_snapshot_list.as_sorted_vec();
                                                 Some((
                                                     task,
-                                                    file_start,
-                                                    file_limit,
+                                                    file_numbers,
                                                     l0_inputs,
                                                     is_bottom,
                                                     active_snaps,
@@ -1336,8 +1323,7 @@ impl DB {
 
                                     let Some((
                                         task,
-                                        file_start,
-                                        file_limit,
+                                        file_numbers,
                                         l0_inputs,
                                         is_bottom,
                                         active_snaps,
@@ -1363,7 +1349,10 @@ impl DB {
                                         active_snapshots: &active_snaps,
                                     };
                                     let output = LeveledCompaction::execute_compaction_io(
-                                        &ctx, &task, file_start, file_limit, is_bottom,
+                                        &ctx,
+                                        &task,
+                                        &file_numbers,
+                                        is_bottom,
                                     )
                                     .map_err(|e| format!("compaction error: {}", e))?;
 
@@ -2676,7 +2665,7 @@ impl DB {
         // Range-filtered compaction: compact files overlapping [begin, end)
         loop {
             let pick = {
-                let mut inner = self.inner.lock();
+                let inner = self.inner.lock();
                 let version = inner.versions.current();
                 match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
                     Some(task) => {
@@ -2688,9 +2677,7 @@ impl DB {
                         } else {
                             Vec::new()
                         };
-                        let max_out = LeveledCompaction::max_output_files(&task, &self.options);
-                        let file_start = inner.versions.reserve_file_numbers(max_out);
-                        let file_limit = file_start.saturating_add(max_out);
+                        let file_numbers = inner.versions.file_numbers.clone();
                         let all_inputs: Vec<_> = task
                             .input_files_level
                             .iter()
@@ -2731,8 +2718,7 @@ impl DB {
                         };
                         Some((
                             task,
-                            file_start,
-                            file_limit,
+                            file_numbers,
                             l0_inputs,
                             is_bottom,
                             active_snaps,
@@ -2743,8 +2729,7 @@ impl DB {
                 }
             };
 
-            let Some((task, file_start, file_limit, l0_inputs, is_bottom, active_snaps, claimed)) =
-                pick
+            let Some((task, file_numbers, l0_inputs, is_bottom, active_snaps, claimed)) = pick
             else {
                 break;
             };
@@ -2760,10 +2745,9 @@ impl DB {
                 stats: Some(&self.stats),
                 active_snapshots: &active_snaps,
             };
-            let output = LeveledCompaction::execute_compaction_io(
-                &ctx, &task, file_start, file_limit, is_bottom,
-            )
-            .ctx()?;
+            let output =
+                LeveledCompaction::execute_compaction_io(&ctx, &task, &file_numbers, is_bottom)
+                    .ctx()?;
 
             // Pre-warm the table cache for the new output files while
             // unlocked (see the background compaction loop for rationale).
@@ -3775,10 +3759,10 @@ impl DB {
         Ok(())
     }
 
-    /// Phase 1 (under lock, fast): swap memtable, create WAL, reserve SST numbers.
+    /// Phase 1 (under lock, fast): swap memtable and create WAL.
     /// Returns the FrozenMemtable for synchronous processing without queueing for background threads.
     fn freeze_memtable_sync(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
-        let new_wal_number = inner.versions.new_file_number();
+        let new_wal_number = inner.versions.file_numbers.allocate().ctx()?;
         let new_wal_path = self.path.join(format!("{:06}.wal", new_wal_number));
         let new_wal = WalWriter::new(&new_wal_path).ctx()?;
         let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
@@ -3788,19 +3772,11 @@ impl DB {
         inner.wal_number = new_wal_number;
         inner.immutable_memtables.push(old_mem.clone());
 
-        // Reserve enough file numbers for the flush to split its output when
-        // projected single-block metadata grows large (key-heavy data).
-        // Generous over-reservation is harmless: file numbers come
-        // from a monotonic u64 counter and unused ones are never reused.
-        let reserve =
-            2 + (4 * old_mem.approximate_size() as u64) / META_BLOCK_SPLIT_THRESHOLD as u64;
-        let base = inner.versions.reserve_file_numbers(reserve);
-        let sst_numbers: Vec<u64> = (base..base + reserve).collect();
         self.install_super_version(inner);
 
         Ok(FrozenMemtable {
             old_mem,
-            sst_numbers,
+            file_numbers: inner.versions.file_numbers.clone(),
             old_wal_number,
             new_wal_number,
         })
@@ -3811,7 +3787,6 @@ impl DB {
         &self,
         frozen: &FrozenMemtable,
     ) -> Result<Vec<(u64, TableBuildResult)>> {
-        let mut numbers = frozen.sst_numbers.iter().copied();
         // Block-property collectors are user code. A panic unwinding out of
         // here would skip every caller's fail-stop arm (leaving
         // `leader_active` set, or a frozen memtable whose WAL a later flush
@@ -3821,21 +3796,12 @@ impl DB {
                 &frozen.old_mem,
                 &self.path,
                 &|| self.flush_build_opts(),
-                &mut || {
-                    numbers.next().ok_or_else(|| {
-                        Error::invalid_argument(
-                            "reserved flush output file numbers exhausted".to_string(),
-                        )
-                    })
-                },
+                &frozen.file_numbers,
             )
         }));
         let results = match written {
             Ok(results) => results?,
             Err(panic_payload) => {
-                for num in &frozen.sst_numbers {
-                    let _ = fs::remove_file(self.path.join(format!("{:06}.sst", num)));
-                }
                 let msg = if let Some(s) = panic_payload.downcast_ref::<String>() {
                     s.as_str()
                 } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
@@ -3997,10 +3963,10 @@ impl DB {
         };
         let mut installed = false;
         loop {
-            // Phase 1: pick + pre-allocate (short lock). Only L0 work: deeper
+            // Phase 1: pick and claim (short lock). Only L0 work: deeper
             // levels are left to the background workers.
             let (pick, l0_blocked) = {
-                let mut inner = self.inner.lock();
+                let inner = self.inner.lock();
                 let version = inner.versions.current();
                 let mut claimed = self.compacting_files.lock();
                 match LeveledCompaction::pick_l0_compaction(&version, &claimed) {
@@ -4010,9 +3976,7 @@ impl DB {
                             .iter()
                             .map(|f| f.meta.number)
                             .collect();
-                        let max_out = LeveledCompaction::max_output_files(&task, &force_opts);
-                        let file_start = inner.versions.reserve_file_numbers(max_out);
-                        let file_limit = file_start.saturating_add(max_out);
+                        let file_numbers = inner.versions.file_numbers.clone();
                         let all_inputs: Vec<_> = task
                             .input_files_level
                             .iter()
@@ -4034,8 +3998,7 @@ impl DB {
                         (
                             Some((
                                 task,
-                                file_start,
-                                file_limit,
+                                file_numbers,
                                 l0_inputs,
                                 is_bottom,
                                 active_snaps,
@@ -4049,15 +4012,8 @@ impl DB {
                     None => (None, version.l0_file_count() > 0),
                 }
             }; // lock released
-            let Some((
-                task,
-                file_start,
-                file_limit,
-                l0_inputs,
-                is_bottom,
-                active_snaps,
-                claimed_numbers,
-            )) = pick
+            let Some((task, file_numbers, l0_inputs, is_bottom, active_snaps, claimed_numbers)) =
+                pick
             else {
                 if wait_for_inflight && l0_blocked {
                     // Wait (without holding `inner`) for the in-flight
@@ -4083,10 +4039,9 @@ impl DB {
                 stats: Some(&self.stats),
                 active_snapshots: &active_snaps,
             };
-            let output = LeveledCompaction::execute_compaction_io(
-                &ctx, &task, file_start, file_limit, is_bottom,
-            )
-            .ctx()?;
+            let output =
+                LeveledCompaction::execute_compaction_io(&ctx, &task, &file_numbers, is_bottom)
+                    .ctx()?;
 
             // Pre-warm the table cache for the new output files while
             // unlocked (see the background compaction loop for rationale).
@@ -4414,17 +4369,9 @@ impl DB {
         mem: &MemTable,
         db_path: &Path,
         make_opts: &dyn Fn() -> TableBuildOptions,
-        next_number: &mut dyn FnMut() -> Result<u64>,
+        file_numbers: &FileNumbers,
     ) -> Result<Vec<(u64, TableBuildResult)>> {
-        let cleanup = |results: &[(u64, TableBuildResult)], current: Option<u64>| {
-            for (num, _) in results {
-                let _ = fs::remove_file(db_path.join(format!("{:06}.sst", num)));
-            }
-            if let Some(num) = current {
-                let _ = fs::remove_file(db_path.join(format!("{:06}.sst", num)));
-            }
-        };
-
+        let pending = PendingSsts::new(db_path, file_numbers);
         let mut results: Vec<(u64, TableBuildResult)> = Vec::new();
         let mut builder: Option<(u64, TableBuilder)> = None;
         let mut pending_cut = false;
@@ -4440,51 +4387,24 @@ impl DB {
                 && uk_changed
                 && let Some((num, b)) = builder.take()
             {
-                match b.finish().ctx() {
-                    Ok(result) => results.push((num, result)),
-                    Err(e) => {
-                        cleanup(&results, Some(num));
-                        return Err(e);
-                    }
-                }
+                results.push((num, b.finish().ctx()?));
                 pending_cut = false;
             }
             if builder.is_none() {
-                let num = match next_number() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        cleanup(&results, None);
-                        return Err(e).ctx();
-                    }
-                };
+                let num = pending.allocate().ctx()?;
                 let sst_path = db_path.join(format!("{:06}.sst", num));
-                match TableBuilder::new(&sst_path, make_opts()).ctx() {
-                    Ok(b) => builder = Some((num, b)),
-                    Err(e) => {
-                        cleanup(&results, None);
-                        return Err(e);
-                    }
-                }
+                builder = Some((num, TableBuilder::new(&sst_path, make_opts()).ctx()?));
             }
-            let (num, b) = builder.as_mut().unwrap();
-            if let Err(e) = b.add(key, value).ctx() {
-                let num = *num;
-                cleanup(&results, Some(num));
-                return Err(e);
-            }
+            let (_, b) = builder.as_mut().unwrap();
+            b.add(key, value).ctx()?;
             if b.projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD {
                 pending_cut = true;
             }
         }
         if let Some((num, b)) = builder.take() {
-            match b.finish().ctx() {
-                Ok(result) => results.push((num, result)),
-                Err(e) => {
-                    cleanup(&results, Some(num));
-                    return Err(e);
-                }
-            }
+            results.push((num, b.finish().ctx()?));
         }
+        pending.keep();
         Ok(results)
     }
 }
@@ -5076,13 +4996,8 @@ mod tests {
             internal_keys: true,
             ..Default::default()
         };
-        let mut next = 0u64;
         let (outputs, allocations) = crate::test_alloc::measure(|| {
-            DB::write_memtable_ssts(&mem, dir.path(), &make_opts, &mut || {
-                next += 1;
-                Ok(next)
-            })
-            .unwrap()
+            DB::write_memtable_ssts(&mem, dir.path(), &make_opts, &FileNumbers::new(1)).unwrap()
         });
         assert!(!outputs.is_empty());
         assert!(
@@ -5090,6 +5005,27 @@ mod tests {
             "flushing 16 MiB held {} bytes at once",
             allocations.peak_live
         );
+    }
+
+    #[test]
+    fn flush_splits_small_memtable_for_large_bloom_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            bloom_bits_per_key: ((META_BLOCK_SPLIT_THRESHOLD - 1) * 8) as u32,
+            l0_compaction_trigger: usize::MAX,
+            ..Default::default()
+        };
+        let db = DB::open(options, dir.path()).unwrap();
+        for key in [b"a", b"b", b"c"] {
+            db.put(key, key).unwrap();
+        }
+        db.flush().unwrap();
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("3"));
+        db.close().unwrap();
+        let reader = DB::open_read_only(dir.path()).unwrap();
+        for key in [b"a", b"b", b"c"] {
+            assert_eq!(reader.get(key).unwrap().as_deref(), Some(key.as_slice()));
+        }
     }
 
     /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0
@@ -5406,7 +5342,7 @@ mod tests {
         assert_eq!(db.get(b"boom").unwrap().as_deref(), Some(&b"2"[..]));
     }
 
-    /// Regression: a flush reserves its L0 file numbers at freeze and installs
+    /// Regression: a flush can allocate its L0 file numbers and install
     /// them after an unlocked write. A sweep that rewrote L0 in between gave
     /// older data higher file numbers, so after reopen (L0 sorted by number)
     /// a point read returned the overwritten value.

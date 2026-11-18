@@ -18,7 +18,7 @@ Validate before append; after install, rotation is deferred or latches fail-stop
 
 **MAN4 Recovery ≡ live apply** — same file set/counters. Exact-level deletes; delete-before-add for trivial move; reject dups/level mismatch/missing SST; incomplete zero-padded final append only (left untouched on disk in `open_read_only`). Open only files live after full replay.
 
-**MAN5 IDs monotonic** — file# / seq never reuse or regress. Max-forward apply; `ensure_file_number_at_least` for parallel reserve.
+**MAN5 IDs monotonic** — file# / seq never reuse or regress. Concurrent file creators share one checked allocator. Replay and stale edits can only advance it.
 
 **MAN6 CURRENT publish** — both old writer and new snapshot hold all edits →
 `CURRENT.tmp.<n>` write+sync → rename CURRENT → install writer → dir sync.

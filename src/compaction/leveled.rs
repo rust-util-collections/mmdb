@@ -8,27 +8,25 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::remove_file;
 use std::path::Path;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 use std::thread::scope;
 
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cache::block_cache::BlockCache;
 use crate::cache::table_cache::TableCache;
 use crate::error::{Error, Result, ResultExt};
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::RangeTombstoneTracker;
+use crate::manifest::file_numbers::{FileNumbers, PendingSsts};
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
 use crate::options::{CompactionFilterDecision, DbOptions};
 use crate::rate_limiter::RateLimiter;
 use crate::sst::table_builder::{META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuilder};
-use crate::sst::table_reader::{MAX_DECOMPRESSED_BLOCK_SIZE, TableIterator};
+use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
 use crate::types::{
     InternalKey, LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
@@ -83,10 +81,6 @@ pub struct CompactionOutput {
     pub input_files: Vec<(u32, FileMetaData)>,
     /// File numbers of all input files (for cache eviction and deletion).
     pub input_file_numbers: HashSet<u64>,
-    /// One past the highest file number consumed during I/O.
-    /// Used to ensure VersionSet::next_file_number doesn't fall behind
-    /// the actual numbers used by sub-compaction threads.
-    pub next_file_number_hint: u64,
     /// Range tombstone extents per output file, for the install precheck.
     output_tombstones: OutputTombstones,
     /// True when the compaction filter removed or replaced a value. Install
@@ -316,30 +310,6 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
         .collect()
 }
 
-fn estimated_uncompressed_file_size(tf: &TableFile) -> u64 {
-    let data_blocks = tf
-        .reader
-        .cached_index_entries()
-        .map(|entries| entries.len() as u64)
-        .unwrap_or_else(|e| {
-            tracing::warn!(
-                "failed to parse index entries from SST {} while estimating compaction outputs: {}",
-                tf.meta.number,
-                e
-            );
-            1
-        });
-    let data_bound = data_blocks.saturating_mul(MAX_DECOMPRESSED_BLOCK_SIZE as u64);
-    let range_del_bound = if tf.meta.has_range_deletions {
-        MAX_DECOMPRESSED_BLOCK_SIZE as u64
-    } else {
-        0
-    };
-    data_bound
-        .saturating_add(range_del_bound)
-        .max(tf.meta.file_size)
-}
-
 /// A sub-task covering a key range within a compaction.
 struct SubCompactionTask {
     /// Inclusive lower bound (user key). None = start from beginning.
@@ -358,8 +328,7 @@ struct SubCompactionParams<'a> {
     is_bottommost: bool,
     build_opts: &'a TableBuildOptions,
     oldest_snapshot_seq: SequenceNumber,
-    file_number_counter: &'a AtomicU64,
-    file_number_limit: u64,
+    pending: &'a PendingSsts<'a>,
     all_range_del_entries: &'a [(Vec<u8>, Vec<u8>)],
     all_raw_tombstones: &'a [(Vec<u8>, Vec<u8>, SequenceNumber)],
 }
@@ -487,17 +456,9 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
 /// Collect raw tombstone triples from input files.
 type RawTombstone = (Vec<u8>, Vec<u8>, SequenceNumber);
 
-fn cleanup_output_files(
-    db_path: &Path,
-    new_files: &[(u32, FileMetaData)],
-    active_file_number: Option<u64>,
-) {
+fn cleanup_output_files(db_path: &Path, new_files: &[(u32, FileMetaData)]) {
     for (_, meta) in new_files {
         let orphan = db_path.join(format!("{:06}.sst", meta.number));
-        let _ = remove_file(&orphan);
-    }
-    if let Some(number) = active_file_number {
-        let orphan = db_path.join(format!("{:06}.sst", number));
         let _ = remove_file(&orphan);
     }
 }
@@ -506,30 +467,6 @@ fn evict_table_cache_files(table_cache: Option<&Arc<TableCache>>, files: &[(u32,
     if let Some(cache) = table_cache {
         for (_, meta) in files {
             cache.evict(meta.number);
-        }
-    }
-}
-
-fn allocate_output_file_number(params: &SubCompactionParams<'_>) -> Result<u64> {
-    let mut current = params.file_number_counter.load(Ordering::Relaxed);
-    loop {
-        if current >= params.file_number_limit {
-            return Err(Error::background(format!(
-                "reserved compaction output file numbers exhausted: next={}, limit={}",
-                current, params.file_number_limit
-            )));
-        }
-        let next = current
-            .checked_add(1)
-            .ok_or_else(|| Error::background("compaction output file number overflow"))?;
-        match params.file_number_counter.compare_exchange_weak(
-            current,
-            next,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return Ok(current),
-            Err(actual) => current = actual,
         }
     }
 }
@@ -647,17 +584,7 @@ fn execute_sub_compaction_io(
     range_tombstones.reset();
 
     while let Some((ikey, value)) = merger.next_entry() {
-        let (user_key, entry_seq, vt) = match decode_internal_key(&ikey) {
-            Ok(decoded) => decoded,
-            Err(e) => {
-                cleanup_output_files(
-                    ctx.db_path,
-                    &new_files,
-                    builder.as_ref().map(|_| current_file_number),
-                );
-                return Err(e).ctx();
-            }
-        };
+        let (user_key, entry_seq, vt) = decode_internal_key(&ikey).ctx()?;
 
         // Check upper bound: stop if user_key >= upper_bound
         if let Some(ref hi) = sub.upper_bound
@@ -672,13 +599,7 @@ fn execute_sub_compaction_io(
         // miss a visible version. A size-triggered cut is deferred until the user
         // key changes here.
         if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
-            let result = match builder.take().unwrap().finish().ctx() {
-                Ok(result) => result,
-                Err(e) => {
-                    cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
-                    return Err(e);
-                }
-            };
+            let result = builder.take().unwrap().finish().ctx()?;
             if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
             }
@@ -782,13 +703,7 @@ fn execute_sub_compaction_io(
 
         // Create new output file if needed
         if builder.is_none() {
-            current_file_number = match allocate_output_file_number(params).ctx() {
-                Ok(number) => number,
-                Err(e) => {
-                    cleanup_output_files(ctx.db_path, &new_files, None);
-                    return Err(e);
-                }
-            };
+            current_file_number = params.pending.allocate().ctx()?;
             let sst_path = ctx.db_path.join(format!("{:06}.sst", current_file_number));
             let mut opts = params.build_opts.clone();
             opts.block_property_collectors = ctx
@@ -797,13 +712,7 @@ fn execute_sub_compaction_io(
                 .iter()
                 .map(|f| f())
                 .collect();
-            builder = match TableBuilder::new(&sst_path, opts).ctx() {
-                Ok(builder) => Some(builder),
-                Err(e) => {
-                    cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
-                    return Err(e);
-                }
-            };
+            builder = Some(TableBuilder::new(&sst_path, opts).ctx()?);
             current_size = 0;
         }
 
@@ -820,15 +729,11 @@ fn execute_sub_compaction_io(
         };
 
         let entry_bytes = ikey_ref.len() + final_value.len();
-        if let Err(e) = builder
+        builder
             .as_mut()
             .unwrap()
             .add(ikey_ref, final_value.as_slice())
-            .ctx()
-        {
-            cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
-            return Err(e);
-        }
+            .ctx()?;
         current_size += entry_bytes;
         if current_file_user_key != user_key {
             current_file_user_key.clear();
@@ -851,15 +756,8 @@ fn execute_sub_compaction_io(
     }
 
     // Flush remaining builder
-    let active_file_number = builder.as_ref().map(|_| current_file_number);
     if let Some(b) = builder {
-        let result = match b.finish().ctx() {
-            Ok(result) => result,
-            Err(e) => {
-                cleanup_output_files(ctx.db_path, &new_files, Some(current_file_number));
-                return Err(e);
-            }
-        };
+        let result = b.finish().ctx()?;
         if let Some(s) = ctx.stats {
             s.record_compaction_bytes(result.file_size);
         }
@@ -879,8 +777,6 @@ fn execute_sub_compaction_io(
     }
 
     if let Some(e) = merger.error() {
-        // Clean up orphan SST files written during the failed merge
-        cleanup_output_files(ctx.db_path, &new_files, active_file_number);
         return Err(Error::background(format!(
             "sub-compaction merge error: {}",
             e
@@ -895,44 +791,6 @@ fn execute_sub_compaction_io(
 }
 
 impl LeveledCompaction {
-    pub(crate) fn max_output_files(task: &CompactionTask, options: &DbOptions) -> u64 {
-        // Output files are also cut when projected single-block metadata
-        // reaches META_BLOCK_SPLIT_THRESHOLD (key-heavy data), so
-        // size the reservation for the smaller of the two cut conditions.
-        let target_size = options
-            .target_file_size_base
-            .max(1)
-            .min((META_BLOCK_SPLIT_THRESHOLD / 2) as u64);
-        let estimated_input_size = task
-            .input_files_level
-            .iter()
-            .chain(task.input_files_next.iter())
-            .fold(0u64, |acc, tf| {
-                acc.saturating_add(estimated_uncompressed_file_size(tf))
-            });
-        let size_outputs = estimated_input_size.saturating_add(target_size - 1) / target_size;
-        let input_count = task
-            .input_files_level
-            .len()
-            .saturating_add(task.input_files_next.len()) as u64;
-        // L0 runs serially. Other levels split only at target-file
-        // boundaries, so the configured limit cannot create more jobs than
-        // there are target files (or the single unsplit job).
-        let max_subs = if task.level == 0 {
-            1
-        } else {
-            options
-                .max_subcompactions
-                .max(1)
-                .min(task.input_files_next.len().max(1))
-        };
-        size_outputs
-            .saturating_add(input_count)
-            .saturating_add(max_subs as u64)
-            .saturating_add(16)
-            .max(1)
-    }
-
     /// Check if compaction is needed and return a task if so.
     ///
     /// `in_flight` excludes file numbers already claimed by another
@@ -1138,7 +996,7 @@ impl LeveledCompaction {
 
     /// Pure I/O phase of compaction — does NOT require any lock.
     ///
-    /// Merges input files, writes output SSTs using pre-allocated file numbers,
+    /// Merges input files, writes output SSTs using the shared file-number allocator,
     /// and returns a `CompactionOutput` ready for `install_compaction`.
     ///
     /// When `options.max_subcompactions > 1` and the target level has enough
@@ -1147,8 +1005,7 @@ impl LeveledCompaction {
     pub(crate) fn execute_compaction_io(
         ctx: &CompactionContext<'_>,
         task: &CompactionTask,
-        file_number_start: u64,
-        file_number_limit: u64,
+        file_numbers: &FileNumbers,
         is_bottommost: bool,
     ) -> Result<CompactionOutput> {
         let target_level = task.level + 1;
@@ -1187,8 +1044,6 @@ impl LeveledCompaction {
                 // number here would delete the very file this edit just
                 // added back into the version.
                 input_file_numbers: HashSet::new(),
-                // No new file numbers are consumed by a metadata-only move.
-                next_file_number_hint: file_number_start,
                 output_tombstones: OutputTombstones::new(),
                 filter_mutated: false,
             });
@@ -1254,16 +1109,13 @@ impl LeveledCompaction {
         let all_range_del_entries = collect_range_del_entries(&all_input_files).ctx()?;
         let all_raw_tombstones = collect_raw_tombstones(&all_input_files).ctx()?;
 
-        // Shared atomic counter for thread-safe file number allocation
-        let file_counter = AtomicU64::new(file_number_start);
-
+        let pending = PendingSsts::new(ctx.db_path, file_numbers);
         let sub_params = SubCompactionParams {
             target_level,
             is_bottommost,
             build_opts: &build_opts,
             oldest_snapshot_seq,
-            file_number_counter: &file_counter,
-            file_number_limit,
+            pending: &pending,
             all_range_del_entries: &all_range_del_entries,
             all_raw_tombstones: &all_raw_tombstones,
         };
@@ -1288,45 +1140,7 @@ impl LeveledCompaction {
                     })
                     .collect()
             });
-            let mut outputs = Vec::with_capacity(thread_results.len());
-            let mut first_err: Option<Error> = None;
-            for r in thread_results {
-                match r {
-                    Ok(sub_out) => outputs.push(sub_out),
-                    Err(e) => {
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
-                    }
-                }
-            }
-            if let Some(e) = first_err {
-                // Collect known file numbers from successful sub-compactions.
-                let known: std::collections::HashSet<u64> = outputs
-                    .iter()
-                    .flat_map(|o| o.new_files.iter().map(|(_, m)| m.number))
-                    .collect();
-                // Clean up SST files from successful sub-compactions.
-                for sub_out in &outputs {
-                    for (_, meta) in &sub_out.new_files {
-                        let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
-                        let _ = remove_file(&orphan);
-                    }
-                }
-                // Clean up any orphaned SSTs from the panicked thread(s):
-                // file numbers were consumed from the shared counter but never
-                // reported, so delete any .sst file in the allocated range that
-                // is not accounted for in the successful outputs.
-                let end = file_counter.load(Ordering::Acquire);
-                for num in file_number_start..end {
-                    if !known.contains(&num) {
-                        let orphan = ctx.db_path.join(format!("{:06}.sst", num));
-                        let _ = remove_file(&orphan);
-                    }
-                }
-                return Err(e);
-            }
-            outputs
+            thread_results.into_iter().collect::<Result<Vec<_>>>()?
         };
 
         // Merge sub-compaction outputs
@@ -1364,11 +1178,12 @@ impl LeveledCompaction {
             edit.delete_file(target_level as u32, tf.meta.number);
         }
 
+        pending.keep();
         Ok(CompactionOutput {
             edit,
             input_files,
             input_file_numbers,
-            next_file_number_hint: file_counter.load(Ordering::Relaxed),
+
             output_tombstones,
             filter_mutated,
         })
@@ -1391,7 +1206,7 @@ impl LeveledCompaction {
         // target level), so it must never be deleted or evicted by the
         // discard/error paths below — the current version still references
         // it at the source level, and deleting it would permanently destroy
-        // data the MANIFEST points at. Normal outputs use freshly reserved
+        // data the MANIFEST points at. Normal outputs use freshly allocated
         // numbers that can never collide with an input's.
         let input_numbers: HashSet<u64> = output
             .input_files
@@ -1434,21 +1249,13 @@ impl LeveledCompaction {
                 || Self::outputs_overlap_unexpected_current_files(&output, &version)
         };
         if discard {
-            cleanup_output_files(db_path, &created_files, None);
+            cleanup_output_files(db_path, &created_files);
             evict_table_cache_files(table_cache, &created_files);
             return Ok(PostCompactionCleanup {
                 files_to_delete: HashSet::new(),
             });
         }
 
-        // Belt-and-braces: `allocate_output_file_number` enforces
-        // `file_number_limit`, so the sub-compaction counter cannot exceed
-        // the range reserved under the DB lock, and the reservation already
-        // advanced `next_file_number` past `file_number_limit` — this call
-        // is expected to be a no-op. Keep it as a cheap forward-only guard
-        // so file numbers stay collision-free even if a future edge case
-        // violates that reasoning.
-        versions.ensure_file_number_at_least(output.next_file_number_hint);
         output
             .edit
             .set_next_file_number(versions.next_file_number());
@@ -1456,7 +1263,7 @@ impl LeveledCompaction {
             // Delete only the freshly-written SSTs (otherwise they would be
             // orphaned on disk) — `created_files` excludes a trivial move's
             // still-live input file.
-            cleanup_output_files(db_path, &created_files, None);
+            cleanup_output_files(db_path, &created_files);
             evict_table_cache_files(table_cache, &created_files);
             return Err(e).ctx();
         }
@@ -1646,36 +1453,18 @@ impl LeveledCompaction {
         let mut last_range_del_key: Option<Vec<u8>> = None;
         let mut last_written_seq: SequenceNumber = 0;
         let mut snapshot_idx: usize = ctx.active_snapshots.len();
+        let file_numbers = versions.file_numbers.clone();
+        let pending = PendingSsts::new(ctx.db_path, &file_numbers);
         let mut range_tombstones = RangeTombstoneTracker::new();
 
         while let Some((ikey, value)) = merger.next_entry() {
-            let (user_key, entry_seq, vt) = match decode_internal_key(&ikey) {
-                Ok(decoded) => decoded,
-                Err(e) => {
-                    cleanup_output_files(
-                        ctx.db_path,
-                        &edit.new_files,
-                        builder.as_ref().map(|_| current_file_number),
-                    );
-                    return Err(e).ctx();
-                }
-            };
+            let (user_key, entry_seq, vt) = decode_internal_key(&ikey).ctx()?;
 
             // Defer size-triggered file cuts to user-key boundaries so a key's
             // versions are never split across files (which would create overlapping
             // same-level key ranges and possibly miss visible versions on reads).
             if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
-                let result = match builder.take().unwrap().finish().ctx() {
-                    Ok(result) => result,
-                    Err(e) => {
-                        cleanup_output_files(
-                            ctx.db_path,
-                            &edit.new_files,
-                            Some(current_file_number),
-                        );
-                        return Err(e);
-                    }
-                };
+                let result = builder.take().unwrap().finish().ctx()?;
                 if let Some(s) = ctx.stats {
                     s.record_compaction_bytes(result.file_size);
                 }
@@ -1765,7 +1554,7 @@ impl LeveledCompaction {
             }
 
             if builder.is_none() {
-                current_file_number = versions.new_file_number();
+                current_file_number = pending.allocate().ctx()?;
                 let sst_path = ctx.db_path.join(format!("{:06}.sst", current_file_number));
                 let mut opts = build_opts.clone();
                 opts.block_property_collectors = ctx
@@ -1774,17 +1563,7 @@ impl LeveledCompaction {
                     .iter()
                     .map(|f| f())
                     .collect();
-                builder = match TableBuilder::new(&sst_path, opts).ctx() {
-                    Ok(builder) => Some(builder),
-                    Err(e) => {
-                        cleanup_output_files(
-                            ctx.db_path,
-                            &edit.new_files,
-                            Some(current_file_number),
-                        );
-                        return Err(e);
-                    }
-                };
+                builder = Some(TableBuilder::new(&sst_path, opts).ctx()?);
                 current_size = 0;
             }
 
@@ -1802,15 +1581,11 @@ impl LeveledCompaction {
                 &ikey
             };
 
-            if let Err(e) = builder
+            builder
                 .as_mut()
                 .unwrap()
                 .add(ikey_ref, final_value.as_slice())
-                .ctx()
-            {
-                cleanup_output_files(ctx.db_path, &edit.new_files, Some(current_file_number));
-                return Err(e);
-            }
+                .ctx()?;
             let entry_bytes = ikey_ref.len() + final_value.len();
             current_size += entry_bytes;
             if current_file_user_key != user_key {
@@ -1833,15 +1608,8 @@ impl LeveledCompaction {
             }
         }
 
-        let active_file_number = builder.as_ref().map(|_| current_file_number);
         if let Some(b) = builder {
-            let result = match b.finish().ctx() {
-                Ok(result) => result,
-                Err(e) => {
-                    cleanup_output_files(ctx.db_path, &edit.new_files, Some(current_file_number));
-                    return Err(e);
-                }
-            };
+            let result = b.finish().ctx()?;
             if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
             }
@@ -1859,15 +1627,6 @@ impl LeveledCompaction {
 
         // Abort if the merge iterator encountered an I/O or corruption error.
         if let Some(e) = merger.error() {
-            // Clean up orphan SST files written during the failed merge
-            for (_, meta) in &edit.new_files {
-                let orphan = ctx.db_path.join(format!("{:06}.sst", meta.number));
-                let _ = remove_file(&orphan);
-            }
-            if let Some(num) = active_file_number {
-                let orphan = ctx.db_path.join(format!("{:06}.sst", num));
-                let _ = remove_file(&orphan);
-            }
             return Err(Error::background(format!(
                 "force_merge iterator error: {}",
                 e
@@ -1880,13 +1639,8 @@ impl LeveledCompaction {
         }
 
         edit.set_next_file_number(versions.next_file_number());
-        // Capture output files so they can be deleted if the install fails,
-        // otherwise the freshly-written SSTs would be orphaned on disk.
-        let output_files = edit.new_files.clone();
-        if let Err(e) = versions.log_and_apply(edit) {
-            cleanup_output_files(ctx.db_path, &output_files, None);
-            return Err(e).ctx();
-        }
+        versions.log_and_apply(edit).ctx()?;
+        pending.keep();
         // force_merge_level holds &mut VersionSet for the duration, sync here.
         versions.sync_manifest().ctx()?;
 
@@ -1984,6 +1738,7 @@ impl LeveledCompaction {
 
 #[cfg(test)]
 mod tests {
+    use super::FileNumbers;
     use crate::db::DB;
     use crate::options::DbOptions;
 
@@ -2085,7 +1840,7 @@ mod tests {
             edit,
             input_files: vec![(1, meta1.clone())],
             input_file_numbers: HashSet::new(),
-            next_file_number_hint: versions.next_file_number(),
+
             output_tombstones: OutputTombstones::new(),
             filter_mutated: false,
         };
@@ -2681,8 +2436,13 @@ mod tests {
             stats: None,
             active_snapshots: &[],
         };
-        let output =
-            super::LeveledCompaction::execute_compaction_io(&ctx, &task, 10, 20, false).unwrap();
+        let output = super::LeveledCompaction::execute_compaction_io(
+            &ctx,
+            &task,
+            &FileNumbers::new(10),
+            false,
+        )
+        .unwrap();
         let kept = output
             .output_tombstones
             .values()
@@ -2946,17 +2706,6 @@ mod tests {
             max_subcompactions: usize::MAX,
             ..Default::default()
         };
-        // Raising the configured limit beyond the available target-file
-        // boundaries cannot create more sub-jobs or need more file numbers.
-        let reservation = LeveledCompaction::max_output_files(&task, &options);
-        let feasible_options = DbOptions {
-            max_subcompactions: task.input_files_next.len(),
-            ..options.clone()
-        };
-        assert_eq!(
-            reservation,
-            LeveledCompaction::max_output_files(&task, &feasible_options)
-        );
         let ctx = CompactionContext {
             db_path: dir.path(),
             options: &options,
@@ -2967,7 +2716,7 @@ mod tests {
 
         let before = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
         let output =
-            LeveledCompaction::execute_compaction_io(&ctx, &task, 100, 100 + reservation, true)
+            LeveledCompaction::execute_compaction_io(&ctx, &task, &FileNumbers::new(100), true)
                 .unwrap();
         let after = PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
 
@@ -3155,8 +2904,7 @@ mod tests {
             let output = LeveledCompaction::execute_compaction_io(
                 &ctx,
                 &task,
-                file_number_start,
-                u64::MAX,
+                &FileNumbers::new(file_number_start),
                 is_bottommost,
             )
             .unwrap();
@@ -3345,7 +3093,7 @@ mod tests {
         let mut versions = VersionSet::create(dir.path(), options.num_levels).unwrap();
         let mut edit = VersionEdit::new();
         for file in 0..2u64 {
-            let number = versions.new_file_number();
+            let number = versions.file_numbers.allocate().unwrap();
             let path = dir.path().join(format!("{number:06}.sst"));
             let mut builder = TableBuilder::new(
                 &path,

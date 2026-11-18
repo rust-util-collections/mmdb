@@ -3,6 +3,7 @@
 //! A MANIFEST file is a sequence of VersionEdit records, each describing
 //! a delta (files added/removed) from the previous state.
 
+pub(crate) mod file_numbers;
 pub mod version;
 pub mod version_edit;
 pub mod version_set;
