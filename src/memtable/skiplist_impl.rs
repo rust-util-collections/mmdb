@@ -65,13 +65,14 @@ impl Arena {
             let offset = &mut *self.current_offset.get();
 
             // Try current block.
-            if let Some(block) = blocks.last() {
-                let base = block.as_ptr() as usize;
-                let aligned = (base + *offset + align - 1) & !(align - 1);
-                let new_offset = aligned - base + size;
+            if let Some(block) = blocks.last_mut() {
+                let base = block.as_mut_ptr();
+                let tail = base.add(*offset);
+                let start = *offset + tail.align_offset(align);
+                let new_offset = start + size;
                 if new_offset <= block.capacity() {
                     *offset = new_offset;
-                    return aligned as *mut u8;
+                    return base.add(start);
                 }
             }
 
@@ -84,13 +85,13 @@ impl Arena {
             }
             .max(size + align);
 
-            let block = Vec::<u8>::with_capacity(block_size);
-            let base = block.as_ptr() as usize;
-            let aligned = (base + align - 1) & !(align - 1);
-            let actual = aligned - base + size; // padding + size
-            *offset = actual;
+            let mut block = Vec::<u8>::with_capacity(block_size);
+            let base = block.as_mut_ptr();
+            let start = base.align_offset(align);
+            let aligned = base.add(start);
+            *offset = start + size;
             blocks.push(block);
-            aligned as *mut u8
+            aligned
         }
     }
 
@@ -684,6 +685,22 @@ impl<K: Clone, V: Clone> ExactSizeIterator for SkipListIter<K, V> {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aligned_nodes_remain_readable_across_arena_blocks() {
+        #[repr(align(256))]
+        #[derive(Clone)]
+        struct Aligned(u32);
+
+        let list = ConcurrentSkipList::new();
+        for key in 0..128 {
+            list.insert(key, Aligned(key));
+        }
+        for (key, value) in list.iter_ref() {
+            assert_eq!(value.0, *key);
+            assert!(ptr::from_ref(value).is_aligned());
+        }
+    }
 
     #[test]
     fn test_insert_and_get() {
