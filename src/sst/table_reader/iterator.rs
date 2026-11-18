@@ -147,7 +147,10 @@ impl TableIterator {
         self.block_cursor_offset = 0;
         self.block_cursor_key.clear();
         self.current_block = Some(block);
-        // Invalidate materialized entries
+        // Release reverse positioning after crossing into a new forward block.
+        self.backward_block = None;
+        self.backward_block_index = usize::MAX;
+        self.current_restart_index = 0;
         self.current_block_entries.clear();
         self.block_pos = 0;
     }
@@ -436,142 +439,53 @@ impl TableIterator {
         if self.err.is_some() {
             return;
         }
-        let index_entries = self.index_entries.as_ref().unwrap();
-
+        let index_entries = Arc::clone(self.index_entries.as_ref().unwrap());
         let idx = index_entries.partition_point(|entry| {
             compare_internal_key(&entry.separator_key, target) == Ordering::Less
         });
-
-        // Try the block at `idx` first, then fall back to previous blocks.
-        let mut found = false;
-        let mut try_idx = idx;
-
-        loop {
-            if try_idx >= index_entries.len() {
-                if try_idx == 0 {
-                    break;
-                }
-                try_idx -= 1;
-                continue;
-            }
-
-            let entry = &index_entries[try_idx];
+        for (block_index, entry) in index_entries.iter().enumerate().take(idx + 1).rev() {
             if self.block_properties_should_skip(entry) {
-                if try_idx == 0 {
-                    break;
-                }
-                try_idx -= 1;
                 continue;
             }
-            let handle = entry.handle;
-
-            let block_result = self
+            let positioned = self
                 .reader
-                .read_block_cached_opt(&handle, self.fill_cache)
-                .and_then(Block::new);
-            match block_result {
-                Err(e) => {
-                    self.err = Some(format!("block read error in seek_for_prev: {e}"));
+                .read_block_cached_opt(&entry.handle, self.fill_cache)
+                .and_then(Block::new)
+                .and_then(|block| self.position_reverse_segment(block, block_index, target));
+            match positioned {
+                Ok(true) => return,
+                Ok(false) => continue,
+                Err(error) => {
+                    self.err = Some(format!("block read error in seek_for_prev: {error}"));
                     break;
                 }
-                Ok(block) => match block.seek_for_prev_by(target, compare_internal_key) {
-                    Ok(Some((found_key, _found_val))) => {
-                        // Determine which restart segment this entry belongs to
-                        // and decode all entries from that segment to end of block.
-                        // Using iter_from_restart (not iter_restart_segment) ensures
-                        // that a subsequent next() will see all remaining entries in
-                        // this block before advancing to the next block.
-                        let restart_idx = match self.find_restart_for_key(
-                            &block,
-                            &found_key,
-                            compare_internal_key,
-                        ) {
-                            Ok(idx) => idx,
-                            Err(e) => {
-                                self.err =
-                                    Some(format!("block entry decode error in seek_for_prev: {e}"));
-                                break;
-                            }
-                        };
-                        let entries_from_restart = match block.iter_from_restart(restart_idx) {
-                            Ok(entries) => entries,
-                            Err(e) => {
-                                self.err =
-                                    Some(format!("block entry decode error in seek_for_prev: {e}"));
-                                break;
-                            }
-                        };
-                        // Find position of found entry within the decoded range
-                        let pos_in_entries = entries_from_restart
-                            .iter()
-                            .rposition(|(k, _)| {
-                                compare_internal_key(k, target) != Ordering::Greater
-                            })
-                            .unwrap_or(0);
-
-                        self.index_pos = try_idx + 1;
-                        self.current_block_entries = entries_from_restart;
-                        self.block_pos = pos_in_entries;
-                        self.current_restart_index = restart_idx;
-                        self.backward_block = Some(block);
-                        self.backward_block_index = try_idx;
-                        found = true;
-                        break;
-                    }
-                    Ok(None) => {
-                        // No entry <= target in this block; try previous
-                    }
-                    Err(e) => {
-                        self.err = Some(format!("block entry decode error in seek_for_prev: {e}"));
-                        break;
-                    }
-                }, // Ok(block) => match seek_for_prev_by
-            } // match block_result
-
-            if try_idx == 0 {
-                break;
             }
-            try_idx -= 1;
         }
-
-        if !found {
-            self.index_pos = index_entries.len();
-            self.current_block_entries.clear();
-            self.block_pos = 0;
-            self.backward_block = None;
-        }
+        self.index_pos = index_entries.len();
     }
 
-    /// Find the restart index that contains a given key.
-    /// Uses O(log R) binary search with O(1) per probe (single entry decode).
-    /// Returns `Err` if a restart-point entry is malformed (corrupted data).
-    fn find_restart_for_key<F: Fn(&[u8], &[u8]) -> Ordering>(
-        &self,
-        block: &Block,
-        key: &[u8],
-        compare: F,
-    ) -> Result<u32> {
-        let num = block.num_restarts();
-        if num <= 1 {
-            return Ok(0);
-        }
-        // Binary search: find last restart point whose first key <= key
-        let mut left = 0u32;
-        let mut right = num;
-        while left < right {
-            let mid = left + (right - left) / 2;
-            match block.first_key_at_restart(mid)? {
-                Some(first_key) => {
-                    if compare(&first_key, key) != Ordering::Greater {
-                        left = mid + 1;
-                    } else {
-                        right = mid;
-                    }
-                }
-                None => right = mid,
-            }
-        }
-        Ok(left.saturating_sub(1))
+    fn position_reverse_segment(
+        &mut self,
+        block: Block,
+        block_index: usize,
+        target: &[u8],
+    ) -> Result<bool> {
+        let Some(restart) = block.restart_for_prev(target, compare_internal_key)? else {
+            return Ok(false);
+        };
+        let entries = block.iter_restart_segment(restart)?;
+        let end = entries
+            .partition_point(|(key, _)| compare_internal_key(key, target) != Ordering::Greater);
+        let Some(position) = end.checked_sub(1) else {
+            return Ok(false);
+        };
+        self.index_pos = block_index + 1;
+        self.current_block_entries = entries;
+        self.block_pos = position;
+        self.current_restart_index = restart;
+        self.backward_block = Some(block);
+        self.backward_block_index = block_index;
+        Ok(true)
     }
 
     /// Move to the previous entry. Returns the entry at the new position,
@@ -700,6 +614,22 @@ impl TableIterator {
     }
 
     fn load_next_block(&mut self) -> bool {
+        if let Some(block) = &self.backward_block
+            && self.current_restart_index + 1 < block.num_restarts()
+        {
+            self.current_restart_index += 1;
+            match block.iter_restart_segment(self.current_restart_index) {
+                Ok(entries) => {
+                    self.current_block_entries = entries;
+                    self.block_pos = 0;
+                    return true;
+                }
+                Err(error) => {
+                    self.err = Some(format!("block entry decode error: {error}"));
+                    return false;
+                }
+            }
+        }
         self.ensure_index();
         let index_entries = self.index_entries.as_ref().unwrap();
         while self.index_pos < index_entries.len() {
@@ -1300,6 +1230,43 @@ mod tests {
         }
         builder.finish().unwrap();
         path
+    }
+
+    #[test]
+    fn reverse_seek_copies_only_its_restart_segment() {
+        use crate::BlockCache;
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seek.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1 << 20,
+                block_restart_interval: 1,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let key = |i| InternalKey::new(&[i], 1, ValueType::Value).into_bytes();
+        builder.add(&key(0), b"v").unwrap();
+        for i in 1..16 {
+            builder.add(&key(i), &[7; 8192]).unwrap();
+        }
+        builder.finish().unwrap();
+        let cache = Arc::new(BlockCache::new(1 << 20));
+        let reader = TableReader::open_with_all(&path, 1, Some(cache), None).unwrap();
+        let mut iter = TableIterator::new(Arc::new(reader));
+        iter.seek_for_prev(&key(0)); // warm the index and data block
+        let (_, allocated) = crate::test_alloc::count_allocated(|| iter.seek_for_prev(&key(0)));
+        assert!(allocated < 4096, "reverse seek allocated {allocated} bytes");
+        assert_eq!(iter.current_block_entries.len(), 1);
+        for i in 0..16 {
+            assert_eq!(iter.next().unwrap().0, key(i));
+        }
+        assert!(iter.next().is_none());
+        assert!(iter.err.is_none());
     }
 
     #[test]

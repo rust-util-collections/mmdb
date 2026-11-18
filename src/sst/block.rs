@@ -213,83 +213,32 @@ impl Block {
         Ok(None)
     }
 
-    /// Seek to the last entry where compare(key, target) <= Equal.
-    /// Uses binary search on restart points, then forward scan to find the last entry <= target.
-    /// Returns `Err` if a block entry is malformed (corrupted data).
-    pub fn seek_for_prev_by<F: Fn(&[u8], &[u8]) -> Ordering>(
+    /// Find the last restart whose first key is at or below the target.
+    pub fn restart_for_prev(
         &self,
         target: &[u8],
-        compare: F,
-    ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        compare: impl Fn(&[u8], &[u8]) -> Ordering,
+    ) -> Result<Option<u32>> {
         if self.restart_offset == 0 {
             return Ok(None);
         }
-        // Binary search on restart points to find the last restart point whose
-        // key is <= target.
-        let mut left = 0u32;
-        let mut right = self.num_restarts;
-
+        let (mut left, mut right) = (0, self.num_restarts);
+        let mut key = Vec::new();
         while left < right {
             let mid = left + (right - left) / 2;
-            let rp = self.restart_point(mid) as usize;
-
-            let (key, _, _) = decode_entry_at(self.entry_data(), rp, &[])?;
-            if compare(&key, target) != Ordering::Greater {
-                left = mid + 1;
-            } else {
+            key.clear();
+            decode_entry_reuse(
+                self.entry_data(),
+                self.restart_point(mid) as usize,
+                &mut key,
+            )?;
+            if compare(&key, target) == Ordering::Greater {
                 right = mid;
-            }
-        }
-
-        // `left` is now the first restart point whose key > target.
-        // We need to scan from restart point `left - 1` (or 0 if left == 0),
-        // but we might also need to check from `left - 2` in case entries
-        // between restart points span the boundary.
-        // To be safe, start from one restart point before the one that's > target.
-        let start_restart = if left > 0 { left - 1 } else { 0 };
-        let start = self.restart_point(start_restart) as usize;
-
-        let mut offset = start;
-        let mut current_key = Vec::new();
-        let mut best: Option<(Vec<u8>, Vec<u8>)> = None;
-
-        while offset < self.restart_offset {
-            let (key, value, next_off) = decode_entry_at(self.entry_data(), offset, &current_key)?;
-            if compare(&key, target) != Ordering::Greater {
-                best = Some((key.clone(), value));
             } else {
-                // All subsequent entries will be > target, we're done
-                break;
+                left = mid + 1;
             }
-            current_key = key;
-            offset = next_off;
         }
-
-        Ok(best)
-    }
-
-    /// Decode all entries from the given restart point index through the end of
-    /// the data region. Returns a Vec of (key, value) pairs.
-    /// This is used by TableIterator::prev() to re-decode a block from a restart point.
-    /// Returns `Err` if a block entry is malformed (corrupted data).
-    pub fn iter_from_restart(&self, restart_index: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        if restart_index >= self.num_restarts {
-            return Ok(Vec::new());
-        }
-
-        let start = self.restart_point(restart_index) as usize;
-        let mut offset = start;
-        let mut current_key = Vec::new();
-        let mut entries = Vec::new();
-
-        while offset < self.restart_offset {
-            let (key, value, next_off) = decode_entry_at(self.entry_data(), offset, &current_key)?;
-            entries.push((key.clone(), value));
-            current_key = key;
-            offset = next_off;
-        }
-
-        Ok(entries)
+        Ok(left.checked_sub(1))
     }
 
     /// Decode entries from the given restart point index to the next restart point.
@@ -320,19 +269,6 @@ impl Block {
         }
 
         Ok(entries)
-    }
-
-    /// Decode only the first key at the given restart point (zero shared prefix).
-    /// O(1) — decodes a single entry, no segment walk needed.
-    /// Returns `Err` if the entry at this restart point is malformed (corrupted data).
-    pub fn first_key_at_restart(&self, restart_index: u32) -> Result<Option<Vec<u8>>> {
-        if restart_index >= self.num_restarts {
-            return Ok(None);
-        }
-        let offset = self.restart_point(restart_index) as usize;
-        // At a restart point, shared_len is always 0, so prev_key can be empty.
-        let (key, _, _) = decode_entry_at(self.entry_data(), offset, &[])?;
-        Ok(Some(key))
     }
 
     /// Return the number of restart points in this block.
@@ -763,55 +699,28 @@ mod tests {
     }
 
     #[test]
-    fn test_seek_for_prev_by() {
-        let mut builder = BlockBuilder::new(4); // restart every 4 entries
-
+    fn test_reverse_restart_selection() {
+        let mut builder = BlockBuilder::new(4);
         for i in 0..20 {
-            let key = format!("key_{:04}", i * 2); // even keys: 0,2,4,...,38
-            let val = format!("val_{}", i);
-            builder.add(key.as_bytes(), val.as_bytes());
+            builder.add(&[2 * i], &[i]);
         }
-
-        let data = builder.finish();
-        let block = Block::from_vec(data).unwrap();
-        let compare = |a: &[u8], b: &[u8]| a.cmp(b);
-
-        // Exact match: seek_for_prev to key_0010 (exists)
-        let (k, v) = block
-            .seek_for_prev_by(b"key_0010", compare)
-            .unwrap()
-            .unwrap();
-        assert_eq!(k, b"key_0010");
-        assert_eq!(v, b"val_5");
-
-        // Between entries: seek_for_prev to key_0011 (between key_0010 and key_0012)
-        let (k, _) = block
-            .seek_for_prev_by(b"key_0011", compare)
-            .unwrap()
-            .unwrap();
-        assert_eq!(k, b"key_0010");
-
-        // After last: seek_for_prev to "zzz" should return last entry
-        let (k, _) = block.seek_for_prev_by(b"zzz", compare).unwrap().unwrap();
-        assert_eq!(k, b"key_0038");
-
-        // Before first: seek_for_prev to "aaa" should return None
-        assert!(block.seek_for_prev_by(b"aaa", compare).unwrap().is_none());
-
-        // Exactly first key
-        let (k, v) = block
-            .seek_for_prev_by(b"key_0000", compare)
-            .unwrap()
-            .unwrap();
-        assert_eq!(k, b"key_0000");
-        assert_eq!(v, b"val_0");
-
-        // Just before first key
-        assert!(block.seek_for_prev_by(b"key_", compare).unwrap().is_none());
+        let block = Block::from_vec(builder.finish()).unwrap();
+        for (target, expected) in [
+            (&[][..], None),
+            (&[0], Some(0)),
+            (&[10], Some(1)),
+            (&[11], Some(1)),
+            (&[255], Some(4)),
+        ] {
+            assert_eq!(
+                block.restart_for_prev(target, <[u8]>::cmp).unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
-    fn test_iter_from_restart() {
+    fn test_iter_restart_segment() {
         let mut builder = BlockBuilder::new(4); // restart every 4 entries
 
         for i in 0..12 {
@@ -823,23 +732,23 @@ mod tests {
         let data = builder.finish();
         let block = Block::from_vec(data).unwrap();
 
-        // Restart 0: entries 0..4 and beyond
-        let entries = block.iter_from_restart(0).unwrap();
-        assert_eq!(entries.len(), 12);
+        // Restart 0: entries 0..4
+        let entries = block.iter_restart_segment(0).unwrap();
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].0, b"key_0000");
 
-        // Restart 1: entries 4..8 and beyond
-        let entries = block.iter_from_restart(1).unwrap();
-        assert_eq!(entries.len(), 8); // entries 4 through 11
+        // Restart 1: entries 4..8
+        let entries = block.iter_restart_segment(1).unwrap();
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].0, b"key_0004");
 
         // Restart 2: entries 8..12
-        let entries = block.iter_from_restart(2).unwrap();
+        let entries = block.iter_restart_segment(2).unwrap();
         assert_eq!(entries.len(), 4); // entries 8 through 11
         assert_eq!(entries[0].0, b"key_0008");
 
         // Out of bounds
-        let entries = block.iter_from_restart(100).unwrap();
+        let entries = block.iter_restart_segment(100).unwrap();
         assert!(entries.is_empty());
     }
 
@@ -899,8 +808,8 @@ mod tests {
 
         // iter_restart_segment over the corrupt entry must also error.
         assert!(
-            block.iter_from_restart(2).is_err(),
-            "iter_from_restart at the corrupt entry must return Err"
+            block.iter_restart_segment(2).is_err(),
+            "iter_restart_segment at the corrupt entry must return Err"
         );
     }
 
