@@ -41,7 +41,7 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | MANIFEST version tracking with atomic version edits | Implemented |
 | Leveled compaction with trivial move | Implemented |
 | Multi-threaded background compaction | Implemented |
-| Streaming compaction (O(block) memory) | Implemented |
+| Streaming compaction of point entries | Implemented |
 | MVCC snapshots via sequence numbers | Implemented |
 | Forward/backward/prefix/range iterators | Implemented |
 | Compression: None, LZ4, Zstd (per-level) | Implemented |
@@ -126,7 +126,7 @@ Key optimizations:
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
 - **Sequential readahead**: `posix_fadvise(WILLNEED)` after detecting sequential block access
 - **L0 first-block pinning**: Each L0 file's first data block (smallest key) is pinned via `insert_pinned` so `init_heap`'s first `peek()` is always a cache hit; unpinned on compaction. Index and filter blocks are held directly as `TableReader` fields, and range-tombstone data is cached there; none go through `block_cache`
-- **Sweep-line range tombstone tracking**: O(1) amortized per key
+- **Range tombstones**: Iterators query a prebuilt interval index. Compaction tracks overlapping deletions in a heap ordered by sequence.
 - **Lazy index loading**: Index entries are parsed on first use
 - **Atomic L0 counter**: Write-throttle checks use an atomic counter, avoiding mutex contention on writes
 

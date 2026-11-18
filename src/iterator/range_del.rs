@@ -1,8 +1,9 @@
 //! Efficient range tombstone tracking for forward iteration.
 //!
-//! Uses a sweep-line approach: tombstones are sorted by begin key, and an "active set"
-//! tracks which tombstones currently cover the iteration position. For forward iteration
-//! with monotonically increasing keys, the amortized cost per key check is O(1).
+//! Compaction visits user keys in order at a fixed snapshot cutoff. A max-heap
+//! keeps the newest covering tombstone available between interval boundaries.
+
+use std::collections::BinaryHeap;
 
 use crate::types::SequenceNumber;
 
@@ -18,6 +19,7 @@ thread_local! {
     /// Tombstone activations performed by trackers on this thread.
     pub(crate) static TRACKER_ACTIVATIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static ACTIVE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Sequence predicates evaluated by immutable coverage queries.
     static QUERY_SEQUENCE_COMPARISONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -31,22 +33,28 @@ pub(crate) struct RangeTombstoneTracker {
     sorted: bool,
     /// Index of the next tombstone to consider activating.
     next_idx: usize,
-    /// Indices of currently active tombstones (begin <= current key).
-    active: Vec<usize>,
+    /// Visible tombstones whose begin has been reached, ordered by sequence.
+    /// Expired entries are discarded when they reach the top.
+    active: BinaryHeap<(SequenceNumber, usize)>,
+    snapshot: SequenceNumber,
 }
 
 impl RangeTombstoneTracker {
-    pub fn new() -> Self {
+    pub fn new(snapshot: SequenceNumber) -> Self {
         Self {
             tombstones: Vec::new(),
             sorted: false,
             next_idx: 0,
-            active: Vec::new(),
+            active: BinaryHeap::new(),
+            snapshot,
         }
     }
 
     /// Add a range tombstone. Must call `reset()` after adding to re-sort.
     pub fn add(&mut self, begin: Vec<u8>, end: Vec<u8>, seq: SequenceNumber) {
+        if seq > self.snapshot {
+            return;
+        }
         self.tombstones.push(RangeTombstone { begin, end, seq });
         self.sorted = false;
     }
@@ -57,6 +65,9 @@ impl RangeTombstoneTracker {
     /// new one activates once the scan reaches its begin. Only an
     /// out-of-order begin re-sorts and restarts the sweep, as `add` + `reset`.
     pub fn push_in_order(&mut self, begin: Vec<u8>, end: Vec<u8>, seq: SequenceNumber) {
+        if seq > self.snapshot {
+            return;
+        }
         let in_order = self
             .tombstones
             .last()
@@ -82,19 +93,13 @@ impl RangeTombstoneTracker {
         self.active.clear();
     }
 
-    /// Check if `user_key` at `seq` is deleted by any active range tombstone
-    /// visible at `snapshot`.
-    ///
-    /// For optimal performance, call with monotonically increasing `user_key`.
-    pub fn is_deleted(
-        &mut self,
-        user_key: &[u8],
-        seq: SequenceNumber,
-        snapshot: SequenceNumber,
-    ) -> bool {
+    /// Query in nondecreasing user-key order. Call `reset` before seeking back.
+    pub fn is_deleted(&mut self, user_key: &[u8], seq: SequenceNumber) -> bool {
         // For small counts, linear scan is faster than the sweep overhead
         if self.tombstones.len() <= 4 {
-            return self.linear_check(user_key, seq, snapshot);
+            return self.tombstones.iter().any(|rt| {
+                user_key >= rt.begin.as_slice() && user_key < rt.end.as_slice() && rt.seq > seq
+            });
         }
 
         // Ensure sorted
@@ -107,38 +112,21 @@ impl RangeTombstoneTracker {
             if self.tombstones[self.next_idx].begin.as_slice() <= user_key {
                 #[cfg(test)]
                 TRACKER_ACTIVATIONS.with(|n| n.set(n.get() + 1));
-                self.active.push(self.next_idx);
+                self.active
+                    .push((self.tombstones[self.next_idx].seq, self.next_idx));
                 self.next_idx += 1;
             } else {
                 break;
             }
         }
 
-        // Prune expired tombstones (end <= user_key) and check remaining
-        let tombstones = &self.tombstones;
-        self.active
-            .retain(|&idx| tombstones[idx].end.as_slice() > user_key);
-
-        for &idx in &self.active {
-            let rt = &self.tombstones[idx];
-            if rt.seq <= snapshot && rt.seq > seq {
-                return true;
+        while let Some(&(highest, index)) = self.active.peek() {
+            #[cfg(test)]
+            ACTIVE_PROBES.with(|n| n.set(n.get() + 1));
+            if user_key < self.tombstones[index].end.as_slice() {
+                return highest > seq;
             }
-        }
-
-        false
-    }
-
-    /// Simple linear scan for small tombstone counts.
-    fn linear_check(&self, user_key: &[u8], seq: SequenceNumber, snapshot: SequenceNumber) -> bool {
-        for rt in &self.tombstones {
-            if rt.seq <= snapshot
-                && user_key >= rt.begin.as_slice()
-                && user_key < rt.end.as_slice()
-                && rt.seq > seq
-            {
-                return true;
-            }
+            self.active.pop();
         }
         false
     }
@@ -444,55 +432,55 @@ mod tests {
 
     #[test]
     fn test_empty_tracker() {
-        let mut tracker = RangeTombstoneTracker::new();
-        assert!(!tracker.is_deleted(b"key", 1, 10));
+        let mut tracker = RangeTombstoneTracker::new(10);
+        assert!(!tracker.is_deleted(b"key", 1));
     }
 
     #[test]
     fn test_single_tombstone() {
-        let mut tracker = RangeTombstoneTracker::new();
+        let mut tracker = RangeTombstoneTracker::new(10);
         tracker.add(b"aaa".to_vec(), b"zzz".to_vec(), 5);
         tracker.reset();
 
-        assert!(tracker.is_deleted(b"bbb", 3, 10));
-        assert!(!tracker.is_deleted(b"bbb", 6, 10)); // seq > tombstone seq
-        assert!(!tracker.is_deleted(b"000", 3, 10)); // before range
+        assert!(tracker.is_deleted(b"bbb", 3));
+        assert!(!tracker.is_deleted(b"bbb", 6)); // seq > tombstone seq
+        assert!(!tracker.is_deleted(b"000", 3)); // before range
     }
 
     #[test]
     fn test_same_seq_not_deleted() {
         // A range tombstone at seq=5 must NOT delete entries also at seq=5.
         // This preserves atomicity for WriteBatch (delete_range + put at same seq).
-        let mut tracker = RangeTombstoneTracker::new();
+        let mut tracker = RangeTombstoneTracker::new(10);
         tracker.add(b"a".to_vec(), b"z".to_vec(), 5);
         tracker.reset();
 
         // Same seq as tombstone: should NOT be deleted (strict >)
-        assert!(!tracker.is_deleted(b"m", 5, 10));
+        assert!(!tracker.is_deleted(b"m", 5));
         // Lower seq: should be deleted
-        assert!(tracker.is_deleted(b"m", 4, 10));
+        assert!(tracker.is_deleted(b"m", 4));
     }
 
     #[test]
     fn test_forward_sweep() {
-        let mut tracker = RangeTombstoneTracker::new();
+        let mut tracker = RangeTombstoneTracker::new(10);
         tracker.add(b"b".to_vec(), b"d".to_vec(), 5);
         tracker.add(b"f".to_vec(), b"h".to_vec(), 5);
         tracker.reset();
 
-        assert!(!tracker.is_deleted(b"a", 1, 10));
-        assert!(tracker.is_deleted(b"b", 1, 10));
-        assert!(tracker.is_deleted(b"c", 1, 10));
-        assert!(!tracker.is_deleted(b"d", 1, 10));
-        assert!(!tracker.is_deleted(b"e", 1, 10));
-        assert!(tracker.is_deleted(b"f", 1, 10));
-        assert!(tracker.is_deleted(b"g", 1, 10));
-        assert!(!tracker.is_deleted(b"h", 1, 10));
+        assert!(!tracker.is_deleted(b"a", 1));
+        assert!(tracker.is_deleted(b"b", 1));
+        assert!(tracker.is_deleted(b"c", 1));
+        assert!(!tracker.is_deleted(b"d", 1));
+        assert!(!tracker.is_deleted(b"e", 1));
+        assert!(tracker.is_deleted(b"f", 1));
+        assert!(tracker.is_deleted(b"g", 1));
+        assert!(!tracker.is_deleted(b"h", 1));
     }
 
     #[test]
     fn test_many_tombstones() {
-        let mut tracker = RangeTombstoneTracker::new();
+        let mut tracker = RangeTombstoneTracker::new(10);
         for i in 0..100u32 {
             let begin = format!("key_{:04}", i * 2);
             let end = format!("key_{:04}", i * 2 + 1);
@@ -503,11 +491,27 @@ mod tests {
         // Even keys are deleted, odd keys are not
         for i in 0..200u32 {
             let key = format!("key_{:04}", i);
-            let deleted = tracker.is_deleted(key.as_bytes(), 1, 10);
+            let deleted = tracker.is_deleted(key.as_bytes(), 1);
             if i % 2 == 0 && i < 200 {
                 assert!(deleted, "key_{:04} should be deleted", i);
             }
         }
+    }
+
+    #[test]
+    fn overlapping_ranges_probe_only_the_newest_visible_tombstone() {
+        let mut tracker = RangeTombstoneTracker::new(100);
+        for seq in 1..=100 {
+            tracker.add(b"a".to_vec(), b"z".to_vec(), seq);
+        }
+        tracker.add(b"a".to_vec(), b"zz".to_vec(), 101);
+        ACTIVE_PROBES.set(0);
+        for _ in 0..100 {
+            assert!(!tracker.is_deleted(b"b", 100));
+        }
+        assert_eq!(ACTIVE_PROBES.get(), 100);
+        assert!(tracker.is_deleted(b"y", 99));
+        assert!(!tracker.is_deleted(b"z", 0));
     }
 
     // -----------------------------------------------------------------------

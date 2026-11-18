@@ -564,7 +564,7 @@ fn execute_sub_compaction_io(
     let mut last_written_seq: SequenceNumber = 0;
     let mut snapshot_idx: usize = ctx.active_snapshots.len();
     let mut filter_mutated = false;
-    let mut range_tombstones = RangeTombstoneTracker::new();
+    let mut range_tombstones = RangeTombstoneTracker::new(params.oldest_snapshot_seq);
     // Pre-populate the tracker with every tombstone that can cover a key in
     // this sub-task's range — in particular straddlers whose start key is
     // before lower_bound must still take effect. Tombstones entirely outside
@@ -651,7 +651,7 @@ fn execute_sub_compaction_io(
                 // versions need it too.)
                 if vt == ValueType::Value
                     && !range_tombstones.is_empty()
-                    && range_tombstones.is_deleted(user_key, entry_seq, params.oldest_snapshot_seq)
+                    && range_tombstones.is_deleted(user_key, entry_seq)
                 {
                     continue;
                 }
@@ -675,7 +675,7 @@ fn execute_sub_compaction_io(
 
             if vt == ValueType::Value
                 && !range_tombstones.is_empty()
-                && range_tombstones.is_deleted(user_key, entry_seq, params.oldest_snapshot_seq)
+                && range_tombstones.is_deleted(user_key, entry_seq)
             {
                 continue;
             }
@@ -1455,7 +1455,7 @@ impl LeveledCompaction {
         let mut snapshot_idx: usize = ctx.active_snapshots.len();
         let file_numbers = versions.file_numbers.clone();
         let pending = PendingSsts::new(ctx.db_path, &file_numbers);
-        let mut range_tombstones = RangeTombstoneTracker::new();
+        let mut range_tombstones = RangeTombstoneTracker::new(oldest_snapshot_seq);
 
         while let Some((ikey, value)) = merger.next_entry() {
             let (user_key, entry_seq, vt) = decode_internal_key(&ikey).ctx()?;
@@ -1512,7 +1512,7 @@ impl LeveledCompaction {
                     // resurrect if that tombstone is dropped at the bottommost level.
                     if vt == ValueType::Value
                         && !range_tombstones.is_empty()
-                        && range_tombstones.is_deleted(user_key, entry_seq, oldest_snapshot_seq)
+                        && range_tombstones.is_deleted(user_key, entry_seq)
                     {
                         continue;
                     }
@@ -1531,7 +1531,7 @@ impl LeveledCompaction {
 
                 if vt == ValueType::Value
                     && !range_tombstones.is_empty()
-                    && range_tombstones.is_deleted(user_key, entry_seq, oldest_snapshot_seq)
+                    && range_tombstones.is_deleted(user_key, entry_seq)
                 {
                     continue;
                 }

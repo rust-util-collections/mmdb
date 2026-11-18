@@ -4,7 +4,7 @@
 
 **Arch:** L0 overlap → L1+ sorted disjoint; trigger L0 count ≥ `l0_compaction_trigger`;
 sub-compaction on L(n+1) bounds; trivial move = single file, no target overlap;
-streaming O(block) memory.
+point entries stream from input blocks; memory for the range-deletion tracker grows with the input tombstone count.
 
 ## Invariants
 
