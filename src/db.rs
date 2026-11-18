@@ -378,7 +378,7 @@ impl Drop for CompactionClaim {
 /// The core database handle.
 pub struct DB {
     path: PathBuf,
-    requested_path: PathBuf,
+    storage_path: PathBuf,
     options: DbOptions,
     /// Whether this handle was opened without write capability.
     read_only: bool,
@@ -1585,8 +1585,8 @@ impl DB {
         }
 
         let db = Self {
-            path,
-            requested_path,
+            path: requested_path,
+            storage_path: path,
             options,
             read_only,
             inner,
@@ -2451,7 +2451,7 @@ impl DB {
 
     /// The path supplied by the caller at open.
     pub fn path(&self) -> &Path {
-        &self.requested_path
+        &self.path
     }
 
     /// Get a database property.
@@ -2740,7 +2740,7 @@ impl DB {
             };
 
             let ctx = CompactionContext {
-                db_path: &self.path,
+                db_path: &self.storage_path,
                 options: &self.options,
                 rate_limiter: Some(&self.rate_limiter),
                 stats: Some(&self.stats),
@@ -2762,7 +2762,7 @@ impl DB {
                     &mut inner.versions,
                     Some(&self.table_cache),
                     Some(&self.block_cache),
-                    &self.path,
+                    &self.storage_path,
                     Some(&self.stats),
                     !self.snapshot_list.is_empty(),
                 )
@@ -2811,7 +2811,7 @@ impl DB {
                 self.set_bg_error(format!("compact_range manifest sync failed: {}", e));
                 return Err(e).ctx();
             }
-            LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
+            LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.storage_path);
         }
 
         drop(wq);
@@ -3654,7 +3654,8 @@ impl DB {
                                     // Clean up orphan SST files: log_and_apply did not
                                     // persist the edit, so these files must be deleted.
                                     for num in &output_numbers {
-                                        let path = self.path.join(format!("{:06}.sst", num));
+                                        let path =
+                                            self.storage_path.join(format!("{:06}.sst", num));
                                         let _ = fs::remove_file(&path);
                                     }
                                     // The frozen memtable is still live in
@@ -3717,7 +3718,7 @@ impl DB {
         if let Err(e) = self.install_flush(inner, &frozen, build_results, prepared_pins) {
             // Clean up orphan SST files produced by the failed flush install.
             for num in &output_numbers {
-                let path = self.path.join(format!("{:06}.sst", num));
+                let path = self.storage_path.join(format!("{:06}.sst", num));
                 let _ = fs::remove_file(&path);
             }
             self.set_bg_error(format!("flush install failed: {}", e));
@@ -3728,7 +3729,9 @@ impl DB {
             self.set_bg_error(format!("flush manifest sync failed: {}", e));
             return Err(e);
         }
-        let old_wal_path = self.path.join(format!("{:06}.wal", frozen.old_wal_number));
+        let old_wal_path = self
+            .storage_path
+            .join(format!("{:06}.wal", frozen.old_wal_number));
         if let Err(e) = fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
         }
@@ -3755,7 +3758,7 @@ impl DB {
             drop(inner);
             // Clean up orphan SST files: log_and_apply did not persist the edit.
             for num in &output_numbers {
-                let path = self.path.join(format!("{:06}.sst", num));
+                let path = self.storage_path.join(format!("{:06}.sst", num));
                 let _ = fs::remove_file(&path);
             }
             self.set_bg_error(format!("flush install failed: {}", e));
@@ -3775,7 +3778,7 @@ impl DB {
     /// Returns the FrozenMemtable for synchronous processing without queueing for background threads.
     fn freeze_memtable_sync(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
         let new_wal_number = inner.versions.file_numbers.allocate().ctx()?;
-        let new_wal_path = self.path.join(format!("{:06}.wal", new_wal_number));
+        let new_wal_path = self.storage_path.join(format!("{:06}.wal", new_wal_number));
         let new_wal = WalWriter::new(&new_wal_path).ctx()?;
         let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
         old_mem.mark_immutable();
@@ -3806,7 +3809,7 @@ impl DB {
         let written = catch_unwind(AssertUnwindSafe(|| {
             Self::write_memtable_ssts(
                 &frozen.old_mem,
-                &self.path,
+                &self.storage_path,
                 &|| self.flush_build_opts(),
                 &frozen.file_numbers,
             )
@@ -3941,7 +3944,7 @@ impl DB {
             self.set_bg_error(format!("post-flush manifest sync failed: {}", e));
             return Err(e).ctx();
         }
-        let old_wal_path = self.path.join(format!("{:06}.wal", old_wal_number));
+        let old_wal_path = self.storage_path.join(format!("{:06}.wal", old_wal_number));
         if let Err(e) = fs::remove_file(&old_wal_path) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
         }
@@ -4045,7 +4048,7 @@ impl DB {
 
             // Phase 2: I/O (no lock held)
             let ctx = CompactionContext {
-                db_path: &self.path,
+                db_path: &self.storage_path,
                 options: &force_opts,
                 rate_limiter: Some(&self.rate_limiter),
                 stats: Some(&self.stats),
@@ -4068,7 +4071,7 @@ impl DB {
                     &mut inner.versions,
                     Some(&self.table_cache),
                     Some(&self.block_cache),
-                    &self.path,
+                    &self.storage_path,
                     Some(&self.stats),
                     !self.snapshot_list.is_empty(),
                 )
@@ -4108,7 +4111,7 @@ impl DB {
                 self.set_bg_error(format!("drain_l0 manifest sync failed: {}", e));
                 return Err(e).ctx();
             }
-            LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.path);
+            LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.storage_path);
             installed = true;
         }
         // The drained L0 data may have pushed L1+ over budget.
@@ -4146,7 +4149,7 @@ impl DB {
             let mut inner = self.inner.lock();
             let active_snaps = self.snapshot_list.as_sorted_vec();
             let ctx = CompactionContext {
-                db_path: &self.path,
+                db_path: &self.storage_path,
                 options: &force_opts,
                 rate_limiter: Some(&self.rate_limiter),
                 stats: Some(&self.stats),
@@ -5522,7 +5525,7 @@ mod tests {
             };
             let snapshots = Vec::new();
             let ctx = CompactionContext {
-                db_path: &db.path,
+                db_path: &db.storage_path,
                 options: &db.options,
                 rate_limiter: Some(&db.rate_limiter),
                 stats: Some(&db.stats),
