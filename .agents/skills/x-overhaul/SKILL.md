@@ -9,11 +9,11 @@ MMDB is an in-process embedded Rust LSM key-value library operating on
 caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
 This workflow checks data-structure, MVCC, persistence, and concurrency
 invariants, fixes confirmed in-scope defects as sequential atomic local commits,
-and finalizes at most one eligible patch version bump.
+and finalizes at most one eligible patch version bump with a local version tag.
 
 Resolve repository paths from the Git root; Markdown links below are relative
 to this file. Read invocation arguments from user prompt text. Never create a
-branch, tag, push, open a PR, publish, or rewrite history.
+branch, push, open a PR, publish, or rewrite history.
 
 ## Preflight
 
@@ -101,7 +101,7 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
    unresolved `Open` blockers, `Won't Fix` / material `Rejected` dispositions,
    or stale-entry cleanup.
 
-### 4. Aggregate check, final gate, and version
+### 4. Aggregate check, final gate, and version tag
 
 1. If commits were added (`starting_HEAD..HEAD`), review the aggregate diff
    once ([x-fix](../x-fix/SKILL.md) Protocol §3) for cross-commit interactions.
@@ -110,7 +110,7 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
    committing an eligible version bump. Reuse passing results when the tree
    state has not changed. Report pre-existing out-of-scope failures separately
    from regressions introduced by this run.
-3. Apply [Version](../../../docs/ai/commit-protocol.md#version-x-overhaul-only-no-tag)
+3. Apply [Version and tag](../../../docs/ai/commit-protocol.md#version-and-tag)
    once only when all required checks pass with no in-scope `Open` findings, no
    unreviewed ledger gaps, and no dirty baseline in `Cargo.toml`. Never accept
    a public API or on-disk format break or choose a major bump on the user's
@@ -120,7 +120,7 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
 
 Report the resolved scope, ledger coverage and any remaining gaps, finding
 dispositions, executed validation commands (including any optional host tool not
-present locally), new commit hashes and subjects, version outcome, and preserved
-baseline paths. Handle failed or incomplete steps per
+present locally), new commit hashes and subjects, version and tag outcomes,
+and preserved baseline paths. Handle failed or incomplete steps per
 [workflow-policy.md](../../../docs/ai/workflow-policy.md#4-validation-and-failure),
 keeping validated local commits intact.

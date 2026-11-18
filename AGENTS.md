@@ -66,7 +66,7 @@ selection with `allow_implicit_invocation: false`.
 - [`$x-review`](.agents/skills/x-review/SKILL.md) — review a scope (default: latest commit). Updates `docs/audit.md` only
 - [`$x-fix`](.agents/skills/x-fix/SKILL.md) — resolve Open findings, one validated commit each. No version bump
 - [`$x-commit`](.agents/skills/x-commit/SKILL.md) — review and commit the current worktree. No version bump
-- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (empty = latest commit; `all` = full repo), then review, fix, and create atomic local commits, plus at most one eligible patch bump when shipped library inputs changed. Never tag, push, or open a PR
+- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (empty = latest commit; `all` = full repo), then review, fix, and create atomic local commits. When shipped library changes qualify for a patch bump, bump once and tag the version commit locally. Never push or open a PR
 
 All four workflows follow [workflow-policy.md](docs/ai/workflow-policy.md):
 specify local storage operations, invariants, and expected vs observed results,
@@ -81,7 +81,7 @@ Supporting docs (`docs/ai/`):
 - [technical-patterns.md](docs/ai/technical-patterns.md) / [design-patterns.md](docs/ai/design-patterns.md) — LSM bugs + D-\* design lens
 - [review-core.md](docs/ai/review-core.md) — evidence/report templates + Subsystem Map
 - [false-positive-guide.md](docs/ai/false-positive-guide.md) — check existing guarantees before recording findings
-- [commit-protocol.md](docs/ai/commit-protocol.md) — validate → commit → version (no tag)
+- [commit-protocol.md](docs/ai/commit-protocol.md) — validate → commit → version bump → local version tag
 - `patterns/*` — per-subsystem checklists
 
 Audit registry: `docs/audit.md` — maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim.

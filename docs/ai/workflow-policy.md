@@ -3,9 +3,9 @@
 Shared workflow rules for `$x-review`, `$x-commit`, `$x-fix`, and `$x-overhaul`.
 Skills must not weaken these rules. See also `pragmatic-engineering.md`.
 
-**Hard rules:** user-invoked only · local commits only (never push or open a
-PR) · no history rewrite · one independent issue per commit · no auto tag ·
-at most one eligible patch bump only in `$x-overhaul`.
+**Hard rules:** user-invoked only · never push or open a PR · no history
+rewrite · one independent issue per commit · at most one eligible patch bump
+in `$x-overhaul`, with a local tag on the version commit.
 
 ## Skill discovery and invocation
 
@@ -131,8 +131,9 @@ One independent issue, root cause, or behavior change → one commit:
 - No drive-by refactors, unrelated lints, or whole-repo formatting churn.
 - Stage exact paths/hunks (`git add -- <paths>`); never use `git add -A`, `-u`,
   `.`, or `git commit -a`. Inspect `git diff --cached` before every commit.
-- Create new local commits only — never amend, rebase, rewrite history, tag,
-  push, or open a PR.
+- Create new local commits. Never amend, rebase, rewrite history, push, or open
+  a PR. Create local version tags only during
+  [version finalization](commit-protocol.md#version-and-tag).
 - Never commit a `docs/audit.md` inventory ahead of fixing the defects in the
   same run. Remove pre-existing `Open` entries inside their fix commit; put
   remaining registry-only dispositions (`Won't Fix`, `Rejected`, unresolved

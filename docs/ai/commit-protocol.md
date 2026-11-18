@@ -1,8 +1,8 @@
 # Atomic Commit Protocol
 
 Validation, staging, and local commit rules for `$x-commit`, `$x-fix`, and
-`$x-overhaul`. Crate version finalization applies only to `$x-overhaul`, with no
-automatic Git tags. Use alongside `workflow-policy.md`.
+`$x-overhaul`. Crate version finalization, including the local Git tag, applies
+only to `$x-overhaul`. Use alongside `workflow-policy.md`.
 
 ## Invocation ledger
 
@@ -100,7 +100,7 @@ Notes on gate execution:
   and re-run the gate. In narrow scopes, report pre-existing out-of-scope lint
   or test failures with file:line evidence rather than editing unowned files.
 
-## Version (`$x-overhaul` only; no tag)
+## Version and tag
 
 `$x-commit` and `$x-fix` never bump `Cargo.toml` or create tags. `$x-overhaul`
 performs at most one patch bump (`X.Y.Z` → `X.Y.(Z+1)`) after the Final
@@ -139,21 +139,32 @@ Scope eligibility:
 
 When eligible:
 
-1. Increment `package.version` from `X.Y.Z` to `X.Y.(Z+1)` once, verifying that
-   starting and current versions match.
+1. Verify that the starting and current versions match. Compute the next patch
+   version and set `tag` to `v<new>`. Check for a collision with
+   `git show-ref --verify --quiet "refs/tags/$tag"`. If the tag already exists,
+   stop and report the conflict before editing `Cargo.toml`. Otherwise increment
+   `package.version` from `X.Y.Z` to `X.Y.(Z+1)` once.
 2. Run `cargo +stable metadata --no-deps --format-version 1` to verify manifest
    parsing and the updated version.
 3. Stage only `Cargo.toml` and inspect `git diff --cached`.
 4. Commit `chore: bump version to <new>` as one separate final commit (the sole
-   exception to one-root-cause-per-commit; never an empty commit).
+   exception to one-root-cause-per-commit; never an empty commit). Record
+   its commit hash as `bump_commit`.
+5. Create an annotated local tag with
+   `git tag -a "$tag" -m "$tag" "$bump_commit"`. Verify that
+   `git rev-parse --verify "refs/tags/${tag}^{commit}"` returns `bump_commit`.
+   If the step remains blocked after addressing recoverable errors, preserve
+   the version commit and any existing tag. Report the incomplete step with
+   the tag name, expected commit, and error or observed target.
 
 Never accept a public API or persisted on-disk format break on the user's
 behalf: keep unaccepted breaking findings `Open` and uncommitted; an explicitly
 user-approved breaking change uses a major bump and migration docs instead of an
-automatic patch. Never create tags, backfill missing tags, push, open a PR,
-publish, or force-add gitignored `Cargo.lock`.
+automatic patch. Never backfill missing tags, push, open a PR, publish, or
+force-add gitignored `Cargo.lock`.
 
 ## Final state
 
 Report all new commit hashes/subjects and, for `$x-overhaul`, the version
-outcome. Owned changes are committed; unrelated baseline files remain untouched.
+outcome and the verified tag name and target commit when a bump was made.
+Owned changes are committed; unrelated baseline files remain untouched.
