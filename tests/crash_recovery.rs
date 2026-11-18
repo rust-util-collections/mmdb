@@ -17,6 +17,47 @@ fn make_opts() -> DbOptions {
 }
 
 #[test]
+fn relative_store_survives_working_directory_change() {
+    use std::{env, path::Path, process::Command};
+
+    // A child process can change its working directory without affecting
+    // other tests running concurrently.
+    if env::var_os("MMDB_TEST_CHANGE_CWD").is_some() {
+        let db = DB::open(make_opts(), "store").unwrap();
+        assert_eq!(db.path(), Path::new("store"));
+        db.put(b"key", b"value").unwrap();
+        env::set_current_dir("other").unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("other/store")).unwrap();
+    let child = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "relative_store_survives_working_directory_change",
+        ])
+        .env("MMDB_TEST_CHANGE_CWD", "1")
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(child.success());
+    assert_eq!(
+        fs::read_dir(dir.path().join("other/store"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let reopened = DB::open_read_only(dir.path().join("store")).unwrap();
+    assert_eq!(
+        reopened.get(b"key").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+}
+
+#[test]
 fn test_crash_after_single_write() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();

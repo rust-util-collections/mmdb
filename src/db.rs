@@ -381,6 +381,7 @@ impl Drop for CompactionClaim {
 /// The core database handle.
 pub struct DB {
     path: PathBuf,
+    requested_path: PathBuf,
     options: DbOptions,
     /// Whether this handle was opened without write capability.
     read_only: bool,
@@ -663,7 +664,12 @@ impl DB {
 
     fn open_impl(options: DbOptions, path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         let mut options = options;
-        let path = path.as_ref().to_path_buf();
+        let requested_path = path.as_ref().to_path_buf();
+        let path = if requested_path.is_relative() {
+            std::env::current_dir().ctx()?.join(&requested_path)
+        } else {
+            requested_path.clone()
+        };
 
         // A leveled LSM needs at least L0 plus one lower level (`num_levels >= 2`),
         // and VersionEdit encodes level numbers as `u32` (`0..num_levels`).
@@ -734,6 +740,10 @@ impl DB {
                 )));
             }
         }
+
+        // Keep every later flush, compaction and cleanup in the directory
+        // selected at open, even if a symlink in the caller's path changes.
+        let path = fs::canonicalize(&path).ctx()?;
 
         // Lock before reading CURRENT/MANIFEST/WAL. Writable handles create
         // the lock file and take LOCK_EX. Read-only handles open an existing
@@ -1561,6 +1571,7 @@ impl DB {
 
         let db = Self {
             path,
+            requested_path,
             options,
             read_only,
             inner,
@@ -2446,8 +2457,9 @@ impl DB {
         }
     }
 
+    /// The path supplied by the caller at open.
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.requested_path
     }
 
     /// Get a database property.
