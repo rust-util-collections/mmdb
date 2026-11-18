@@ -2315,33 +2315,20 @@ impl DB {
 
     /// Create a forward iterator that merges uncommitted batch writes with the
     /// current DB state. The iterator is a snapshot read at the committed
-    /// sequence captured here; batch entries are overlaid with sequence
-    /// numbers from a reserved region at the top of the sequence space
-    /// (`MAX_SEQUENCE_NUMBER - count + 1 ..= MAX_SEQUENCE_NUMBER`), which real
-    /// writers can never reach. This gives batch entries precedence over all
-    /// committed data without colliding with sequence numbers that concurrent
-    /// writers commit after the iterator is created (those stay invisible,
-    /// preserving snapshot isolation).
+    /// sequence captured here. Batch entries use higher sequence numbers
+    /// in operation order. Later commits in the active memtable stay hidden,
+    /// including commits with the same sequence as an overlay entry.
     pub fn iter_with_batch(&self, batch: &WriteBatchWithIndex) -> Result<DBIterator> {
+        if batch.is_empty() {
+            return self.iter();
+        }
         let sv = self.get_super_version();
         self.check_usable().ctx()?;
         let seq = self.current_sequence();
-        let batch_count = batch.operation_count();
-        // Reserve the top of the sequence space for the batch overlay.
-        let batch_base_seq = if batch_count == 0 {
-            // No overlay entries; the floor is irrelevant but must stay above
-            // any committed sequence.
-            MAX_SEQUENCE_NUMBER
-        } else {
-            MAX_SEQUENCE_NUMBER - (batch_count - 1)
-        };
-        if batch_base_seq <= seq {
-            // The committed sequence has reached the reserved region —
-            // practically unreachable (2^56 writes), but never alias.
-            return Err(Error::invalid_argument(
-                "sequence number space exhausted".to_string(),
-            ));
-        }
+        let batch_base_seq = MAX_SEQUENCE_NUMBER
+            .checked_sub(batch.operation_count() - 1)
+            .filter(|base| *base > seq)
+            .ok_or_else(|| Error::invalid_argument("sequence number space exhausted"))?;
         let batch_entries = batch.sorted_entries(batch_base_seq).ctx()?;
 
         let (active_mem, imm_mems, version) =
@@ -2380,16 +2367,10 @@ impl DB {
         }
 
         let mut db_iter = DBIterator::from_sources(sources, seq);
-        if batch_count > 0 {
-            db_iter.set_batch_seq_floor(batch_base_seq);
-        }
+        db_iter.include_batch_source();
 
-        // Collect range tombstones (same as iter_with_range). Batch iterators
-        // lift the tombstone visibility bound to MAX (the batch overlay lives
-        // in the reserved top region of the sequence space — see
-        // `DBIterator::set_batch_seq_floor`), so DB-sourced tombstones
-        // committed after `seq` was captured must be excluded here; other
-        // iterator paths instead filter them at query time.
+        // Batch tombstones can shadow any database source. Freeze the
+        // database tombstones at the captured sequence before combining them.
         let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
         // Batch range tombstones use position-based sequences (preserving write order).
         for &(ref b, ref e, pos) in batch.range_tombstones() {
@@ -4517,6 +4498,44 @@ impl Drop for Snapshot<'_> {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+
+    #[test]
+    fn batch_iterator_hides_future_commits_at_the_overlay_sequence() {
+        for with_range in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = open_test_db(dir.path());
+            let mut overlay = WriteBatchWithIndex::new();
+            if with_range {
+                overlay.delete_range(b"a", b"b");
+            }
+            overlay.put(b"x", b"overlay");
+            db.sequence.store(
+                MAX_SEQUENCE_NUMBER - overlay.operation_count(),
+                Ordering::Release,
+            );
+            db.put(b"base", b"visible").unwrap();
+            let forward = db.iter_with_batch(&overlay).unwrap();
+            let mut reverse = db.iter_with_batch(&overlay).unwrap();
+            // The first future commit has exactly the lowest overlay sequence.
+            db.put(b"z", b"future").unwrap();
+            let keys: Vec<_> = forward.map(|(key, _)| key).collect();
+            assert_eq!(keys, [b"base".to_vec(), b"x".to_vec()]);
+            reverse.seek_to_last();
+            assert_eq!(reverse.key(), Some(b"x".as_slice()));
+            reverse.prev();
+            assert_eq!(reverse.key(), Some(b"base".as_slice()));
+            if with_range {
+                db.put(b"zz", b"last").unwrap();
+            }
+            assert_eq!(db.current_sequence(), MAX_SEQUENCE_NUMBER);
+            assert_eq!(
+                db.iter_with_batch(&WriteBatchWithIndex::new())
+                    .unwrap()
+                    .count(),
+                db.iter().unwrap().count()
+            );
+        }
+    }
 
     #[test]
     fn options_upper_bound_prunes_unrelated_l0_prefetch() {

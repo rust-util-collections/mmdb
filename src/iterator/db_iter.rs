@@ -21,12 +21,8 @@ pub struct DBIterator {
     merger: MergingIterator<IKeyCompareFn>,
     /// Snapshot sequence number for visibility filtering.
     sequence: SequenceNumber,
-    /// Start of the reserved batch-overlay sequence region (see
-    /// `DB::iter_with_batch`). Entries with `seq >= floor` are uncommitted
-    /// batch entries that must be visible *in addition to* entries at or
-    /// below `sequence`. Real writers can never produce sequences in the
-    /// reserved region, so the two visibility ranges never alias.
-    batch_seq_floor: Option<SequenceNumber>,
+    /// Source zero contains the uncommitted batch when an overlay is present.
+    has_batch_overlay: bool,
     /// Reusable buffer for last user key (for deduplication).
     last_user_key: Vec<u8>,
     /// Whether last_user_key has been set at least once.
@@ -48,10 +44,7 @@ pub struct DBIterator {
     iterate_lower_bound: Option<Vec<u8>>,
     /// Overshoot buffer for backward iteration: when collecting entries for one
     /// user key, we may read the first entry of the *previous* user key. This
-    /// field saves that entry — along with the LSM level it came from
-    /// (captured via `peek_source_level()` at the time it was taken, mirroring
-    /// the forward path) — so the next backward walk consumes it first with
-    /// correct cross-level tombstone pruning.
+    /// field retains the entry and its source for visibility and level checks.
     prev_overshoot: Option<(Vec<u8>, LazyValue, usize)>,
     /// True when the last operation was a backward resolution (prev/seek_to_last).
     /// On the next forward iteration (next_visible), the merger must be re-seeked
@@ -92,7 +85,7 @@ impl DBIterator {
         Self {
             merger,
             sequence,
-            batch_seq_floor: None,
+            has_batch_overlay: false,
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
@@ -118,7 +111,7 @@ impl DBIterator {
         Self {
             merger,
             sequence,
-            batch_seq_floor: None,
+            has_batch_overlay: false,
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
@@ -149,7 +142,7 @@ impl DBIterator {
         Self {
             merger,
             sequence,
-            batch_seq_floor: None,
+            has_batch_overlay: false,
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
@@ -190,20 +183,8 @@ impl DBIterator {
         self.clean_read = false;
     }
 
-    /// Mark the start of the reserved batch-overlay sequence region. Entries
-    /// (and range tombstones) with `seq >= floor` become visible in addition
-    /// to entries at or below the snapshot sequence. Used by
-    /// `DB::iter_with_batch` to overlay uncommitted batch writes on top of a
-    /// snapshot read without aliasing committed sequence numbers.
-    pub(crate) fn set_batch_seq_floor(&mut self, floor: SequenceNumber) {
-        self.batch_seq_floor = Some(floor);
-    }
-
-    /// Visibility predicate: an entry is visible if it is within the snapshot
-    /// (`seq <= sequence`) or part of the batch overlay (`seq >= floor`).
-    #[inline]
-    fn is_visible(&self, seq: SequenceNumber) -> bool {
-        seq <= self.sequence || self.batch_seq_floor.is_some_and(|floor| seq >= floor)
+    pub(crate) fn include_batch_source(&mut self) {
+        self.has_batch_overlay = true;
     }
 
     /// Snapshot bound to use for range-tombstone visibility. The tombstone
@@ -214,7 +195,7 @@ impl DBIterator {
     /// the bound is lifted to MAX.
     #[inline]
     fn tombstone_snapshot(&self) -> SequenceNumber {
-        if self.batch_seq_floor.is_some() {
+        if self.has_batch_overlay {
             MAX_SEQUENCE_NUMBER
         } else {
             self.sequence
@@ -377,27 +358,27 @@ impl DBIterator {
                 self.merger.seek(seek_key.as_bytes());
             }
         }
-        // Decisions extracted from peek_entry() to avoid borrow conflicts.
-        // peek_entry() borrows self.merger; we need self.is_range_deleted() etc.
+        // Decisions extracted from peek_key() to avoid borrow conflicts.
+        // peek_key() borrows self.merger; we need self.is_range_deleted() etc.
         enum Action {
             Skip,
             Take {
                 uk_len: usize,
             },
-            /// Deferred tombstone check — need peek_source_level() after
-            /// the peek_entry() borrow ends so the heap is initialized.
+            /// Check the source level after dropping the borrowed key.
             TakeCheckTombstone {
                 uk_len: usize,
                 seq: SequenceNumber,
+                source: usize,
             },
         }
-        // Copy visibility parameters out of self: peek_entry() holds a
+        // Copy visibility parameters out of self: peek_key() holds a
         // mutable borrow of self.merger across the checks below.
         let snapshot = self.sequence;
-        let batch_floor = self.batch_seq_floor;
+        let has_batch_overlay = self.has_batch_overlay;
         loop {
             let action = {
-                let (ikey_ref, _value_ref) = self.merger.peek_entry()?;
+                let (ikey_ref, source) = self.merger.peek_key()?;
                 match decode_internal_key(ikey_ref) {
                     Err(e) => {
                         self.key_decode_error = Some(e.to_string());
@@ -405,7 +386,7 @@ impl DBIterator {
                         return None;
                     }
                     Ok((_, seq, vt)) => {
-                        if !(seq <= snapshot || batch_floor.is_some_and(|floor| seq >= floor)) {
+                        if !(seq <= snapshot || (has_batch_overlay && source == 0)) {
                             Action::Skip
                         } else {
                             let uk_len = ikey_ref.len() - 8;
@@ -454,9 +435,11 @@ impl DBIterator {
                                 } else if self.range_tombstones.is_empty() {
                                     Action::Take { uk_len }
                                 } else {
-                                    // Defer tombstone check until after peek_entry
-                                    // borrow ends so we can call peek_source_level().
-                                    Action::TakeCheckTombstone { uk_len, seq }
+                                    Action::TakeCheckTombstone {
+                                        uk_len,
+                                        seq,
+                                        source,
+                                    }
                                 }
                             }
                         }
@@ -469,10 +452,12 @@ impl DBIterator {
                     self.merger.advance_entry();
                     continue;
                 }
-                Action::TakeCheckTombstone { uk_len, seq } => {
-                    // Now that peek_entry() borrow is released and the heap is
-                    // initialized, peek_source_level() returns the true level.
-                    let source_level = self.merger.peek_source_level();
+                Action::TakeCheckTombstone {
+                    uk_len,
+                    seq,
+                    source,
+                } => {
+                    let source_level = self.merger.source_level(source);
                     let level_filter = if source_level != usize::MAX {
                         Some(source_level)
                     } else {
@@ -528,12 +513,12 @@ impl DBIterator {
                 self.merger.seek(seek_key.as_bytes());
             }
         }
-        // Copy visibility parameters out of self: peek_entry() holds a
+        // Copy visibility parameters out of self: peek_key() holds a
         // mutable borrow of self.merger across the checks below.
         let snapshot = self.sequence;
-        let batch_floor = self.batch_seq_floor;
+        let has_batch_overlay = self.has_batch_overlay;
         loop {
-            let (ikey_ref, _) = self.merger.peek_entry()?;
+            let (ikey_ref, source) = self.merger.peek_key()?;
             let (seq, vt) = match decode_internal_key(ikey_ref) {
                 Err(e) => {
                     self.key_decode_error = Some(e.to_string());
@@ -544,7 +529,7 @@ impl DBIterator {
             };
             let uk_len = ikey_ref.len() - 8;
 
-            if !(seq <= snapshot || batch_floor.is_some_and(|floor| seq >= floor)) {
+            if !(seq <= snapshot || (has_batch_overlay && source == 0)) {
                 self.merger.advance_entry();
                 continue;
             }
@@ -747,18 +732,6 @@ impl DBIterator {
         self.resolve_prev_user_key(Some(&bound));
     }
 
-    /// Fetch the next backward entry from the merger along with the LSM level
-    /// it came from. Mirrors the forward path's `peek_entry()`, `peek_source_level()`,
-    /// `take_entry()` ordering: `peek_source_level()` is called immediately before
-    /// `prev_entry()`, so it reads the level of the entry `prev_entry()` is about to
-    /// pop (`prev_entry()` takes from `self.sources[self.heap[0]]`, exactly what
-    /// `peek_source_level()` reads).
-    #[inline]
-    fn prev_entry_with_level(&mut self) -> Option<(Vec<u8>, LazyValue, usize)> {
-        let level = self.merger.peek_source_level();
-        self.merger.prev_entry().map(|(k, v)| (k, v, level))
-    }
-
     /// Internal: given the merger positioned backward at or before target,
     /// find the previous visible user key and position on it.
     ///
@@ -787,19 +760,18 @@ impl DBIterator {
             // Track if best visible version is a deletion
             let mut best_is_deletion = false;
             // LSM level the current best_entry came from (for cross-level
-            // tombstone pruning), captured via peek_source_level() at the
-            // time the entry was taken from the merger.
+            // tombstone pruning).
             let mut best_level: usize = usize::MAX;
 
             // First, consume any overshoot entry saved from a previous backward walk
             let first_entry = self
                 .prev_overshoot
                 .take()
-                .or_else(|| self.prev_entry_with_level());
+                .or_else(|| self.merger.prev_entry());
 
             let mut iter_entry = first_entry;
 
-            while let Some((ikey, value, level)) = iter_entry.take() {
+            while let Some((ikey, value, source)) = iter_entry.take() {
                 let (uk_owned, seq, vt) = match decode_internal_key(&ikey) {
                     Err(e) => {
                         self.key_decode_error = Some(e.to_string());
@@ -829,7 +801,7 @@ impl DBIterator {
                 if let Some(ref bound) = current_bound
                     && uk >= bound.as_slice()
                 {
-                    iter_entry = self.prev_entry_with_level();
+                    iter_entry = self.merger.prev_entry();
                     continue;
                 }
 
@@ -843,7 +815,7 @@ impl DBIterator {
                             // We've moved to a different (earlier) user key.
                             // Save this entry (with its level) as overshoot for
                             // next iteration.
-                            self.prev_overshoot = Some((ikey, value, level));
+                            self.prev_overshoot = Some((ikey, value, source));
                             break;
                         }
                     }
@@ -851,7 +823,7 @@ impl DBIterator {
 
                 // Skip range deletion entries — tombstones are pre-loaded.
                 if vt == ValueType::RangeDeletion {
-                    iter_entry = self.prev_entry_with_level();
+                    iter_entry = self.merger.prev_entry();
                     continue;
                 }
 
@@ -859,9 +831,11 @@ impl DBIterator {
                 // Backward order = seq ascending, so each new entry has higher seq.
                 // Use >= so that sequence-0 entries (produced by bottommost compaction)
                 // are correctly picked up when best_seq starts at 0.
-                if self.is_visible(seq) && seq >= best_seq {
+                if (seq <= self.sequence || (self.has_batch_overlay && source == 0))
+                    && seq >= best_seq
+                {
                     best_seq = seq;
-                    best_level = level;
+                    best_level = self.merger.source_level(source);
                     best_is_deletion = vt == ValueType::Deletion;
                     if !best_is_deletion {
                         // Truncate ikey to user key in-place
@@ -873,7 +847,7 @@ impl DBIterator {
                     }
                 }
 
-                iter_entry = self.prev_entry_with_level();
+                iter_entry = self.merger.prev_entry();
             }
 
             // A failed source may hold newer versions of the candidate that

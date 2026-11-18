@@ -239,8 +239,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         Some(entry)
     }
 
-    /// Get the previous (key, value) pair from the merged stream (backward direction).
-    pub fn prev_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+    /// Get the previous key, value and source index in backward order.
+    pub fn prev_entry(&mut self) -> Option<(Vec<u8>, LazyValue, usize)> {
         if self.error.is_some() {
             return None;
         }
@@ -265,7 +265,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                     self.latch_source_error(0);
                 }
             }
-            return entry;
+            return entry.map(|(key, value)| (key, value, 0));
         }
 
         self.init_heap();
@@ -290,7 +290,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             self.remove_exhausted_top(max_idx);
         }
 
-        Some(entry)
+        Some((entry.0, entry.1, max_idx))
     }
 
     /// Switch from backward to forward direction.
@@ -464,11 +464,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.init_heap();
     }
 
-    /// Peek the current minimum entry without transferring ownership.
-    /// Returns references to the key and value of the smallest entry.
-    /// For the single-source fast path, this is a direct reference to the source's buffer.
+    /// Peek the minimum key and the index of the source that supplies it.
     #[inline]
-    pub fn peek_entry(&mut self) -> Option<(&[u8], &[u8])> {
+    pub fn peek_key(&mut self) -> Option<(&[u8], usize)> {
         if self.error.is_some() {
             return None;
         }
@@ -484,7 +482,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 self.latch_source_error(0);
                 return None;
             }
-            return self.sources[0].peek();
+            return self.sources[0].peek().map(|(key, _)| (key, 0));
         }
 
         self.init_heap();
@@ -492,7 +490,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             return None;
         }
         let min_idx = self.heap[0];
-        self.sources[min_idx].peek()
+        self.sources[min_idx].peek().map(|(key, _)| (key, min_idx))
     }
 
     /// Advance past the current minimum entry (discard it).
@@ -608,17 +606,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
     }
 
-    /// Return the LSM level of the source currently at the top of the heap
-    /// (i.e., the source whose entry would be returned by peek_entry).
-    /// Returns `usize::MAX` if no entry is available.
-    pub fn peek_source_level(&self) -> usize {
-        if self.single_source {
-            return self.sources[0].level;
-        }
-        if self.heap_size == 0 {
-            return usize::MAX;
-        }
-        self.sources[self.heap[0]].level
+    pub fn source_level(&self, index: usize) -> usize {
+        self.sources[index].level
     }
 
     /// True once a source failed; the merged stream then yields nothing.
