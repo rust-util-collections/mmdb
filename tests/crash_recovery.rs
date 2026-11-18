@@ -23,12 +23,20 @@ fn relative_store_survives_working_directory_change() {
     // A child process can change its working directory without affecting
     // other tests running concurrently.
     if env::var_os("MMDB_TEST_CHANGE_CWD").is_some() {
+        assert_eq!(
+            DB::open(make_opts(), "").err().unwrap().kind(),
+            mmdb::ErrorKind::InvalidArgument
+        );
+        assert!(!Path::new("CURRENT").exists());
         let db = DB::open(make_opts(), "store").unwrap();
         assert_eq!(db.path(), Path::new("store"));
         db.put(b"key", b"value").unwrap();
         env::set_current_dir("other").unwrap();
         db.flush().unwrap();
         db.close().unwrap();
+        env::set_current_dir("../store").unwrap();
+        assert!(DB::open_read_only("").is_err());
+        DB::open_read_only(".").unwrap();
         return;
     }
 

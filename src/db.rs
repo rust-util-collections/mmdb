@@ -669,6 +669,9 @@ impl DB {
     fn open_impl(options: DbOptions, path: impl AsRef<Path>, read_only: bool) -> Result<Self> {
         let mut options = options;
         let requested_path = path.as_ref().to_path_buf();
+        if requested_path.as_os_str().is_empty() {
+            return Err(Error::invalid_argument("database path is empty"));
+        }
         let path = if requested_path.is_relative() {
             std::env::current_dir().ctx()?.join(&requested_path)
         } else {
