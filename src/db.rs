@@ -34,6 +34,7 @@ use crate::options::{
     CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
 };
 use crate::rate_limiter::RateLimiter;
+use crate::sst::SstBuilds;
 use crate::sst::filter::BloomFilter;
 use crate::sst::table_builder::{
     META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuildResult, TableBuilder,
@@ -403,6 +404,7 @@ pub struct DB {
     manifest_poisoned: Arc<AtomicBool>,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
+    builds: Arc<SstBuilds>,
     rate_limiter: Arc<RateLimiter>,
     stats: Arc<DbStats>,
     /// Shutdown flag for compaction threads.
@@ -829,6 +831,7 @@ impl DB {
             // Private single-member pool — the historical behavior.
             None => BlockCache::new(options.block_cache_capacity),
         });
+        let builds = Arc::new(SstBuilds::default());
         let rate_limiter = Arc::new(RateLimiter::new(options.rate_limiter_bytes_per_sec));
         let stats = Arc::new(DbStats::new());
         let table_cache = Arc::new(TableCache::new_with_stats(
@@ -1091,6 +1094,7 @@ impl DB {
             let bg_options = options.clone();
             let bg_table_cache = table_cache.clone();
             let bg_block_cache = block_cache.clone();
+            let bg_builds = builds.clone();
             let bg_rate_limiter = rate_limiter.clone();
             let bg_stats = stats.clone();
             let bg_l0_count = l0_file_count.clone();
@@ -1204,6 +1208,7 @@ impl DB {
                                                 let ctx = CompactionContext {
                                                     db_path: &bg_path,
                                                     options: &bg_options,
+                                                    builds: &bg_builds,
                                                     rate_limiter: Some(&bg_rate_limiter),
                                                     stats: Some(&bg_stats),
                                                     active_snapshots: &active_snaps,
@@ -1373,6 +1378,7 @@ impl DB {
                                     let ctx = CompactionContext {
                                         db_path: &bg_path,
                                         options: &bg_options,
+                                        builds: &bg_builds,
                                         rate_limiter: Some(&bg_rate_limiter),
                                         stats: Some(&bg_stats),
                                         active_snapshots: &active_snaps,
@@ -1475,6 +1481,7 @@ impl DB {
                                         let ctx = CompactionContext {
                                             db_path: &bg_path,
                                             options: &bg_options,
+                                            builds: &bg_builds,
                                             rate_limiter: Some(&bg_rate_limiter),
                                             stats: Some(&bg_stats),
                                             active_snapshots: &active_snaps,
@@ -1606,6 +1613,7 @@ impl DB {
             manifest_poisoned,
             block_cache,
             table_cache,
+            builds,
             rate_limiter,
             stats,
             compaction_shutdown,
@@ -2745,6 +2753,7 @@ impl DB {
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
                 options: &self.options,
+                builds: &self.builds,
                 rate_limiter: Some(&self.rate_limiter),
                 stats: Some(&self.stats),
                 active_snapshots: &active_snaps,
@@ -3068,8 +3077,15 @@ impl DB {
     /// Close the database.
     ///
     /// Resources are released even when this returns a flush, sync, or
-    /// previously recorded fail-stop error.
+    /// previously recorded fail-stop error. A compaction filter or block
+    /// property collector closing its own store receives `InvalidArgument`
+    /// because shutdown must wait for the callback to return.
     pub fn close(&self) -> Result<()> {
+        if self.builds.contains_current_thread() {
+            return Err(Error::invalid_argument(
+                "cannot close a store from its own SST build callback",
+            ));
+        }
         // All close callers wait for worker shutdown and the directory unlock.
         // Workers never acquire this guard, including during their final install.
         let mut directory_lock = self.lock_file.lock();
@@ -3809,6 +3825,7 @@ impl DB {
         // here would skip every caller's fail-stop arm (leaving
         // `leader_active` set, or a frozen memtable whose WAL a later flush
         // skips), so report it as an error instead.
+        let _build = self.builds.enter();
         let written = catch_unwind(AssertUnwindSafe(|| {
             Self::write_memtable_ssts(
                 &frozen.old_mem,
@@ -4053,6 +4070,7 @@ impl DB {
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
                 options: &force_opts,
+                builds: &self.builds,
                 rate_limiter: Some(&self.rate_limiter),
                 stats: Some(&self.stats),
                 active_snapshots: &active_snaps,
@@ -4154,6 +4172,7 @@ impl DB {
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
                 options: &force_opts,
+                builds: &self.builds,
                 rate_limiter: Some(&self.rate_limiter),
                 stats: Some(&self.stats),
                 active_snapshots: &active_snaps,
@@ -5235,7 +5254,8 @@ mod tests {
         struct BlockFirstCall {
             armed: AtomicBool,
             entered: Mutex<Option<mpsc::Sender<()>>>,
-            release: Mutex<Option<mpsc::Receiver<()>>>,
+            release: Mutex<Option<mpsc::Receiver<Arc<DB>>>>,
+            close_result: mpsc::Sender<ErrorKind>,
         }
         impl CompactionFilter for BlockFirstCall {
             fn filter(
@@ -5246,7 +5266,10 @@ mod tests {
             ) -> CompactionFilterDecision {
                 if self.armed.swap(false, Ordering::SeqCst) {
                     self.entered.lock().take().unwrap().send(()).unwrap();
-                    self.release.lock().take().unwrap().recv().unwrap();
+                    let db = self.release.lock().take().unwrap().recv().unwrap();
+                    self.close_result
+                        .send(db.close().unwrap_err().kind())
+                        .unwrap();
                 }
                 CompactionFilterDecision::Keep
             }
@@ -5273,10 +5296,12 @@ mod tests {
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
+        let (close_result, callback_done) = mpsc::channel();
         let filter = Arc::new(BlockFirstCall {
             armed: AtomicBool::new(true),
             entered: Mutex::new(Some(entered_tx)),
             release: Mutex::new(Some(release_rx)),
+            close_result,
         });
         // The inherited L0 backlog starts one job; the tiny level budget
         // leaves more jobs queued behind it.
@@ -5312,7 +5337,11 @@ mod tests {
             let db = db.clone();
             thread::spawn(move || db.close())
         };
-        release_tx.send(()).unwrap();
+        release_tx.send(db.clone()).unwrap();
+        assert_eq!(
+            callback_done.recv_timeout(Duration::from_secs(10)).unwrap(),
+            ErrorKind::InvalidArgument
+        );
         second.join().unwrap().unwrap();
         let reopened = DB::open_read_only(dir.path()).unwrap();
         closer.join().unwrap().unwrap();
@@ -5530,6 +5559,7 @@ mod tests {
             let ctx = CompactionContext {
                 db_path: &db.storage_path,
                 options: &db.options,
+                builds: &db.builds,
                 rate_limiter: Some(&db.rate_limiter),
                 stats: Some(&db.stats),
                 active_snapshots: &snapshots,

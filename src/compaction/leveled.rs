@@ -25,6 +25,7 @@ use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::VersionSet;
 use crate::options::{CompactionFilterDecision, DbOptions};
 use crate::rate_limiter::RateLimiter;
+use crate::sst::SstBuilds;
 use crate::sst::table_builder::{META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
@@ -52,6 +53,7 @@ pub struct CompactionHint {
 pub(crate) struct CompactionContext<'a> {
     pub db_path: &'a Path,
     pub options: &'a DbOptions,
+    pub builds: &'a SstBuilds,
     pub rate_limiter: Option<&'a Arc<RateLimiter>>,
     pub stats: Option<&'a Arc<DbStats>>,
     pub active_snapshots: &'a [SequenceNumber],
@@ -1019,6 +1021,7 @@ impl LeveledCompaction {
         file_numbers: &FileNumbers,
         is_bottommost: bool,
     ) -> Result<CompactionOutput> {
+        let _build = ctx.builds.enter();
         let target_level = task.level + 1;
 
         // Trivial move optimization: if there's exactly one input file and no
@@ -1141,7 +1144,12 @@ impl LeveledCompaction {
             let thread_results: Vec<Result<SubCompactionOutput>> = scope(|s| {
                 let handles: Vec<_> = sub_tasks
                     .iter()
-                    .map(|sub| s.spawn(|| execute_sub_compaction_io(ctx, sub, &sub_params)))
+                    .map(|sub| {
+                        s.spawn(|| {
+                            let _build = ctx.builds.enter();
+                            execute_sub_compaction_io(ctx, sub, &sub_params)
+                        })
+                    })
                     .collect();
                 handles
                     .into_iter()
@@ -1381,6 +1389,7 @@ impl LeveledCompaction {
         table_cache: Option<&Arc<TableCache>>,
         block_cache: Option<&Arc<BlockCache>>,
     ) -> Result<()> {
+        let _build = ctx.builds.enter();
         let oldest_snapshot_seq = ctx
             .active_snapshots
             .iter()
@@ -2443,6 +2452,7 @@ mod tests {
         let ctx = super::CompactionContext {
             db_path: dir.path(),
             options: &options,
+            builds: &super::SstBuilds::default(),
             rate_limiter: None,
             stats: None,
             active_snapshots: &[],
@@ -2720,6 +2730,7 @@ mod tests {
         let ctx = CompactionContext {
             db_path: dir.path(),
             options: &options,
+            builds: &super::SstBuilds::default(),
             rate_limiter: None,
             stats: None,
             active_snapshots: &[],
@@ -2906,6 +2917,7 @@ mod tests {
             let ctx = CompactionContext {
                 db_path: dir.path(),
                 options: &options,
+                builds: &super::SstBuilds::default(),
                 rate_limiter: None,
                 stats: None,
                 active_snapshots,
@@ -3143,6 +3155,7 @@ mod tests {
         let ctx = CompactionContext {
             db_path: dir.path(),
             options: &options,
+            builds: &super::SstBuilds::default(),
             rate_limiter: None,
             stats: None,
             active_snapshots: &[],
