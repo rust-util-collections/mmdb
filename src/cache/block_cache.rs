@@ -182,7 +182,7 @@ impl BlockCachePool {
         let inner = moka::sync::SegmentedCache::builder(lru_segments(capacity_bytes))
             .max_capacity(capacity_bytes)
             .weigher(|_key: &CacheKey, value: &CacheValue| -> u32 {
-                value.len().min(u32::MAX as usize) as u32
+                value.capacity().max(1) as u32
             })
             .eviction_listener(
                 move |key: Arc<CacheKey>, _value: CacheValue, _cause: RemovalCause| {
@@ -294,6 +294,14 @@ impl BlockCache {
     pub fn insert(&self, file_number: u64, block_offset: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let arc = Arc::new(data);
         if self.pool.disabled || self.detached.load(Ordering::Relaxed) {
+            return arc;
+        }
+        // Moka weights are u32. A larger allocation cannot be charged in
+        // full, and a replacement must retire any older cached value.
+        if u32::try_from(arc.capacity()).is_err() {
+            self.pool
+                .inner
+                .invalidate(&(self.member, file_number, block_offset));
             return arc;
         }
         self.pool.index.add(self.member, file_number, block_offset);
@@ -445,6 +453,26 @@ impl BlockCache {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn empty_blocks_and_spare_capacity_count_toward_the_limit() {
+        let cache = BlockCache::new(1);
+        for offset in 0..16 {
+            cache.insert(1, offset, Vec::new());
+        }
+        cache.insert(2, 0, Vec::with_capacity(4096));
+        cache.pool.inner.run_pending_tasks();
+        assert!(cache.entry_count() <= 1);
+        assert!(cache.get(2, 0).is_none());
+        let tracked: usize = cache
+            .pool
+            .index
+            .shards
+            .iter()
+            .map(|shard| shard.lock().values().map(HashSet::len).sum::<usize>())
+            .sum();
+        assert!(tracked <= 1);
+    }
 
     #[test]
     fn eviction_during_insert_prunes_reverse_offsets() {
