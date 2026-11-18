@@ -698,6 +698,21 @@ impl DB {
             )));
         }
 
+        let num_compaction_threads = if read_only {
+            0
+        } else {
+            options.max_background_compactions.max(1)
+        };
+        let mut compaction_handles = Vec::new();
+        compaction_handles
+            .try_reserve_exact(num_compaction_threads)
+            .map_err(|err| {
+                Error::invalid_argument(format!(
+                    "cannot reserve handles for {num_compaction_threads} compaction workers"
+                ))
+                .with_source(err)
+            })?;
+
         // A filter too large for even one key would fail every flush after
         // writes were acknowledged; reject it before accepting any.
         if !read_only {
@@ -1057,13 +1072,6 @@ impl DB {
             }));
             (l0, sv)
         };
-        let num_compaction_threads = if read_only {
-            0
-        } else {
-            options.max_background_compactions.max(1)
-        };
-        let mut compaction_handles = Vec::with_capacity(num_compaction_threads);
-
         let read_compaction_hints = Arc::new(Mutex::new(Vec::<CompactionHint>::new()));
         let snapshot_list = Arc::new(SnapshotList::new());
         for i in 0..num_compaction_threads {
@@ -5676,6 +5684,20 @@ mod tests {
             0,
             "every still-absent registration must still be pruned"
         );
+    }
+
+    #[test]
+    fn impossible_worker_count_fails_before_database_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions {
+            max_background_compactions: usize::MAX,
+            ..Default::default()
+        };
+        let result = DB::open(opts.clone(), dir.path());
+        assert_eq!(result.err().unwrap().kind(), ErrorKind::InvalidArgument);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        open_test_db(dir.path()).close().unwrap();
+        DB::open_read_only_with_options(opts, dir.path()).unwrap();
     }
 
     /// Regression: if a later worker's spawn fails during `DB::open`, the
