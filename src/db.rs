@@ -4366,6 +4366,12 @@ impl DB {
                 }
             }
         }
+        if offset != data.len() {
+            return Err(Error::corruption(format!(
+                "WAL batch contains {} trailing bytes after {count} entries",
+                data.len() - offset
+            )));
+        }
         Ok(())
     }
 
@@ -6619,6 +6625,32 @@ mod tests {
             open_test_db(dir.path()).get(b"key").unwrap(),
             Some(b"value".to_vec())
         );
+    }
+
+    #[test]
+    fn recovery_preserves_a_wal_with_trailing_batch_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        let mut batch = WriteBatch::new();
+        batch.put(b"key", b"value");
+        let mut record = DB::encode_wal_record(1, &batch);
+        record.push(0);
+        let wal_path = {
+            let mut inner = db.inner.lock();
+            let wal = inner.wal_writer.as_mut().unwrap();
+            wal.add_record(&record).unwrap();
+            wal.sync().unwrap();
+            dir.path().join(format!("{:06}.wal", inner.wal_number))
+        };
+        db.simulate_crash();
+        let before = fs::read(&wal_path).unwrap();
+        for result in [
+            DB::open_read_only(dir.path()),
+            DB::open(DbOptions::default(), dir.path()),
+        ] {
+            assert_eq!(result.err().unwrap().kind(), ErrorKind::Corruption);
+            assert_eq!(fs::read(&wal_path).unwrap(), before);
+        }
     }
 
     #[test]
