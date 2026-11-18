@@ -227,9 +227,9 @@ impl VersionSet {
     ) -> Result<Self> {
         // Read CURRENT to find manifest file
         let current_path = db_path.join("CURRENT");
-        let manifest_name = fs::read_to_string(&current_path)
-            .map_err(|e| Error::corruption(format!("cannot read CURRENT: {}", e)))
-            .ctx()?;
+        let contents = fs::read(&current_path).with_ctx(|| "reading CURRENT")?;
+        let manifest_name = std::str::from_utf8(&contents)
+            .map_err(|e| Error::corruption("CURRENT contains invalid UTF-8").with_source(e))?;
         let manifest_name = manifest_name.trim_end_matches(['\r', '\n']);
         let manifest_number = Self::parse_manifest_number(manifest_name).ctx()?;
         let manifest_path = db_path.join(format!("MANIFEST-{manifest_number:06}"));

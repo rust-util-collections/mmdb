@@ -710,15 +710,10 @@ impl DB {
             // capability actually granted to this handle.
             options.create_if_missing = false;
             options.error_if_exists = false;
-            if !path.join("CURRENT").exists() {
-                return Err(Error::invalid_argument(format!(
-                    "DB does not exist: {}",
-                    path.display()
-                )));
-            }
-        } else if options.create_if_missing {
+        }
+        if options.create_if_missing {
             fs::create_dir_all(&path).ctx()?;
-        } else if !path.join("CURRENT").exists() {
+        } else if !path.join("CURRENT").try_exists().ctx()? {
             // Match RocksDB/LevelDB: existence means a DB marker (`CURRENT`),
             // not merely a directory path. An empty dir must not be initialized
             // when creation is disabled (and must not create LOCK either).
@@ -5287,10 +5282,28 @@ mod tests {
         // A self-referential symlink makes stat fail with ELOOP.
         std::os::unix::fs::symlink("CURRENT", &current).unwrap();
 
-        assert!(DB::open(DbOptions::default(), dir.path()).is_err());
+        let check_errors = || {
+            for result in [
+                DB::open(DbOptions::default(), dir.path()),
+                DB::open(
+                    DbOptions {
+                        create_if_missing: false,
+                        ..Default::default()
+                    },
+                    dir.path(),
+                ),
+                DB::open_read_only(dir.path()),
+            ] {
+                assert_eq!(result.err().unwrap().kind(), ErrorKind::Io);
+            }
+        };
+        check_errors();
+        fs::remove_file(&current).unwrap();
+        fs::create_dir(&current).unwrap();
+        check_errors();
+        fs::remove_dir(&current).unwrap();
         assert_eq!(count_ssts(), ssts, "a failed open must not delete SSTs");
 
-        fs::remove_file(&current).unwrap();
         fs::write(&current, saved).unwrap();
         let db = DB::open(DbOptions::default(), dir.path()).unwrap();
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v"[..]));
