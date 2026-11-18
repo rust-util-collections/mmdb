@@ -735,7 +735,7 @@ impl TableReader {
         };
         let entry = entries.first()?;
         let cache = self.block_cache.as_ref()?;
-        if cache.get(self.file_number, entry.handle.offset).is_some() {
+        if !cache.is_enabled() || cache.get(self.file_number, entry.handle.offset).is_some() {
             return None;
         }
         #[cfg(test)]

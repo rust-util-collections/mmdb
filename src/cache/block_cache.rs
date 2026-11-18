@@ -258,6 +258,10 @@ pub struct BlockCache {
 }
 
 impl BlockCache {
+    pub(crate) fn is_enabled(&self) -> bool {
+        !self.pool.disabled && !self.detached.load(Ordering::Relaxed)
+    }
+
     /// Create a private single-member cache with the given capacity in
     /// bytes — the non-shared form, and exactly the historical behavior.
     /// A capacity of 0 disables caching entirely.
@@ -267,7 +271,7 @@ impl BlockCache {
 
     /// Look up a cached block. Pinned entries are checked first.
     pub fn get(&self, file_number: u64, block_offset: u64) -> Option<Arc<Vec<u8>>> {
-        if self.pool.disabled || self.detached.load(Ordering::Relaxed) {
+        if !self.is_enabled() {
             return None;
         }
         // The snapshot load never acquires the pin-update mutex.
@@ -293,7 +297,7 @@ impl BlockCache {
     /// barrier against concurrent insertion.
     pub fn insert(&self, file_number: u64, block_offset: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let arc = Arc::new(data);
-        if self.pool.disabled || self.detached.load(Ordering::Relaxed) {
+        if !self.is_enabled() {
             return arc;
         }
         // Moka weights are u32. A larger allocation cannot be charged in

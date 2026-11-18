@@ -125,7 +125,7 @@ Key optimizations:
 - **Cursor-based block iteration**: Decodes entries one-at-a-time from raw block data — no per-block Vec allocation
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
 - **Sequential readahead**: `posix_fadvise(WILLNEED)` after detecting sequential block access
-- **L0 first-block pinning**: Each L0 file's first data block (smallest key) is pinned via `insert_pinned` so `init_heap`'s first `peek()` is always a cache hit; unpinned on compaction. Index and filter blocks are held directly as `TableReader` fields, and range-tombstone data is cached there; none go through `block_cache`
+- With L0 pinning and caching enabled, a flush reads and pins the first data block of each new L0 SST. Compaction releases those pins. Each table reader holds its own index, filters, and cached range tombstones.
 - **Range tombstones**: Iterators query a prebuilt interval index. Compaction tracks overlapping deletions in a heap ordered by sequence.
 - **Lazy index loading**: Index entries are parsed on first use
 - **Atomic L0 counter**: Write-throttle checks use an atomic counter, avoiding mutex contention on writes

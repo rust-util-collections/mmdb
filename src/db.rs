@@ -5070,6 +5070,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn disabled_cache_skips_first_block_pin_io() {
+        use crate::sst::table_reader::PREPARE_FIRST_BLOCK_PIN_HOOK;
+        for pool in [None, Some(Arc::new(crate::BlockCachePool::new(0)))] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open(
+                DbOptions {
+                    block_cache_capacity: 0,
+                    block_cache: pool,
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .unwrap();
+            db.put(b"key", b"value").unwrap();
+            PREPARE_FIRST_BLOCK_PIN_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(|| {
+                    panic!("disabled cache read a block for pinning")
+                }));
+            });
+            db.flush().unwrap();
+            PREPARE_FIRST_BLOCK_PIN_HOOK.with(|hook| assert!(hook.borrow_mut().take().is_some()));
+        }
+    }
+
     /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0
     /// was empty it ran level-size compactions inline — in the stop-trigger
     /// path while holding `write_queue`, stalling every writer.
