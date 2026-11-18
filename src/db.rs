@@ -3084,6 +3084,9 @@ impl DB {
     /// Resources are released even when this returns a flush, sync, or
     /// previously recorded fail-stop error.
     pub fn close(&self) -> Result<()> {
+        // All close callers wait for worker shutdown and the directory unlock.
+        // Workers never acquire this guard, including during their final install.
+        let mut directory_lock = self.lock_file.lock();
         // Serialize with every mutate path that holds `write_queue` across
         // unlocked SST/MANIFEST I/O (`write_batch_group` leaders, stop-trigger
         // drain, compact_range, flush, compact). Set `closed` only after the
@@ -3121,7 +3124,7 @@ impl DB {
 
         drop(inner);
         drop(wq);
-        self.shutdown_background_and_release_resources();
+        self.shutdown_background_and_release_resources(&mut directory_lock);
 
         if first_error.is_none() {
             first_error = self.fail_stop_error();
@@ -3157,7 +3160,7 @@ impl DB {
         cvar.notify_one();
     }
 
-    fn shutdown_background_and_release_resources(&self) {
+    fn shutdown_background_and_release_resources(&self, directory_lock: &mut Option<DirLock>) {
         {
             let (lock, cvar) = &*self.compaction_notify;
             let _guard = lock.lock();
@@ -3168,14 +3171,8 @@ impl DB {
             let _ = handle.join();
         }
         self.block_cache.detach();
-        self.release_directory_lock();
-    }
-
-    /// Drop the directory lock. `LOCK_UN` runs before the fd is closed:
-    /// `close` can defer the final `fput`, and a same-process reopen then
-    /// sees `EAGAIN` even though no handle still owns the file.
-    fn release_directory_lock(&self) {
-        drop(self.lock_file.lock().take());
+        // DirLock performs LOCK_UN before closing the descriptor.
+        directory_lock.take();
     }
 
     /// Find the highest sequence number among range tombstones covering `key`
@@ -4440,7 +4437,7 @@ impl DB {
     /// Useful for testing WAL recovery without lingering background compaction threads.
     pub fn simulate_crash(self) {
         self.closed.store(true, Ordering::Release);
-        self.shutdown_background_and_release_resources();
+        self.shutdown_background_and_release_resources(&mut self.lock_file.lock());
         let mut inner = self.inner.lock();
         if let Some(wal) = inner.wal_writer.take() {
             wal.discard_buffer();
@@ -4461,7 +4458,7 @@ impl Drop for DB {
                 let _ = wal.sync();
             }
         }
-        self.shutdown_background_and_release_resources();
+        self.shutdown_background_and_release_resources(&mut self.lock_file.lock());
     }
 }
 
@@ -5239,8 +5236,20 @@ mod tests {
             assert!(Instant::now() < deadline, "close never requested shutdown");
             thread::sleep(Duration::from_millis(1));
         }
+        let holds_close_guard = db.lock_file.try_lock().is_none();
+        let second = {
+            let db = db.clone();
+            thread::spawn(move || db.close())
+        };
         release_tx.send(()).unwrap();
+        second.join().unwrap().unwrap();
+        let reopened = DB::open_read_only(dir.path()).unwrap();
         closer.join().unwrap().unwrap();
+        assert!(
+            holds_close_guard,
+            "a concurrent close could return before LOCK was released"
+        );
+        drop(reopened);
 
         assert_eq!(
             db.stats.compactions_completed.load(Ordering::Relaxed),
