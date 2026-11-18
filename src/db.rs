@@ -4497,7 +4497,13 @@ impl DB {
     pub fn simulate_crash(self) {
         self.closed.store(true, Ordering::Release);
         self.shutdown_background_and_release_resources();
-        mem::forget(self);
+        let mut inner = self.inner.lock();
+        if let Some(wal) = inner.wal_writer.take() {
+            wal.discard_buffer();
+        }
+        if let Some(manifest) = inner.versions.manifest_sync_handle().lock().take() {
+            manifest.discard_buffer();
+        }
     }
 }
 
@@ -6574,6 +6580,32 @@ mod tests {
                 Some(b"another_val".to_vec())
             );
         }
+    }
+
+    #[test]
+    fn simulated_crash_releases_readers_and_discards_pending_wal_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.put(b"key", b"value").unwrap();
+        let state = Arc::downgrade(&db.inner);
+        let wal_path = dir
+            .path()
+            .join(format!("{:06}.wal", db.inner.lock().wal_number));
+        let committed = fs::read(&wal_path).unwrap();
+        db.inner
+            .lock()
+            .wal_writer
+            .as_mut()
+            .unwrap()
+            .add_record(b"pending")
+            .unwrap();
+        db.simulate_crash();
+        assert!(state.upgrade().is_none());
+        assert_eq!(fs::read(wal_path).unwrap(), committed);
+        assert_eq!(
+            open_test_db(dir.path()).get(b"key").unwrap(),
+            Some(b"value".to_vec())
+        );
     }
 
     #[test]

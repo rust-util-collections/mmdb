@@ -23,6 +23,12 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
+    /// Release the file without letting BufWriter flush during a simulated crash.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn discard_buffer(self) {
+        drop(self.writer.into_parts());
+    }
+
     /// Create a new WAL writer for the given file path.
     pub fn new(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
