@@ -42,6 +42,14 @@ impl Version {
         &self.files[level]
     }
 
+    pub fn total_sst_size(&self) -> u64 {
+        self.files
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(|file| file.meta.file_size)
+            .fold(0, u64::saturating_add)
+    }
+
     /// Total number of files across all levels (test helper).
     #[cfg(test)]
     pub(crate) fn total_files(&self) -> usize {

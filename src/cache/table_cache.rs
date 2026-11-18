@@ -5,6 +5,8 @@ use std::{
     sync::Arc,
 };
 
+use arc_swap::ArcSwapOption;
+
 use crate::cache::block_cache::BlockCache;
 use crate::error::{Result, ResultExt};
 use crate::sst::table_reader::TableReader;
@@ -13,7 +15,7 @@ use crate::stats::DbStats;
 /// Cache for open TableReader instances.
 pub struct TableCache {
     db_path: PathBuf,
-    inner: moka::sync::Cache<u64, Arc<TableReader>>,
+    inner: ArcSwapOption<moka::sync::Cache<u64, Arc<TableReader>>>,
     block_cache: Option<Arc<BlockCache>>,
     stats: Option<Arc<DbStats>>,
 }
@@ -36,9 +38,11 @@ impl TableCache {
     ) -> Self {
         Self {
             db_path: db_path.to_path_buf(),
-            inner: moka::sync::Cache::builder()
-                .max_capacity(max_open_files)
-                .build(),
+            inner: ArcSwapOption::from_pointee(
+                moka::sync::Cache::builder()
+                    .max_capacity(max_open_files)
+                    .build(),
+            ),
             block_cache,
             stats,
         }
@@ -52,7 +56,10 @@ impl TableCache {
         let db_path = self.db_path.clone();
         let block_cache = self.block_cache.clone();
         let stats = self.stats.clone();
-        self.inner
+        let cache = self.inner.load();
+        cache
+            .as_ref()
+            .ok_or_else(crate::Error::db_closed)?
             .try_get_with(file_number, || {
                 let path = db_path.join(format!("{:06}.sst", file_number));
                 TableReader::open_with_all(&path, file_number, block_cache, stats).map(Arc::new)
@@ -81,9 +88,15 @@ impl TableCache {
         }
     }
 
+    pub fn close(&self) {
+        self.inner.store(None);
+    }
+
     /// Evict a file from the cache.
     pub fn evict(&self, file_number: u64) {
-        self.inner.invalidate(&file_number);
+        if let Some(cache) = self.inner.load().as_ref() {
+            cache.invalidate(&file_number);
+        }
     }
 }
 
@@ -115,7 +128,7 @@ mod tests {
 
         // Evict and re-open
         cache.evict(1);
-        cache.inner.run_pending_tasks();
+        cache.inner.load().as_ref().unwrap().run_pending_tasks();
         let reader3 = cache.get_reader(1).unwrap();
         assert!(!Arc::ptr_eq(&reader, &reader3));
     }

@@ -478,6 +478,13 @@ struct DBInner {
     wal_writer: Option<WalWriter>,
     wal_number: u64,
     versions: VersionSet,
+    closed_properties: Option<ClosedProperties>,
+}
+
+struct ClosedProperties {
+    files_per_level: Vec<usize>,
+    total_sst_size: u64,
+    compaction_pending: bool,
 }
 
 /// Snapshot of the read-visible state: memtables + current version.
@@ -1039,6 +1046,7 @@ impl DB {
             wal_writer,
             wal_number,
             versions,
+            closed_properties: None,
         }));
 
         // Spawn background compaction threads
@@ -1694,11 +1702,10 @@ impl DB {
     }
 
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.check_usable().ctx()?;
-
         // Pin the files/memtables before selecting visibility: compaction
         // may otherwise remove the captured sequence before we retain its data.
         let sv = self.get_super_version();
+        self.check_usable().ctx()?;
         let seq = self.resolve_read_sequence(options.snapshot);
         let (active_mem, imm_mems, version) =
             (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
@@ -1905,13 +1912,12 @@ impl DB {
         lower_bound: Option<&[u8]>,
         upper_bound: Option<&[u8]>,
     ) -> Result<DBIterator> {
-        self.check_usable().ctx()?;
-
         let (lower_bound, upper_bound) = intersect_iter_bounds(options, lower_bound, upper_bound);
 
         // Pin the files/memtables before selecting visibility: compaction
         // may otherwise remove the captured sequence before we retain its data.
         let sv = self.get_super_version();
+        self.check_usable().ctx()?;
         let seq = self.resolve_read_sequence(options.snapshot);
         if lower_bound
             .zip(upper_bound)
@@ -2115,9 +2121,8 @@ impl DB {
     /// Set `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to further
     /// restrict iteration to a sub-range inside the prefix.
     pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator> {
-        self.check_usable().ctx()?;
-
         let sv = self.get_super_version();
+        self.check_usable().ctx()?;
         let seq = self.resolve_read_sequence(options.snapshot);
         // Compute prefix upper bound once, share across all uses.
         let prefix_owned: Arc<[u8]> = Arc::from(prefix);
@@ -2318,9 +2323,8 @@ impl DB {
     /// writers commit after the iterator is created (those stay invisible,
     /// preserving snapshot isolation).
     pub fn iter_with_batch(&self, batch: &WriteBatchWithIndex) -> Result<DBIterator> {
-        self.check_usable().ctx()?;
-
         let sv = self.get_super_version();
+        self.check_usable().ctx()?;
         let seq = self.current_sequence();
         let batch_count = batch.operation_count();
         // Reserve the top of the sequence space for the batch overlay.
@@ -2494,6 +2498,9 @@ impl DB {
 
         if let Some(level_str) = name.strip_prefix("num-files-at-level") {
             if let Ok(level) = level_str.parse::<usize>() {
+                if let Some(ref props) = inner.closed_properties {
+                    return props.files_per_level.get(level).map(usize::to_string);
+                }
                 let version = inner.versions.current();
                 if level < version.num_levels {
                     return Some(version.level_files(level).len().to_string());
@@ -2504,23 +2511,18 @@ impl DB {
 
         match name {
             "total-sst-size" => {
-                let version = inner.versions.current();
-                let total: u64 = version
-                    .files
-                    .iter()
-                    .flat_map(|level| level.iter())
-                    .map(|f| f.meta.file_size)
-                    .sum();
+                let total = inner.closed_properties.as_ref().map_or_else(
+                    || inner.versions.current().total_sst_size(),
+                    |props| props.total_sst_size,
+                );
                 Some(total.to_string())
             }
             "block-cache-usage" => Some(self.block_cache.entry_count().to_string()),
             "compaction-pending" => {
-                let version = inner.versions.current();
-                // Informational only (not an actual pick+claim), so don't
-                // bother excluding in-flight files here.
-                let needed =
-                    LeveledCompaction::pick_compaction(&version, &self.options, &HashSet::new())
-                        .is_some();
+                let needed = inner.closed_properties.as_ref().map_or_else(
+                    || LeveledCompaction::is_pending(&inner.versions.current(), &self.options),
+                    |props| props.compaction_pending,
+                );
                 Some(if needed { "1" } else { "0" }.to_string())
             }
             "stats.bytes_written" => {
@@ -3124,7 +3126,23 @@ impl DB {
 
         drop(inner);
         drop(wq);
-        self.shutdown_background_and_release_resources(&mut directory_lock);
+        self.stop_background_and_detach_cache();
+        let mut inner = self.inner.lock();
+        let version = inner.versions.current();
+        inner.closed_properties = Some(ClosedProperties {
+            files_per_level: version.files.iter().map(|level| level.len()).collect(),
+            total_sst_size: version.total_sst_size(),
+            compaction_pending: LeveledCompaction::is_pending(&version, &self.options),
+        });
+        drop(version);
+        inner.wal_writer.take();
+        inner.versions.release_files();
+        inner.active_memtable = Arc::new(MemTable::new());
+        inner.immutable_memtables.clear();
+        self.install_super_version(&inner);
+        drop(inner);
+        self.table_cache.close();
+        directory_lock.take();
 
         if first_error.is_none() {
             first_error = self.fail_stop_error();
@@ -3160,7 +3178,7 @@ impl DB {
         cvar.notify_one();
     }
 
-    fn shutdown_background_and_release_resources(&self, directory_lock: &mut Option<DirLock>) {
+    fn stop_background_and_detach_cache(&self) {
         {
             let (lock, cvar) = &*self.compaction_notify;
             let _guard = lock.lock();
@@ -3171,8 +3189,6 @@ impl DB {
             let _ = handle.join();
         }
         self.block_cache.detach();
-        // DirLock performs LOCK_UN before closing the descriptor.
-        directory_lock.take();
     }
 
     /// Find the highest sequence number among range tombstones covering `key`
@@ -4437,7 +4453,7 @@ impl DB {
     /// Useful for testing WAL recovery without lingering background compaction threads.
     pub fn simulate_crash(self) {
         self.closed.store(true, Ordering::Release);
-        self.shutdown_background_and_release_resources(&mut self.lock_file.lock());
+        self.stop_background_and_detach_cache();
         let mut inner = self.inner.lock();
         if let Some(wal) = inner.wal_writer.take() {
             wal.discard_buffer();
@@ -4458,7 +4474,12 @@ impl Drop for DB {
                 let _ = wal.sync();
             }
         }
-        self.shutdown_background_and_release_resources(&mut self.lock_file.lock());
+        self.stop_background_and_detach_cache();
+        let mut inner = self.inner.lock();
+        inner.wal_writer.take();
+        inner.versions.manifest_sync_handle().lock().take();
+        drop(inner);
+        self.lock_file.lock().take();
     }
 }
 
@@ -5958,6 +5979,36 @@ mod tests {
 
         let reopened = open_test_db(dir.path());
         assert_eq!(reopened.get(b"key").unwrap(), Some(b"val".to_vec()));
+    }
+
+    #[test]
+    fn close_releases_file_handles_and_preserves_properties_and_iterators() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+        let reader = Arc::downgrade(&db.inner.lock().versions.current().level_files(0)[0].reader);
+        let names = [
+            "total-sst-size",
+            "num-files-at-level0",
+            "compaction-pending",
+        ];
+        let properties = names.map(|name| db.get_property(name));
+        let mut iter = db.iter().unwrap();
+        db.close().unwrap();
+        assert_eq!(names.map(|name| db.get_property(name)), properties);
+        assert!(db.inner.lock().wal_writer.is_none());
+        assert!(
+            db.inner
+                .lock()
+                .versions
+                .manifest_sync_handle()
+                .lock()
+                .is_none()
+        );
+        assert_eq!(iter.next(), Some((b"key".to_vec(), b"value".to_vec())));
+        drop(iter);
+        assert!(reader.upgrade().is_none());
     }
 
     #[test]

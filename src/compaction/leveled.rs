@@ -791,6 +791,23 @@ fn execute_sub_compaction_io(
 }
 
 impl LeveledCompaction {
+    fn level_over_budget(version: &Version, options: &DbOptions, level: usize) -> bool {
+        let size: u64 = version
+            .level_files(level)
+            .iter()
+            .map(|file| file.meta.file_size)
+            .fold(0, u64::saturating_add);
+        size > Self::max_bytes_for_level(options, level)
+    }
+
+    /// Informational backlog test without scheduling work or opening input blocks.
+    pub fn is_pending(version: &Version, options: &DbOptions) -> bool {
+        let l0 = version.l0_file_count();
+        (l0 > 0 && l0 >= options.l0_compaction_trigger)
+            || (1..version.num_levels - 1)
+                .any(|level| Self::level_over_budget(version, options, level))
+    }
+
     /// Check if compaction is needed and return a task if so.
     ///
     /// `in_flight` excludes file numbers already claimed by another
@@ -815,13 +832,7 @@ impl LeveledCompaction {
 
         // Priority 2: Check each level for size overflow
         for level in 1..version.num_levels - 1 {
-            let level_size: u64 = version
-                .level_files(level)
-                .iter()
-                .map(|f| f.meta.file_size)
-                .sum();
-            let max_size = Self::max_bytes_for_level(options, level);
-            if level_size > max_size
+            if Self::level_over_budget(version, options, level)
                 && let Some(task) = Self::pick_level_compaction(version, level, in_flight)
             {
                 return Some(task);

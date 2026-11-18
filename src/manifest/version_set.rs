@@ -645,6 +645,12 @@ impl VersionSet {
         Arc::clone(&self.manifest_writer)
     }
 
+    /// Release this handle's readers and writer after the last worker exits.
+    pub fn release_files(&mut self) {
+        self.manifest_writer.lock().take();
+        self.current = Arc::new(Version::new(self.num_levels));
+    }
+
     /// Get the current version.
     pub fn current(&self) -> Arc<Version> {
         self.current.clone()
