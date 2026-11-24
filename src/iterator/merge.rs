@@ -356,6 +356,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.current_key.clear();
         if self.single_source {
             self.initialized = true;
+            if !self.sources[0].has_peeked {
+                self.latch_source_error(0);
+            }
             return;
         }
         // Rebuild heap
@@ -381,19 +384,44 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             const MAX_STEPS: usize = 4;
 
             if self.single_source {
-                // Single-source: just advance until >= target or fallback
-                let src = &mut self.sources[0];
+                // Single-source: advance up to MAX_STEPS before falling back to full seek,
+                // latching any read/decode error before a fallback seek could run.
                 let mut stepped = 0;
-                while let Some((k, _)) = src.peek() {
-                    if (self.compare)(k, target) != Ordering::Less {
-                        break; // already >= target
-                    }
-                    src.has_peeked = false;
+                let mut reached = false;
+                if self.sources[0]
+                    .peek()
+                    .is_some_and(|(k, _)| (self.compare)(k, target) != Ordering::Less)
+                {
+                    reached = true;
+                } else if self.latch_source_error(0) {
+                    self.current_key.clear();
+                    return;
+                } else if !self.sources[0].has_peeked {
+                    reached = true;
+                }
+                while !reached {
+                    self.sources[0].has_peeked = false;
                     stepped += 1;
-                    if stepped >= MAX_STEPS {
-                        // Fallback to full seek
-                        src.seek_to(target, &self.compare);
+                    if let Some((k, _)) = self.sources[0].peek() {
+                        if (self.compare)(k, target) != Ordering::Less {
+                            reached = true;
+                            break;
+                        }
+                    } else if self.latch_source_error(0) {
+                        self.current_key.clear();
+                        return;
+                    } else {
+                        reached = true;
                         break;
+                    }
+                    if stepped >= MAX_STEPS {
+                        break;
+                    }
+                }
+                if !reached {
+                    self.sources[0].seek_to(target, &self.compare);
+                    if !self.sources[0].has_peeked {
+                        self.latch_source_error(0);
                     }
                 }
                 self.current_key.clear();
@@ -578,6 +606,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.current_key.clear();
         if self.single_source {
             self.initialized = true;
+            if !self.sources[0].has_peeked {
+                self.latch_source_error(0);
+            }
             return;
         }
         self.initialized = false;
@@ -869,5 +900,115 @@ mod tests {
         assert_eq!(merger.next_entry().unwrap().0, b"c");
         assert_eq!(merger.next_entry().unwrap().0, b"d");
         assert!(merger.next_entry().is_none());
+    }
+
+    #[test]
+    fn single_source_seek_and_seek_opt_latch_source_errors() {
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::sync::Arc;
+
+        use crate::iterator::level_iter::LevelIterator;
+        use crate::manifest::version::TableFile;
+        use crate::manifest::version_edit::FileMetaData;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::TableReader;
+        use crate::types::{InternalKey, ValueType, compare_internal_key};
+
+        let dir = tempfile::tempdir().unwrap();
+        let build_file = |num: u64, keys: &[&[u8]], corrupt_block: Option<usize>| -> TableFile {
+            let path = dir.path().join(format!("{num:06}.sst"));
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    block_size: 1,
+                    bloom_bits_per_key: 0,
+                    internal_keys: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for k in keys {
+                let ik = InternalKey::new(k, 10, ValueType::Value);
+                builder.add(ik.as_bytes(), b"v").unwrap();
+            }
+            let res = builder.finish().unwrap();
+            if let Some(bidx) = corrupt_block {
+                let r = TableReader::open(&path).unwrap();
+                let h = r.cached_index_entries().unwrap()[bidx].handle;
+                let mut f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap();
+                let crc = h.offset + h.size + 1;
+                f.seek(SeekFrom::Start(crc)).unwrap();
+                let mut b = [0u8; 1];
+                f.read_exact(&mut b).unwrap();
+                f.seek(SeekFrom::Start(crc)).unwrap();
+                f.write_all(&[b[0].wrapping_add(1)]).unwrap();
+            }
+            TableFile {
+                meta: FileMetaData {
+                    number: num,
+                    file_size: res.file_size,
+                    smallest_key: res.smallest_key.unwrap(),
+                    largest_key: res.largest_key.unwrap(),
+                    has_range_deletions: false,
+                },
+                reader: Arc::new(TableReader::open(&path).unwrap()),
+            }
+        };
+
+        let corrupt0 = build_file(1, &[b"a", b"b"], Some(0));
+        let intact2 = build_file(2, &[b"z"], None);
+
+        // 1. single_source seek() must latch has_failed() immediately.
+        let mut m1 = MergingIterator::new(
+            vec![IterSource::from_level_iter(
+                LevelIterator::new(vec![corrupt0.clone(), intact2.clone()]).with_fill_cache(false),
+            )],
+            compare_internal_key,
+        );
+        m1.seek(InternalKey::new(b"a", 100, ValueType::Value).as_bytes());
+        assert!(
+            m1.has_failed(),
+            "single_source seek() must latch has_failed()"
+        );
+        assert!(m1.error().is_some());
+
+        // 2. single_source seek_to_first() must latch has_failed() immediately.
+        let mut m2 = MergingIterator::new(
+            vec![IterSource::from_level_iter(
+                LevelIterator::new(vec![corrupt0, intact2.clone()]).with_fill_cache(false),
+            )],
+            compare_internal_key,
+        );
+        m2.seek_to_first();
+        assert!(
+            m2.has_failed(),
+            "single_source seek_to_first() must latch has_failed()"
+        );
+        assert!(m2.error().is_some());
+
+        // 3. single_source seek_opt(..., true) must latch a step read error and halt.
+        let corrupt2 = build_file(3, &[b"a", b"b", b"c"], Some(2));
+        let mut m3 = MergingIterator::new(
+            vec![IterSource::from_level_iter(
+                LevelIterator::new(vec![corrupt2, intact2]).with_fill_cache(false),
+            )],
+            compare_internal_key,
+        );
+        assert!(m3.next_entry().is_some()); // yields "a", peeks "b"
+        m3.seek_opt(
+            InternalKey::new(b"z", 100, ValueType::Value).as_bytes(),
+            true,
+        );
+        assert!(
+            m3.has_failed(),
+            "single_source seek_opt() must latch step failure"
+        );
+        assert!(m3.error().is_some());
+        assert!(m3.next_entry().is_none());
     }
 }

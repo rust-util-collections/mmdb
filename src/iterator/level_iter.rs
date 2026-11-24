@@ -75,9 +75,8 @@ pub struct LevelIterator {
     /// Block property filters to pass to each TableIterator.
     block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
     /// First I/O error encountered while iterating or repositioning. Once
-    /// set, iteration stops instead of silently advancing to the next file
-    /// (which would truncate the errored file's contribution). Cleared on
-    /// explicit seeks, which start a fresh scan.
+    /// set, iteration and subsequent seeks stay halted instead of silently
+    /// clearing the failure or advancing past the errored file.
     error: Option<String>,
     /// Whether cache misses populate the block cache (default: true).
     fill_cache: bool,
@@ -186,9 +185,26 @@ impl LevelIterator {
         FileFilter::Pass
     }
 
+    fn latch_current_error_and_check(&mut self) -> bool {
+        if self.error.is_none()
+            && let Some(e) = self.current_iter.as_ref().and_then(|it| it.iter_error())
+        {
+            self.error = Some(e);
+        }
+        if self.error.is_some() {
+            self.current_iter = None;
+            self.file_index = self.files.len();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Seek to the first entry >= target.
     fn seek_impl(&mut self, target: &[u8]) {
-        self.error = None;
+        if self.latch_current_error_and_check() {
+            return;
+        }
         // Binary search: find first file whose largest_key >= target.
         // partition_point returns first index where predicate is false.
         let idx = self.files.partition_point(|tf| {
@@ -345,7 +361,10 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
-        self.error = None;
+        if self.latch_current_error_and_check() {
+            self.file_index = 0;
+            return;
+        }
         if self.has_empty_bounds() {
             self.file_index = 0;
             self.current_iter = None;
@@ -402,14 +421,19 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn seek_to_first(&mut self) {
-        self.error = None;
+        if self.latch_current_error_and_check() {
+            return;
+        }
         self.file_index = 0;
         self.current_iter = None;
         self.open_file_and_seek(None);
     }
 
     fn seek_to_last(&mut self) {
-        self.error = None;
+        if self.latch_current_error_and_check() {
+            self.file_index = 0;
+            return;
+        }
         self.current_iter = None;
         if self.has_empty_bounds() {
             self.file_index = 0;
@@ -925,5 +949,55 @@ mod tests {
                 .map(|(k, _)| user_key_from_internal(&k).to_vec()),
             Some(b"key_000009".to_vec())
         );
+    }
+
+    #[test]
+    fn latched_error_persists_across_seeks() {
+        use super::super::merge::SeekableIterator;
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file1 = build_sst(dir.path(), 1, 0, 10);
+        let file2 = build_sst(dir.path(), 2, 10, 20);
+
+        // Corrupt file 1's first data block while leaving file 2 intact.
+        let path1 = dir.path().join(format!("{:06}.sst", 1));
+        let handle0 = file1.reader.cached_index_entries().unwrap()[0].handle;
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path1)
+                .unwrap();
+            let crc_pos = handle0.offset + handle0.size + 1;
+            f.seek(SeekFrom::Start(crc_pos)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            f.seek(SeekFrom::Start(crc_pos)).unwrap();
+            f.write_all(&[b[0].wrapping_add(1)]).unwrap();
+        }
+
+        let mut iter = LevelIterator::new(vec![file1, file2]).with_fill_cache(false);
+        assert!(iter.next().is_none());
+        assert!(iter.iter_error().is_some());
+
+        // Re-seeking into intact file 2 must not clear the latched error.
+        let target = InternalKey::new(b"key_000015", 100, ValueType::Value);
+        iter.seek_to(target.as_bytes());
+        assert!(iter.iter_error().is_some());
+        assert!(iter.next().is_none());
+
+        iter.seek_to_last();
+        assert!(iter.iter_error().is_some());
+        assert!(iter.current().is_none());
+
+        iter.seek_for_prev(target.as_bytes());
+        assert!(iter.iter_error().is_some());
+        assert!(iter.current().is_none());
+
+        iter.seek_to_first();
+        assert!(iter.iter_error().is_some());
+        assert!(iter.next().is_none());
     }
 }
