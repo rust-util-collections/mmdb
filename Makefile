@@ -6,7 +6,9 @@ fmt:
 	cargo fmt
 
 lint:
+	cargo clippy --lib -- -D warnings
 	cargo clippy --all-targets -- -D warnings
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 check:
 	cargo check

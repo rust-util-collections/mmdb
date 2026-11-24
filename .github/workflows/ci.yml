@@ -39,7 +39,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --lib -- -D warnings
       - run: cargo clippy --all-targets -- -D warnings
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
   test:
     name: Test

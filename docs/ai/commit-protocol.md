@@ -73,6 +73,7 @@ the union and report the drift):
 cargo +stable fmt --all -- --check
 cargo +stable clippy --lib -- -D warnings
 cargo +stable clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
 cargo +stable test --lib
 cargo +stable test --doc
 cargo +stable test --test crash_recovery

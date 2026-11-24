@@ -24,7 +24,7 @@ are separate developer-tooling actions with their own runtime controls.
 make all          # fmt + lint + test
 make test         # cargo test && cargo test --release
 make ci           # fmt check + clippy + the CI test set (no release, no scale_profile)
-make lint         # cargo clippy --all-targets -- -D warnings (matches CI)
+make lint         # clippy (--lib + --all-targets) + rustdoc check (matches CI)
 make bench        # cargo bench (criterion)
 cargo test --test integration   # integration tests only
 cargo test --test crash_recovery
