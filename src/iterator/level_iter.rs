@@ -164,12 +164,18 @@ impl LevelIterator {
                 return FileFilter::BeforeRange;
             }
         }
-        // Range filter: file's smallest user key must be < end_hint
-        if let Some(ref end) = self.end_hint {
-            let smallest_uk = user_key_from_internal(&tf.meta.smallest_key);
-            if smallest_uk >= end.as_slice() {
-                return FileFilter::AfterRange;
-            }
+        // Range filter: file's smallest user key must be < end_hint and < upper_bound
+        let smallest_uk = user_key_from_internal(&tf.meta.smallest_key);
+        if self
+            .end_hint
+            .as_deref()
+            .is_some_and(|end| smallest_uk >= end)
+            || self
+                .upper_bound
+                .as_deref()
+                .is_some_and(|ub| smallest_uk >= ub)
+        {
+            return FileFilter::AfterRange;
         }
         // Prefix bloom filter
         if let Some(ref prefix) = self.prefix_filter
@@ -207,15 +213,6 @@ impl LevelIterator {
                 FileFilter::Skip | FileFilter::BeforeRange => {
                     self.file_index += 1;
                     continue;
-                }
-            }
-            // Skip files whose smallest user key >= upper_bound
-            if let Some(ref ub) = self.upper_bound {
-                let smallest_uk = user_key_from_internal(&tf.meta.smallest_key);
-                if smallest_uk >= ub.as_slice() {
-                    self.file_index = self.files.len();
-                    self.current_iter = None;
-                    return;
                 }
             }
             let mut table_iter =
@@ -879,5 +876,54 @@ mod tests {
             iter.seek_for_prev(target.as_bytes());
             assert!(iter.current().is_none());
         }
+    }
+
+    #[test]
+    fn upper_bound_skips_out_of_bound_files_on_backward_seeks() {
+        use super::super::merge::SeekableIterator;
+        use std::fs::OpenOptions;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file1 = build_sst(dir.path(), 1, 0, 10);
+        let file2 = build_sst(dir.path(), 2, 10, 20);
+
+        // Corrupt file 2's first data block on disk; upper_bound = key_000010
+        // excludes the entire file, so backward seeks must skip it without I/O.
+        let path2 = dir.path().join(format!("{:06}.sst", 2));
+        let handle0 = file2.reader.cached_index_entries().unwrap()[0].handle;
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path2)
+                .unwrap();
+            let crc_pos = handle0.offset + handle0.size + 1;
+            f.seek(SeekFrom::Start(crc_pos)).unwrap();
+            let mut b = [0u8; 1];
+            f.read_exact(&mut b).unwrap();
+            f.seek(SeekFrom::Start(crc_pos)).unwrap();
+            f.write_all(&[b[0].wrapping_add(1)]).unwrap();
+        }
+
+        let mut iter = LevelIterator::new(vec![file1, file2]).with_fill_cache(false);
+        iter.set_bounds(None, Some(b"key_000010"));
+
+        iter.seek_to_last();
+        assert_eq!(iter.iter_error(), None);
+        assert_eq!(
+            iter.current()
+                .map(|(k, _)| user_key_from_internal(&k).to_vec()),
+            Some(b"key_000009".to_vec())
+        );
+
+        let target = InternalKey::new(b"key_000019", 100, ValueType::Value);
+        iter.seek_for_prev(target.as_bytes());
+        assert_eq!(iter.iter_error(), None);
+        assert_eq!(
+            iter.current()
+                .map(|(k, _)| user_key_from_internal(&k).to_vec()),
+            Some(b"key_000009".to_vec())
+        );
     }
 }
