@@ -322,7 +322,8 @@ impl DBIterator {
                 let target = self.effective_forward_target(&succ);
                 // Use seek_opt with try_next=true since target > current.
                 use crate::types::InternalKey;
-                let seek_key = InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::Value);
+                let seek_key =
+                    InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
                 self.merger.seek_opt(seek_key.as_bytes(), true);
                 self.last_seek_key = Some(target);
                 self.has_last_key = false;
@@ -641,7 +642,7 @@ impl DBIterator {
         self.prefix_exhausted = false;
         let target = self.effective_forward_target(target);
         // Seek the merger to a synthetic internal key with max sequence
-        let seek_key = InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::Value);
+        let seek_key = InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
         // TrySeekUsingNext: if the new target is strictly after the last seek target, use
         // incremental advancement instead of full re-seek.
         let try_next = self
@@ -711,7 +712,7 @@ impl DBIterator {
         let (mut seek_key, mut bound) = if upper_clamps_target {
             let ub = self.iterate_upper_bound.as_deref().unwrap();
             (
-                InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::Value),
+                InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion),
                 ub.to_vec(),
             )
         } else {
@@ -727,7 +728,7 @@ impl DBIterator {
         if let Some(succ) = self.prefix_successor()
             && succ.as_slice() < bound.as_slice()
         {
-            seek_key = InternalKey::new(&succ, MAX_SEQUENCE_NUMBER, ValueType::Value);
+            seek_key = InternalKey::new(&succ, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
             bound = succ;
         }
 
@@ -792,11 +793,26 @@ impl DBIterator {
                 let uk = uk_owned.as_slice();
                 let uk_len = uk.len();
 
-                // Prefix guard
+                // Skip entries >= current_bound (same or later user key) before
+                // checking prefix/lower bounds so boundary keys at or above
+                // prefix_successor never prematurely terminate the walk.
+                if let Some(ref bound) = current_bound
+                    && uk >= bound.as_slice()
+                {
+                    iter_entry = self.merger.prev_entry();
+                    continue;
+                }
+
+                // Prefix guard: only keys strictly below `prefix` terminate a
+                // backward scan; non-matching keys above `prefix` are skipped.
                 if let Some(ref pfx) = self.prefix
                     && !uk.starts_with(pfx)
                 {
-                    break;
+                    if uk < pfx.as_slice() {
+                        break;
+                    }
+                    iter_entry = self.merger.prev_entry();
+                    continue;
                 }
 
                 // Lower bound guard
@@ -804,14 +820,6 @@ impl DBIterator {
                     && uk < lb.as_slice()
                 {
                     break;
-                }
-
-                // Skip entries >= current_bound (same or later user key)
-                if let Some(ref bound) = current_bound
-                    && uk >= bound.as_slice()
-                {
-                    iter_entry = self.merger.prev_entry();
-                    continue;
                 }
 
                 match &candidate_uk {
@@ -971,7 +979,7 @@ impl DBIterator {
 
         if let Some(ref ub) = resolve_bound {
             // Upper-bound constrained: seek backward from upper bound.
-            let seek_key = InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::Value);
+            let seek_key = InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
             self.merger.seek_for_prev(seek_key.as_bytes());
         } else {
             self.merger.seek_to_last_merge();
@@ -2101,5 +2109,59 @@ mod tests {
         iter3.next_prefix(0);
         assert!(!iter3.valid());
         assert!(iter3.error().is_some_and(|e| e.contains("CRC")));
+    }
+
+    #[test]
+    fn prefix_reverse_scan_skips_boundary_entry_at_prefix_successor() {
+        use crate::iterator::bidi_iter::BidiIterator;
+
+        for boundary_vt in [ValueType::Value, ValueType::RangeDeletion] {
+            let boundary_val: &[u8] = match boundary_vt {
+                ValueType::RangeDeletion => b"z",
+                _ => b"vb",
+            };
+            let entries = vec![
+                make_entry(b"a1", 10, ValueType::Value, b"v1"),
+                make_entry(b"a2", 11, ValueType::Value, b"v2"),
+                make_entry(b"b", MAX_SEQUENCE_NUMBER, boundary_vt, boundary_val),
+            ];
+
+            // 1. seek_to_last on a prefix-bounded DBIterator
+            let mut iter = DBIterator::from_sources_with_prefix(
+                vec![IterSource::new(entries.clone()).with_level(0)],
+                MAX_SEQUENCE_NUMBER,
+                b"a".to_vec(),
+            );
+            iter.seek_to_last();
+            assert_eq!(iter.key(), Some(&b"a2"[..]));
+            iter.prev();
+            assert_eq!(iter.key(), Some(&b"a1"[..]));
+            iter.prev();
+            assert!(!iter.valid());
+
+            // 2. seek_for_prev past the prefix successor
+            let mut iter2 = DBIterator::from_sources_with_prefix(
+                vec![IterSource::new(entries.clone()).with_level(0)],
+                MAX_SEQUENCE_NUMBER,
+                b"a".to_vec(),
+            );
+            iter2.seek_for_prev(b"zz");
+            assert_eq!(iter2.key(), Some(&b"a2"[..]));
+
+            // 3. BidiIterator::lazy reverse drain
+            let bidi = BidiIterator::lazy(DBIterator::from_sources_with_prefix(
+                vec![IterSource::new(entries).with_level(0)],
+                MAX_SEQUENCE_NUMBER,
+                b"a".to_vec(),
+            ));
+            let rev: Vec<_> = bidi.rev().collect();
+            assert_eq!(
+                rev,
+                vec![
+                    (b"a2".to_vec(), b"v2".to_vec()),
+                    (b"a1".to_vec(), b"v1".to_vec()),
+                ]
+            );
+        }
     }
 }
