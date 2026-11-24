@@ -803,12 +803,15 @@ fn execute_sub_compaction_io(
 
 impl LeveledCompaction {
     fn level_over_budget(version: &Version, options: &DbOptions, level: usize) -> bool {
-        let size: u64 = version
-            .level_files(level)
+        let files = version.level_files(level);
+        if files.is_empty() {
+            return false;
+        }
+        let size: u64 = files
             .iter()
             .map(|file| file.meta.file_size)
             .fold(0, u64::saturating_add);
-        size > Self::max_bytes_for_level(options, level)
+        size > 0 && size > Self::max_bytes_for_level(options, level)
     }
 
     /// Informational backlog test without scheduling work or opening input blocks.
@@ -1761,8 +1764,16 @@ impl LeveledCompaction {
     /// Maximum bytes for a given level.
     fn max_bytes_for_level(options: &DbOptions, level: usize) -> u64 {
         let mut result = options.max_bytes_for_level_base;
+        if level <= 1 || result == 0 || options.max_bytes_for_level_multiplier == 1.0 {
+            return result;
+        }
         for _ in 1..level {
+            #[cfg(test)]
+            LEVEL_BUDGET_MULS.with(|n| n.set(n.get() + 1));
             result = (result as f64 * options.max_bytes_for_level_multiplier) as u64;
+            if result == 0 || result == u64::MAX {
+                break;
+            }
         }
         result
     }
@@ -3226,4 +3237,51 @@ mod tests {
             2 * PER_FILE
         );
     }
+
+    #[test]
+    fn empty_and_deep_levels_keep_budget_checks_linear() {
+        use super::{HashSet, LeveledCompaction};
+        use crate::manifest::version_set::VersionSet;
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            num_levels: 500,
+            ..Default::default()
+        };
+        let versions = VersionSet::create(dir.path(), options.num_levels).unwrap();
+        let version = versions.current();
+
+        super::LEVEL_BUDGET_MULS.with(|n| n.set(0));
+        assert!(!LeveledCompaction::is_pending(&version, &options));
+        assert!(LeveledCompaction::pick_compaction(&version, &options, &HashSet::new()).is_none());
+        let empty_muls = super::LEVEL_BUDGET_MULS.with(|n| n.get());
+        assert_eq!(
+            empty_muls, 0,
+            "empty levels must not run O(level) budget multiplications"
+        );
+
+        super::LEVEL_BUDGET_MULS.with(|n| n.set(0));
+        let _ = LeveledCompaction::max_bytes_for_level(&options, 499);
+        let deep_muls = super::LEVEL_BUDGET_MULS.with(|n| n.get());
+        assert!(
+            deep_muls <= 32,
+            "saturated level budget should stop multiplying once u64::MAX is reached, got {deep_muls}"
+        );
+
+        let unit_opts = DbOptions {
+            max_bytes_for_level_multiplier: 1.0,
+            ..options
+        };
+        super::LEVEL_BUDGET_MULS.with(|n| n.set(0));
+        assert_eq!(
+            LeveledCompaction::max_bytes_for_level(&unit_opts, 499),
+            unit_opts.max_bytes_for_level_base
+        );
+        assert_eq!(super::LEVEL_BUDGET_MULS.with(|n| n.get()), 0);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEVEL_BUDGET_MULS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
