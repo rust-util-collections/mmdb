@@ -1289,3 +1289,58 @@ fn enlarged_payload_preserves_later_wal_writes() {
         assert_eq!(fs::read(&path).unwrap(), bytes);
     }
 }
+
+#[test]
+fn earlier_wal_truncated_after_block_trailer_fails_closed_while_tail_wal_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+    // Choose value length so the first WAL record ends at BLOCK_SIZE - 4 (32764),
+    // leaving a 4-byte block trailer [32764..32768] before the second record at 32768.
+    // encode_wal_record overhead for 1 Put entry with 1-byte key "a":
+    // 8 (seq) + 4 (count) + 1 (type) + 4 (key_len) + 1 ("a") + 4 (val_len) = 22 bytes.
+    // Physical record = 7 (WAL header) + 22 + val_len = 32764 => val_len = 32735.
+    let val_a = vec![b'x'; 32768 - 4 - 7 - 22];
+    let sync = WriteOptions {
+        sync: true,
+        ..Default::default()
+    };
+    db.put_with_options(&sync, b"a", &val_a).unwrap();
+    db.put_with_options(&sync, b"b", b"in_block_1").unwrap();
+    db.simulate_crash();
+
+    let wal1 = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "wal"))
+        .unwrap();
+    let full_wal1 = fs::read(&wal1).unwrap();
+    assert!(
+        full_wal1.len() > 32768,
+        "second record must land in block 1"
+    );
+    assert_eq!(&full_wal1[32764..32768], &[0, 0, 0, 0]);
+
+    // Plant a non-empty newer WAL (e.g. from a later write before crash) while
+    // truncating the earlier WAL at exact BLOCK_SIZE (losing "b" in block 1).
+    let wal2 = dir.path().join("000099.wal");
+    fs::write(&wal2, &full_wal1[..32764]).unwrap();
+    fs::write(&wal1, &full_wal1[..32768]).unwrap();
+
+    for res in [
+        DB::open_read_only(dir.path()),
+        DB::open(DbOptions::default(), dir.path()),
+    ] {
+        assert_eq!(res.err().unwrap().kind(), mmdb::ErrorKind::Corruption);
+    }
+    assert!(wal1.exists(), "corrupt earlier WAL must be preserved");
+
+    // When the truncated block-aligned WAL is itself the active tail WAL, recovery
+    // tolerates the interrupted append and preserves "a".
+    fs::remove_file(&wal2).unwrap();
+    let reopened = DB::open(DbOptions::default(), dir.path()).unwrap();
+    assert_eq!(
+        reopened.get(b"a").unwrap().as_deref(),
+        Some(val_a.as_slice())
+    );
+    assert_eq!(reopened.get(b"b").unwrap(), None);
+}

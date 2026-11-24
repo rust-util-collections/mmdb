@@ -224,14 +224,16 @@ impl WalReader {
     /// Read a single physical record (fragment).
     /// Returns None at EOF.
     fn read_physical_record(&mut self) -> Result<Option<(RecordType, Vec<u8>)>> {
+        let mut skipped_trailer = false;
         loop {
             // Check if we need to skip to the next block
             let leftover = BLOCK_SIZE - self.block_offset;
             if leftover < HEADER_SIZE {
                 // Skip the trailer padding. A clean EOF at the trailer start is
-                // a normal end of file; a partial trailer is a torn tail and is
-                // surfaced like a partial header, so only the recoverable
-                // active WAL tolerates it.
+                // a normal end of file; any non-zero trailer byte is corruption,
+                // and a partial trailer (or a full trailer with no following
+                // block) is a torn tail so only the recoverable active WAL or
+                // MANIFEST tolerates it.
                 if leftover > 0 {
                     let mut skip = [0u8; HEADER_SIZE];
                     let mut skipped = 0;
@@ -239,6 +241,9 @@ impl WalReader {
                         match self.reader.read(&mut skip[skipped..leftover]) {
                             Ok(0) if skipped == 0 => return Ok(None),
                             Ok(0) => {
+                                if skip[..skipped].iter().any(|&b| b != 0) {
+                                    return self.fail_corruption("non-zero WAL block trailer");
+                                }
                                 return self.fail_truncation("truncated WAL block trailer");
                             }
                             Ok(n) => skipped += n,
@@ -246,19 +251,29 @@ impl WalReader {
                             Err(e) => return Err(e).ctx(),
                         }
                     }
+                    if skip[..leftover].iter().any(|&b| b != 0) {
+                        return self.fail_corruption("non-zero WAL block trailer");
+                    }
+                    skipped_trailer = true;
                 }
                 self.block_offset = 0;
                 continue;
             }
 
-            // Read the header. A clean EOF before the first header byte is normal;
-            // a partial header is a torn tail and must be surfaced to recovery so
-            // only the active WAL can tolerate it.
+            // Read the header. A clean EOF before the first header byte is normal
+            // unless we just consumed a non-empty block trailer, which the writer
+            // only emits immediately before another fragment in the next block.
             let mut header_buf = [0u8; HEADER_SIZE];
             let mut header_read = 0;
             while header_read < HEADER_SIZE {
                 match self.reader.read(&mut header_buf[header_read..]) {
-                    Ok(0) if header_read == 0 => return Ok(None),
+                    Ok(0) if header_read == 0 => {
+                        if skipped_trailer {
+                            return self
+                                .fail_truncation("WAL block trailer without following record");
+                        }
+                        return Ok(None);
+                    }
                     Ok(0) => {
                         return self.fail_truncation("truncated WAL record header");
                     }
@@ -788,6 +803,58 @@ mod tests {
         assert!(
             !reader.last_error_is_truncation(),
             "a type-0 record with a non-zero payload must fail closed, got {err}"
+        );
+    }
+
+    #[test]
+    fn block_trailer_full_padding_eof_and_nonzero_bytes_fail_appropriately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailer_boundary.wal");
+        let trailer_len = 6usize;
+        let payload = vec![0x42_u8; BLOCK_SIZE - HEADER_SIZE - trailer_len];
+        {
+            let mut writer = WalWriter::new(&path).unwrap();
+            writer.add_record(&payload).unwrap();
+            writer.add_record(b"committed_in_block_1").unwrap();
+            writer.sync().unwrap();
+        }
+        let full_bytes = std::fs::read(&path).unwrap();
+
+        // 1. Non-zero byte inside a full trailer before block 1 is corruption, not skipped padding.
+        let trailer_start = BLOCK_SIZE - trailer_len;
+        let mut damaged_full = full_bytes.clone();
+        damaged_full[trailer_start + 2] = 0xFF;
+        std::fs::write(&path, &damaged_full).unwrap();
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), payload);
+        assert!(reader.read_record().is_err());
+        assert!(
+            !reader.last_error_is_truncation(),
+            "non-zero bytes in a full block trailer must fail closed"
+        );
+
+        // 2. Truncated at exact BLOCK_SIZE (after all 6 trailer zero bytes, losing block 1):
+        // must surface as a truncation error (so non-tail WALs reject it), NOT clean Ok(None).
+        std::fs::write(&path, &full_bytes[..BLOCK_SIZE]).unwrap();
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), payload);
+        assert!(
+            reader.read_record().is_err(),
+            "EOF right after non-empty block trailer lost next block and must not be clean EOF"
+        );
+        assert!(reader.last_error_is_truncation());
+
+        // 3. Non-zero bytes in a partial trailer must fail as non-truncation corruption
+        // (must not be hidden from rest_is_zero_padding()).
+        let mut damaged_partial = full_bytes[..trailer_start + 3].to_vec();
+        damaged_partial[trailer_start + 2] = 0xFF;
+        std::fs::write(&path, &damaged_partial).unwrap();
+        let mut reader = WalReader::new(&path).unwrap();
+        assert_eq!(reader.read_record().unwrap().unwrap(), payload);
+        assert!(reader.read_record().is_err());
+        assert!(
+            !reader.last_error_is_truncation(),
+            "non-zero bytes in partial block trailer must not be treated as a zero-padded torn tail"
         );
     }
 }
