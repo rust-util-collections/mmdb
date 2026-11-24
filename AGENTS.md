@@ -66,7 +66,7 @@ selection with `allow_implicit_invocation: false`.
 - [`$x-review`](.agents/skills/x-review/SKILL.md) — review a scope (default: latest commit). Updates `docs/audit.md` only
 - [`$x-fix`](.agents/skills/x-fix/SKILL.md) — resolve Open findings, one validated commit each. No version bump
 - [`$x-commit`](.agents/skills/x-commit/SKILL.md) — review and commit the current worktree. No version bump
-- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (empty = latest commit; `all` = full repo), then review, fix, and create atomic local commits. When shipped library changes qualify for a patch bump, bump once and tag the version commit locally. Never push or open a PR
+- [`$x-overhaul`](.agents/skills/x-overhaul/SKILL.md) — same scopes as `$x-review` (empty = latest commit; `all` = full repo), then review, prove each fix with a test that fails before it, sweep sibling variants, and create atomic local commits. When shipped library changes qualify for a patch bump, bump once and tag the version commit locally. Never push or open a PR
 
 All four workflows follow [workflow-policy.md](docs/ai/workflow-policy.md):
 specify local storage operations, invariants, and expected vs observed results,

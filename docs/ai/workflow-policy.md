@@ -41,7 +41,10 @@ resolves as a commit hash. Reject invalid or out-of-range counts rather than
 broadening scope.
 
 Historical scopes fix only defects rooted in that diff that remain present at
-`HEAD`. Empty is never the full repository; full repository requires `all`.
+`HEAD`. That includes an incomplete fix: a sibling path that breaks the same
+invariant a reviewed `fix(...)` commit establishes. Record independent variants
+found outside the frozen scope as `Open` instead of fixing them. Empty is never
+the full repository; full repository requires `all`.
 
 ## Storage-engine specification and reporting
 
@@ -118,6 +121,9 @@ A dirty worktree is permitted when ownership boundaries remain disjoint.
 - If a required fix overlaps dirty baseline hunks, or if `staged` scope touches
   a file that also has unstaged edits affecting worktree `cargo` validation,
   stop and report before editing.
+- `$x-overhaul` revert probe: may temporarily reverse-apply a reviewed commit's
+  `src/` hunks only on paths with no baseline or owned edits. Re-apply them and
+  confirm `git diff --quiet -- <paths>` before any other step.
 - Delegated review agents are strictly read-only. Investigation and read-only
   checks may run in parallel; edits and commits on one checkout are sequential.
 
