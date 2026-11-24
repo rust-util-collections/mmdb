@@ -10,6 +10,7 @@ fn main() -> mmdb::Result<()> {
     // --- Open (presets: DbOptions::balanced/write_heavy/read_heavy) ---
     let opts = DbOptions {
         create_if_missing: true,
+        prefix_len: 5, // matches "user:" and "acct:" prefixes for SST prefix blooms
         ..DbOptions::balanced()
     };
     let db = DB::open(opts, dir.path())?;

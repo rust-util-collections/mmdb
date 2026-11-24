@@ -87,7 +87,8 @@ struct Inner {
     source: Option<Arc<dyn StdError + Send + Sync + 'static>>,
 }
 
-/// The MMDB error type. See the [module documentation](self) for details.
+/// The MMDB error type, carrying an [`ErrorKind`], message, and `file:line:column`
+/// propagation trace recorded via [`ResultExt`].
 #[derive(Clone)]
 pub struct Error {
     inner: Box<Inner>,

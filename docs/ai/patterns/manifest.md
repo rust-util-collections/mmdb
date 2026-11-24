@@ -1,6 +1,6 @@
 # MANIFEST / VersionSet Review Patterns
 
-**Files:** `version_set`, `version_edit`, `version`, `mod`; tests: `crash_recovery`.
+**Files:** `version_set`, `version_edit`, `version`, `file_numbers`, `mod`; tests: `crash_recovery`.
 
 **Arch:** VersionEdit in WAL-framed MANIFEST; CURRENT names active MANIFEST;
 replay → immutable `Version` (`files: Vec<Arc<Vec<TableFile>>>` sharing unchanged

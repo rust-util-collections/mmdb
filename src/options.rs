@@ -99,7 +99,8 @@ pub struct DbOptions {
     /// file build to produce a fresh collector instance.
     pub block_property_collectors:
         Vec<Arc<dyn Fn() -> Box<dyn BlockPropertyCollector> + Send + Sync>>,
-    /// When the number of keys registered via [`DB::lazy_delete_batch`]
+    /// When the number of keys registered via [`DB::lazy_delete`](crate::DB::lazy_delete)
+    /// or [`DB::lazy_delete_batch`](crate::DB::lazy_delete_batch)
     /// reaches this threshold, a background sweep is automatically
     /// scheduled: every populated level is force-rewritten through the
     /// compaction filter so the registered keys are physically removed
@@ -107,7 +108,7 @@ pub struct DbOptions {
     /// holds the DB mutex for its full duration, so new snapshots stall
     /// for that rewrite. The sweep does not hold the write queue: writers
     /// stall only while the mutex is held and can proceed between levels.
-    /// [`DB::compact`] holds the write queue for the entire call as well as
+    /// [`DB::compact`](crate::DB::compact) holds the write queue for the entire call as well as
     /// the DB mutex for each level rewrite, so it stalls writers longer,
     /// not shorter. Default: `0` (disabled).
     pub lazy_delete_compaction_threshold: usize,

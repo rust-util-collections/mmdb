@@ -59,7 +59,7 @@ Safe byte-slice parsing in `src/sst/block.rs`, `src/sst/format.rs`, and
     remains parked on `write_cv` under `write_queue` until `done == true`; the
     leader never touches the pointer after setting `done` and releasing the
     queue lock, and no pointer is stored outside the queue.
-  - `flock` borrows a live `File` descriptor owned by `DirectoryLock`, and drops
+  - `flock` borrows a live `File` descriptor owned by `DirLock`, and drops
     release the lock before closing the handle.
 - **SST readahead (`sst/table_reader/mod.rs`)**:
   - `posix_fadvise` passes `self.file.as_raw_fd()` while `TableReader` owns the

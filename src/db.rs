@@ -1901,9 +1901,10 @@ impl DB {
     /// a single `iter_with_prefix()` call.
     ///
     /// If your range *does* align to a prefix (e.g. all keys starting with
-    /// `b"user:"`), prefer `iter_with_prefix()`: it additionally uses bloom
-    /// filters to skip SST files that don't contain the prefix, which is more
-    /// precise than range-metadata pruning alone.
+    /// `b"user:"`), prefer `iter_with_prefix()`: when `DbOptions::prefix_len > 0`
+    /// (`prefix.len() >= prefix_len`), it additionally uses prefix bloom filters
+    /// to skip SST files that don't contain the prefix, which is more precise
+    /// than range-metadata pruning alone.
     ///
     /// # Pruning comparison
     ///
@@ -1911,7 +1912,7 @@ impl DB {
     /// |---------------------|:-----------------:|:--------------------:|
     /// | `iter()`            | ✗                 | ✗                    |
     /// | `iter_with_range()` | ✓                 | ✗                    |
-    /// | `iter_with_prefix()`| ✓                 | ✓                    |
+    /// | `iter_with_prefix()`| ✓                 | ✓ (`prefix_len > 0`) |
     ///
     /// # Bound merging
     ///
@@ -2121,8 +2122,9 @@ impl DB {
     ///
     /// 1. **Range pruning** — skips SST files whose `[smallest, largest]` key
     ///    range does not overlap the prefix.
-    /// 2. **Bloom filter pruning** — among the remaining files, skips those
-    ///    whose file-level bloom filter reports that `prefix` is absent.
+    /// 2. **Bloom filter pruning** — when `DbOptions::prefix_len > 0` and
+    ///    `prefix.len() >= prefix_len`, skips remaining files whose file-level
+    ///    prefix bloom filter reports that `prefix[..prefix_len]` is absent.
     ///
     /// For cross-prefix ranges (e.g. `[b"m", b"z")`) use `iter_with_range()`
     /// instead, as there is no single prefix that covers the query.
