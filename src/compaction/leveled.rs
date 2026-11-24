@@ -63,9 +63,12 @@ pub(crate) struct CompactionContext<'a> {
 pub struct CompactionTask {
     /// Source level (files to compact from).
     pub level: usize,
+    /// Destination level (`level + 1` for cross-level compactions, or `level`
+    /// for an in-place bottommost rewrite).
+    pub target_level: usize,
     /// Files from the source level.
     pub input_files_level: Vec<TableFile>,
-    /// Files from the target level (level + 1).
+    /// Files from the target level (empty for in-place bottommost rewrites).
     pub input_files_next: Vec<TableFile>,
 }
 
@@ -95,6 +98,9 @@ pub struct CompactionOutput {
 pub struct PostCompactionCleanup {
     /// Old SST file numbers to delete from disk.
     pub files_to_delete: HashSet<u64>,
+    /// True when `log_and_apply` installed the compaction edit (false when a
+    /// stale/raced output was discarded).
+    pub installed: bool,
 }
 
 impl CompactionTask {}
@@ -883,6 +889,7 @@ impl LeveledCompaction {
 
         Some(CompactionTask {
             level: 0,
+            target_level: 1,
             input_files_level: input_l0,
             input_files_next: input_l1,
         })
@@ -933,17 +940,21 @@ impl LeveledCompaction {
 
         Some(CompactionTask {
             level,
+            target_level: next_level,
             input_files_level: input_level,
             input_files_next: input_next,
         })
     }
 
     /// Pick compaction for a specific key range. Collects files overlapping
-    /// [begin, end) at each level and compacts them.
-    pub fn pick_compaction_for_range(
+    /// `[begin, end)` at each level and compacts them, ending with an in-place
+    /// bottommost pass at `num_levels - 1` for overlapping files not yet
+    /// rewritten by the current `compact_range` call (`settled_bottom`).
+    pub(crate) fn pick_compaction_for_range(
         version: &Version,
         begin: Option<&[u8]>,
         end: Option<&[u8]>,
+        settled_bottom: &HashSet<u64>,
     ) -> Option<CompactionTask> {
         // Check L0 first: collect L0 files overlapping the range
         let l0_files = version.level_files(0);
@@ -970,12 +981,13 @@ impl LeveledCompaction {
             let input_l1 = overlapping_files_for_inputs(version.level_files(1), &input_l0);
             return Some(CompactionTask {
                 level: 0,
+                target_level: 1,
                 input_files_level: input_l0,
                 input_files_next: input_l1,
             });
         }
 
-        // Check L1+ levels
+        // Check L1..num_levels-1 cross-level compactions
         for level in 1..version.num_levels - 1 {
             let files = version.level_files(level);
             let mut input_level: Vec<TableFile> = Vec::new();
@@ -991,15 +1003,40 @@ impl LeveledCompaction {
                 // that the bounds filter alone would leave behind.
                 input_level = overlapping_files_for_inputs(files, &input_level);
                 let next_level = level + 1;
-                let input_next = if next_level < version.num_levels {
-                    overlapping_files_for_inputs(version.level_files(next_level), &input_level)
-                } else {
-                    Vec::new()
-                };
+                let input_next =
+                    overlapping_files_for_inputs(version.level_files(next_level), &input_level);
                 return Some(CompactionTask {
                     level,
+                    target_level: next_level,
                     input_files_level: input_level,
                     input_files_next: input_next,
+                });
+            }
+        }
+
+        // Bottommost level (`num_levels - 1`): once shallower levels are clear,
+        // rewrite overlapping bottommost files once so CompactionFilter,
+        // lazy_delete, and snapshot-expired tombstones/versions take effect
+        // even when data already lives at `num_levels - 1` (or reached it via
+        // trivial moves).
+        let bottom = version.num_levels - 1;
+        let bottom_files = version.level_files(bottom);
+        let mut input_bottom: Vec<TableFile> = bottom_files
+            .iter()
+            .filter(|tf| file_overlaps_compact_bounds(tf, begin, end))
+            .cloned()
+            .collect();
+        if !input_bottom.is_empty() {
+            input_bottom = overlapping_files_for_inputs(bottom_files, &input_bottom);
+            if input_bottom
+                .iter()
+                .any(|tf| !settled_bottom.contains(&tf.meta.number))
+            {
+                return Some(CompactionTask {
+                    level: bottom,
+                    target_level: bottom,
+                    input_files_level: input_bottom,
+                    input_files_next: Vec::new(),
                 });
             }
         }
@@ -1022,20 +1059,23 @@ impl LeveledCompaction {
         is_bottommost: bool,
     ) -> Result<CompactionOutput> {
         let _build = ctx.builds.enter();
-        let target_level = task.level + 1;
+        let target_level = task.target_level;
 
         // Trivial move optimization: if there's exactly one input file and no
         // overlap with the next level, just move the metadata without
-        // rewriting. Skip it when the compaction filter could remove or
-        // change entries — it needs to see every key-value pair. A filter
-        // that reports itself a no-op (e.g. lazy-delete with no user filter
-        // and no registered dead keys) still permits the move. Building this
-        // as a normal `CompactionOutput` (rather than applying it directly)
-        // means it goes through `install_compaction`'s stale-input check
-        // like any other compaction — required now that every caller of
-        // this function (including concurrent background workers) can reach
-        // this path, not just the single-threaded `do_compaction`.
-        if task.input_files_level.len() == 1
+        // rewriting. Skip it for an in-place bottommost rewrite
+        // (`target_level == task.level`) and when the compaction filter could
+        // remove or change entries — it needs to see every key-value pair. A
+        // filter that reports itself a no-op (e.g. lazy-delete with no user
+        // filter and no registered dead keys) still permits cross-level moves.
+        // Building this as a normal `CompactionOutput` (rather than applying
+        // it directly) means it goes through `install_compaction`'s
+        // stale-input check like any other compaction — required now that
+        // every caller of this function (including concurrent background
+        // workers) can reach this path, not just the single-threaded
+        // `do_compaction`.
+        if target_level != task.level
+            && task.input_files_level.len() == 1
             && task.input_files_next.is_empty()
             && ctx
                 .options
@@ -1272,6 +1312,7 @@ impl LeveledCompaction {
             evict_table_cache_files(table_cache, &created_files);
             return Ok(PostCompactionCleanup {
                 files_to_delete: HashSet::new(),
+                installed: false,
             });
         }
 
@@ -1304,6 +1345,7 @@ impl LeveledCompaction {
         // Return the file numbers that need deletion AFTER manifest sync
         Ok(PostCompactionCleanup {
             files_to_delete: output.input_file_numbers,
+            installed: true,
         })
     }
 
@@ -2044,8 +2086,13 @@ mod tests {
         versions.log_and_apply(edit).unwrap();
 
         let version = versions.current();
-        let task =
-            LeveledCompaction::pick_compaction_for_range(&version, Some(b"a"), Some(b"b")).unwrap();
+        let task = LeveledCompaction::pick_compaction_for_range(
+            &version,
+            Some(b"a"),
+            Some(b"b"),
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(task.level, 0);
         let picked: HashSet<u64> = task
             .input_files_level
@@ -2439,6 +2486,7 @@ mod tests {
         let l2_right = write(3, b"z", 1, ValueType::Value, b"right");
         let task = super::CompactionTask {
             level: 1,
+            target_level: 2,
             input_files_level: vec![l1],
             input_files_next: vec![l2_left, l2_right],
         };
@@ -2719,6 +2767,7 @@ mod tests {
 
         let task = CompactionTask {
             level: 1,
+            target_level: 2,
             input_files_level: vec![source_file],
             input_files_next: target_files,
         };
@@ -2872,6 +2921,7 @@ mod tests {
 
             CompactionTask {
                 level: 1,
+                target_level: 2,
                 input_files_level: vec![source_file],
                 input_files_next: target_files,
             }
@@ -3088,6 +3138,7 @@ mod tests {
 
         let task = CompactionTask {
             level: 1,
+            target_level: 2,
             input_files_level: vec![f],
             input_files_next: targets,
         };

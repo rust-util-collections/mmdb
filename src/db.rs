@@ -2674,12 +2674,20 @@ impl DB {
             return Ok(());
         }
 
-        // Range-filtered compaction: compact files overlapping [begin, end)
+        // Range-filtered compaction: compact files overlapping [begin, end),
+        // including one bottommost rewrite pass at `num_levels - 1` for files
+        // not already rewritten into that level during this call.
+        let mut settled_bottom: HashSet<u64> = HashSet::new();
         loop {
             let pick = {
                 let inner = self.inner.lock();
                 let version = inner.versions.current();
-                match LeveledCompaction::pick_compaction_for_range(&version, begin, end) {
+                match LeveledCompaction::pick_compaction_for_range(
+                    &version,
+                    begin,
+                    end,
+                    &settled_bottom,
+                ) {
                     Some(task) => {
                         let l0_inputs: Vec<u64> = if task.level == 0 {
                             task.input_files_level
@@ -2767,6 +2775,20 @@ impl DB {
             self.table_cache
                 .prewarm(output.edit.new_files.iter().map(|(_, meta)| meta.number));
 
+            let rewritten_bottom_outputs: Vec<u64> = if task.target_level
+                == self.options.num_levels - 1
+                && !output.input_file_numbers.is_empty()
+            {
+                output
+                    .edit
+                    .new_files
+                    .iter()
+                    .map(|(_, meta)| meta.number)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             let cleanup = {
                 let mut inner = self.inner.lock();
                 let cleanup = LeveledCompaction::install_compaction(
@@ -2779,6 +2801,9 @@ impl DB {
                     !self.snapshot_list.is_empty(),
                 )
                 .ctx()?;
+                if cleanup.installed {
+                    settled_bottom.extend(rewritten_bottom_outputs);
+                }
                 // Unpin L0 inputs that actually left L0 — a trivial move
                 // relabels the same physical file to L1 (not in
                 // files_to_delete), while a discarded (stale) install leaves

@@ -646,3 +646,65 @@ fn compact_waits_for_inflight_compaction_and_removes_dead_keys() {
         );
     }
 }
+
+#[test]
+fn compact_range_rewrites_bottommost_level_for_lazy_delete_and_tombstone_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions {
+        l0_compaction_trigger: 100,
+        ..Default::default()
+    };
+    let db = DB::open(opts, dir.path()).unwrap();
+
+    // Keep out-of-range key in its own L0 SST so [c, d) compaction only touches [c1, c2].
+    db.put(b"x1", b"v").unwrap();
+    db.flush().unwrap();
+
+    for k in [b"c1" as &[u8], b"c2"] {
+        db.put(k, b"v").unwrap();
+    }
+    db.flush().unwrap();
+
+    // Hold a snapshot so deleting c1 must retain its tombstone all the way to L6.
+    let snap = db.snapshot();
+    db.delete(b"c1").unwrap();
+    db.flush().unwrap();
+
+    // First range compaction cascades the [c, d) inputs down to L6 (num_levels - 1).
+    db.compact_range(Some(b"c"), Some(b"d")).unwrap();
+    assert_eq!(db.get_property("num-files-at-level6").as_deref(), Some("1"));
+    assert_eq!(
+        db.get_with_options(&snap.read_options(), b"c1")
+            .unwrap()
+            .as_deref(),
+        Some(b"v".as_slice())
+    );
+    drop(snap);
+
+    // Register c2 for lazy deletion once the SST already lives at num_levels - 1.
+    db.lazy_delete(b"c2");
+    assert_eq!(db.dead_key_count(), 1);
+
+    db.compact_range(Some(b"c"), Some(b"d")).unwrap();
+
+    assert_eq!(
+        db.get(b"c2").unwrap(),
+        None,
+        "compact_range must apply compaction filter / lazy_delete at num_levels - 1"
+    );
+    assert_eq!(
+        db.dead_key_count(),
+        0,
+        "in-range dead-key registration must settle after compact_range"
+    );
+    assert_eq!(
+        db.get_property("num-files-at-level6").as_deref(),
+        Some("0"),
+        "bottommost SST holding only expired tombstones and filtered keys must be reclaimed"
+    );
+    assert_eq!(
+        db.get(b"x1").unwrap().as_deref(),
+        Some(b"v".as_slice()),
+        "out-of-range key must remain intact"
+    );
+}
