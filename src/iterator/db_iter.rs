@@ -298,6 +298,10 @@ impl DBIterator {
         if !self.ensure_current() {
             return;
         }
+        if self.has_failed() {
+            self.halt_on_error();
+            return;
+        }
         let Some((ref key, _)) = self.current else {
             return;
         };
@@ -586,6 +590,13 @@ impl DBIterator {
 
     /// Ensure current is populated. Returns whether there's a valid entry.
     fn ensure_current(&mut self) -> bool {
+        // Keep an already-resolved, unconsumed entry stable across repeated
+        // valid()/key()/value() calls even if take_entry()'s lookahead into the
+        // next block latched a source read error; the failure halts the
+        // iterator once the caller advances past this entry.
+        if !self.needs_advance {
+            return self.current.is_some();
+        }
         if self.has_failed() {
             self.halt_on_error();
             return false;
@@ -593,14 +604,12 @@ impl DBIterator {
         if self.prefix_exhausted {
             return false;
         }
-        if self.needs_advance {
-            self.current = if self.clean_read {
-                self.next_visible_clean()
-            } else {
-                self.next_visible()
-            };
-            self.needs_advance = false;
-        }
+        self.current = if self.clean_read {
+            self.next_visible_clean()
+        } else {
+            self.next_visible()
+        };
+        self.needs_advance = false;
         self.current.is_some()
     }
 
@@ -853,9 +862,7 @@ impl DBIterator {
             // A failed source may hold newer versions of the candidate that
             // were never read, so the best entry seen is not the visible one.
             if self.merger.has_failed() {
-                self.current = None;
-                self.needs_advance = false;
-                self.backward_positioned = false;
+                self.halt_on_error();
                 return;
             }
 
@@ -2040,5 +2047,59 @@ mod tests {
             "BidiIterator::next must not resume after next_back hit key_decode_error"
         );
         assert!(bidi.error().is_some());
+    }
+
+    #[test]
+    fn cursor_api_preserves_resolved_entry_when_readahead_hits_corrupt_next_block() {
+        use crate::iterator::bidi_iter::BidiIterator;
+        use crate::sst::table_reader::TableIterator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = sst_with_corrupt_block(
+            &dir.path().join("000001.sst"),
+            &[
+                make_entry(b"a", 20, ValueType::Value, b"va"),
+                make_entry(b"b", 19, ValueType::Value, b"vb"),
+            ],
+            1, // block 0 ("a") is valid; block 1 ("b") has a corrupt CRC
+        );
+
+        // 1. valid() -> key() -> value() -> advance() must match Iterator::next()
+        let mut iter = DBIterator::from_sources(
+            vec![
+                IterSource::new(vec![]).with_level(0),
+                IterSource::from_table_iter(TableIterator::new(file.reader.clone())).with_level(0),
+            ],
+            100,
+        );
+        assert!(iter.valid());
+        assert_eq!(iter.key(), Some(&b"a"[..]));
+        assert_eq!(iter.value(), Some(&b"va"[..]));
+        iter.advance();
+        assert!(!iter.valid());
+        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
+
+        // 2. BidiIterator::lazy after valid() must still yield the unconsumed front entry
+        let mut iter2 = DBIterator::from_sources(
+            vec![
+                IterSource::from_table_iter(TableIterator::new(file.reader.clone())).with_level(0),
+            ],
+            100,
+        );
+        assert!(iter2.valid());
+        let mut bidi = BidiIterator::lazy(iter2);
+        assert_eq!(bidi.next(), Some((b"a".to_vec(), b"va".to_vec())));
+        assert_eq!(bidi.next(), None);
+        assert!(bidi.error().is_some_and(|e| e.contains("CRC")));
+
+        // 3. next_prefix() after valid() must halt instead of clearing the failure
+        let mut iter3 = DBIterator::from_sources(
+            vec![IterSource::from_table_iter(TableIterator::new(file.reader)).with_level(0)],
+            100,
+        );
+        assert!(iter3.valid());
+        iter3.next_prefix(0);
+        assert!(!iter3.valid());
+        assert!(iter3.error().is_some_and(|e| e.contains("CRC")));
     }
 }
