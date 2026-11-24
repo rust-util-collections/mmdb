@@ -307,6 +307,7 @@ fn bench_readseq(c: &mut Criterion) {
                             db.put(&make_key(i), &value).unwrap();
                         }
                         db.flush().unwrap();
+                        assert_eq!(db.iter().unwrap().count(), 10_000);
                         (dir, db)
                     },
                     |(dir, db)| {
@@ -378,6 +379,7 @@ fn bench_prefix_scan(c: &mut Criterion) {
                     db.put(key.as_bytes(), &value).unwrap();
                 }
                 db.flush().unwrap();
+                assert_eq!(db.iter().unwrap().count(), 10_000);
                 (dir, db)
             },
             |(dir, db)| {
@@ -448,6 +450,7 @@ fn bench_seek(c: &mut Criterion) {
                     db.put(&make_key(i), &value).unwrap();
                 }
                 db.flush().unwrap();
+                assert_eq!(db.iter().unwrap().count(), 50_000);
                 let targets: Vec<Vec<u8>> = (0..500u64)
                     .map(|i| make_key((i.wrapping_mul(6364136223846793005)) % 50_000))
                     .collect();
@@ -621,6 +624,7 @@ fn bench_scan_large(c: &mut Criterion) {
                             db.put(&make_key(i), &value).unwrap();
                         }
                         db.flush().unwrap();
+                        assert_eq!(db.iter().unwrap().count(), 100_000);
                         (dir, db)
                     },
                     |(dir, db)| {
