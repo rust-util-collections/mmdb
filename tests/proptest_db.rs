@@ -23,7 +23,7 @@ enum Op {
 fn arb_key() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         3 => (0u8..16).prop_map(|b| vec![b]),
-        1 => vec(any::<u8>(), 1..32),
+        1 => vec(any::<u8>(), 0..32),
     ]
 }
 

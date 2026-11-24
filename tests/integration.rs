@@ -34,9 +34,11 @@ fn test_empty_key_and_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = make_db(dir.path());
 
-    // Empty value
+    // Empty value with non-empty key, and non-empty value with empty key
     db.put(b"key", b"").unwrap();
+    db.put(b"", b"empty_key_val").unwrap();
     assert_eq!(db.get(b"key").unwrap(), Some(vec![]));
+    assert_eq!(db.get(b"").unwrap(), Some(b"empty_key_val".to_vec()));
 }
 
 #[test]
@@ -626,7 +628,7 @@ fn test_concurrent_high_pressure() {
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
                 // Read a few known-pattern keys — result may or may not exist yet
                 let key = format!("w0_{:06}", reads % ops_per_writer as u64);
-                let _ = db.get(key.as_bytes());
+                db.get(key.as_bytes()).unwrap();
                 reads += 1;
             }
         }));
@@ -680,24 +682,37 @@ fn test_iterator_during_compaction() {
         db.flush().unwrap();
     }
 
-    // Take an iterator snapshot before compaction
-    let pre_compact: Vec<(Vec<u8>, Vec<u8>)> = db.iter().unwrap().collect();
+    // Hold a live streaming iterator mid-scan across overwrites, flush, and
+    // compaction (which unlinks superseded L0 SSTs on disk).
+    let expected_snapshot: Vec<(Vec<u8>, Vec<u8>)> = db.iter().unwrap().collect();
+    assert_eq!(expected_snapshot.len(), 150);
 
-    // Compact
+    let mut mid_scan = db.iter().unwrap();
+    let mut observed: Vec<(Vec<u8>, Vec<u8>)> = mid_scan.by_ref().take(50).collect();
+    assert_eq!(observed.len(), 50);
+
+    // Overwrite keys, flush, and compact while `mid_scan` stays open.
+    for i in 0..150 {
+        let key = format!("iter_{:04}", i);
+        let val = format!("v_new_{}", i);
+        db.put(key.as_bytes(), val.as_bytes()).unwrap();
+    }
+    db.flush().unwrap();
     db.compact().unwrap();
 
-    // Take an iterator after compaction
-    let post_compact: Vec<(Vec<u8>, Vec<u8>)> = db.iter().unwrap().collect();
+    // Finish draining the pre-compaction iterator and verify snapshot isolation.
+    observed.extend(mid_scan.by_ref());
+    assert_eq!(mid_scan.error(), None);
+    assert_eq!(observed, expected_snapshot);
 
-    // Both iterators should see the same data
-    assert_eq!(
-        pre_compact.len(),
-        post_compact.len(),
-        "iterator length mismatch after compaction"
-    );
-    for (a, b) in pre_compact.iter().zip(post_compact.iter()) {
-        assert_eq!(a.0, b.0, "key mismatch after compaction");
-        assert_eq!(a.1, b.1, "value mismatch after compaction");
+    // Take an iterator after compaction and verify the updated values.
+    let mut post_iter = db.iter().unwrap();
+    let post_compact: Vec<(Vec<u8>, Vec<u8>)> = post_iter.by_ref().collect();
+    assert_eq!(post_iter.error(), None);
+    assert_eq!(post_compact.len(), expected_snapshot.len());
+    for (idx, (k, v)) in post_compact.iter().enumerate() {
+        assert_eq!(k, &expected_snapshot[idx].0);
+        assert_eq!(v, format!("v_new_{}", idx).as_bytes());
     }
 
     // Verify sorted order
@@ -979,16 +994,35 @@ fn test_empty_key_empty_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = make_db(dir.path());
 
-    // Empty value with non-empty key
+    // Empty key + empty value alongside a non-empty key
+    db.put(b"", b"").unwrap();
     db.put(b"nonempty", b"").unwrap();
+    assert_eq!(db.get(b"").unwrap(), Some(vec![]));
     assert_eq!(db.get(b"nonempty").unwrap(), Some(vec![]));
 
-    // Verify through flush + read from SST
+    // Verify through flush + compact + forward/backward iteration
     db.flush().unwrap();
+    db.compact().unwrap();
+    assert_eq!(db.get(b"").unwrap(), Some(vec![]));
     assert_eq!(db.get(b"nonempty").unwrap(), Some(vec![]));
 
-    // Delete and verify
+    let fwd: Vec<_> = db.iter().unwrap().collect();
+    assert_eq!(
+        fwd,
+        vec![(b"".to_vec(), vec![]), (b"nonempty".to_vec(), vec![])]
+    );
+    let mut rev_iter = db.iter().unwrap();
+    rev_iter.seek_to_last();
+    assert_eq!(rev_iter.key(), Some(&b"nonempty"[..]));
+    rev_iter.prev();
+    assert_eq!(rev_iter.key(), Some(&b""[..]));
+    rev_iter.prev();
+    assert!(!rev_iter.valid());
+
+    // Delete both and verify
+    db.delete(b"").unwrap();
     db.delete(b"nonempty").unwrap();
+    assert_eq!(db.get(b"").unwrap(), None);
     assert_eq!(db.get(b"nonempty").unwrap(), None);
 }
 

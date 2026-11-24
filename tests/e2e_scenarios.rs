@@ -417,7 +417,7 @@ fn test_mixed_workload() {
 
                 if pct < 50 {
                     // Read (50%)
-                    let _ = db.get(key.as_bytes());
+                    db.get(key.as_bytes()).unwrap();
                 } else if pct < 80 {
                     // Write (30%)
                     let val = format!("t{}_{}", tid, op_idx);
@@ -437,6 +437,7 @@ fn test_mixed_workload() {
                         let _ = iter.value();
                         iter.advance();
                     }
+                    assert_eq!(iter.error(), None);
                 }
             }
         }));
