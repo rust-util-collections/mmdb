@@ -2644,6 +2644,9 @@ impl DB {
     /// If `begin` is None, starts from the beginning. If `end` is None, goes to the end.
     pub fn compact_range(&self, begin: Option<&[u8]>, end: Option<&[u8]>) -> Result<()> {
         self.check_writable().ctx()?;
+        if begin.zip(end).is_some_and(|(b, e)| b >= e) {
+            return Ok(());
+        }
 
         // Hold write_queue across every flush/install phase so close cannot
         // observe an empty active barrier mid-range job, release LOCK/caches,

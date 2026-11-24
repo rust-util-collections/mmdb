@@ -2639,3 +2639,42 @@ fn lazy_bidi_preserves_the_remaining_frontier() {
     assert!(bidi.next_back().is_none());
     assert!(bidi.next().is_none());
 }
+
+#[test]
+fn empty_and_inverted_compact_range_do_not_flush_or_rewrite_spanning_ssts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    db.put(b"a", b"va").unwrap();
+    db.put(b"z", b"vz").unwrap();
+    db.flush().unwrap();
+
+    // Unflushed key inside the spanning SST's [a, z] key space.
+    db.put(b"m", b"vm").unwrap();
+
+    assert_eq!(
+        db.get_property("stats.flushes_completed").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        db.get_property("stats.compactions_completed").as_deref(),
+        Some("0")
+    );
+
+    db.compact_range(Some(b"m"), Some(b"m")).unwrap();
+    db.compact_range(Some(b"r"), Some(b"c")).unwrap();
+
+    assert_eq!(
+        db.get_property("stats.flushes_completed").as_deref(),
+        Some("1"),
+        "empty or inverted [begin, end) must not flush the active memtable"
+    );
+    assert_eq!(
+        db.get_property("stats.compactions_completed").as_deref(),
+        Some("0"),
+        "empty or inverted [begin, end) must not compact spanning SSTs"
+    );
+    assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("1"));
+    assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"va".as_slice()));
+    assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"vm".as_slice()));
+    assert_eq!(db.get(b"z").unwrap().as_deref(), Some(b"vz".as_slice()));
+}

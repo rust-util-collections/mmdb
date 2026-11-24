@@ -138,6 +138,9 @@ fn file_metadata_overlaps_bounds(
     lower: Option<&[u8]>,
     upper: Option<&[u8]>,
 ) -> bool {
+    if lower.zip(upper).is_some_and(|(lo, hi)| lo >= hi) {
+        return false;
+    }
     let file_smallest = user_key(&tf.meta.smallest_key);
     let file_largest = user_key(&tf.meta.largest_key);
     let above_lower = lower.is_none_or(|lo| file_largest >= lo);
@@ -956,6 +959,9 @@ impl LeveledCompaction {
         end: Option<&[u8]>,
         settled_bottom: &HashSet<u64>,
     ) -> Option<CompactionTask> {
+        if begin.zip(end).is_some_and(|(b, e)| b >= e) {
+            return None;
+        }
         // Check L0 first: collect L0 files overlapping the range
         let l0_files = version.level_files(0);
         let mut input_l0: Vec<TableFile> = Vec::new();

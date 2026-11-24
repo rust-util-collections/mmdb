@@ -279,6 +279,9 @@ pub fn tombstone_overlaps_bounds(
     lower: Option<&[u8]>,
     upper: Option<&[u8]>,
 ) -> bool {
+    if begin >= end || lower.zip(upper).is_some_and(|(lo, hi)| lo >= hi) {
+        return false;
+    }
     lower.is_none_or(|lo| end > lo) && upper.is_none_or(|hi| begin < hi)
 }
 
@@ -764,6 +767,34 @@ mod tests {
         assert_eq!(wb.entries[3].value_type, ValueType::RangeDeletion);
         assert_eq!(wb.entries[3].key, b"a");
         assert_eq!(wb.entries[3].value, Some(b"z".to_vec()));
+    }
+
+    #[test]
+    fn empty_or_inverted_bounds_do_not_overlap_tombstones() {
+        assert!(!tombstone_overlaps_bounds(
+            b"a",
+            b"z",
+            Some(b"m"),
+            Some(b"m")
+        ));
+        assert!(!tombstone_overlaps_bounds(
+            b"a",
+            b"z",
+            Some(b"r"),
+            Some(b"c")
+        ));
+        assert!(!tombstone_overlaps_bounds(
+            b"m",
+            b"m",
+            Some(b"a"),
+            Some(b"z")
+        ));
+        assert!(tombstone_overlaps_bounds(
+            b"a",
+            b"z",
+            Some(b"m"),
+            Some(b"n")
+        ));
     }
 }
 

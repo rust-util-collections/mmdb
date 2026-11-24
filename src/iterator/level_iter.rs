@@ -136,12 +136,27 @@ impl LevelIterator {
         self
     }
 
+    fn has_empty_bounds(&self) -> bool {
+        self.start_hint
+            .as_deref()
+            .zip(self.end_hint.as_deref())
+            .is_some_and(|(s, e)| s >= e)
+            || self
+                .start_hint
+                .as_deref()
+                .zip(self.upper_bound.as_deref())
+                .is_some_and(|(s, u)| s >= u)
+    }
+
     /// Check a file against all configured filters. Files in a level are
     /// sorted and disjoint, so a range rejection also rejects every file
     /// beyond it in that direction; only a prefix-bloom rejection is local.
     fn check_file_filters(&self, tf: &TableFile) -> FileFilter {
         #[cfg(test)]
         FILES_FILTERED.with(|n| n.set(n.get() + 1));
+        if self.has_empty_bounds() {
+            return FileFilter::AfterRange;
+        }
         // Range filter: file's largest user key must be >= start_hint
         if let Some(ref start) = self.start_hint {
             let largest_uk = user_key_from_internal(&tf.meta.largest_key);
@@ -334,6 +349,11 @@ impl super::merge::SeekableIterator for LevelIterator {
 
     fn seek_for_prev(&mut self, target: &[u8]) {
         self.error = None;
+        if self.has_empty_bounds() {
+            self.file_index = 0;
+            self.current_iter = None;
+            return;
+        }
         // Binary search: find last file whose smallest_key <= target.
         let idx = self.files.partition_point(|tf| {
             compare_internal_key(&tf.meta.smallest_key, target) != Ordering::Greater
@@ -394,6 +414,11 @@ impl super::merge::SeekableIterator for LevelIterator {
     fn seek_to_last(&mut self) {
         self.error = None;
         self.current_iter = None;
+        if self.has_empty_bounds() {
+            self.file_index = 0;
+            self.current_iter = None;
+            return;
+        }
         // Start from the last file and work backward
         for idx in (0..self.files.len()).rev() {
             let tf = &self.files[idx];
@@ -832,5 +857,27 @@ mod tests {
         let mut iter = LevelIterator::new(files).with_prefix(b"xxxx_".to_vec());
         let entries: Vec<_> = (&mut iter).collect();
         assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn empty_or_inverted_range_hints_skip_spanning_files() {
+        use super::super::merge::SeekableIterator;
+
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![build_sst(dir.path(), 1, 0, 30)];
+
+        for (start, end) in [
+            (b"key_000015".to_vec(), b"key_000015".to_vec()),
+            (b"key_000020".to_vec(), b"key_000010".to_vec()),
+        ] {
+            let mut iter =
+                LevelIterator::new(files.clone()).with_range_hints(Some(start), Some(end));
+            assert!(iter.next().is_none());
+            iter.seek_to_last();
+            assert!(iter.current().is_none());
+            let target = InternalKey::new(b"key_000015", 100, ValueType::Value);
+            iter.seek_for_prev(target.as_bytes());
+            assert!(iter.current().is_none());
+        }
     }
 }
