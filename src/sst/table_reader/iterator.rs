@@ -483,7 +483,11 @@ impl TableIterator {
                 }
             }
         }
-        self.index_pos = index_entries.len();
+        if self.err.is_some() {
+            self.index_pos = index_entries.len();
+        } else {
+            self.index_pos = 0;
+        }
     }
 
     fn position_reverse_segment(
@@ -554,15 +558,14 @@ impl TableIterator {
         }
 
         // Need to load the previous block's last segment.
-        let current_block_index = if self.backward_block_index < usize::MAX {
-            self.backward_block_index
-        } else if self.index_pos > 0 {
-            self.index_pos - 1
-        } else {
+        if self.backward_block_index == usize::MAX {
             return None;
-        };
+        }
+        let current_block_index = self.backward_block_index;
 
         if current_block_index == 0 {
+            self.reset_positioning_state();
+            self.index_pos = 0;
             return None; // Already at first block
         }
 
@@ -578,6 +581,8 @@ impl TableIterator {
             let entry = &index_entries[prev_block_index];
             if self.block_properties_should_skip(entry) {
                 if prev_block_index == 0 {
+                    self.reset_positioning_state();
+                    self.index_pos = 0;
                     return None;
                 }
                 prev_block_index -= 1;
@@ -603,6 +608,8 @@ impl TableIterator {
                         }
                         if self.current_block_entries.is_empty() {
                             if prev_block_index == 0 {
+                                self.reset_positioning_state();
+                                self.index_pos = 0;
                                 return None;
                             }
                             prev_block_index -= 1;
@@ -2226,5 +2233,58 @@ mod tests {
         assert_eq!(legacy_iter.iter_error(), None);
         assert!(legacy_iter.next().is_none());
         assert_eq!(legacy_iter.iter_error(), None);
+    }
+
+    #[test]
+    fn backward_exhaustion_clears_current_and_does_not_wrap_into_tail_blocks() {
+        use crate::types::InternalKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backward_exhaust.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for key in [b"b", b"m", b"z"] {
+            let ik = InternalKey::new(key, 10, ValueType::Value);
+            builder.add(ik.as_bytes(), b"val").unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let mut iter = TableIterator::new(reader);
+
+        // 1. seek_for_prev before the table's smallest key must stay exhausted on prev().
+        let before_first = InternalKey::new(b"a", 100, ValueType::Value);
+        iter.seek_for_prev(before_first.as_bytes());
+        assert!(iter.current().is_none());
+        assert!(
+            iter.prev().is_none(),
+            "prev() after an unpositioned seek_for_prev must not wrap into tail blocks"
+        );
+        assert!(iter.current().is_none());
+
+        // 2. Stepping prev() off the first entry must clear current() and reset to start.
+        let at_first = InternalKey::new(b"b", 0, ValueType::Deletion);
+        iter.seek_for_prev(at_first.as_bytes());
+        assert_eq!(
+            iter.current().map(|(k, _)| user_key(&k).to_vec()),
+            Some(b"b".to_vec())
+        );
+        assert!(iter.prev().is_none());
+        assert!(
+            iter.current().is_none(),
+            "current() must be None once prev() steps before the first entry"
+        );
+        assert_eq!(
+            iter.next().map(|(k, _)| user_key(&k).to_vec()),
+            Some(b"b".to_vec())
+        );
     }
 }
