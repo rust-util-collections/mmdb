@@ -111,7 +111,7 @@ impl MemTable {
         key: &[u8],
         sequence: SequenceNumber,
     ) -> Option<(Option<Vec<u8>>, SequenceNumber)> {
-        let search_key = InternalKey::new(key, sequence, ValueType::Value);
+        let search_key = InternalKey::new(key, sequence, ValueType::RangeDeletion);
         self.inner.get_with_seq(search_key.into_bytes(), key)
     }
 
@@ -457,5 +457,19 @@ mod tests {
         assert!(mt2.is_empty());
         mt2.put(b"k", b"", 1, ValueType::Deletion);
         assert!(!mt2.is_empty());
+    }
+
+    #[test]
+    fn get_with_seq_at_range_tombstone_sequence_does_not_skip_to_older_value() {
+        let mt = MemTable::new();
+        mt.put(b"k", b"old_val", 5, ValueType::Value);
+        mt.put(b"k", b"z", 10, ValueType::RangeDeletion);
+
+        assert_eq!(
+            mt.get_with_seq(b"k", 9),
+            Some((Some(b"old_val".to_vec()), 5))
+        );
+        assert_eq!(mt.get_with_seq(b"k", 10), Some((None, 10)));
+        assert_eq!(mt.get_with_seq(b"k", 11), Some((None, 10)));
     }
 }

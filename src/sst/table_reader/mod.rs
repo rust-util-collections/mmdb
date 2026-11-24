@@ -331,7 +331,7 @@ impl TableReader {
             return Ok(None);
         }
 
-        let seek_key = InternalKey::new(user_key, sequence, ValueType::Value);
+        let seek_key = InternalKey::new(user_key, sequence, ValueType::RangeDeletion);
 
         let handle = match self
             .find_data_block(seek_key.as_bytes(), compare_internal_key)
@@ -1063,5 +1063,46 @@ mod tests {
         let reader = TableReader::open(&path).unwrap();
         assert_eq!(reader.filter_hash, Some(FILTER_HASH_MURMUR2));
         assert!(reader.bloom_may_match(b"k", reader.filter_data.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn get_internal_with_seq_at_inline_range_tombstone_sequence_does_not_skip_to_older_value() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy_inline_rangedel_seq.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                internal_keys: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        builder.use_legacy_inline_range_deletions();
+        builder
+            .add(
+                InternalKey::new(b"k", 10, ValueType::RangeDeletion).as_bytes(),
+                b"z",
+            )
+            .unwrap();
+        builder
+            .add(
+                InternalKey::new(b"k", 5, ValueType::Value).as_bytes(),
+                b"old_val",
+            )
+            .unwrap();
+        builder.finish().unwrap();
+
+        let reader = TableReader::open(&path).unwrap();
+        assert_eq!(
+            reader.get_internal_with_seq(b"k", 9, true).unwrap(),
+            Some((Some(b"old_val".to_vec()), 5))
+        );
+        assert_eq!(
+            reader.get_internal_with_seq(b"k", 10, true).unwrap(),
+            Some((None, 10))
+        );
     }
 }
