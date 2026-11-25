@@ -6,6 +6,11 @@ concrete storage failure mode. Specify the exact local API/file operation,
 invariant, and expected vs observed result on MMDB's embedded data structures
 and local files.
 
+Use the [architecture support policy](workflow-policy.md#supported-architectures)
+when checking platform-specific claims. Name the affected target and distinguish
+static evidence from a native test result. Record confirmed defects confined
+to unsupported architectures under `Won't Fix`.
+
 ## 1. Context
 
 1. Read the full diff and surrounding functions, callers, error paths, and tests.

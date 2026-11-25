@@ -144,7 +144,8 @@ hunk), skip the probe and trace coverage statically, saying so in the report.
 
 ### 3. Prove, then fix
 
-Resolve findings in scope sequentially (`CRITICAL` → `LOW`), following
+Record confirmed unsupported-architecture-only findings under `Won't Fix` in
+Step 4. Resolve actionable findings in scope sequentially (`CRITICAL` → `LOW`), following
 [x-fix](../x-fix/SKILL.md) Protocol §1–§2 with these additions per unit:
 
 1. **Red**: write the focused regression test first, in a `tempfile` DB with

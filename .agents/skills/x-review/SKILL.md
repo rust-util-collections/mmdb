@@ -90,7 +90,9 @@ Update `docs/audit.md` from current code, using the forms in `review-core.md`:
 1. Prune fixed or obsolete in-scope `Open` entries.
 2. Add confirmed `Open` entries, deduped and sorted `CRITICAL` → `LOW`.
 3. Re-check intersecting `Won't Fix` entries (`all` → all). Move stale entries
-   to `Open` or `Rejected`; do not add new `Won't Fix` here.
+   to `Open` or `Rejected` as appropriate. Add a new `Won't Fix` only for a
+   confirmed defect confined to unsupported architectures, citing the target
+   and the [architecture policy](../../../docs/ai/workflow-policy.md#supported-architectures).
 4. Record material disproven claims as `Rejected`; omit routine noise and
    non-defects.
 5. No dates.

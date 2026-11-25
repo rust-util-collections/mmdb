@@ -72,6 +72,10 @@ Select the installed official stable Rust toolchain via `cargo +stable` under
 `AGENTS.md`; do not run `rustup update stable` automatically unless the user
 requested a toolchain update, and do not add MSRV pins or compatibility shims.
 
+Validation targets follow the [architecture support policy](workflow-policy.md#supported-architectures):
+64-bit ARM (`aarch64`) and 64-bit x86 (`x86_64`). Report the architecture
+on which checks actually ran.
+
 After the last behavior commit, run these commands once (do not substitute a
 `make` target unless requested by the user). Including `clippy --lib` checks the
 production library configuration without `[dev-dependencies]` enabling

@@ -4,7 +4,7 @@
 >
 > Severities: CRITICAL, HIGH, MEDIUM, LOW.
 >
-> **Won't Fix** is a confirmed defect whose complete fix has disproportionate cost or regression risk. Not a feature request or a documented contract. `$x-review` does not add these. Re-check one when a review touches its code, callers, assumptions, or subsystem; a full audit re-checks every entry.
+> **Won't Fix** records confirmed defects accepted under the [disposition rules](ai/workflow-policy.md#5-finding-dispositions). During review, record defects confined to unsupported architectures here with the affected target and evidence. Re-check entries when their code or assumptions change and during full audits.
 >
 > **Rejected** is a disproven claim, not a deferred defect. Re-check it only when its cited code or invariant changes.
 >
@@ -12,9 +12,23 @@
 
 ## Open
 
+None.
+
 ---
 
 ## Won't Fix
+
+### [MEDIUM] compaction: a 4 GiB SST size target truncates to zero on 32-bit targets
+
+- **Where**: `src/compaction/leveled.rs:539,710–723` (`execute_sub_compaction_io`).
+- **What**: Compaction casts the configured `u64` target to `usize`. On a 32-bit target, `target_file_size_base = 1 << 32` becomes zero, so a rewrite requests an SST split at every distinct user-key boundary.
+- **Reason**: Confirmed by tracing the integer conversion and split predicate. The supported 64-bit ABIs preserve this value. The project accepts the 32-bit behavior under its [architecture policy](../README.md#supported-architectures).
+
+### [MEDIUM] v4 exporter: the Windows rename binding uses the wrong ABI on 32-bit x86
+
+- **Where**: `tools/v4-export/src/main.rs` (`publish`), `tools/v4-export/Cargo.toml`, and `renamest` 0.1.3 (`src/windows.rs:8–13,26`).
+- **What**: The exporter's Windows backend declares `MoveFileExW` with `extern "C"`. The Win32 binding uses `extern "system"`, which selects `stdcall` on 32-bit x86. This mismatch can prevent linking or cause incorrect stack cleanup if the call resolves. [Windows binding](https://docs.rs/windows-sys/0.61.2/src/windows_sys/Windows/Win32/Storage/FileSystem/mod.rs.html#273) · [Rust ABI reference](https://doc.rust-lang.org/reference/items/external-blocks.html#abi)
+- **Reason**: Static inspection establishes the declaration mismatch. Its effect is specific to the unsupported 32-bit x86 Windows ABI. Re-check the entry when the exporter changes rename backends or updates the dependency.
 
 ### [LOW] lazy_delete: in-flight compaction wait test uses a fixed sleep
 - **Where**: `tests/lazy_delete.rs` (`compact_waits_for_inflight_compaction_and_removes_dead_keys`, the 200 ms delay before opening the filter gate)

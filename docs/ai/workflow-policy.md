@@ -46,6 +46,17 @@ invariant a reviewed `fix(...)` commit establishes. Record independent variants
 found outside the frozen scope as `Open` instead of fixing them. Empty is never
 the full repository; full repository requires `all`.
 
+## Supported architectures
+
+MMDB guarantees correct behavior on 64-bit ARM (AArch64, `aarch64`) and
+64-bit x86 (`x86_64`), using a 64-bit ABI. Other architectures are outside
+the project’s tested correctness guarantee.
+Apply this boundary to all four workflows, including `all` reviews and
+release validation. Record a confirmed defect confined to an unsupported
+architecture under `Won't Fix` with its affected target and reason. If a
+supported target is also affected, use normal triage. For example, an
+in-memory offset narrowed to `u32` can overflow on a 64-bit target.
+
 ## Storage-engine specification and reporting
 
 MMDB is an in-process embedded Rust LSM key-value library (`vsdb` backend)
@@ -192,13 +203,14 @@ passing gate.
 | State | Meaning |
 |-------|---------|
 | `Open` | Confirmed, actionable storage defect |
-| `Won't Fix` | Confirmed defect whose complete fix has disproportionate cost or regression risk (fix-time triage only; never for feature requests or documented contracts) |
+| `Won't Fix` | Confirmed defect confined to unsupported architectures, or a defect accepted during fix triage because repair has disproportionate cost or regression risk |
 | `Rejected` | Material claim disproven by code or tests (no severity label; omit routine noise) |
 | *omit* | Feature request, documented contract, or pure style preference |
 
 `$x-review` may add or prune `Open`, add `Rejected`, move a stale `Won't Fix`
-to `Open` or `Rejected`, and delete entries shown never to have been defects; it
-does not add `Won't Fix`. `$x-fix` and `$x-overhaul` may add `Won't Fix` during
-triage and delete non-defects. Never relabel an active defect merely to empty
+to `Open` or `Rejected`, and delete entries shown never to have been defects. During review,
+the sole reason to add a new `Won't Fix` is a confirmed defect confined to
+unsupported architectures. Cost and regression-risk decisions remain with
+`$x-fix` and `$x-overhaul` during fix triage. Never relabel an active defect merely to empty
 `Open`. Formats and severities follow `review-core.md`, with no dates or "last
 reviewed" markers.

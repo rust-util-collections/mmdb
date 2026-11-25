@@ -19,6 +19,15 @@ boundary. Reliability tests operate on isolated `tempfile` directories and
 deterministic generated records. Cargo dependency downloads and Git operations
 are separate developer-tooling actions with their own runtime controls.
 
+## Supported architectures
+
+MMDB guarantees correct behavior on 64-bit ARM (AArch64, `aarch64`) and
+64-bit x86 (`x86_64`), using a 64-bit ABI. Other architectures are outside
+the project’s tested correctness guarantee.
+Record confirmed defects confined to other architectures, including 32-bit
+targets, under `Won't Fix` in [the audit registry](docs/audit.md#wont-fix).
+A defect that also affects a supported target follows normal review and fix triage.
+
 ## Build & Test
 
 ```bash

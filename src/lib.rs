@@ -12,6 +12,11 @@
 //! scan with inclusive lower and exclusive upper bounds. The crate-root
 //! re-exports below define the public API.
 //!
+//! # Supported architectures
+//!
+//! MMDB guarantees correct behavior on 64-bit ARM (AArch64) and 64-bit x86
+//! (x86_64). Other architectures carry no tested correctness guarantee.
+//!
 //! # Read-only stores
 //!
 //! [`DB::open_read_only`] opens an existing store without modifying its

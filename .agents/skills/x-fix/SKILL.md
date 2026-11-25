@@ -42,6 +42,8 @@ Before editing, read the full implementation, callers, tests, and mapped guides
 Verify each finding against current code and dedupe shared root causes:
 
 - Ruled out by code or tests → `Rejected`.
+- Confirmed only on an unsupported architecture → record the target and reason
+  under `Won't Fix`.
 - Confirmed defect whose complete fix has disproportionate cost or regression
   risk → `Won't Fix` + concrete reason.
 - Feature request or documented contract → delete the entry (never `Won't Fix`).

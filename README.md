@@ -13,6 +13,12 @@ copy-on-write mutations, and compaction-driven garbage collection. Each
 database is a local directory. The caller reads and writes byte strings through
 the Rust API. Optimization work targets the vsdb workload. A writable handle runs flush and compaction workers in-process.
 
+## Supported architectures
+
+MMDB guarantees correct behavior on 64-bit ARM (AArch64, `aarch64`) and
+64-bit x86 (`x86_64`), using a 64-bit ABI. Other architectures are outside
+the project’s tested correctness guarantee.
+
 ## Getting started
 
 ```rust
