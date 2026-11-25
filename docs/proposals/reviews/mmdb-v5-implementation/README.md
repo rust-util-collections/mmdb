@@ -26,6 +26,24 @@ and `grouped-public`.
 python3 -c 'import gzip,json; print(json.load(gzip.open("milestones.json.gz", "rt"))["checkpoints"]["l0"]["reports"]["grok"])'
 ```
 
+## Final release review
+
+Four fresh reviews covered the release candidate at `90b220e`, with
+particular attention to the executable and tooling changes since `223d058`.
+The earlier integrated-source round reviewed `736b87e`; the development
+rounds covered five smaller checkpoints. Together the three archives hold
+**28 completed reports**. The OpenCode entry below is the final response
+from its resumed session. All four reviewers found the final delta
+satisfactory on static inspection.
+[Final release reports and English brief](release.json.gz) · [Native and AArch64 validation receipts](../../../benchmarks/engine-profile/validation.json)
+
+| Reviewer | Final check |
+|---|---|
+| Grok Build | Checked the reference/candidate RSS statuses, grouped read slot/byte semantics, end-of-run memory observation, and per-stream pacing. Its concern about mixing deadlines with a fixed arrival rate is addressed at option parsing: `Config::load` rejects simultaneous nonzero `RATE` and `SECONDS`. [Profile configuration](../../../../benches/engine_profile/main.rs) |
+| agy | Confirmed successful-group byte accounting, failure precedence, request-local cursor clearing, refusal wakeups, export publication, and the updated feature-isolated gates. The same explicit configuration check settles its remaining manual-mode hypothesis. [Grouped lookup](../../../../src/db/read.rs) · [Feature and test gates](../../../ai/commit-protocol.md#final-repository-gate) |
+| Claude Code | Confirmed that both reference repetitions influence the reference memory status, that the candidate has its own status, and that a very short multi-stream trial includes each issuer's newly arrived request. [Memory decisions](../../../benchmarks/engine-profile/summarize.py) · [Paced checks](../../../benchmarks/engine-profile/paced_load.py) |
+| OpenCode | Confirmed the corrected late-error counter, cursor lifetime, and independent feature checks. For device evidence the benchmark counts a request only when the process records at least 4,096 storage bytes; qualification requires that for at least 95% of all requests. The reported p99 uses the full request population. This measures request-level storage activity and leaves individual key/block residency unresolved. [Benchmark](../../../../benches/grouped_reads.rs) · [Qualification](../../../benchmarks/grouped-reads/read_evidence.py) |
+
 ## Integrated-source review
 
 After the five development checkpoints, the same four CLIs independently
