@@ -106,13 +106,14 @@ impl DB {
     /// - Keys and values must obey [`MAX_USER_KEY_SIZE`](crate::types::MAX_USER_KEY_SIZE)
     ///   and [`MAX_WRITE_ENTRY_SIZE`](crate::types::MAX_WRITE_ENTRY_SIZE)
     ///   (`InvalidArgument`).
-    /// - The ingested `[min_key, max_key]` span must be strictly disjoint from
-    ///   all point entries and range tombstones across active/immutable
-    ///   memtables and every existing SST in `L0..num_levels - 1`
-    ///   (`InvalidArgument`). On rejection or I/O error, newly written staging
-    ///   SSTs are removed and no partial data becomes visible.
-    /// - Active [`Snapshot`] handles taken before `ingest_sorted` completes do
-    ///   not observe the ingested keys.
+    /// - The entire `[min_key, max_key]` span must be disjoint from active
+    ///   and immutable memtable entries and tombstones, and from every live
+    ///   SST's key range and range-deletion partition extents (`InvalidArgument`).
+    /// - A failure before MANIFEST installation discards the staged SSTs.
+    ///   If confirming MANIFEST durability fails after installation, MMDB
+    ///   retains the referenced files and latches a background error.
+    /// - All rows share one fresh sequence. Snapshots with an earlier
+    ///   sequence retain their previous view.
     pub fn ingest_sorted<I, K, V>(&self, iter: I) -> Result<u64>
     where
         I: IntoIterator<Item = (K, V)>,

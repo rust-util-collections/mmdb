@@ -1943,34 +1943,11 @@ impl DB {
 
     /// Create a forward iterator for an arbitrary key range `[lower_bound, upper_bound)`.
     ///
-    /// SST files whose key range does not overlap `[lower_bound, upper_bound)` are
-    /// skipped entirely at construction time, avoiding unnecessary block reads.
-    /// `None` means unbounded in that direction.
-    ///
-    /// # When to use
-    ///
-    /// Use this when the scan range **does not align to a single key prefix** —
-    /// for example `[b"m", b"z")` spans many prefixes and cannot be expressed as
-    /// a single `iter_with_prefix()` call.
-    ///
-    /// If your range *does* align to a prefix (e.g. all keys starting with
-    /// `b"user:"`), prefer `iter_with_prefix()`: when `DbOptions::prefix_len > 0`
-    /// (`prefix.len() >= prefix_len`), it additionally uses prefix bloom filters
-    /// to skip SST files that don't contain the prefix, which is more precise
-    /// than range-metadata pruning alone.
-    ///
-    /// # Pruning comparison
-    ///
-    /// | Method              | SST range pruning | Bloom filter pruning |
-    /// |---------------------|:-----------------:|:--------------------:|
-    /// | `iter()`            | ✗                 | ✗                    |
-    /// | `iter_with_range()` | ✓                 | ✗                    |
-    /// | `iter_with_prefix()`| ✓                 | ✓ (`prefix_len > 0`) |
-    ///
-    /// # Bound merging
-    ///
-    /// Explicit `lower_bound`/`upper_bound` parameters are merged with any bounds
-    /// already set in `ReadOptions`, using the tighter of the two.
+    /// Each explicit bound is intersected with the bounds in [`ReadOptions`].
+    /// `None` leaves that side open. The scan prunes point sources outside the
+    /// resulting range and accounts separately for overlapping range tombstones.
+    /// For keys that share a prefix, [`Self::iter_with_prefix`] can also use
+    /// the SST's prefix Bloom filter.
     pub fn iter_with_range(
         &self,
         options: &ReadOptions,
@@ -1985,26 +1962,10 @@ impl DB {
     ///
     /// Iterates over all keys that start with `prefix` in order.
     ///
-    /// # When to use
-    ///
-    /// Use this whenever your query is naturally prefix-scoped — for example,
-    /// all keys under a tenant (`b"tenant_42:"`), a table (`b"orders:"`), etc.
-    /// It is the fastest iterator variant because it applies **two levels of
-    /// SST pruning**:
-    ///
-    /// 1. **Range pruning** — skips SST files whose `[smallest, largest]` key
-    ///    range does not overlap the prefix.
-    /// 2. **Bloom filter pruning** — when `DbOptions::prefix_len > 0` and
-    ///    `prefix.len() >= prefix_len`, skips remaining files whose file-level
-    ///    prefix bloom filter reports that `prefix[..prefix_len]` is absent.
-    ///
-    /// For cross-prefix ranges (e.g. `[b"m", b"z")`) use `iter_with_range()`
-    /// instead, as there is no single prefix that covers the query.
-    ///
-    /// # Sub-range within a prefix
-    ///
-    /// Set `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to further
-    /// restrict iteration to a sub-range inside the prefix.
+    /// The prefix interval is intersected with the bounds in [`ReadOptions`].
+    /// When an SST has a prefix Bloom filter and `prefix.len() >= prefix_len`,
+    /// a negative probe skips that file's point entries. The scan still checks
+    /// range deletions that can cover keys in the prefix.
     pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator> {
         let upper = types::prefix_successor(prefix);
         self.read
@@ -2073,12 +2034,11 @@ impl DB {
     /// - `"block-cache-usage"` — approximate block cache entry count.
     ///   When `DbOptions::block_cache` attaches this DB to a shared
     ///   [`BlockCachePool`](crate::BlockCachePool), the count is the
-    ///   **pool-wide** LRU total across every attached member (plus this
-    ///   DB's own pinned entries) — not this DB's share of it.
+    ///   total across both pool stores for all members plus this DB's own pins.
     /// - `"compaction-pending"` — "1" if compaction is needed, "0" otherwise
     /// - `"stats.bytes_written"` — total user bytes written
     /// - `"stats.bytes_read"` — key and value bytes returned by point
-    ///   lookups (`get*`); iterator reads are not counted
+    ///   lookups that find a visible value, including existence checks
     /// - `"stats.compactions_completed"` — number of compactions completed
     /// - `"stats.compaction_bytes_written"` — total bytes written during compaction
     /// - `"stats.flushes_completed"` — number of memtable flushes

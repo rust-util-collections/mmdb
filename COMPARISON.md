@@ -1,133 +1,31 @@
-# mmdb vs RocksDB / Pebble Feature Comparison
+# MMDB, RocksDB, and Pebble
 
-## Iterator / Range
+## Common operations
 
-| Feature | RocksDB | Pebble | mmdb | Notes |
-|---------|---------|--------|------|-------|
-| MergingIterator (heap-based) | Yes | Yes | Yes | O(N log K) merge |
-| Direction switch (bidirectional iteration) | Yes | Yes | Yes | Re-seeks all sources on switch — removed the in-heap tracking optimization since peeked entries in the heap belong to the wrong ordering (min vs max) after a switch |
-| TrySeekUsingNext | Yes | Yes | Yes | Step-forward instead of full seek when target >= current |
-| NextPrefix skip | No | Yes | Yes | O(log N) inter-prefix jump |
-| SeekGEWithLimit / IterAtLimit | No | Yes | No | Soft limit for distributed shard scanning |
-| LazyValue / deferred value loading | Partial (BlobDB) | Yes | Yes | Zero-copy within SST blocks, no value alloc on skip path |
-| Iterator object pool | Yes | Yes | No | Removed in v4.0 — always-empty global pool added a lock hop per iterator for zero benefit; iterators are flat structs, sources dominate construction cost |
-| SetBounds propagation to sub-iterators | Yes | Yes | Yes | upper_bound propagated to TableIterator/LevelIterator |
-| SkipPoint callback | No | Yes | Yes | ReadOptions.skip_point callback filtering |
-| Iterator error propagation | Yes | Yes | Yes | DBIterator::error() exposes I/O errors |
+These are entry points for readers familiar with the RocksDB 9.10 C++ or
+Pebble 1.1 Go APIs. MMDB v5 operates on a single local byte-key space. Its
+batch format, SST format, and configuration belong to MMDB.
 
-## Range Tombstone
+| Operation | MMDB v5 | RocksDB 9.10.0 | Pebble 1.1.5 |
+|-----------|---------|----------------|--------------|
+| Read a value | `DB::get` returns owned bytes. `get_pinned` can retain the SST block or memtable | `DB::Get` can fill a string or a `PinnableSlice` | `DB.Get` returns bytes and a closer |
+| Group mutations | `WriteBatch` and `DB::write` | `WriteBatch` and `DB::Write` | `Batch` and `DB.Apply` |
+| Delete a key range | `DB::delete_range` covers `[begin, end)` | `DB::DeleteRange` | `DB.DeleteRange` |
+| Read a stable view | `DB::snapshot` or `DB::arc_snapshot` | `DB::GetSnapshot` | `DB.NewSnapshot` |
+| Position a cursor | `seek` (≥), `seek_for_prev` (≤) | `Seek` (≥), `SeekForPrev` (≤) | `SeekGE` (≥), `SeekLT` (<) |
+| Report an iterator failure | Lending steps return `Result`. Owned iteration exposes `error()` | `Iterator::status` | `Iterator.Error` |
 
-| Feature | RocksDB | Pebble | mmdb | Notes |
-|---------|---------|--------|------|-------|
-| Range Deletion (RANGEDEL) | Yes | Yes | Yes | Stored in separate SST block |
-| FragmentedRangeTombstone O(log T) | Yes | Yes | Yes | Pre-fragmented + binary search |
-| Cross-level tombstone pruning | Yes | Yes | Yes | Shallow tombstones don't mis-delete deeper keys |
-| Point query tombstone O(log T) | Yes | Yes | Yes | Replaces original O(T) linear scan |
-| Range Key (RANGEKEYSET/UNSET) | No | Yes | No | CRDB-specific, not needed for general KV |
+For signatures and lifetimes, see the [MMDB API](src/lib.rs), [RocksDB database](https://github.com/facebook/rocksdb/blob/v9.10.0/include/rocksdb/db.h) and [iterator](https://github.com/facebook/rocksdb/blob/v9.10.0/include/rocksdb/iterator_base.h) interfaces, and the [Pebble database](https://github.com/cockroachdb/pebble/blob/v1.1.5/db.go) and [iterator](https://github.com/cockroachdb/pebble/blob/v1.1.5/iterator.go) implementations.
 
-## Memtable
+## MMDB storage choices
 
-| Feature | RocksDB | Pebble | mmdb | Notes |
-|---------|---------|--------|------|-------|
-| SkipList (lock-free) | Yes | Yes | Yes | Single-writer multi-reader, arena allocation |
-| Backward O(1) (prev pointer) | Yes | Yes | No | Forward links only: `prev` re-seeks in O(log N) (`seek_lt_raw`); the cached tail makes `seek_to_last` O(1) |
-| Multiple MemTable implementations | Yes (HashSkipList, Vector) | No | No | SkipList is sufficient |
+| Area | What v5 implements |
+|------|--------------------|
+| Scans | Range and prefix bounds, prefix Bloom pruning, lending forward/backward steps, block-property filters, and a lazy double-ended iterator |
+| Values | SST data blocks hold inline values. Pinned reads retain the block or memtable that supplies the bytes |
+| Deletions | Point deletions and half-open range tombstones participate in MVCC. Range tombstones have their own partitioned SST index. The API has no range-key set/unset operations |
+| Writes | A group-commit leader serializes WAL append and memtable application. Sorted disjoint input can instead be streamed directly to the bottommost level |
+| Compaction | Leveled compaction with optional parallel subcompactions, read-triggered level hints, snapshot-aware deletion handling, and a user compaction filter |
+| Cache and compression | Shareable block-cache pools, member-local L0 pins, resident point-index and range-deletion directories and Bloom filters, and per-level choice of uncompressed, LZ4, or Zstd data blocks |
 
-## SST / Block
-
-| Feature | RocksDB | Pebble | mmdb | Notes |
-|---------|---------|--------|------|-------|
-| BlockPropertyFilter | Yes | Yes | Yes | User-defined block-level property collection + filtering |
-| Bloom Filter (whole-key) | Yes | Yes | Yes | Configurable bits_per_key |
-| Prefix Bloom Filter | Yes | Yes | Yes | prefix_len configurable |
-| Block compression (LZ4/Zstd) | Yes | Yes | Yes | Per-level configurable |
-| BlockCache (LRU) | Yes | Yes | Yes | moka concurrent SegmentedCache + L0 pinning; shareable via `BlockCachePool` |
-| Value Block separation | Partial (BlobDB/Titan) | Yes | No | LazyValue provides zero-copy within blocks |
-
-## Compaction
-
-| Feature | RocksDB | Pebble | mmdb | Notes |
-|---------|---------|--------|------|-------|
-| Leveled Compaction | Yes | Yes | Yes | Core strategy |
-| Sequence number zeroing | Yes | Yes | Yes | Bottommost + snapshot-aware |
-| Range tombstone GC | Yes | Yes | Yes | Discard tombstones at bottommost level |
-| Compaction Filter | Yes | Yes | Yes | Keep/Remove/ChangeValue |
-| Read-triggered compaction | Yes | Yes | Yes | Hot key sampling, hint-driven |
-| Sub-compaction parallelism | Yes | Yes | Yes | std::thread::scope, split on Ln+1 file boundaries |
-| CompactionIter snapshot boundary awareness | Yes | Yes | Yes | Keeps one version per snapshot stripe; zeroes sequence numbers at the bottommost level |
-| Tiered/Universal Compaction | Yes | No | No | Leveled only |
-
-## Write Path
-
-| Feature | RocksDB | Pebble | mmdb | Notes |
-|---------|---------|--------|------|-------|
-| WAL (Write-Ahead Log) | Yes | Yes | Yes | Group commit |
-| WriteBatch | Yes | Yes | Yes | Atomic batch writes |
-| WriteBatchWithIndex (batch iteration) | Yes | Yes | Yes | Uncommitted writes are iterable |
-| Pipeline Write | Yes | No | No | Group commit serves as alternative |
-| Rate Limiter | Yes | Yes | Yes | Compaction write rate limiting |
-
-## Read Path
-
-| Feature | RocksDB | Pebble | mmdb | Notes |
-|---------|---------|--------|------|-------|
-| Point Get (multi-level lookup) | Yes | Yes | Yes | memtable -> L0 -> L1+ |
-| SuperVersion (lock-free reads) | Yes | Yes | Yes | ArcSwap\<SuperVersion\> (single atomic load, no RwLock) |
-| Prefix Iterator | Yes | Yes | Yes | Prefix stop; bloom pruning when `prefix_len > 0` |
-| Bidirectional Iterator | Yes | Yes | Yes | Lazy streaming, forward/backward |
-| Prefetch-based init_heap I/O | No | Partial (goroutine) | Yes | Sequential prefetch hints + page-cache-overlapped peek (not thread-parallel) |
-
-## Key Gaps Summary
-
-| Category | Missing Feature | Impact |
-|----------|----------------|--------|
-| Feature | Range Key (RANGEKEYSET/RANGEUNSET) | CRDB-specific, not needed for general use |
-| Feature | SeekGEWithLimit (soft limit) | Needed for distributed shard scanning |
-| Performance | Full value block separation | Further optimization for large values (>4KB) |
-| Performance | Tiered/Universal Compaction | Alternative strategy for write-heavy workloads |
-
-## Gap Analysis: What Is Worth Implementing?
-
-Below is an objective assessment of each missing feature, ordered by value/effort ratio.
-
-### Implemented
-
-**Sub-compaction parallelism** — Implemented via `max_subcompactions` option.
-Split points derived from target-level file boundaries. Uses `std::thread::scope` for
-parallel execution with shared `AtomicU64` file number counter and pre-populated
-`RangeTombstoneTracker` for cross-boundary tombstone correctness.
-
-**Compaction reads bypass the block cache** — compaction `TableIterator`s run
-with `fill_cache=false` (RocksDB behavior): every input block is read exactly
-once, so inserting it would only evict hot point-read blocks. Public scans can
-opt out of cache population with `ReadOptions::fill_cache = false`.
-
-### High Value
-
-**Value Block separation (BlobDB / value separation)**
-- **What**: Store large values (>4KB) in separate blob files; SST data blocks contain only keys + value handles.
-- **Why it matters**: With inline values, compaction must read/write all value bytes even when only keys are relevant. For workloads with large values (>4KB), this causes 5–10x write amplification compared to a value-separated design. Additionally, the block cache becomes more effective when data blocks contain only keys + small pointers — cache hit rates increase significantly.
-- **Effort**: High. Requires a new blob file format, GC mechanism for stale blobs, and integration with the compaction and read paths. The existing `LazyValue::BlockRef` provides zero-copy within blocks, but this is not the same as cross-file separation.
-- **Verdict**: **Recommended if mmdb targets workloads with values >4KB.** If the primary use case is small-value KV (chat metadata, indexes, config), the existing LazyValue is sufficient and the complexity is not justified.
-
-### Medium Value
-
-**Tiered/Universal Compaction**
-- **What**: An alternative compaction strategy that merges sorted runs of similar size, optimizing for write amplification at the cost of read amplification and space amplification.
-- **Why it matters**: For write-heavy workloads (logging, time-series, bulk ingestion), leveled compaction's O(10x) write amplification is the dominant cost. Universal compaction reduces write amplification to O(1x–3x) in exchange for higher read amplification.
-- **Effort**: High. Requires a fundamentally different compaction picker, file management strategy, and configuration surface. Pebble chose not to implement this — they solve the write-heavy case with MVCC + range keys instead.
-- **Verdict**: **Defer unless there is a concrete write-heavy use case.** Sub-compaction parallelism addresses the most acute write stall problem at far lower cost. Universal compaction is a separate architectural bet.
-
-### Low Value
-
-**SeekGEWithLimit (soft limit for distributed scanning)**
-- **What**: A seek variant that returns `IterAtLimit` when the next key exceeds a boundary, allowing the caller to redistribute work across shards without scanning past the boundary.
-- **Why it matters**: This is a Pebble-specific optimization for CockroachDB's distributed SQL layer where scan requests are split across range replicas. It avoids scanning beyond the replica's key range and paying unnecessary I/O.
-- **Effort**: Low (a few dozen lines in DBIterator).
-- **Verdict**: **Only implement if mmdb is embedded in a distributed system.** For standalone or single-node use, `iterate_upper_bound` already provides hard boundary enforcement. The "soft limit" semantic is only valuable when a higher layer wants to distinguish "exhausted within range" from "hit boundary".
-
-**Range Key (RANGEKEYSET/RANGEUNSET)**
-- **What**: Key-range-scoped metadata that can be associated with a span of keys without touching each individual key.
-- **Why it matters**: Pebble uses this for CockroachDB MVCC range tombstones and import-time key rewriting. It is not part of RocksDB's feature set either.
-- **Effort**: High (new value type, SST block format, iterator integration, compaction handling).
-- **Verdict**: **Not recommended.** This is highly specialized for CockroachDB's requirements and adds significant complexity for no benefit in a general-purpose KV engine.
+For file operations and resource bounds, see the [v5 architecture](docs/architecture.md). The [design record](docs/proposals/v5-roadmap.md) covers the proposed write pipeline and large-value separation. The repository's [benchmarks](benches/benchmarks.rs) measure MMDB workloads.

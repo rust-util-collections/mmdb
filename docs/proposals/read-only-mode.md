@@ -1,13 +1,13 @@
 # Proposal: Read-Only Open Mode
 
-Status: **Implemented** (historical design record) · Author: ktmlm · Scope:
-`DB::open` family, read path, mutation guards, shutdown path
+Implemented in the v4 series. Original author: ktmlm.
 
-> This document preserves the approved design and implementation plan; the
-> sections below retain their original design-time wording. It is not a current
-> work item. User-facing behavior is documented in
-> [README.md](../../README.md#read-only-databases); where this plan and the
-> code differ, the code is authoritative.
+This proposal records the design of shared read-only locking, residual WAL
+replay, and shutdown on immutable media. The sections below describe the
+v4 implementation plan. In v5 the option structs are `#[non_exhaustive]`,
+read-only recovery adopts the geometry in the MANIFEST header, and
+`sync_wal` and `ingest_sorted` also check write capability.
+[Current read-only contract](../usage.md#read-only-databases) · [Acceptance tests](../../tests/read_only.rs)
 
 ## 1. Goal
 
@@ -34,7 +34,7 @@ Non-goals:
   stable snapshot or successful cooperative lock;
 - removing or slowing the existing writable fast path.
 
-## 2. Current write-capability inventory
+## 2. Write-capability inventory at proposal time
 
 ### 2.1 Writable open — `DB::open_impl`
 

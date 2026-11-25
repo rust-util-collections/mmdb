@@ -5,7 +5,7 @@ use std::{ops::Deref, sync::Arc};
 
 /// Immutable bytes returned by [`crate::DB::get_pinned`].
 ///
-/// A pin keeps its entire SST block (up to 64 MiB) or memtable arena alive,
+/// A nonempty pin keeps its entire SST block (up to 64 MiB) or memtable arena alive,
 /// including after eviction, compaction, and database close. Those retained
 /// bytes are outside the cache and write-buffer budgets. Use [`Self::into_vec`]
 /// to retain just the value.

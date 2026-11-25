@@ -1,16 +1,7 @@
-//! LRU block cache for SST data blocks, backed by moka.
-//!
-//! Two-level shape: a [`BlockCachePool`] owns the shared storage (moka
-//! LRU + sharded reverse index) and can be shared by many DBs; a
-//! [`BlockCache`] is one DB's *member view* of a pool (and privately
-//! owns that member's pinned entries). Every pool key is namespaced by
-//! a pool-unique member id, so two DBs that both own an SST numbered 5
-//! can never observe each other's blocks — sharing is a capacity
-//! decision, never a correctness one.
-//!
-//! The historical single-DB API is unchanged: [`BlockCache::new`]
-//! builds a private single-member pool internally, so callers that
-//! never share see exactly the old behavior.
+//! SST block caches backed by moka. A [`BlockCachePool`] shares weighted
+//! storage across DBs. Each [`BlockCache`] member has a distinct cache-key
+//! namespace and its own L0 block pins. [`BlockCache::new`] creates a
+//! private pool with a single member.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -194,19 +185,20 @@ impl FileOffsetsIndex {
     }
 }
 
-/// Shared storage for one or more DBs' block caches: a single moka LRU
-/// (capacity applies to the whole pool) and the sharded reverse index.
-/// Pinned entries live on each member's [`BlockCache`] view, not here.
-/// Construct once, wrap in an `Arc`, and hand a
-/// [`attach`](Self::attach)ed view to each DB (via
-/// `DbOptions::block_cache`); DBs given the same pool share capacity,
-/// DBs given none keep a private pool. The LRU is segmented, so a single
-/// unpinned block must fit the capacity share of its hashed segment; caches
-/// below 1 MiB use one segment, while pools of 64 MiB or more use 64.
+/// Shared weighted storage for one or more DBs' block caches.
+///
+/// Blocks that fit a segment's share use the segmented cache. Blocks larger
+/// than that share and within the configured capacity use an unsegmented
+/// overflow cache. Each store has its own capacity limit and weighs a block
+/// by its buffer capacity. Their combined weight can exceed the configured
+/// capacity. L0 pins are accounted for separately on each member.
+///
+/// Supply the same `Arc<BlockCachePool>` to multiple DBs through
+/// [`DbOptions::block_cache`](crate::DbOptions::block_cache) to share these stores.
 pub struct BlockCachePool {
     inner: moka::sync::SegmentedCache<CacheKey, CacheValue>,
     /// Unsegmented fallback for valid blocks whose weight exceeds a single
-    /// segment's `capacity / segments` share (`1 MiB < weight <= capacity`).
+    /// segment's share and fit within `capacity_bytes`.
     overflow: moka::sync::Cache<CacheKey, CacheValue>,
     has_overflow: AtomicBool,
     capacity_bytes: u64,
@@ -221,8 +213,7 @@ pub struct BlockCachePool {
 }
 
 impl BlockCachePool {
-    /// Create a new pool with the given capacity in bytes (the capacity
-    /// bounds the pool as a whole, not any single member).
+    /// Set the capacity in bytes for each of the segmented and overflow stores.
     /// A capacity of 0 disables caching entirely.
     pub fn new(capacity_bytes: u64) -> Self {
         let index = Arc::new(FileOffsetsIndex::new());
@@ -279,8 +270,7 @@ impl BlockCachePool {
         }
     }
 
-    /// Approximate entry count of the whole pool's LRU store (all
-    /// members; pinned entries are member-local and not included).
+    /// Approximate entry count across both stores and all members, excluding pins.
     pub fn entry_count(&self) -> u64 {
         let extra = if self.has_overflow.load(Ordering::Relaxed) {
             self.overflow.entry_count()
@@ -301,13 +291,9 @@ impl BlockCachePool {
     }
 }
 
-/// One DB's view of a [`BlockCachePool`]: the same five-method surface
-/// the cache has always had, with every key transparently namespaced
-/// by this member's id.
-///
-/// Supports pinning entries that should never be evicted — in practice
-/// this is just the first data block of each L0 file (see
-/// [`insert_pinned`](Self::insert_pinned)).
+/// One DB's view of a [`BlockCachePool`]. Cache keys include the member ID.
+/// The member also owns its pinned entries, such as the first data block
+/// of a newly flushed L0 file. See [`insert_pinned`](Self::insert_pinned).
 pub struct BlockCache {
     pool: Arc<BlockCachePool>,
     member: u64,
@@ -341,8 +327,7 @@ impl BlockCache {
         !self.pool.disabled && !self.detached.load(Ordering::Relaxed)
     }
 
-    /// Create a private single-member cache with the given capacity in
-    /// bytes — the non-shared form, and exactly the historical behavior.
+    /// Create a private pool with [`BlockCachePool::new`] and attach one member.
     /// A capacity of 0 disables caching entirely.
     pub fn new(capacity_bytes: u64) -> Self {
         Arc::new(BlockCachePool::new(capacity_bytes)).attach()
@@ -597,10 +582,8 @@ impl BlockCache {
         self.pinned.load().bytes
     }
 
-    /// Current approximate entry count: the underlying pool's LRU store
-    /// (all members) plus this member's pinned entries. For a private
-    /// (non-shared) cache this is exactly this DB's count — the
-    /// historical semantics; a detached view reports 0.
+    /// Approximate entry count across both pool stores for all members, plus
+    /// this member's pinned entries. A detached view reports zero.
     pub fn entry_count(&self) -> u64 {
         if self.detached.load(Ordering::Relaxed) {
             return 0;

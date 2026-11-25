@@ -50,7 +50,9 @@ pub struct DbOptions {
     pub bloom_bits_per_key: u32,
     /// Compression type for SST data blocks.
     pub compression: CompressionType,
-    /// Block cache capacity in bytes. 0 disables caching.
+    /// Capacity in bytes for each weighted store in the private block cache.
+    /// See [`BlockCachePool`](crate::BlockCachePool) for overflow and pin accounting.
+    /// Zero disables caching when using a private pool.
     pub block_cache_capacity: u64,
     /// Maximum number of TableReader entries retained by the table cache.
     /// Live Versions and iterators can pin additional readers.
@@ -90,10 +92,9 @@ pub struct DbOptions {
     // ---- Cache behavior ----
     /// Warm the index and pin the first data block of newly installed L0 files.
     pub pin_l0_first_block_and_warm_index: bool,
-    /// Omit point-lookup Bloom filters (`filter.bloom`) on SSTs written to the
-    /// bottommost level (`num_levels - 1`), saving ~85–90% of filter memory on
-    /// workloads where point queries predominantly hit existing keys. Prefix
-    /// Bloom filters (`filter.prefix`, when `prefix_len > 0`) are still built.
+    /// Omit whole-key Bloom filters on SSTs built for the bottommost level.
+    /// This trades more reads on point misses for lower filter memory.
+    /// Configured prefix filters retain their base bits-per-key budget.
     /// Default: `false`.
     pub optimize_filters_for_hits: bool,
 
@@ -110,14 +111,9 @@ pub struct DbOptions {
     /// outside the DB mutex, then validates its inputs and active snapshots
     /// before installation. Default: 0 (disabled).
     pub lazy_delete_compaction_threshold: usize,
-    /// Optional shared block-cache pool. `None` (the default) gives this
-    /// DB a private cache sized by `block_cache_capacity` — the
-    /// historical behavior, unchanged. `Some(pool)` attaches this DB to
-    /// the caller-owned pool: DBs given the same `Arc` share one LRU
-    /// capacity (every key is namespaced by a per-DB member id, so
-    /// sharing is a capacity decision, never a correctness one), and
-    /// **`block_cache_capacity` is ignored** — capacity belongs to the
-    /// pool.
+    /// Shared pool for this DB's block-cache entries. With `None`, the DB
+    /// creates a private pool sized by [`Self::block_cache_capacity`]. With
+    /// `Some(pool)`, the supplied pool controls cache sizing for all members.
     pub block_cache: Option<Arc<crate::cache::block_cache::BlockCachePool>>,
 }
 
@@ -531,8 +527,7 @@ impl DbOptions {
     /// Allocates `(ln R / ln^2 2) * (L_bottom - level)` extra bits per key to
     /// exponentially smaller shallower levels (clamped to `24` for standard `<= 24`
     /// configurations) and `max(min(b, 8), b - 1)` at `L_bottom` (or `0` when
-    /// [`Self::optimize_filters_for_hits`] is enabled), cutting multi-level point-miss
-    /// false positives by ~6x without increasing total filter RAM.
+    /// [`Self::optimize_filters_for_hits`] is enabled).
     pub(crate) fn bloom_bits_for_level(&self, level: usize) -> u32 {
         let base = self.bloom_bits_per_key;
         if base == 0 {

@@ -1,11 +1,16 @@
 //! MMDB — the pure-Rust LSM-Tree storage engine behind
 //! [vsdb](https://github.com/rust-util-collections/vsdb).
 //!
-//! A high-performance LSM-Tree storage engine in pure Rust.
+//! Open a local directory with [`DB::open`] and [`DbOptions`]. A [`WriteBatch`]
+//! makes related mutations visible together. [`DurabilityMode`] controls
+//! what reaches the WAL before acknowledgement. [`DB::sync_wal`] fences
+//! preceding WAL-enabled writes, and [`DB::flush`] installs memtable data
+//! in durable SSTs.
 //!
-//! The public API is the set of items re-exported from this crate root;
-//! internal modules (WAL, SST, manifest, compaction, cache, ...) are
-//! implementation details and deliberately private.
+//! Use [`DB::snapshot`] for a consistent view across reads, [`DB::get_pinned`]
+//! to retain a value's backing storage, and [`DB::iter_with_range`] for a
+//! scan with inclusive lower and exclusive upper bounds. The crate-root
+//! re-exports below define the public API.
 //!
 //! # Read-only stores
 //!
@@ -30,7 +35,7 @@
 //! # }
 //! ```
 //!
-//! For a store created with custom read/cache settings, use
+//! To choose read/cache settings for this handle, use
 //! [`DB::open_read_only_with_options`]. Read-only recovery adopts the level count
 //! and prefix length recorded in the MANIFEST.
 //!
