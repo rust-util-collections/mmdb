@@ -42,7 +42,7 @@ impl ReadState {
         // Pin storage before choosing the committed read sequence.
         let sv = self.get_super_version();
         self.check_usable().ctx()?;
-        let sequence = self.resolve_read_sequence(options.snapshot)?;
+        let sequence = self.resolve_read_sequence(&sv, options.snapshot)?;
         let mut tomb_seq = self.max_covering_tombstone_seq(
             key,
             sequence,
@@ -129,7 +129,7 @@ impl ReadState {
         // can replace those sources and discard their old versions concurrently.
         let sv = self.get_super_version();
         self.check_usable().ctx()?;
-        let sequence = self.resolve_read_sequence(options.snapshot)?;
+        let sequence = self.resolve_read_sequence(&sv, options.snapshot)?;
         let (lower, upper) = intersect_iter_bounds(options, lower, upper);
         if lower.zip(upper).is_some_and(|(lo, hi)| lo >= hi) {
             return Ok(DBIterator::from_sources(Vec::new(), sequence));
@@ -261,7 +261,12 @@ impl ReadState {
         if let Some(hook) = BEFORE_READ_VIEW.with(|h| h.borrow_mut().take()) {
             hook();
         }
-        self.super_version.load()
+        let guard = self.super_version.load();
+        #[cfg(test)]
+        if let Some(hook) = AFTER_READ_VIEW.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        guard
     }
 
     /// Signal background compaction threads (non-blocking).
@@ -332,10 +337,16 @@ impl ReadState {
         self.committed_sequence.load(Ordering::Acquire)
     }
 
-    fn resolve_read_sequence(&self, snapshot: Option<SnapshotRef<'_>>) -> Result<SequenceNumber> {
+    fn resolve_read_sequence(
+        &self,
+        sv: &SuperVersion,
+        snapshot: Option<SnapshotRef<'_>>,
+    ) -> Result<SequenceNumber> {
         match snapshot {
             Some(snapshot) => snapshot.sequence_for(self),
-            None => Ok(self.current_sequence()),
+            None => Ok(self
+                .current_sequence()
+                .min(sv.ingest_ceiling.load(Ordering::Acquire))),
         }
     }
 }

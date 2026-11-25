@@ -294,6 +294,7 @@ fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
         active_memtable: inner.active_memtable.clone(),
         immutable_memtables: inner.immutable_memtables.iter().cloned().collect(),
         version: inner.versions.current(),
+        ingest_ceiling: inner.ingest_ceiling.clone(),
     }));
 }
 
@@ -635,6 +636,7 @@ impl Drop for MaintenanceGuard<'_> {
 struct DBInner {
     active_memtable: Arc<MemTable>,
     immutable_memtables: VecDeque<Arc<MemTable>>,
+    ingest_ceiling: Arc<AtomicU64>,
     l0_install_epoch: u64,
     wal_writer: Option<WalWriter>,
     wal_number: u64,
@@ -657,6 +659,7 @@ struct SuperVersion {
     active_memtable: Arc<MemTable>,
     immutable_memtables: Vec<Arc<MemTable>>,
     version: Arc<crate::manifest::version::Version>,
+    ingest_ceiling: Arc<AtomicU64>,
 }
 
 /// Internal compaction filter that checks the dead-keys set before
@@ -709,6 +712,8 @@ fn intersect_iter_bounds<'a>(
 #[cfg(test)]
 thread_local! {
     static BEFORE_READ_VIEW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_READ_VIEW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1207,6 +1212,7 @@ impl DB {
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
             immutable_memtables: VecDeque::new(),
+            ingest_ceiling: Arc::new(AtomicU64::new(MAX_SEQUENCE_NUMBER)),
             l0_install_epoch: 0,
             wal_writer,
             wal_number,
@@ -1242,6 +1248,7 @@ impl DB {
                 active_memtable: g.active_memtable.clone(),
                 immutable_memtables: g.immutable_memtables.iter().cloned().collect(),
                 version: g.versions.current(),
+                ingest_ceiling: g.ingest_ceiling.clone(),
             }));
             (l0, sv)
         };

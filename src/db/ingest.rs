@@ -289,7 +289,11 @@ impl DB {
         }
 
         {
-            let inner = self.inner.lock();
+            let mut inner = self.inner.lock();
+            inner
+                .ingest_ceiling
+                .store(ingest_seq - 1, Ordering::Release);
+            inner.ingest_ceiling = Arc::new(AtomicU64::new(MAX_SEQUENCE_NUMBER));
             self.install_super_version(&inner);
             self.read
                 .committed_sequence
@@ -550,5 +554,44 @@ mod tests {
             })
             .count();
         assert_eq!(disk_ssts, live_ssts);
+    }
+
+    #[test]
+    fn ingest_sorted_isolates_concurrent_pre_ingest_super_version_from_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"b", b"1").unwrap();
+
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let db_ref = &db;
+            let reader = scope.spawn(move || {
+                super::super::AFTER_READ_VIEW.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        pinned_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }));
+                });
+                db_ref.iter().unwrap().collect::<Vec<_>>()
+            });
+
+            pinned_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(db.ingest_sorted([(b"a", b"1")]).unwrap(), 1);
+            db.delete(b"b").unwrap();
+            db.put(b"c", b"2").unwrap();
+            resume_tx.send(()).unwrap();
+
+            let rows = reader.join().unwrap();
+            assert_eq!(rows, vec![(b"b".to_vec(), b"1".to_vec())]);
+        });
+
+        assert_eq!(
+            db.iter().unwrap().collect::<Vec<_>>(),
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"c".to_vec(), b"2".to_vec()),
+            ]
+        );
     }
 }
