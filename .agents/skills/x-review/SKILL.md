@@ -65,6 +65,10 @@ Cover what the scope touches: key/value ordering, MVCC visibility,
 interrupted-write recovery, thread synchronization, `unsafe` preconditions,
 design shape, public API contract, and quantified hot-path cost.
 
+For a measured performance claim, trace the operation actually exercised,
+including the benchmark feature configuration, and consult the [profile
+evidence](../../../docs/ai/review-core.md#documentation-map).
+
 Each candidate needs a location, invariant, concrete inputs/ordering, expected
 and observed results, existing checks, a minimal correction, and a regression
 test. For a documentation discrepancy, cite the claim and its verifiable

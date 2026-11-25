@@ -21,6 +21,7 @@
 ## Checklist
 
 - [ ] `DBHeader` validated before MANIFEST tail repair or WAL recovery; preserved on every MANIFEST rotation
+- [ ] For exporter changes, compare the ordered visible source and destination rows and final iterator statuses. Verify a writable reopen with the exported geometry, a new write and another reopen; the read-only opener adopts the stored geometry.
 - [ ] Writable reopen rejects `(num_levels, prefix_len)` mismatch with `InvalidArgument`; read-only adopts stored geometry
 - [ ] `open_table` validates `decode_internal_key` + `smallest_key <= largest_key` + `has_range_deletions`; `validate_level_disjointness` never skips empty bounds
 - [ ] `DirSynced` + `confirm_manifest_durable` precede WAL/SST unlinks; `PendingSsts` cleans failed builds without touching sibling jobs

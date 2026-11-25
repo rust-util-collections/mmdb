@@ -32,14 +32,15 @@ A defect that also affects a supported target follows normal review and fix tria
 
 ```bash
 make all          # fmt + lint + test
-make test         # root debug + release suites, then exporter tests
+make test         # debug/release suites, optional profile-counter tests, exporter
 make ci           # fmt check + clippy + the CI test set (no release, no scale_profile)
-make lint         # clippy (--lib + --all-targets) + rustdoc check (matches CI)
-make bench        # cargo bench (criterion)
+make lint         # default and bench-metrics clippy, exporter clippy, rustdoc
+make bench        # cargo bench with default features
 cargo test --test integration   # integration tests only
 cargo test --test crash_recovery
 cargo test --test e2e_scenarios
 cargo test --test proptest_db
+cargo test --lib --features bench-metrics  # include opt-in diagnostic counters
 ```
 
 Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks (including `--manifest-path tools/v4-export/Cargo.toml` for the separately built v4 exporter crate). Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
@@ -101,6 +102,7 @@ The [audit registry](docs/audit.md) is maintained by `$x-review`, `$x-fix`, and 
 - Typed errors: `Error`/`ErrorKind` in `src/error.rs` (hand-rolled, no thiserror/ruc); propagate with `.ctx()` / `.with_ctx(|| ..)` — each hop records `file:line:column` via `#[track_caller]`
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
+- Feature `bench-metrics` enables per-worker write-stage timing and per-DB L0 statistics. Use the [engine workload profiles](docs/benchmarks/engine-profile/) and [L0 evidence](docs/benchmarks/l0-profile/) for benchmark configurations, controls and counter units.
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests. Under Miri it also exposes `concurrent_arena_pins()` for `cargo +nightly miri test --test arena_miri`
 - Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock and advisory WAL writeback paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes

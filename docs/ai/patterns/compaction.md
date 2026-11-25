@@ -18,7 +18,15 @@
 
 **C5 Stale inputs, `l0_install_epoch`, & snapshot races** — under `DB::inner`, verify all inputs remain live, outputs do not overlap unexpected target files (using `output_tombstones` captured in I/O phase), and `!(output.filter_mutated && live_snapshots_present)`. Full-level `LevelRewrite` claims inputs via `CompactionClaim`; if an L0 in-place rewrite (`0 -> 0`) sees `l0_install_epoch` change, discard created outputs (never live trivial-move inputs) and switch to `L0 -> L1`.
 
-**C6 Filter & typed errors** — `CompactionFilter` runs at most once per logical user key when `is_bottommost && active_snapshots.is_empty() && vt == ValueType::Value`. `SstBuilds` blocks re-entrant DB mutations/close from filter/collector callbacks (`ErrorKind::InvalidArgument`). Preserve typed `MergingIterator::error()` (`ErrorKind::Corruption` / `ErrorKind::Io` + `source()`) on synchronous `compact()` / `compact_range()` rather than reclassifying as `ErrorKind::Background` when the DB is not fail-stopped.
+**C6 Filter & typed errors** — A filter may examine the newest point value when the job captured no active snapshots. Honor `Remove` or `ChangeValue` only after whole-range or per-key bottommost verification. `SstBuilds` blocks re-entrant DB mutations/close from filter/collector callbacks (`ErrorKind::InvalidArgument`). Preserve typed `MergingIterator::error()` (`ErrorKind::Corruption` / `ErrorKind::Io` + `source()`) on synchronous `compact()` / `compact_range()` rather than reclassifying as `ErrorKind::Background` when the DB is not fail-stopped.
+
+The automatic L0→L1 picker claims the entire current L0 set and runs one range. A
+deeper-level parallel test exercises a different path. With `bench-metrics`,
+the number of jobs with multiple target files, ranges started, peak
+simultaneous ranges on one DB, and jobs that joined multiple ranges measure
+different events. A trivial move adds zero rewritten SST bytes. The
+[two-range experiment](../../benchmarks/l0-profile/) records the tested
+prototype and the outstanding foreground read-latency guardrail.
 
 ## Checklist
 

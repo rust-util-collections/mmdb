@@ -102,7 +102,7 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
 |-------------|-------|-----------------------|
 | any | Subject/body claim matches the diff; public behavior agrees with item rustdoc, the relevant reader guide, and tests | Contract drift (LOW) or the behavior defect itself |
 | `fix(...)` | The diff removes the root cause, not one symptom; a test fails when the commit's `src/` hunks are reverted (revert probe below) | Incomplete fix (severity of the original defect); missing regression test (LOW) |
-| `perf(...)` | Path is hot or warm (FP-9) and observable results are unchanged at boundaries: empty/single-entry block, first/last restart, `[lower, upper)` bounds, reverse direction, snapshot cutoff, range tombstones, latched errors | Any changed result or dropped check is a correctness finding, not a perf note |
+| `perf(...)` | Verify the measured path, control and feature flags against the [performance priorities](../../../docs/ai/pragmatic-engineering.md#performance-priorities). Check hot/warm scope (FP-9) and observable results at boundaries: empty/single-entry block, first/last restart, `[lower, upper)` bounds, reverse direction, snapshot cutoff, range tombstones, latched errors | Any changed result or dropped check is a correctness finding, not a perf note |
 | `refactor(...)` | No behavior change: same `ErrorKind`, same order of fsync / dir-sync / MANIFEST append / `CURRENT` rename / unlink, same lock scope | Behavior defect at its own severity |
 
 **Revert probe** (each `fix(...)` commit in the frozen range): when the commit's

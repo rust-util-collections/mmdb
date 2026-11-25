@@ -47,6 +47,8 @@ by this invocation.
    - `src/memtable/` arena or skiplist `unsafe` → when `cargo +nightly miri` is
      installed locally, also run `cargo +nightly miri test --test arena_miri`
      (never install toolchains automatically; note if `miri` is absent);
+   - optional diagnostic counters or profiles → exercise the affected test with
+     `--features bench-metrics` and check the caller with the feature disabled;
    - `tools/v4-export/**` →
      `cargo +stable test --manifest-path tools/v4-export/Cargo.toml` (clean
      `tools/v4-export/target` if `.gitignore` does not yet ignore nested `target/`).
@@ -87,11 +89,16 @@ commands cover the standalone `tools/v4-export` crate (if CI and
 ```bash
 cargo +stable fmt --all -- --check
 cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check
+cargo +stable check --all-targets
+cargo +stable check --benches --features bench-metrics
+cargo +stable check --manifest-path tools/v4-export/Cargo.toml --all-targets
 cargo +stable clippy --lib -- -D warnings
 cargo +stable clippy --all-targets -- -D warnings
+cargo +stable clippy --all-targets --features bench-metrics -- -D warnings
 cargo +stable clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
 cargo +stable test --lib
+cargo +stable test --lib --features bench-metrics
 cargo +stable test --doc
 cargo +stable test --test crash_recovery
 cargo +stable test --test e2e_scenarios
@@ -101,17 +108,25 @@ cargo +stable test --test bidi_debug
 cargo +stable test --test lazy_delete
 cargo +stable test --test shared_cache
 cargo +stable test --test read_only
-cargo +stable test --manifest-path tools/v4-export/Cargo.toml
+CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml
 ```
 
 Notes on gate execution:
 
+- The default-feature checks exercise the shipped hot paths. The additional
+  Clippy and lib-test runs compile the feature-gated benchmark and verify the
+  profiling counters. Timed trials belong to performance investigations.
+- CI runs correctness tests on x86_64 and AArch64 Linux. Distinguish a native
+  execution, an emulated execution, and a cross-compile in the validation report.
 - Exclude `tests/scale_profile.rs` and `--release`.
 - `tests/read_only.rs` always exercises OS permission-enforced (`0444`/`0555`)
   read-only stores; on Linux it also runs an external `strace` check when
   `strace` is installed (enforced in CI via `CI=1`). If `strace` is absent on
   the local host, note in the report that the optional `strace` probe skipped
   while the read-only suite passed.
+- The exporter command sets `CI=1` so the Linux gate must actually publish
+  and reopen the exported shard. Other local filesystems may exercise the
+  unsupported-exclusive-rename fallback in ordinary exporter tests.
 - If `.gitignore` uses root-anchored `/target` rather than `target/`, run
   `cargo +stable clean --manifest-path tools/v4-export/Cargo.toml` after the
   exporter checks so `tools/v4-export/target/` is not left untracked.

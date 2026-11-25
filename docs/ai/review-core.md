@@ -27,6 +27,7 @@ to unsupported architectures under `Won't Fix`.
 | Public operations, errors, defaults | [Usage guide](../usage.md), public rustdoc on the items re-exported by `src/lib.rs`, and the corresponding API tests |
 | Read, write, recovery, format, or resource behavior | [Storage architecture](../architecture.md), the subsystem implementation and its tests |
 | Store and caller migration | [Migration guide](../migration.md), `tools/v4-export/src/main.rs` and its golden-store tests |
+| Engine performance and diagnostic changes | [Engine workloads](../benchmarks/engine-profile/), [L0 trial and disposition](../benchmarks/l0-profile/), and [performance priorities](pragmatic-engineering.md#performance-priorities). Match revision, feature flags, load and counter scope. |
 | Historical measurements or proposed designs | [Design records](../proposals/) and their cited revisions. Use the current implementation to establish what shipped |
 | Skill scope, outputs, and validation | [Project guide](../../AGENTS.md#skills), the four skill entry points and their `agents/openai.yaml`, [workflow policy](workflow-policy.md) and [commit protocol](commit-protocol.md) |
 
@@ -46,7 +47,8 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 
 | Subsystem | Files | Guides |
 |-----------|-------|--------|
-| write / flush / lifecycle | `src/db.rs`, `src/db/directory.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/wal.md`, `patterns/manifest.md`, `patterns/unsafe-audit.md` (`db.rs`) |
+| write / flush / lifecycle | `src/db.rs`, `src/db/directory.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/wal.md`, `patterns/manifest.md`, `patterns/unsafe-audit.md` (`db.rs`) |
+| memory and diagnostics | `src/db/memory.rs`, `src/profile.rs`, `src/stats.rs`; L0 job counters belong to the compaction row | `patterns/cache.md`, `patterns/concurrency.md`, `pragmatic-engineering.md` |
 | sorted ingest | `src/db/ingest.rs` (ascending disjoint span, one sequence, bottommost install) | `patterns/manifest.md`, `patterns/concurrency.md` |
 | read / snapshots / pins | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/iterator.md`, `patterns/unsafe-audit.md` (`pinned.rs`) |
 | memtable | `src/memtable/**` | `patterns/memtable.md`, `patterns/unsafe-audit.md` |

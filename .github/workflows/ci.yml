@@ -43,12 +43,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --lib -- -D warnings
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features bench-metrics -- -D warnings
       - run: cargo clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Test
+            runner: ubuntu-latest
+          - name: Test (AArch64)
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,6 +65,7 @@ jobs:
       # The read-only acceptance test traces syscalls; it must not skip in CI.
       - run: sudo apt-get update && sudo apt-get install -y strace
       - run: cargo test --lib
+      - run: cargo test --lib --features bench-metrics
       - run: cargo test --doc
       - run: cargo test --test crash_recovery
       - run: cargo test --test e2e_scenarios
@@ -65,7 +75,7 @@ jobs:
       - run: cargo test --test lazy_delete
       - run: cargo test --test shared_cache
       - run: cargo test --test read_only
-      - run: cargo test --manifest-path tools/v4-export/Cargo.toml
+      - run: CI=1 cargo test --manifest-path tools/v4-export/Cargo.toml
       # scale_profile is profiling-only and intentionally excluded.
 
   bench-compile:
@@ -75,4 +85,4 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --benches
+      - run: cargo check --benches --features bench-metrics

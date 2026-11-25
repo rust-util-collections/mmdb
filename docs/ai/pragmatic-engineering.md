@@ -17,6 +17,15 @@ read, scan, and write paths. Compare the same workload before and after a
 change. Include background flush or compaction when its throughput limits
 admission or causes foreground stalls.
 
+For a measured optimization, identify the control, operation class, offered
+load, durability and memory/CPU budget. Keep arrival-to-ack and service
+latency distinct. Separate per-thread diagnostic timing (`bench-metrics`)
+from uninstrumented trials and report the actual worker or shard scope.
+Compare paired changes against baseline-to-baseline variation. A promising
+primary metric leaves the candidate provisional when a protected read,
+write or resource budget remains unresolved. Raw paired runs and deferred
+prototypes belong with their [benchmark evidence](../benchmarks/).
+
 An occasional cleanup pass or a one-time format conversion can take longer
 when correctness or a simpler implementation requires it. Keep tool-specific
 optimizations in the tool. Before adding state, locking, or branches to the
