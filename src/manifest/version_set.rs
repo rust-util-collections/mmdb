@@ -34,19 +34,33 @@ thread_local! {
 }
 
 /// Evidence that all new SST directory entries precede the referencing edit.
+#[derive(Debug)]
 pub(crate) struct DirSynced(());
 
-pub(crate) fn sync_new_sst_parent_dir(path: &Path, poisoned: &AtomicBool) -> Result<DirSynced> {
+pub(crate) fn sync_new_sst_parent_dir(
+    handle: &Mutex<Option<fs::File>>,
+    poisoned: &AtomicBool,
+) -> Result<DirSynced> {
+    let dir = handle.lock();
+    let dir = dir.as_ref().ok_or_else(Error::read_only)?;
     check_manifest_poison(poisoned)?;
     #[cfg(test)]
     if FAIL_NEXT_SST_DIR_SYNC.with(|fault| fault.replace(false)) {
+        if let Some(hook) = BEFORE_SYNC_POISON.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
         poisoned.store(true, Ordering::Release);
         return Err(std::io::Error::other("injected SST directory sync failure")).ctx();
     }
-    if let Err(e) = VersionSet::fsync_directory(path) {
+    if let Err(e) = dir.sync_all() {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_SYNC_POISON.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
         poisoned.store(true, Ordering::Release);
         return Err(e).ctx();
     }
+    check_manifest_poison(poisoned)?;
     Ok(DirSynced(()))
 }
 
@@ -148,6 +162,9 @@ pub struct VersionSet {
     /// MANIFEST writer, behind its own lock so `sync` can be called
     /// without holding the main DB mutex.
     manifest_writer: Arc<Mutex<Option<WalWriter>>>,
+    /// Open store-directory handle shared across unlocked SST and CURRENT
+    /// directory syncs so `sync_all()` and `poisoned` publication serialize.
+    parent_dir: Arc<Mutex<Option<fs::File>>>,
     /// Table cache for opening SST readers.
     table_cache: Option<Arc<TableCache>>,
     /// Count of edits since last MANIFEST snapshot (for Phase I compaction).
@@ -291,6 +308,7 @@ impl VersionSet {
         let manifest_path = db_path.join(format!("MANIFEST-{:06}", manifest_number));
         let mut manifest_writer = WalWriter::new(&manifest_path).ctx()?;
         manifest_writer.add_record(&header.encode()).ctx()?;
+        let parent_dir = fs::File::open(db_path).ctx()?;
 
         let mut vs = Self {
             header,
@@ -302,6 +320,7 @@ impl VersionSet {
             last_sequence: 0,
             manifest_number,
             manifest_writer: Arc::new(Mutex::new(Some(manifest_writer))),
+            parent_dir: Arc::new(Mutex::new(Some(parent_dir))),
             table_cache,
             edits_since_snapshot: 0,
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -313,7 +332,14 @@ impl VersionSet {
         edit.set_last_sequence(vs.last_sequence);
         vs.apply_metadata(edit).ctx()?;
         vs.sync_manifest().ctx()?;
-        Self::set_current_file(db_path, manifest_number).ctx()?;
+        Self::write_current_file_tmp(db_path, manifest_number).ctx()?;
+        Self::rename_current_file(db_path, manifest_number).ctx()?;
+        vs.parent_dir
+            .lock()
+            .as_ref()
+            .expect("writable parent_dir")
+            .sync_all()
+            .ctx()?;
 
         Ok(vs)
     }
@@ -507,11 +533,13 @@ impl VersionSet {
 
         // Writable recovery repairs a torn tail and reopens the MANIFEST for
         // append. Read-only recovery must leave the file byte-for-byte intact.
-        let manifest_writer = if requested.is_none() {
-            None
+        let (manifest_writer, parent_dir) = if requested.is_none() {
+            (None, None)
         } else {
             let valid_offset = reader.last_valid_offset();
-            Some(WalWriter::open_append_truncated(&manifest_path, valid_offset).ctx()?)
+            let writer = WalWriter::open_append_truncated(&manifest_path, valid_offset).ctx()?;
+            let dir_file = fs::File::open(db_path).ctx()?;
+            (Some(writer), Some(dir_file))
         };
 
         Ok(Self {
@@ -524,6 +552,7 @@ impl VersionSet {
             last_sequence,
             manifest_number,
             manifest_writer: Arc::new(Mutex::new(manifest_writer)),
+            parent_dir: Arc::new(Mutex::new(parent_dir)),
             table_cache,
             edits_since_snapshot: edits_replayed,
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -548,7 +577,7 @@ impl VersionSet {
         if edit.new_files.is_empty() {
             return self.apply_metadata(edit);
         }
-        let synced = sync_new_sst_parent_dir(&self.db_path, &self.poisoned)?;
+        let synced = sync_new_sst_parent_dir(&self.parent_dir, &self.poisoned)?;
         self.log_and_apply_synced(edit, synced)
     }
 
@@ -707,9 +736,15 @@ impl VersionSet {
         Arc::clone(&self.manifest_writer)
     }
 
+    /// Return the persistent store-directory handle for unlocked SST directory syncs.
+    pub fn dir_sync_handle(&self) -> Arc<Mutex<Option<fs::File>>> {
+        Arc::clone(&self.parent_dir)
+    }
+
     /// Release this handle's readers and writer after the last worker exits.
     pub fn release_files(&mut self) {
         self.manifest_writer.lock().take();
+        self.parent_dir.lock().take();
         self.current = Arc::new(Version::new(self.num_levels));
     }
 
@@ -871,21 +906,29 @@ impl VersionSet {
         *self.manifest_writer.lock() = Some(new_writer);
         self.edits_since_snapshot = 0;
 
-        if let Err(e) = Self::fsync_directory(&self.db_path) {
-            // The CURRENT rename is visible in the live filesystem (the new
-            // writer stays installed for in-process consistency) but its
-            // durability is unknown: a crash could recover from either
-            // MANIFEST. Both contain every applied edit thanks to the old-
-            // writer sync above. Poison further edits so the two files cannot
-            // diverge, and keep the old MANIFEST as the fallback.
-            let _writer = self.manifest_writer.lock();
-            self.poisoned.store(true, Ordering::Release);
-            tracing::error!(
-                "MANIFEST rotation could not fsync the DB directory; \
-                 poisoning manifest writer (reopen the database to recover): {}",
-                e
-            );
-            return;
+        {
+            let dir = self.parent_dir.lock();
+            let sync_res = dir
+                .as_ref()
+                .ok_or_else(Error::read_only)
+                .and_then(|f| f.sync_all().ctx());
+            if let Err(e) = sync_res {
+                // The CURRENT rename is visible in the live filesystem (the new
+                // writer stays installed for in-process consistency) but its
+                // durability is unknown: a crash could recover from either
+                // MANIFEST. Both contain every applied edit thanks to the old-
+                // writer sync above. Poison further edits while holding both
+                // sync guards so concurrent directory/manifest syncs observe
+                // poison before proceeding, and keep the old MANIFEST.
+                let _writer = self.manifest_writer.lock();
+                self.poisoned.store(true, Ordering::Release);
+                tracing::error!(
+                    "MANIFEST rotation could not fsync the DB directory; \
+                     poisoning manifest writer (reopen the database to recover): {}",
+                    e
+                );
+                return;
+            }
         }
 
         // Delete old manifest
@@ -899,13 +942,6 @@ impl VersionSet {
                 e
             );
         }
-    }
-
-    fn set_current_file(db_path: &Path, manifest_number: u64) -> Result<()> {
-        Self::write_current_file_tmp(db_path, manifest_number).ctx()?;
-        Self::rename_current_file(db_path, manifest_number).ctx()?;
-        Self::fsync_directory(db_path).ctx()?;
-        Ok(())
     }
 
     fn write_current_file_tmp(db_path: &Path, manifest_number: u64) -> Result<()> {
@@ -930,13 +966,6 @@ impl VersionSet {
         let tmp_path = db_path.join(format!("CURRENT.tmp.{}", manifest_number));
         // Atomic rename
         fs::rename(&tmp_path, db_path.join("CURRENT")).ctx()?;
-        Ok(())
-    }
-
-    /// Fsync a directory to persist metadata changes (renames, creates).
-    fn fsync_directory(dir: &Path) -> Result<()> {
-        let f = fs::File::open(dir).ctx()?;
-        f.sync_all().ctx()?;
         Ok(())
     }
 }
@@ -1745,5 +1774,55 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), ErrorKind::Corruption);
+    }
+
+    #[test]
+    fn dir_sync_failure_blocks_following_sst_directory_sync() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vs = VersionSet::create(dir.path(), 7).unwrap();
+        let handle = vs.dir_sync_handle();
+        let poison = vs.poison_flag();
+        let (start_tx, start_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let next_handle = handle.clone();
+            let next_poison = poison.clone();
+            scope.spawn(move || {
+                start_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                ready_tx.send(()).unwrap();
+                result_tx
+                    .send(sync_new_sst_parent_dir(&next_handle, &next_poison))
+                    .unwrap();
+            });
+            let checked_handle = handle.clone();
+            BEFORE_SYNC_POISON.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    start_tx.send(()).unwrap();
+                    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(
+                        checked_handle.try_lock().is_none(),
+                        "failed directory sync must retain the handle until poison is published"
+                    );
+                }));
+            });
+            FAIL_NEXT_SST_DIR_SYNC.with(|fail| fail.set(true));
+            assert_eq!(
+                sync_new_sst_parent_dir(&handle, &poison)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Io
+            );
+            assert_eq!(
+                result_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Background
+            );
+        });
     }
 }

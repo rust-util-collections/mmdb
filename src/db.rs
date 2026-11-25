@@ -558,6 +558,7 @@ pub struct DB {
     read: Arc<ReadState>,
     path: PathBuf,
     storage_path: PathBuf,
+    dir_sync: Arc<Mutex<Option<fs::File>>>,
     options: DbOptions,
     inner: Arc<Mutex<DBInner>>,
     /// Global sequence number (next to assign).
@@ -1161,7 +1162,8 @@ impl DB {
             if recovery_outputs.is_empty() {
                 versions.apply_metadata(edit).ctx()?;
             } else {
-                let synced = sync_new_sst_parent_dir(&path, &versions.poison_flag())?;
+                let synced =
+                    sync_new_sst_parent_dir(&versions.dir_sync_handle(), &versions.poison_flag())?;
                 for meta in recovery_outputs {
                     edit.add_file(0, meta);
                 }
@@ -1184,6 +1186,7 @@ impl DB {
         let committed_sequence = Arc::new(AtomicU64::new(max_sequence));
 
         let manifest_poisoned = versions.poison_flag();
+        let dir_sync = versions.dir_sync_handle();
 
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
@@ -1250,6 +1253,7 @@ impl DB {
             let bg_compacting_files = compacting_files.clone();
             let bg_dead_key_sweep = dead_key_sweep.clone();
             let bg_manifest_poisoned = manifest_poisoned.clone();
+            let bg_dir_sync = dir_sync.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
@@ -1351,6 +1355,7 @@ impl DB {
                                                 // Phase 2: I/O (no lock)
                                                 let ctx = CompactionContext {
                                                     db_path: &bg_path,
+                                                    dir_sync: &bg_dir_sync,
                                                     manifest_poisoned: &bg_manifest_poisoned,
                                                     options: &bg_options,
                                                     builds: &bg_builds,
@@ -1519,6 +1524,7 @@ impl DB {
                                     // Phase 2: I/O (no lock held)
                                     let ctx = CompactionContext {
                                         db_path: &bg_path,
+                                        dir_sync: &bg_dir_sync,
                                         manifest_poisoned: &bg_manifest_poisoned,
                                         options: &bg_options,
                                         builds: &bg_builds,
@@ -1619,6 +1625,7 @@ impl DB {
                                         blocked_by_snapshot |= !bg_snapshot_list.is_empty();
                                         let ctx = CompactionContext {
                                             db_path: &bg_path,
+                                            dir_sync: &bg_dir_sync,
                                             manifest_poisoned: &bg_manifest_poisoned,
                                             options: &bg_options,
                                             builds: &bg_builds,
@@ -1753,6 +1760,7 @@ impl DB {
             }),
             path: requested_path,
             storage_path: path,
+            dir_sync,
             options,
             inner,
             sequence: sequence_start.clone(),
@@ -2312,6 +2320,7 @@ impl DB {
 
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
+                dir_sync: &self.dir_sync,
                 manifest_poisoned: &self.read.manifest_poisoned,
                 options: &self.options,
                 builds: &self.builds,
@@ -3285,6 +3294,7 @@ impl DB {
         FlushContext {
             inner: self.inner.clone(),
             storage_path: self.storage_path.clone(),
+            dir_sync: self.dir_sync.clone(),
             options: self.options.clone(),
             builds: self.builds.clone(),
             stats: self.read.stats.clone(),
@@ -3397,6 +3407,7 @@ impl DB {
             // Phase 2: I/O (no lock held)
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
+                dir_sync: &self.dir_sync,
                 manifest_poisoned: &self.read.manifest_poisoned,
                 options: &force_opts,
                 builds: &self.builds,
@@ -3495,6 +3506,7 @@ impl DB {
         self.drain_l0(true)?;
         let ctx = CompactionContext {
             db_path: &self.storage_path,
+            dir_sync: &self.dir_sync,
             manifest_poisoned: &self.read.manifest_poisoned,
             options: &self.options,
             builds: &self.builds,
@@ -3757,6 +3769,7 @@ impl DB {
         if let Some(manifest) = inner.versions.manifest_sync_handle().lock().take() {
             manifest.discard_buffer();
         }
+        self.dir_sync.lock().take();
     }
 }
 
@@ -3774,6 +3787,7 @@ impl Drop for DB {
         let mut inner = self.inner.lock();
         inner.wal_writer.take();
         inner.versions.manifest_sync_handle().lock().take();
+        self.dir_sync.lock().take();
         drop(inner);
         self.lock_file.lock().take();
     }
@@ -4976,6 +4990,7 @@ mod tests {
             let snapshots = Vec::new();
             let ctx = CompactionContext {
                 db_path: &db.storage_path,
+                dir_sync: &db.dir_sync,
                 manifest_poisoned: &db.read.manifest_poisoned,
                 options: &db.options,
                 builds: &db.builds,

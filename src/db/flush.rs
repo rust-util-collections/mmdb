@@ -131,6 +131,7 @@ impl FlushQueue {
 pub(super) struct FlushContext {
     pub(super) inner: Arc<Mutex<DBInner>>,
     pub(super) storage_path: PathBuf,
+    pub(super) dir_sync: Arc<Mutex<Option<fs::File>>>,
     pub(super) options: DbOptions,
     pub(super) builds: Arc<SstBuilds>,
     pub(super) stats: Arc<DbStats>,
@@ -184,7 +185,7 @@ impl FlushContext {
         for output in outputs {
             edit.add_file(0, file_metadata(output));
         }
-        let synced = sync_new_sst_parent_dir(&self.storage_path, &self.manifest_poisoned)?;
+        let synced = sync_new_sst_parent_dir(&self.dir_sync, &self.manifest_poisoned)?;
         let output_numbers: Vec<_> = edit.new_files.iter().map(|(_, m)| m.number).collect();
         let (claim, manifest) = {
             let mut inner = self.inner.lock();
@@ -525,6 +526,7 @@ mod tests {
             let rewrite = scope.spawn(|| {
                 let ctx = CompactionContext {
                     db_path: &db.storage_path,
+                    dir_sync: &db.dir_sync,
                     manifest_poisoned: &db.read.manifest_poisoned,
                     options: &db.options,
                     builds: &db.builds,

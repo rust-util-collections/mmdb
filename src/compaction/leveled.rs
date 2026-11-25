@@ -6,10 +6,12 @@
 //! After compaction, the old files are deleted and new files are installed.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::remove_file;
+use std::fs::{File, remove_file};
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::thread::scope;
+
+use parking_lot::Mutex;
 
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,6 +55,7 @@ pub struct CompactionHint {
 /// Shared context for compaction operations, reducing argument count.
 pub(crate) struct CompactionContext<'a> {
     pub db_path: &'a Path,
+    pub dir_sync: &'a Mutex<Option<File>>,
     pub manifest_poisoned: &'a AtomicBool,
     pub options: &'a DbOptions,
     pub builds: &'a SstBuilds,
@@ -1049,7 +1052,7 @@ impl LeveledCompaction {
             edit.delete_file(task.level as u32, tf.meta.number);
             edit.add_file(target_level as u32, tf.meta.clone());
             return Ok(CompactionOutput {
-                dir_synced: sync_new_sst_parent_dir(ctx.db_path, ctx.manifest_poisoned)?,
+                dir_synced: sync_new_sst_parent_dir(ctx.dir_sync, ctx.manifest_poisoned)?,
                 edit,
                 input_files: vec![(task.level as u32, tf.meta.clone())],
                 // Empty, NOT `{tf.meta.number}`: a trivial move relabels the
@@ -1196,7 +1199,7 @@ impl LeveledCompaction {
             edit.delete_file(target_level as u32, tf.meta.number);
         }
 
-        let dir_synced = sync_new_sst_parent_dir(ctx.db_path, ctx.manifest_poisoned)?;
+        let dir_synced = sync_new_sst_parent_dir(ctx.dir_sync, ctx.manifest_poisoned)?;
         pending.keep();
         Ok(CompactionOutput {
             dir_synced,
@@ -1612,8 +1615,11 @@ mod tests {
         edit.delete_file(1, meta1.number);
         edit.add_file(2, meta1.clone());
         let output = CompactionOutput {
-            dir_synced: super::sync_new_sst_parent_dir(dir.path(), &versions.poison_flag())
-                .unwrap(),
+            dir_synced: super::sync_new_sst_parent_dir(
+                &versions.dir_sync_handle(),
+                &versions.poison_flag(),
+            )
+            .unwrap(),
             edit,
             input_files: vec![(1, meta1.clone())],
             input_file_numbers: HashSet::new(),
@@ -2207,7 +2213,9 @@ mod tests {
             max_subcompactions: 2,
             ..DbOptions::default()
         };
+        let dir_sync = super::Mutex::new(Some(super::File::open(dir.path()).unwrap()));
         let ctx = super::CompactionContext {
+            dir_sync: &dir_sync,
             manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
             options: &options,
@@ -2487,7 +2495,9 @@ mod tests {
             max_subcompactions: usize::MAX,
             ..Default::default()
         };
+        let dir_sync = super::Mutex::new(Some(super::File::open(dir.path()).unwrap()));
         let ctx = CompactionContext {
+            dir_sync: &dir_sync,
             manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
             options: &options,
@@ -2675,7 +2685,9 @@ mod tests {
                 max_subcompactions,
                 ..Default::default()
             };
+            let dir_sync = super::Mutex::new(Some(super::File::open(dir.path()).unwrap()));
             let ctx = CompactionContext {
+                dir_sync: &dir_sync,
                 manifest_poisoned: &super::AtomicBool::new(false),
                 db_path: dir.path(),
                 options: &options,
@@ -2916,7 +2928,9 @@ mod tests {
         edit.set_next_file_number(versions.next_file_number());
         versions.log_and_apply(edit).unwrap();
 
+        let dir_sync = versions.dir_sync_handle();
         let ctx = CompactionContext {
+            dir_sync: &dir_sync,
             manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
             options: &options,
