@@ -74,10 +74,23 @@ pub struct Block {
 /// Packed index/offset descriptor for a single entry inside a restart segment.
 #[derive(Clone, Copy)]
 pub(crate) struct RestartSegmentEntry {
-    pub key_start: u32,
-    pub key_end: u32,
+    // Expanded keys share an arena that can exceed the encoded block's size.
+    pub key_start: usize,
+    pub key_end: usize,
     pub val_offset: u32,
     pub val_len: u32,
+}
+
+impl RestartSegmentEntry {
+    fn new(key_start: usize, key_end: usize, val_offset: usize, val_len: usize) -> Self {
+        // Value locations address the encoded block, capped at 64 MiB.
+        Self {
+            key_start,
+            key_end,
+            val_offset: val_offset as u32,
+            val_len: val_len as u32,
+        }
+    }
 }
 
 impl Block {
@@ -318,15 +331,14 @@ impl Block {
         while offset < end {
             let (val_start, val_len, next_off) =
                 decode_entry_reuse(&self.entry_data()[..end], offset, &mut current_key)?;
-            let key_start = keys_arena.len() as u32;
+            let key_start = keys_arena.len();
             keys_arena.extend_from_slice(&current_key);
-            let key_end = keys_arena.len() as u32;
-            entries.push(RestartSegmentEntry {
+            entries.push(RestartSegmentEntry::new(
                 key_start,
-                key_end,
-                val_offset: val_start as u32,
-                val_len: val_len as u32,
-            });
+                keys_arena.len(),
+                val_start,
+                val_len,
+            ));
             offset = next_off;
         }
         Ok(())
@@ -622,6 +634,16 @@ impl<'a> Iterator for BlockIterator<'a> {
 mod tests {
     use super::*;
     use crate::sst::block_builder::BlockBuilder;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn reverse_key_offsets_preserve_the_expanded_arena_position() {
+        let start = u32::MAX as usize - 2;
+        let end = start + 8;
+        let entry = RestartSegmentEntry::new(start, end, 48, 10);
+        assert_eq!(entry.key_end - entry.key_start, 8);
+        assert!(entry.key_end > u32::MAX as usize);
+    }
 
     #[test]
     fn empty_restart_segment_is_corruption() {

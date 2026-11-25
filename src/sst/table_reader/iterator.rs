@@ -262,7 +262,7 @@ impl TableIterator {
     #[inline]
     fn backward_entry_owned(&self, pos: usize) -> (Vec<u8>, Vec<u8>) {
         let e = self.backward_entries[pos];
-        let key = self.backward_keys[e.key_start as usize..e.key_end as usize].to_vec();
+        let key = self.backward_keys[e.key_start..e.key_end].to_vec();
         let val = self
             .backward_block
             .as_ref()
@@ -275,7 +275,7 @@ impl TableIterator {
     fn copy_backward_into_lazy(&self, pos: usize, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) {
         let e = self.backward_entries[pos];
         key_buf.clear();
-        key_buf.extend_from_slice(&self.backward_keys[e.key_start as usize..e.key_end as usize]);
+        key_buf.extend_from_slice(&self.backward_keys[e.key_start..e.key_end]);
         if let Some(ref block) = self.backward_block {
             val_out.set_block_ref(block.data_arc(), e.val_offset, e.val_len);
         } else {
@@ -553,8 +553,7 @@ impl TableIterator {
         )?;
         let keys = &self.backward_keys;
         let end = self.backward_entries.partition_point(|e| {
-            cmp_bounded(&keys[e.key_start as usize..e.key_end as usize], target)
-                != Ordering::Greater
+            cmp_bounded(&keys[e.key_start..e.key_end], target) != Ordering::Greater
         });
         let Some(position) = end.checked_sub(1) else {
             self.backward_entries.clear();
@@ -934,7 +933,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             // Try materialized entries (backward iteration)
             if self.block_pos < self.backward_entries.len() {
                 let e = self.backward_entries[self.block_pos];
-                let k = &self.backward_keys[e.key_start as usize..e.key_end as usize];
+                let k = &self.backward_keys[e.key_start..e.key_end];
                 if let Some(ref ub) = self.config.upper
                     && user_key(k) >= ub.as_slice()
                 {
