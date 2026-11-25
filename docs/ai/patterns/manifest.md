@@ -16,7 +16,7 @@
 
 **MAN5 Monotonic IDs** — `FileNumbers` (`checked_add(1)` → `ErrorKind::Background` on `u64::MAX` exhaustion) and `last_sequence` never reuse or regress; recovery advances `FileNumbers` past every live/on-disk file number before creating new files.
 
-**MAN6 `CURRENT` creation & rotation** — `create_with_cache` writes `DBHeader` + initial `VersionEdit` and `sync_manifest()`s *before* publishing `CURRENT`. `maybe_compact_manifest` writes `DBHeader` + snapshot `VersionEdit` to `MANIFEST-{new}`, syncs both new and old MANIFESTs, writes+syncs `CURRENT.tmp.{new}`, renames `CURRENT`, installs the writer, and syncs `db_path` (keeping the old MANIFEST and latching `poisoned` if post-rename directory sync fails).
+**MAN6 `CURRENT` creation & rotation** — before first publication, `db/directory.rs` syncs the links for newly created store directories. `create_with_cache` writes `DBHeader` + initial `VersionEdit` and `sync_manifest()`s *before* publishing `CURRENT`. `maybe_compact_manifest` writes `DBHeader` + snapshot `VersionEdit` to `MANIFEST-{new}`, syncs both new and old MANIFESTs, writes+syncs `CURRENT.tmp.{new}`, renames `CURRENT`, installs the writer, and syncs `db_path` (keeping the old MANIFEST and latching `poisoned` if post-rename directory sync fails).
 
 ## Checklist
 

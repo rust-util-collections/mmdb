@@ -65,6 +65,9 @@ bounds prune the corresponding point source.
 | `*.wal` | Batch records split into checksummed fragments within 32 KiB blocks. The batch header contains the starting sequence and entry count |
 | `*.sst` | Immutable SST v2 tables with a 48-byte footer ending in `TABLE_MAGIC_V2` |
 
+On store creation, MMDB syncs each new directory entry through its containing
+directory before descending to the next path component. [Directory creation](../src/db/directory.rs)
+
 Open replays eligible WALs in file-number order, starting at the MANIFEST log
 number. Only the highest **nonempty** eligible WAL may have an incomplete
 tail followed by zero padding or EOF. A higher empty standby WAL does not

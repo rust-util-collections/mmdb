@@ -4,7 +4,10 @@
 
 `DB::open(options, path)` opens a writable store. By default it creates a
 missing database. MMDB uses the presence of `CURRENT` to identify an existing
-store. At creation it records `num_levels` and `prefix_len` in the MANIFEST.
+store. When creating missing directories, the opener needs access to sync
+their containing directories before publishing the store. A caller supplying
+an existing directory under a search-only parent is responsible for the
+durability of that existing directory entry. At creation MMDB records `num_levels` and `prefix_len` in the MANIFEST.
 Supply the same values on every writable reopen.
 
 | Option | Default | What it controls |

@@ -1,5 +1,6 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
+mod directory;
 mod flush;
 mod ingest;
 mod read;
@@ -874,16 +875,15 @@ impl DB {
             options.create_if_missing = false;
             options.error_if_exists = false;
         }
-        if options.create_if_missing {
-            fs::create_dir_all(&path).ctx()?;
-        } else if !path.join("CURRENT").try_exists().ctx()? {
-            // Match RocksDB/LevelDB: existence means a DB marker (`CURRENT`),
-            // not merely a directory path. An empty dir must not be initialized
-            // when creation is disabled (and must not create LOCK either).
-            return Err(Error::invalid_argument(format!(
-                "DB does not exist: {}",
-                path.display()
-            )));
+        if !path.join("CURRENT").try_exists().ctx()? {
+            if !options.create_if_missing {
+                return Err(Error::invalid_argument(format!(
+                    "DB does not exist: {}",
+                    path.display()
+                )));
+            }
+            directory::create_durable(&path, fs::File::sync_all)
+                .with_ctx(|| format!("preparing database directory {}", path.display()))?;
         }
 
         if !read_only && options.error_if_exists {

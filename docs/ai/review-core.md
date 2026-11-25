@@ -41,7 +41,7 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 
 | Subsystem | Files | Guides |
 |-----------|-------|--------|
-| write / flush / lifecycle | `src/db.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/wal.md`, `patterns/manifest.md`, `patterns/unsafe-audit.md` (`db.rs`) |
+| write / flush / lifecycle | `src/db.rs`, `src/db/directory.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/wal.md`, `patterns/manifest.md`, `patterns/unsafe-audit.md` (`db.rs`) |
 | sorted ingest | `src/db/ingest.rs` (ascending disjoint span, one sequence, bottommost install) | `patterns/manifest.md`, `patterns/concurrency.md` |
 | read / snapshots / pins | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/iterator.md`, `patterns/unsafe-audit.md` (`pinned.rs`) |
 | memtable | `src/memtable/**` | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
