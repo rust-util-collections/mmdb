@@ -1268,3 +1268,38 @@ fn earlier_wal_truncated_after_block_trailer_fails_closed_while_tail_wal_recover
     );
     assert_eq!(reopened.get(b"b").unwrap(), None);
 }
+
+#[test]
+fn missing_manifest_wal_rejects_partial_recovery_in_both_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+    let sync = WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync);
+    db.put_with_options(&sync, b"latest", b"durable").unwrap();
+    db.simulate_crash();
+
+    // A higher WAL in an incomplete copy cannot stand in for the floor.
+    let wal = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "wal"))
+        .unwrap();
+    let backup = tempfile::tempdir().unwrap();
+    let saved = backup.path().join("saved-wal");
+    fs::rename(&wal, &saved).unwrap();
+    let standby = dir.path().join("000099.wal");
+    fs::write(&standby, []).unwrap();
+    let current = fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let manifest = dir.path().join(current.trim());
+    let before = fs::read(&manifest).unwrap();
+    for result in [
+        DB::open_read_only(dir.path()),
+        DB::open(DbOptions::default(), dir.path()),
+    ] {
+        assert_eq!(result.err().unwrap().kind(), mmdb::ErrorKind::Corruption);
+        assert_eq!(fs::read(&manifest).unwrap(), before);
+        assert!(standby.exists());
+    }
+    fs::rename(saved, wal).unwrap();
+    let db = DB::open_read_only(dir.path()).unwrap();
+    assert_eq!(db.get(b"latest").unwrap().as_deref(), Some(&b"durable"[..]));
+}

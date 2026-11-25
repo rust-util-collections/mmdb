@@ -69,7 +69,8 @@ On store creation, MMDB syncs each new directory entry through its containing
 directory before descending to the next path component. [Directory creation](../src/db/directory.rs)
 
 Open replays eligible WALs in file-number order, starting at the MANIFEST log
-number. Only the highest **nonempty** eligible WAL may have an incomplete
+number. A nonzero log number names a required WAL. If it is absent, both
+open modes return `Corruption`. Only the highest **nonempty** eligible WAL may have an incomplete
 tail followed by zero padding or EOF. A higher empty standby WAL does not
 change that choice. Checksum errors and malformed batch contents fail
 recovery. Writable recovery can spill to staged L0 files during replay and

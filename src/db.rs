@@ -1012,6 +1012,20 @@ impl DB {
         (options.num_levels, options.prefix_len) = versions.geometry();
         let mut max_sequence = versions.last_sequence();
 
+        // The zero log number belongs to a fresh MANIFEST before the first
+        // WAL is installed. Every later floor names a dir-synced WAL.
+        let log_number = versions.log_number();
+        if log_number != 0
+            && !path
+                .join(format!("{log_number:06}.wal"))
+                .try_exists()
+                .ctx()?
+        {
+            return Err(Error::corruption(format!(
+                "MANIFEST references missing WAL {log_number:06}.wal"
+            )));
+        }
+
         // Recover from any WAL files not yet flushed
         let mut active_memtable = Arc::new(MemTable::new());
         let mut wal_numbers: Vec<u64> = Vec::new();
@@ -1032,7 +1046,7 @@ impl DB {
                 && let Ok(num) = num_str.parse::<u64>()
             {
                 // Only recover WAL files newer than what's recorded in MANIFEST
-                if num >= versions.log_number() {
+                if num >= log_number {
                     wal_numbers.push(num);
                 }
             }
@@ -6112,6 +6126,23 @@ mod tests {
 
         db.put(b"new_key", b"new_val").unwrap();
         assert_eq!(db.get(b"new_key").unwrap(), Some(b"new_val".to_vec()));
+    }
+
+    #[test]
+    fn initial_manifest_without_a_wal_can_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate interruption between publishing the first CURRENT and
+        // installing the first WAL number. Zero is the bootstrap sentinel.
+        drop(VersionSet::create(dir.path(), DbOptions::default().num_levels).unwrap());
+        let reader = DB::open_read_only(dir.path()).unwrap();
+        assert!(reader.get(b"k").unwrap().is_none());
+        reader.close().unwrap();
+        let writer = DB::open(DbOptions::default(), dir.path()).unwrap();
+        writer.put(b"k", b"v").unwrap();
+        writer.sync_wal().unwrap();
+        writer.simulate_crash();
+        let reader = DB::open_read_only(dir.path()).unwrap();
+        assert_eq!(reader.get(b"k").unwrap().as_deref(), Some(b"v".as_slice()));
     }
 
     #[test]
