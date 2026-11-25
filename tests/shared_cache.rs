@@ -79,9 +79,21 @@ fn shared_pool_reports_weighted_charges_and_member_pin_lengths() {
     assert_charges(1 + survivor_charge, 0);
     a.insert(2, 0, large);
     assert_charges(survivor_charge, large_charge);
+    // Moving between stores must retain the file-offset registration even
+    // if the old store's removal callback has already run.
+    a.invalidate_file(2);
+    assert_charges(survivor_charge, 0);
+    a.insert(2, 0, vec![8; 2 << 20]);
+    assert_charges(survivor_charge, 2 << 20);
     let larger = vec![6; 3 << 20];
     let larger_charge = larger.capacity() as u64;
     a.insert(2, 0, larger);
+    a.insert(3, 0, vec![2; 2 << 20]);
+    pool.run_pending_tasks();
+    a.insert(3, 0, vec![4]);
+    assert_charges(1 + survivor_charge, larger_charge);
+    a.invalidate_file(3);
+    assert_charges(survivor_charge, larger_charge);
     let mut pin = Vec::with_capacity(512);
     pin.extend_from_slice(b"pin");
     a.insert_pinned(2, 1, pin);
