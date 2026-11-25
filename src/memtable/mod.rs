@@ -296,6 +296,34 @@ impl MemTable {
     pub fn is_empty(&self) -> bool {
         self.approximate_size.load(Ordering::Relaxed) == 0
     }
+
+    /// Return `true` if any point entry or range tombstone in this memtable
+    /// overlaps the closed user-key span `[min_key, max_key]`.
+    pub(crate) fn overlaps_user_key_range(&self, min_key: &[u8], max_key: &[u8]) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let tag = (!crate::types::pack_sequence_and_type(
+            crate::types::MAX_SEQUENCE_NUMBER,
+            ValueType::RangeDeletion,
+        ))
+        .to_be_bytes();
+        if let Some((encoded, _)) = self.inner.lower_bound(min_key, &tag)
+            && crate::types::user_key(encoded) <= max_key
+        {
+            return true;
+        }
+        if self.has_range_deletions() {
+            let tombstones = self.range_tombstones.read();
+            if tombstones
+                .iter()
+                .any(|rt| rt.begin.as_slice() <= max_key && rt.end.as_slice() > min_key)
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl Default for MemTable {

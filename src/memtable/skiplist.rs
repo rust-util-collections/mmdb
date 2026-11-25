@@ -42,6 +42,10 @@ impl SkipListMemTable {
             .sum()
     }
 
+    pub(super) fn lower_bound(&self, user: &[u8], tag: &[u8; 8]) -> Option<(&[u8], &[u8])> {
+        self.map.lower_bound(user, tag)
+    }
+
     pub fn get_ref_with_seq(
         &self,
         user: &[u8],

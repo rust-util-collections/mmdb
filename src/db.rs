@@ -1,6 +1,7 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
 mod flush;
+mod ingest;
 mod read;
 mod snapshot;
 use flush::{FlushContext, FlushQueue};

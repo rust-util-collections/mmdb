@@ -47,11 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         fill_cache: false,
         ..Default::default()
     })?;
-    let mut count = 0u64;
-    for (key, value) in iter.by_ref() {
-        target.put(&key, &value)?;
-        count += 1;
-    }
+    let count = target.ingest_sorted(iter.by_ref())?;
     if let Some(error) = iter.error() {
         return Err(error.into());
     }
