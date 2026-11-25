@@ -79,8 +79,9 @@ readers and writers. Set `MMDB_PROFILE_IMMUTABLES` on separate runs to compare
 queue limits (the profile defaults to two).
 The engine profile separates foreground writes, bulk batches and snapshot
 reads. It also measures shared-pool memory and reopen with residual WALs.
-Use `bench-metrics` for diagnostic stage timings.
-[Criterion benchmarks](benches/benchmarks.rs) · [v5 profile](benches/v5_profile.rs) · [Engine workloads and reproduction](docs/benchmarks/engine-profile/README.md) · [L0 results](docs/benchmarks/l0-profile/README.md)
+Use `bench-metrics` for diagnostic stage timings. The bounded point-read
+benchmark compares 1-, 8- and 32-key requests at one stable snapshot.
+[Criterion benchmarks](benches/benchmarks.rs) · [v5 profile](benches/v5_profile.rs) · [Engine workloads and reproduction](docs/benchmarks/engine-profile/README.md) · [L0 results](docs/benchmarks/l0-profile/README.md) · [Grouped point-read results](docs/benchmarks/grouped-reads/README.md)
 
 ## License
 

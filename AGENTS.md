@@ -102,8 +102,8 @@ The [audit registry](docs/audit.md) is maintained by `$x-review`, `$x-fix`, and 
 - Typed errors: `Error`/`ErrorKind` in `src/error.rs` (hand-rolled, no thiserror/ruc); propagate with `.ctx()` / `.with_ctx(|| ..)` — each hop records `file:line:column` via `#[track_caller]`
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
-- Feature `bench-metrics` enables per-worker write-stage timing and per-DB L0 statistics. Use the [engine workload profiles](docs/benchmarks/engine-profile/) and [L0 evidence](docs/benchmarks/l0-profile/) for benchmark configurations, controls and counter units.
-- Feature `test-utils` exposes `DB::simulate_crash()` for durability tests. Under Miri it also exposes `concurrent_arena_pins()` for `cargo +nightly miri test --test arena_miri`
+- Feature `bench-metrics` enables per-worker write-stage timing and per-DB L0 statistics. Use the [engine workload profiles](docs/benchmarks/engine-profile/) and [L0 evidence](docs/benchmarks/l0-profile/) for benchmark configurations, controls and counter units. The [grouped read trials](docs/benchmarks/grouped-reads/) record returned-pin ownership, actual storage-read coverage and independent scalar controls.
+- Feature `test-utils` exposes `DB::simulate_crash()` for durability tests and `point_table_probes()` / `PinnedSlice::sst_backing_charge()` for grouped-read attribution. Under Miri it also exposes `concurrent_arena_pins()` for `cargo +nightly miri test --test arena_miri`
 - Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock and advisory WAL writeback paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes
 - **No Co-Authored-By in commits** — never add `Co-Authored-By:` or similar trailers to commit messages; project commits are authored only by the human contributor
