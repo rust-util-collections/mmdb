@@ -35,8 +35,8 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | WAL with group commit & crash recovery | Implemented |
 | Read-only open for immutable/permission-restricted stores | Implemented |
 | SST files with prefix-compressed blocks | Implemented |
-| Bloom filters (per-key + prefix bloom) | Implemented |
-| Block cache (moka LRU) with L0 first-block pinning (insert_pinned) | Implemented |
+| Bloom filters (Monkey level-proportional 64B blocked + prefix bloom) | Implemented |
+| Block cache (moka LRU) with L0 first-block pinning & >1 MiB pool overflow | Implemented |
 | Table cache (open file handles) | Implemented |
 | MANIFEST version tracking with atomic version edits | Implemented |
 | Leveled compaction with trivial move | Implemented |
@@ -48,6 +48,7 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | Write backpressure (slowdown/stop) | Implemented |
 | DeleteRange (range tombstones) | Implemented |
 | CompactRange API (with range filtering) | Implemented |
+| Sorted bottommost bulk ingestion (`DB::ingest_sorted`) | Implemented |
 | Compaction filter | Implemented |
 | Rate limiter (token bucket, wired to compaction) | Implemented |
 | DB properties/statistics (reads, writes, flushes, compaction) | Implemented |
@@ -169,7 +170,7 @@ Index directory: upper separator -> index leaf handle
 Footer (48 bytes): [metaindex_handle, index_directory_handle, padding, TABLE_MAGIC_V2]
 ```
 
-The key and prefix Bloom filters use XXH3-64 with seed zero. All eight probes touch one aligned 64-byte line. Index and range-deletion leaves target 64 KiB and can grow to fit a single large entry. Large directories span checksummed pages that the reader loads at open. Adjacent index partitions for one user key share the user-key bytes in memory. A point query checks at most one range-deletion leaf per SST. Flush and compaction clip crossing tombstones at output boundaries and preserve a sequence for each live snapshot stripe.
+The key and prefix Bloom filters use XXH3-64 with seed zero and derive eight independent 9-bit bit probes within one aligned 64-byte cache line (`filter.format = 2`), sized per level with a Monkey bits-per-key schedule (with optional bottommost point-filter elision via `DbOptions::optimize_filters_for_hits`). Index and range-deletion leaves target 64 KiB and can grow to fit a single large entry. Large directories span checksummed pages that the reader loads at open. Adjacent index partitions for one user key share the user-key bytes in memory. A point query checks at most one range-deletion leaf per SST. Flush and compaction clip crossing tombstones at output boundaries and preserve a sequence for each live snapshot stripe.
 
 
 ---
@@ -183,6 +184,11 @@ subsystem implementation; pure re-export `mod.rs` files are omitted.
 src/
 +-- lib.rs                  # Public API re-exports
 +-- db.rs                   # DB: open/get/put/delete/write/flush/compact/close
++-- db/
+|   +-- flush.rs            # FIFO FlushQueue worker & async 0-byte standby WAL rotation
+|   +-- ingest.rs           # Bottommost sorted bulk ingestion (DB::ingest_sorted)
+|   +-- read.rs             # Lock-free SuperVersion point-read state
+|   +-- snapshot.rs         # Registered Snapshot / ArcSnapshot handles
 +-- options.rs              # DbOptions, ReadOptions, WriteOptions (RocksDB-compatible)
 +-- types.rs                # InternalKey, ValueType, SequenceNumber, WriteBatch
 +-- error.rs                # Error types
@@ -253,6 +259,11 @@ impl DB {
     pub fn delete_range_with_options(&self, options: &WriteOptions, begin: &[u8], end: &[u8]) -> Result<()>;
     pub fn write(&self, batch: WriteBatch) -> Result<()>;
     pub fn write_with_options(&self, options: &WriteOptions, batch: WriteBatch) -> Result<()>;
+    pub fn ingest_sorted<I, K, V>(&self, iter: I) -> Result<u64>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>;
     pub fn iter(&self) -> Result<DBIterator>;
     /// ReadOptions bounds prune SST point sources before iteration starts;
     /// range tombstones that can cover the scan are retained independently.
@@ -364,10 +375,11 @@ cargo +stable run --manifest-path tools/v4-export/Cargo.toml -- /data/v4 /data/v
 ```
 
 The exporter opens the source read-only with MMDB 4.3.15, replays residual
-WALs, streams visible key/value pairs, checks the final iterator error, and
-closes the v5 database before publishing the destination. For v4 stores with
-more than sixteen levels it writes sixteen v5 levels. Snapshot registrations
-and physical SST/WAL history live only in the source. Use the vsdb logical
+WALs, streams visible key/value pairs directly into bottommost SSTs via
+`DB::ingest_sorted`, checks the final iterator error, and closes the v5
+database before publishing the destination. For v4 stores with more than
+sixteen levels it writes sixteen v5 levels. Snapshot registrations and
+physical SST/WAL history live only in the source. Use the vsdb logical
 exporter when migrating vsdb collection formats.
 
 For Rust callers moving to v5:
@@ -385,7 +397,9 @@ For Rust callers moving to v5:
 - Use the prefixed batch methods to append a prefix and key directly to the
   WAL payload. `WriteBatchWithIndex::range_tombstones()` iterates borrowed
   endpoints and write positions. Propagate `into_batch()?` to check admission.
-- Use `pin_l0_first_block_and_warm_index` for L0 pinning.
+- Use `pin_l0_first_block_and_warm_index` for L0 pinning, and
+  `optimize_filters_for_hits` to omit bottommost point Bloom filters on
+  hit-dominated stores.
 
 ## Read-only databases
 
@@ -434,7 +448,7 @@ fn open_custom(path: &Path) -> mmdb::Result<DB> {
 |---------------------------------|----------|
 | `get*`, iterators, snapshots, properties | Fully supported |
 | `close` and drop | Release resources without changing the store |
-| `put*`, `delete*`, `write*`, `sync_wal`, `flush`, `compact*` | Return `ErrorKind::ReadOnly` before side effects |
+| `put*`, `delete*`, `write*`, `ingest_sorted`, `sync_wal`, `flush`, `compact*` | Return `ErrorKind::ReadOnly` before side effects |
 | `lazy_delete*` | No-op (the existing infallible API cannot return an error) |
 
 On Unix, an existing `LOCK` file is opened without write access and held with
