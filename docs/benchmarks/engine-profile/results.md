@@ -42,6 +42,17 @@ The hot saturation candidate left nine more L0 files across the database set tha
 
 The separate instrumented hot-shard runs explain the depth-one penalty. At 16 MiB, writers accumulated 69.54 seconds waiting for immutable capacity at depth one and zero at depths two and four. With the equal allowance, depth one at 15 MiB accumulated 59.71 seconds of the same wait, again with zero at depths two and four. Cumulative waiting across concurrent writers can exceed elapsed time. The fixed-buffer all-active sample reached about 272 MiB across 16 immutable generations, versus about 17 MiB and one generation with a single hot shard. These component maxima came from periodic 50 ms observations on the instrumented binary. Whole-process RSS in the primary table is measured independently on the ordinary binary.
 
+### Focused p99 repeat and caller decision
+
+**Retain the current immutable limit of four across placements.** Only depth two with a 10 MiB buffer remained a plausible alternative within the 30 MiB allowance after the first sweep. The focused repeat doubled the paced trace to 20,000 requests per stream, using the same rates, binary and placements. Each placement ran five fresh A/A pairs and five independent A/B pairs. All 40 processes completed all offered work and all pairs passed the backlog test.
+
+| Placement | Depth 4 / 6 MiB median p99 | Depth 2 / 10 MiB median p99 | Paired gain and range | Largest A/A difference | Pairs favoring depth 2 |
+|---|---:|---:|---|---:|---:|
+| One hot shard | 2.017 ms | 2.143 ms | −5.60% (−14.73% to −0.02%) | 11.11% | 0/5 |
+| All active | 17.327 ms | 13.223 ms | +35.17% (−73.35% to +49.92%) | 73.98% | 3/5 |
+
+Depth two missed the 5% hot p99 ceiling on the paired median. Both A/A bands exceeded 5%. In the longer hot runs, the median endpoint was 19 L0 files and one immutable at depth four versus 18 and zero at depth two. With all shards active the corresponding endpoints were 52 and nine versus 49 and zero. All runs started at 16 L0 files and zero immutables. The depth-two throughput and saturation RSS results make this geometry worth considering for VSDB deployments dominated by simultaneous writes across shards. Its actual p99 under a caller's mix remains a deployment input. The experiment supplies no common lower-latency profile to replace the existing depth. [Per-seed repeat and debt](memory-tail-extension-summary.csv) · [Raw focused repeat](memory-tail-extension.jsonl.gz) · [Reproduction command](README.md)
+
 ## Small foreground writes during bulk updates
 
 One producer issued 10,000 puts with 128-byte values. A second producer issued a 4,096-entry batch per 128 foreground arrivals. The split arm routed only the bulk producer to another local DB. Both placements had the same calibrated offer and identical per-round keys. All four workloads completed all offered operations and passed the backlog screens in all matched pairs.
