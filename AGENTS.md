@@ -87,7 +87,7 @@ Supporting docs (`docs/ai/`):
 - [commit-protocol.md](docs/ai/commit-protocol.md) — validate → commit → version bump → local version tag
 - `patterns/*` — per-subsystem checklists
 
-The [audit registry](docs/audit.md) is maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim. Other [maintenance tasks](TODO.md) are tracked separately.
+The [audit registry](docs/audit.md) is maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim.
 
 ## Conventions
 
