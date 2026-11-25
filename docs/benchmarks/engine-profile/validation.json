@@ -1,0 +1,226 @@
+{
+  "revision": "90b220e227474059469173e1d2dbdccf3c84ff54",
+  "compiler": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "native_x86_64_linux": [
+    {
+      "command": "cargo +stable fmt --all -- --check",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable check --all-targets",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable check --benches --features bench-metrics",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable check --manifest-path tools/v4-export/Cargo.toml --all-targets",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable clippy --lib -- -D warnings",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable clippy --lib --features bench-metrics -- -D warnings",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable clippy --all-targets -- -D warnings",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable clippy --all-targets --features bench-metrics -- -D warnings",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "RUSTDOCFLAGS=\"-D warnings\" cargo +stable doc --no-deps",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "RUSTDOCFLAGS=\"-D warnings\" cargo +stable doc --no-deps --features bench-metrics",
+      "passed": null,
+      "ignored": null
+    },
+    {
+      "command": "cargo +stable test --lib",
+      "passed": 425,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --lib --features bench-metrics",
+      "passed": 429,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --doc",
+      "passed": 2,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test crash_recovery",
+      "passed": 27,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test e2e_scenarios",
+      "passed": 10,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test integration",
+      "passed": 74,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test proptest_db",
+      "passed": 3,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test bidi_debug",
+      "passed": 1,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test lazy_delete",
+      "passed": 21,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test shared_cache",
+      "passed": 4,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test grouped_reads",
+      "passed": 7,
+      "ignored": 0
+    },
+    {
+      "command": "cargo +stable test --test read_only",
+      "passed": 7,
+      "ignored": 1
+    },
+    {
+      "command": "CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml",
+      "passed": 6,
+      "ignored": 0
+    }
+  ],
+  "emulated_aarch64_linux": {
+    "source": "90b220e22747",
+    "arch": "aarch64",
+    "evidence": "QEMU 10.2 full-system, Debian kernel 6.1.176-1, UID 1000, CI=1 with guest native strace",
+    "suites": [
+      [
+        "root-mmdb",
+        425,
+        0,
+        0
+      ],
+      [
+        "root-crash_recovery",
+        27,
+        0,
+        0
+      ],
+      [
+        "root-e2e_scenarios",
+        10,
+        0,
+        0
+      ],
+      [
+        "root-integration",
+        74,
+        0,
+        0
+      ],
+      [
+        "root-proptest_db",
+        3,
+        0,
+        0
+      ],
+      [
+        "root-bidi_debug",
+        1,
+        0,
+        0
+      ],
+      [
+        "root-lazy_delete",
+        21,
+        0,
+        0
+      ],
+      [
+        "root-shared_cache",
+        4,
+        0,
+        0
+      ],
+      [
+        "root-read_only",
+        7,
+        0,
+        1
+      ],
+      [
+        "root-grouped_reads",
+        7,
+        0,
+        0
+      ],
+      [
+        "exporter-mmdb-v4-export",
+        1,
+        0,
+        0
+      ],
+      [
+        "exporter-golden",
+        5,
+        0,
+        0
+      ],
+      [
+        "metrics-mmdb",
+        429,
+        0,
+        0
+      ]
+    ],
+    "passed": 1014,
+    "gate_commands": 25,
+    "doc_tests": 2,
+    "vm_log_sha256": "e273c03ed2b653962b8b1804f5cb09208dd23a67c0a51ba14952828cbbb83d65"
+  },
+  "note": "Feature-enabled library tests overlap the default suite. The read-only strace helper is invoked by its parent test.",
+  "miri": {
+    "target": "x86_64-unknown-linux-gnu",
+    "case": "concurrent_arena_pins",
+    "passed": 1
+  }
+}
