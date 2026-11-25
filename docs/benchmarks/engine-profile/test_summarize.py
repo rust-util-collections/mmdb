@@ -68,18 +68,29 @@ class SummaryTest(unittest.TestCase):
                                       "outstanding_end": 0, "arrival_p99_us": latency}
                                for name, count in (("SmallPut", 20000), ("Read", 20000), ("Batch", 320000))}
                     records.append({"case": f"envelope-{placement}-paced", "round": i, "binary": "control",
-                                    "mode": "memory", "arm": arm, "config": {"entropy": "true", "sync": "false"},
+                                    "mode": "memory", "arm": arm,
+                                    "config": {"mode": "memory", "entropy": "true", "sync": "false", "depth": q,
+                                               "buffer_mib": b, "rate": rate, "ops": 20000, "seed": i, "pool_mib": 256,
+                                               "seconds": 0, "sample": "false"},
                                     "settings": {"RATE": rate, "OPS": 20000, "SEED": i, "SECONDS": 0,
                                                  "POOL_MIB": 256, "BATCH_ENTRIES": 32, "IMMUTABLES": q,
                                                  "BUFFER_MIB": b, "PLACEMENT": placement},
                                     "run": {"seconds": 1, "peak_kib": 555, "compaction_output_bytes": 10,
-                                            "dbs": 16, "instrumented": "false"}, "classes": classes})
+                                            "dbs": 16, "placement": placement, "instrumented": "false"},
+                                    "classes": classes})
         for row in summary("memory-tail", records):
             if row["metric"] == "SmallPut_p99_us":
                 self.assertEqual((float(row["control_median"]), float(row["paired_gain_pct"]),
                                   float(row["aa_max_abs_pct"]), row["status"]), (150, -20, 3, "guard-regression"))
         with self.assertRaisesRegex(ValueError, "missing or unexpected arms"):
             summary("memory-tail", [r for r in records if r["arm"] != "AB1"])
+        for observed, field, wrong in ((records[-1]["config"], "depth", 4),
+                                       (records[-1]["run"], "placement", "hot")):
+            original = observed[field]
+            observed[field] = wrong
+            with self.assertRaisesRegex(ValueError, "unexpected memory-tail"):
+                summary("memory-tail", records)
+            observed[field] = original
         records[-1]["settings"]["RATE"] = 1380
         with self.assertRaisesRegex(ValueError, "unexpected memory-tail"):
             summary("memory-tail", records)

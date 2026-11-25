@@ -187,10 +187,16 @@ def summarize(meta, records, writer):
             expected_rate = {"hot": 251, "all": 1381}.get(placement)
             settings = {"RATE": expected_rate, "OPS": 20_000, "SEED": meta["seed"] + record["round"],
                         "SECONDS": 0, "BATCH_ENTRIES": 32, "POOL_MIB": 256}
+            config = record["config"]
+            emitted = {"mode": "memory", "rate": expected_rate, "ops": 20_000, "seconds": 0,
+                       "seed": settings["SEED"], "pool_mib": 256, "entropy": "true", "sync": "false",
+                       "sample": "false", "depth": record["settings"]["IMMUTABLES"],
+                       "buffer_mib": record["settings"]["BUFFER_MIB"]}
             require(meta["rounds"] == 5 and record["round"] in rounds and record["binary"] == "control"
                     and record["mode"] == "memory" and expected_rate is not None
                     and record["case"] == f"envelope-{placement}-paced"
-                    and record["config"]["entropy"] == "true" and record["config"]["sync"] == "false"
+                    and all(config.get(k) == v for k, v in emitted.items())
+                    and record["run"].get("placement") == placement
                     and record["run"]["instrumented"] == "false" and record["run"]["dbs"] == 16
                     and all(record["settings"].get(k) == v for k, v in settings.items()),
                     "unexpected memory-tail settings, seed or round")
