@@ -38,7 +38,7 @@ Preflight, then freeze owned paths before editing.
 ### 1. Scope
 
 1. Inspect `git status --short`, full diffs, and user-intended untracked
-   source/test files (`git diff HEAD` misses untracked files). Leave untracked
+   source/test files and explicitly requested untracked documentation (`git diff HEAD` misses untracked files). Leave untracked
    design drafts or scratch notes (such as `docs/proposals/*`) untouched unless
    the user asked to commit them.
 2. Nothing intended → report "nothing to commit" and stop.
@@ -53,13 +53,14 @@ Preflight, then freeze owned paths before editing.
 
 ### 2. Review and fix (per unit)
 
-Read full functions, callers, error paths, and tests. Check data-structure and
+For documentation units, check the affected [reader guide or skill reference](../../../docs/ai/review-core.md#documentation-map) against its implementation, links, and examples.
+For code units, read full functions, callers, error paths, and tests. Check data-structure and
 SST v2 directory-leaf invariants, MVCC/snapshot cutoffs, post-commit and
 interrupted-write durability, concurrency/wake ordering, `unsafe` provenance
 preconditions, quantified hot-path cost, design shape, unfinished placeholders,
 standalone `tools/v4-export` parity, and the public API in `src/lib.rs`. Apply
 `false-positive-guide.md`. Fix confirmed defects in the owned unit completely,
-add a focused regression test, and re-check until clean. Stop and report on no
+cover behavior fixes with a focused regression test, and re-check the affected unit. Stop and report on no
 progress or when a fix requires editing an unowned baseline file.
 
 Reads may run in parallel; edits and commits are strictly sequential.

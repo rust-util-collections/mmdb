@@ -49,7 +49,10 @@ Verify each finding against current code and dedupe shared root causes:
 
 ### 2. One finding → one commit
 
-1. Implement the root-cause fix and a focused regression test in a temporary DB.
+1. For a behavior defect, implement the root-cause fix and a focused regression
+   test in a temporary DB. For a documentation defect, correct the owning page
+   in the [documentation map](../../../docs/ai/review-core.md#documentation-map)
+   and verify its claim against the relevant code or test.
 2. Trace typed `ErrorKind` propagation, post-commit acknowledgement boundaries,
    interrupted-write recovery, lock/claim/fail-stop publication order, and
    resource cleanup paths; check sibling twins (`forward`/`reverse`,

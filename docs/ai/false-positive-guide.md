@@ -32,8 +32,8 @@ caller guards, and tests (panics OK).
 ## FP-5: Clippy already enforces
 
 CI is `-D warnings`. Skip unused vars, needless clones, redundant closures, etc.
-Focus on semantics clippy cannot see (note: check standalone crates outside root
-`[workspace]` such as `tools/v4-export` explicitly).
+Focus on semantics clippy cannot see. Check the exporter separately with
+`--manifest-path tools/v4-export/Cargo.toml`.
 
 ## FP-6: Advice without downside
 

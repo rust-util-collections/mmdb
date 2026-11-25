@@ -12,7 +12,7 @@
 
 **MAN3 Serialized fail-stop (`VersionSet::poisoned`)** — failed MANIFEST append, `confirm_manifest_durable`, `sync_new_sst_parent_dir`, or post-`CURRENT` directory sync latches shared `Arc<AtomicBool>` `poisoned` (`Release`) until reopen. Both `confirm_manifest_durable` and directory syncs must serialize `(check_poison, sync, store_poison)` on retained descriptors so no concurrent caller can observe a clean second `fsync` and unlink inputs before `poisoned` is published.
 
-**MAN4 Recovery ≡ live apply & atomic multi-WAL spill** — `DBHeader::read` (`levels` in `2..=16`, version `5`) and writable geometry match (`levels`, `prefix_len` → `ErrorKind::InvalidArgument` on mismatch; `ErrorKind::Corruption` on v4/invalid header) run *before* `VersionEdit` replay, `WalWriter::open_append_truncated`, or any store file mutation. Read-only open adopts `versions.geometry()` and never opens or truncates MANIFEST/WAL files. Writable multi-WAL recovery stages spilled SSTs via `PendingSsts` and commits one atomic `VersionEdit` (`new_files` in ascending number order, `log_number = new_wal`, `last_sequence = max_seq`) + `sync_manifest()` *before* `remove_orphan_files`.
+**MAN4 Recovery ≡ live apply & atomic multi-WAL spill** — `DBHeader::read` (`levels` in `2..=16`, version `5`) and writable geometry match (`levels`, `prefix_len` → `ErrorKind::InvalidArgument` on mismatch; `ErrorKind::Corruption` on v4/invalid header) run *before* `VersionEdit` replay, `WalWriter::open_append_truncated`, or writable WAL recovery. The writable opener can create `LOCK` before validating the header. Read-only open adopts `versions.geometry()`, opens the MANIFEST and eligible WALs for reading, and leaves their bytes intact. Writable multi-WAL recovery stages spilled SSTs via `PendingSsts` and commits one atomic `VersionEdit` (`new_files` in ascending number order, `log_number = new_wal`, `last_sequence = max_seq`) + `sync_manifest()` *before* `remove_orphan_files`.
 
 **MAN5 Monotonic IDs** — `FileNumbers` (`checked_add(1)` → `ErrorKind::Background` on `u64::MAX` exhaustion) and `last_sequence` never reuse or regress; recovery advances `FileNumbers` past every live/on-disk file number before creating new files.
 
@@ -20,10 +20,10 @@
 
 ## Checklist
 
-- [ ] `DBHeader` validated before tail truncation or store writes; preserved on every MANIFEST rotation
+- [ ] `DBHeader` validated before MANIFEST tail repair or WAL recovery; preserved on every MANIFEST rotation
 - [ ] Writable reopen rejects `(num_levels, prefix_len)` mismatch with `InvalidArgument`; read-only adopts stored geometry
 - [ ] `open_table` validates `decode_internal_key` + `smallest_key <= largest_key` + `has_range_deletions`; `validate_level_disjointness` never skips empty bounds
 - [ ] `DirSynced` + `confirm_manifest_durable` precede WAL/SST unlinks; `PendingSsts` cleans failed builds without touching sibling jobs
 - [ ] `confirm_manifest_durable` and `sync_new_sst_parent_dir` serialize `fsync` failure with `poisoned` publication
-- [ ] Multi-WAL recovery stages spills without mutating MANIFEST until all WALs validate
+- [ ] Multi-WAL recovery stages spills and appends its recovery edit only after all eligible WALs validate
 - [ ] `CURRENT` tmp/sync/rename/dir-sync order keeps fallback MANIFEST on post-rename dir-sync failure

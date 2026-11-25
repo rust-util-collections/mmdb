@@ -28,7 +28,7 @@ Reject unknown tokens, multiple scopes, and `--fix` rather than guessing.
 | *(empty)* | Latest commit |
 | `N` | Last N commits, N a positive integer |
 | `staged` | `git diff --cached` |
-| `worktree` | Tracked staged/unstaged changes + user-intended untracked source/test files |
+| `worktree` | Tracked staged/unstaged changes + user-intended untracked source/test files and explicitly requested untracked documentation |
 | `all` | Full repository |
 | `<rev>` | One commit; `git rev-parse --verify --quiet '<rev>^{commit}'` must succeed |
 | `<rev1>..<rev2>` | Two-dot range; verify both commits (`git log <rev1>..<rev2>` and `git diff <rev1> <rev2>`), never three-dot |
@@ -75,14 +75,16 @@ concrete storage-engineering terms:
    or quantified hot-path cost.
 4. **Existing checks and regression test** — why current guards do or do not
    cover the path, and the smallest deterministic test that fails before the fix.
+   For documentation drift, identify the claimed behavior and verify it against
+   the implementing symbol, an existing test, or the documented example.
 
 Keep exact Rust and MMDB identifiers (`unsafe`, `ErrorKind::Corruption`,
 `VersionSet::poisoned`, `ReadState::has_bg_error`, `DirSynced`, `PinnedSlice`,
 `SequenceNumber`, `ArcSwap`) verbatim, while conversing in the user's language.
 
-`tools/v4-export` is a standalone Cargo package (`exclude = ["tools/v4-export"]`
-in root `Cargo.toml`) because it links `mmdb = "=4.3.15"` alongside path `../..`;
-keep it excluded from `[workspace]` and run Cargo checks against it via
+The exporter has its own [Cargo manifest](../../tools/v4-export/Cargo.toml)
+and links MMDB 4.3.15 alongside the v5 path dependency. Root Cargo commands
+cover the library package. Run the exporter checks with
 `--manifest-path tools/v4-export/Cargo.toml`.
 
 ### Review-agent handoffs

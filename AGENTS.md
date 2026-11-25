@@ -9,7 +9,8 @@ results.
 ## What is this project?
 
 MMDB implements leveled compaction, WAL-based recovery across interrupted
-writes, MVCC snapshots, and lock-free reads via `ArcSwap<SuperVersion>`.
+writes, MVCC snapshots, and lock-free acquisition of the read view via
+`ArcSwap<SuperVersion>`.
 
 The library runs entirely inside the caller's process on local database files
 (`CURRENT`, `MANIFEST-*`, `*.wal`, `*.sst`, `LOCK`); it opens no network
@@ -22,7 +23,7 @@ are separate developer-tooling actions with their own runtime controls.
 
 ```bash
 make all          # fmt + lint + test
-make test         # cargo test && cargo test --release
+make test         # root debug + release suites, then exporter tests
 make ci           # fmt check + clippy + the CI test set (no release, no scale_profile)
 make lint         # clippy (--lib + --all-targets) + rustdoc check (matches CI)
 make bench        # cargo bench (criterion)
@@ -32,7 +33,7 @@ cargo test --test e2e_scenarios
 cargo test --test proptest_db
 ```
 
-Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks (including `--manifest-path tools/v4-export/Cargo.toml` for the standalone v4 exporter crate, which is excluded from the root workspace). Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
+Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks (including `--manifest-path tools/v4-export/Cargo.toml` for the separately built v4 exporter crate). Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
 
 Toolchain: official latest stable Rust (edition 2024) for development, CI, and
 releases, selected via `RUSTUP_TOOLCHAIN=stable` or `cargo +stable`. Do not run
@@ -43,18 +44,10 @@ jobs, or older-compiler compatibility shims.
 
 ## Architecture
 
-| Subsystem | Key files | Purpose |
-|-----------|-----------|---------|
-| Write & flush | `src/db.rs`, `src/db/flush.rs` | Group commit (`WalAsync`/`WalSync`/`DisableWal` + `WalFence`), unlocked WAL rotation, FIFO `FlushQueue` worker |
-| Read & snapshots | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | Lock-free `ArcSwap<SuperVersion>`, zero-copy `PinnedSlice`, `Snapshot` / `ArcSnapshot` (`SnapshotRef`) |
-| MemTable | `src/memtable/` | Slab-arena `ConcurrentSkipList` (`MemTablePin`), range-del list, same-key metadata buckets |
-| WAL | `src/wal/` | Vectored `add_record_parts`, 32 KiB block-framed CRC32 records, multi-WAL bounded recovery |
-| SST v2 | `src/sst/` | `TABLE_MAGIC_V2`, paged two-level index & pre-fragmented `rangedel` directories, 64B XXH3-64 blocked Bloom (`filter.format = 2`), LZ4/Zstd |
-| Iterator | `src/iterator/` | Heap merge, `FragmentedRangeTombstoneList`, lending `step_next`/`step_prev` with typed `&Error`, lazy `BidiIterator` |
-| Compaction | `src/compaction/leveled.rs`, `src/db.rs` (`LevelRewrite`) | Unlocked leveled & full-level compaction, sub-compaction range/stripe clipping |
-| Manifest | `src/manifest/` | `VersionSet`, v5 `DBHeader` (`levels`, `prefix_len`), `DirSynced`, `FileNumbers` / `PendingSsts` |
-| Cache | `src/cache/` | `BlockCachePool` (`SegmentedCache`), lock-free `ArcSwap` L0 block-0 pins, `TableCache` |
-| Migration | `tools/v4-export/` | Standalone `mmdb-v4-export` (`=4.3.15` read-only → v5 staging + atomic rename) |
+Follow a write, read, compaction, or reopen in the [v5 storage architecture](docs/architecture.md).
+The [subsystem map](docs/ai/review-core.md#subsystem-map) pairs each source area
+with its review checklist. For public behavior and format conversion, see
+[Using MMDB v5](docs/usage.md) and [Migrating to v5](docs/migration.md).
 
 ## Skills
 
@@ -85,7 +78,7 @@ Supporting docs (`docs/ai/`):
 - [commit-protocol.md](docs/ai/commit-protocol.md) — validate → commit → version bump → local version tag
 - `patterns/*` — per-subsystem checklists
 
-Audit registry: `docs/audit.md` — maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim.
+The [audit registry](docs/audit.md) is maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim. Other [maintenance tasks](TODO.md) are tracked separately.
 
 ## Conventions
 
@@ -99,7 +92,7 @@ Audit registry: `docs/audit.md` — maintained by `$x-review`, `$x-fix`, and `$x
 - Typed errors: `Error`/`ErrorKind` in `src/error.rs` (hand-rolled, no thiserror/ruc); propagate with `.ctx()` / `.with_ctx(|| ..)` — each hop records `file:line:column` via `#[track_caller]`
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
-- Feature `test-utils` exposes `DB::simulate_crash()` for durability tests and `concurrent_arena_pins()` for `cargo +nightly miri test --test arena_miri`
+- Feature `test-utils` exposes `DB::simulate_crash()` for durability tests. Under Miri it also exposes `concurrent_arena_pins()` for `cargo +nightly miri test --test arena_miri`
 - Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock and advisory WAL writeback paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes
 - **No Co-Authored-By in commits** — never add `Co-Authored-By:` or similar trailers to commit messages; project commits are authored only by the human contributor

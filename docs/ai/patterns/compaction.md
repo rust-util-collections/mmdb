@@ -2,7 +2,7 @@
 
 **Files:** `leveled.rs`, `mod.rs`, `src/db.rs` (`LevelRewrite`, `drain_l0`, `DeadKeySweepScheduler`).
 
-**Arch:** L0 overlap → L1+ sorted disjoint; trigger L0 count ≥ `l0_compaction_trigger` or L1+ level budget overflow; sub-compaction splits on sorted L(n+1) file boundaries (`compute_split_points`); trivial move = single file, `target_level != level`, no target point/range overlap, no effective `CompactionFilter`; `PendingSsts` owns newly allocated SST numbers and unlinks abandoned outputs on error/drop without touching concurrent jobs' files.
+**Arch:** L0 overlap → L1+ sorted disjoint; trigger L0 count ≥ `l0_compaction_trigger` or L1+ level budget overflow; non-L0 sub-compaction splits on sorted L(n+1) file boundaries (`compute_split_points`); trivial move = single file, `target_level != level`, no target point/range overlap, no effective `CompactionFilter`; `PendingSsts` owns newly allocated SST numbers and unlinks abandoned outputs on error/drop without touching concurrent jobs' files.
 
 ## Invariants
 

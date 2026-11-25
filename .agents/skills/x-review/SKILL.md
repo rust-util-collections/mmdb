@@ -43,9 +43,8 @@ anything else, including `--fix`.
 
 1. Worktree baseline: the recorded preflight above.
 2. Changed files, full diff, callers, tests. `worktree` includes intended
-   untracked source/test files (`git status --short`). `all` → ledger of `src/`,
-   `tools/v4-export/`, `tests/`, `benches/`, `examples/`, build/CI/`.gitignore`,
-   public docs, `.agents/`, and `docs/ai/`.
+   untracked source/test files and explicitly requested untracked documentation (`git status --short`). For `all`,
+   use `git ls-files` and the [documentation and subsystem maps](../../../docs/ai/review-core.md#documentation-map).
 3. Map via the Subsystem Map. Load concurrency/`unsafe` guides when relevant.
 4. Mark generated, vendored, and out-of-scope rows explicitly in the ledger.
 
@@ -68,7 +67,8 @@ design shape, public API contract, and quantified hot-path cost.
 
 Each candidate needs a location, invariant, concrete inputs/ordering, expected
 and observed results, existing checks, a minimal correction, and a regression
-test. Drop style, speculation, feature requests, documented contracts, and
+test. For a documentation discrepancy, cite the claim and its verifiable
+source using the documentation map. Drop style, speculation, feature requests, documented contracts, and
 anything an existing check already guarantees.
 
 ### 3. Verify

@@ -1,5 +1,5 @@
 interface:
   display_name: "MMDB Review"
-  short_description: "Review MMDB correctness and compatibility"
+  short_description: "Review a scope and record findings in the audit registry"
 policy:
   allow_implicit_invocation: false

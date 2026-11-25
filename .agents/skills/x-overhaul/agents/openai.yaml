@@ -1,5 +1,5 @@
 interface:
   display_name: "MMDB Overhaul"
-  short_description: "Prove, fix, and commit scoped MMDB defects"
+  short_description: "Review scoped changes, prove fixes, and create local patch tags"
 policy:
   allow_implicit_invocation: false

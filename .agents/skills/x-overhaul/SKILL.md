@@ -60,16 +60,16 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
    and test the working tree rather than the Git index, stop and report before
    editing if any staged file also has unstaged changes that affect validation.
 3. `worktree`: owns tracked staged/unstaged changes and only user-intended
-   untracked source/test files. Leave untracked design drafts or scratch notes
-   (such as `docs/proposals/*`) untouched unless the user asked to include them.
+   untracked source/test files and explicitly requested untracked documentation.
+   Leave untracked design drafts or scratch notes (such as `docs/proposals/*`)
+   untouched unless the user asked to include them.
 4. Committed scopes (`empty`, `N`, `<rev>`, `<rev1>..<rev2>`, `all`): leave all
    baseline worktree changes uncommitted and untouched; stop and report if an
    in-scope fix overlaps dirty baseline lines. List each frozen commit with its
    type (`fix`, `perf`, `refactor`, other) for the intent checks in Step 2.
-5. `all`: build a complete tracked-file ledger across `src/`,
-   `tools/v4-export/`, `tests/`, `benches/`, `examples/`,
-   `Cargo.toml`/`Makefile`/`.github/`/`.gitignore`, public docs (`README.md`,
-   `COMPARISON.md`), `.agents/`, and `docs/ai/`. Large files (`src/db.rs`,
+5. `all`: build the tracked-file ledger from `git ls-files`. Use the
+   [documentation and subsystem maps](../../../docs/ai/review-core.md#documentation-map)
+   to assign coverage. Large files (`src/db.rs`,
    `src/compaction/leveled.rs`, `src/sst/table_reader/{mod.rs,iterator.rs}`,
    `src/sst/table_builder.rs`, `src/iterator/db_iter.rs`,
    `src/manifest/version_set.rs`) may be partitioned into disjoint line-range
@@ -100,7 +100,7 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
 
 | Commit type | Check | Finding when it fails |
 |-------------|-------|-----------------------|
-| any | Subject/body claim matches the diff; changed public behavior updates `src/lib.rs` docs, `README.md`, and tests | Contract drift (LOW) or the behavior defect itself |
+| any | Subject/body claim matches the diff; public behavior agrees with item rustdoc, the relevant reader guide, and tests | Contract drift (LOW) or the behavior defect itself |
 | `fix(...)` | The diff removes the root cause, not one symptom; a test fails when the commit's `src/` hunks are reverted (revert probe below) | Incomplete fix (severity of the original defect); missing regression test (LOW) |
 | `perf(...)` | Path is hot or warm (FP-9) and observable results are unchanged at boundaries: empty/single-entry block, first/last restart, `[lower, upper)` bounds, reverse direction, snapshot cutoff, range tombstones, latched errors | Any changed result or dropped check is a correctness finding, not a perf note |
 | `refactor(...)` | No behavior change: same `ErrorKind`, same order of fsync / dir-sync / MANIFEST append / `CURRENT` rename / unlink, same lock scope | Behavior defect at its own severity |
@@ -125,13 +125,14 @@ hunk), skip the probe and trace coverage statically, saying so in the report.
    twins (`seek` vs `seek_for_prev` / `seek_to_last`), lending `step_next` /
    `step_prev` vs `Iterator::next` / `next_back`, `DBIterator` / `BidiIterator` /
    `LevelIterator` / `TableIterator` / `MergingIterator`, point-index
-   (`partitions` / `index_leaf` / `find_data_block`) vs range-tombstone
+   (`partitions` / `index_leaf_block` / `find_data_block`) vs range-tombstone
    (`range_partitions` / `visit_ranges` / `covering_sequence`) leaves, `get` /
    `get_pinned` / `contains_key` and `Snapshot` / `ArcSnapshot`,
    `WalAsync` / `WalSync` / `DisableWal` + `sync_wal()` (`WalFence`), explicit
    `flush()` vs `write_batch_group` auto-freeze, `FlushQueue::run` vs
    `set_bg_error` vs compaction `set_error`, `confirm_manifest_durable` vs
-   `sync_new_sst_parent_dir`, writable vs read-only open, normal vs multi-WAL
+   `sync_new_sst_parent_dir` in flush, compaction, and sorted ingestion,
+   standby vs fallback WAL creation, writable vs read-only open, normal vs multi-WAL
    recovery path, `close` / `Drop` / `DB::simulate_crash()` teardown, and every
    caller of the guarded function or field (`rg` on the identifier, not only the
    diff).
@@ -148,8 +149,9 @@ Resolve findings in scope sequentially (`CRITICAL` → `LOW`), following
 
 1. **Red**: write the focused regression test first, in a `tempfile` DB with
    deterministic API calls, `DB::simulate_crash()`, or file truncation/byte
-   edits. Run the same targeted filter later used for validation against the
-   unfixed code and record the failing assertion, typed error, or panic. Assert
+   edits. For a documentation defect, select an example, link check, or
+   contract check that exercises the discrepant claim. Run the chosen check
+   against the original tree and record the failure. Assert
    stalls and deadlocks with a bounded wait (`recv_timeout`, a joined thread with
    a deadline), never an unbounded hang.
 2. **Test passes on unfixed code** → the finding is not demonstrated. Re-trace

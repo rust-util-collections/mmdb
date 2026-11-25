@@ -43,12 +43,12 @@
 ### WAL: `WalWriter` needs a `Drop` impl to avoid losing buffered records
 - **Where**: `src/wal/writer.rs`
 - **Claim**: `BufWriter` discards its buffer on drop, so a `WalWriter` dropped without an explicit flush silently loses up to one buffer of records.
-- **Reason**: The premise is false — `std::io::BufWriter`'s `Drop` flushes the buffer (only errors are ignored, per its documentation). Independently, every commit path flushes or syncs the WAL before acknowledging a write, so drop-time behavior only concerns unacknowledged data on panic unwind.
+- **Reason**: The premise is false — `std::io::BufWriter`'s `Drop` flushes the buffer (only errors are ignored, per its documentation). Independently, each WAL-enabled write group flushes or syncs the WAL before acknowledging its WAL-enabled batches, so drop-time behavior only concerns unacknowledged data on panic unwind.
 
 ### memtable: range tombstones evade `approximate_size` accounting
 - **Where**: `src/memtable/mod.rs`, `src/types.rs`
 - **Claim**: valid `delete_range(begin, end)` entries with `begin < end` are nearly free in `approximate_size()`, so their volume never triggers a flush.
-- **Reason**: `MemTable::put` accounts newly reserved arena slab capacity, duplicated `begin`/`end` endpoint bytes, `MemRangeTombstone` vector capacity growth, and `same_key_metadata` bucket charges for every valid `RangeDeletion` entry. Empty/inverted ranges (`begin >= end`) are ignored in `WriteBatch::delete_range_prefixed` before WAL encoding and sequence assignment (and guarded again in `MemTable::put`).
+- **Reason**: `MemTable::put` accounts newly reserved arena slab capacity, duplicated `begin`/`end` endpoint bytes, and `MemRangeTombstone` vector capacity growth for every valid `RangeDeletion` entry. Empty/inverted ranges (`begin >= end`) are ignored in `WriteBatch::delete_range_prefixed` before WAL encoding and sequence assignment (and guarded again in `MemTable::put`).
 
 ### write path: group-commit queue depth is unbounded
 - **Where**: `src/db.rs` (`WriteQueueState`)

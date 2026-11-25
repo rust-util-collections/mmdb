@@ -11,9 +11,24 @@ and local files.
 1. Read the full diff and surrounding functions, callers, error paths, and tests.
 2. Map each Rust file via the Subsystem Map and load the corresponding guides.
 3. Multi-subsystem or design-shaped diffs → also load `design-patterns.md`.
-4. Full `all` review → build a complete tracked-file ledger first across `src/`,
-   `tools/v4-export/`, `tests/`, `benches/`, `examples/`, build/CI configs,
-   public docs, `.agents/`, and `docs/ai/` (no size guesses or silent omissions).
+4. For an `all` review, derive the tracked-file ledger from `git ls-files`.
+   Include reader guides, design records, project skills and their UI metadata,
+   alongside the source, tests, examples, benchmarks, and build configuration.
+
+### Documentation map
+
+| When checking | Compare against |
+|---------------|-----------------|
+| Public operations, errors, defaults | [Usage guide](../usage.md), public rustdoc on the items re-exported by `src/lib.rs`, and the corresponding API tests |
+| Read, write, recovery, format, or resource behavior | [Storage architecture](../architecture.md), the subsystem implementation and its tests |
+| Store and caller migration | [Migration guide](../migration.md), `tools/v4-export/src/main.rs` and its golden-store tests |
+| Historical measurements or proposed designs | [Design records](../proposals/) and their cited revisions. Use the current implementation to establish what shipped |
+| Skill scope, outputs, and validation | [Project guide](../../AGENTS.md#skills), the four skill entry points and their `agents/openai.yaml`, [workflow policy](workflow-policy.md) and [commit protocol](commit-protocol.md) |
+
+The [README](../../README.md#documentation) is the reader index. Update the
+page that explains a changed contract and check links to moved sections.
+For documentation drift, cite the discrepant claim and the API declaration,
+operation, test, or Cargo target that establishes the correction.
 
 ### Subsystem Map
 
@@ -27,6 +42,7 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 | Subsystem | Files | Guides |
 |-----------|-------|--------|
 | write / flush / lifecycle | `src/db.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs`, `src/stats.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/wal.md`, `patterns/manifest.md`, `patterns/unsafe-audit.md` (`db.rs`) |
+| sorted ingest | `src/db/ingest.rs` (ascending disjoint span, one sequence, bottommost install) | `patterns/manifest.md`, `patterns/concurrency.md` |
 | read / snapshots / pins | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/iterator.md`, `patterns/unsafe-audit.md` (`pinned.rs`) |
 | memtable | `src/memtable/**` | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
 | WAL | `src/wal/**` | `patterns/wal.md` |
@@ -68,8 +84,9 @@ For every candidate defect:
 4. State the observable result: wrong value/visibility, lost acknowledged data,
    post-commit `Err` on already-applied writes, unhandled decode error or panic,
    leaked resource/pin, deadlock/stall, or **quantified** hot/warm-path cost.
-5. Specify the smallest deterministic regression test (in a `tempfile` DB) that
-   fails before the fix.
+5. For a storage defect, specify the smallest deterministic regression test
+   that fails before the fix. For a documentation discrepancy, identify the
+   code, example, test, or link that establishes the expected result.
 
 **Boundaries:** empty/single-entry blocks, first/last keys, restart intervals,
 partitioned index/`rangedel` leaf boundaries vs directory entries, half-open
@@ -80,7 +97,7 @@ constants, truncated records, partial or post-commit I/O errors.
 **Concurrency:** derive the lock and atomic graph from live code (`lock_file`,
 `maintenance`, `write_queue`, `inner`, `compacting_files`, `snapshot_list`,
 `manifest_writer`, `flush_queue`, `pin_updates`, `SstBuilds`, condvars). Verify
-acyclic lock order, zero `inner` hold across disk I/O, `SuperVersion`-before-`committed_sequence`
+acyclic lock order, unlocked SST builds and WAL sealing, `SuperVersion`-before-`committed_sequence`
 read barriers, claim release before condvar notify, fail-stop flag store before
 waiter wake, loop-rechecked wait predicates, and clean worker shutdown.
 
@@ -100,7 +117,7 @@ visibility, and public exports.
 `TODO`/`FIXME` on active code paths. Search callers before labeling code dead.
 
 **Public API:** only items re-exported in `src/lib.rs` are public. Keep code,
-defaults, typed errors, doc comments, `README.md`, and tests aligned.
+defaults, typed errors, item rustdoc, [reader documentation](#documentation-map), and tests aligned.
 
 ## 4. Deterministic checks vs review findings
 

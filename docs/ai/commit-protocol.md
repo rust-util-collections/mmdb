@@ -77,7 +77,7 @@ After the last behavior commit, run these commands once (do not substitute a
 production library configuration without `[dev-dependencies]` enabling
 `test-utils`, `--all-targets` and the test binaries mirror
 `.github/workflows/ci.yml` and `make ci`, and the explicit `--manifest-path`
-commands cover the workspace-excluded `tools/v4-export` crate (if CI and
+commands cover the standalone `tools/v4-export` crate (if CI and
 `Makefile` diverge, run the union and report the drift):
 
 ```bash

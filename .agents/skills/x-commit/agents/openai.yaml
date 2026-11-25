@@ -1,5 +1,5 @@
 interface:
   display_name: "MMDB Commit"
-  short_description: "Review and commit intended MMDB changes"
+  short_description: "Review and locally commit intended worktree changes"
 policy:
   allow_implicit_invocation: false

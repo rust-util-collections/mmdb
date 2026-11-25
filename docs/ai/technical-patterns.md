@@ -15,7 +15,7 @@ Describe findings with the registry fields in `review-core.md`.
 **Pattern:** WAL vs MemTable phase reorder, `committed_sequence` stored before all MemTable inserts finish, or post-commit auto-freeze (`submit_active`) / partial-group `append_error` overwriting already-committed callers' results with `Err`.
 **Where:** `db.rs` (`enqueue_write`, `write_batch_group`, `submit_active`).
 **Impact:** Linearizability break, or callers told a durable/visible write failed.
-**Check:** Required order: `admit_range_stripes` + `admit_same_key_runs` → contiguous seq reserve → vectored WAL loop (`DisableWal` skipped; `WalFence` forces `sync_data()`) → `sync_data()`/`flush()` → MemTable loop in group order → `committed_sequence.store(Release)` → `synced_wal_seq`. Any error *after* `committed_sequence` publication must preserve `Ok(())` for committed requests while latching fail-stop.
+**Check:** Required order: `admit_range_stripes` + `admit_same_key_runs` → contiguous seq reserve → vectored WAL loop (`DisableWal` skipped; a fence syncs an outstanding target) → `sync_data()`/`flush()` → MemTable loop in group order → `committed_sequence.store(Release)` → `synced_wal_seq`. Any error *after* `committed_sequence` publication must preserve `Ok(())` for committed requests while latching fail-stop.
 
 ### 1.3 Async `FlushQueue`, claims, & fail-stop wake ordering
 **Pattern:** Popping `immutable_memtables` before `confirm_manifest_durable`; signaling `compaction_notify` while still holding `CompactionClaim` on new L0 SSTs; or waking `FlushQueue` waiters (`flush_queue.fail`) before storing `bg_error` + `has_bg_error` (`Release`).
@@ -35,11 +35,11 @@ Describe findings with the registry fields in `review-core.md`.
 **Pattern:** Non-contiguous sequence reservation, or MANIFEST recovery/repair running before `DBHeader` (`"MMDB"`, v5, `levels` `2..=16`, `prefix_len`) validation.
 **Where:** `db.rs`, `manifest/version_set.rs`, `types.rs`.
 **Impact:** Snapshot anomalies, or corrupting/truncating a store on format/geometry mismatch.
-**Check:** Contiguous seq = op count; `DBHeader::read` + geometry check run before `VersionEdit` replay, `open_append_truncated`, or any store file write (`open_read_only` adopts stored geometry and never writes).
+**Check:** A write batch reserves one sequence per operation. Sorted ingestion assigns one fresh sequence to all rows in a nonempty input. On reopen, `DBHeader::read` + geometry check run before `VersionEdit` replay, `open_append_truncated`, or WAL recovery. Writable locking can create `LOCK` before header validation. Read-only open adopts stored geometry.
 
 ### 2.2 `InternalKey`, `FileMetaData`, & directory↔leaf bounds
 **Pattern:** Unvalidated `< 8`-byte or inverted `FileMetaData` bounds in `VersionSet`, or SST v2 partitioned index/`rangedel` leaves whose start/end keys disagree with `TableReader::partitions` / `range_partitions`.
-**Where:** `manifest/version_set.rs` (`open_table`, `validate_level_disjointness`), `sst/table_reader/mod.rs` (`index_leaf`, `find_data_block`, `covering_sequence`, `visit_ranges`).
+**Where:** `manifest/version_set.rs` (`open_table`, `validate_level_disjointness`), `sst/table_reader/mod.rs` (`index_leaf_block`, `find_data_block`, `covering_sequence`, `visit_ranges`).
 **Impact:** Binary-search point reads/iterators silently return `Ok(None)` or compaction drops partitions.
 **Check:** Validate `decode_internal_key` + `smallest_key <= largest_key` (no empty-key skips at L1+), and cross-check both index leaves and `rangedel` leaves against their directory partition bounds.
 
@@ -47,7 +47,7 @@ Describe findings with the registry fields in `review-core.md`.
 **Pattern:** CRC omits record/block type byte, footer index handle points at an earlier directory page, or LZ4/Zstd allocates uncapped decoded buffers before limit check.
 **Where:** `wal/{record,writer,reader}.rs`, `sst/{format,table_builder,table_reader}`.
 **Impact:** Silent truncation/corruption acceptance or OOM on damaged block headers.
-**Check:** `crc32(type || payload)` matches on writer/reader; head index page ends at `file_size - FOOTER_SIZE`; backward directory offsets decrease strictly; decoded size capped at `64 MiB`.
+**Check:** Verify WAL CRC over fragment type followed by payload and SST CRC over payload followed by the compression byte. The head index page ends at `file_size - FOOTER_SIZE`. Backward directory offsets strictly decrease and decoded blocks are capped at `64 MiB`.
 
 ### 2.4 Block restarts & shortest separators
 **Pattern:** Bad restart offset, mid-block decode error treated as clean EOF, or `shorten_separator` shortening across equal user keys.
