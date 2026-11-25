@@ -2,8 +2,9 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    error::Error as StdError,
     fs,
-    io::{BufWriter, Write},
+    io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -220,13 +221,15 @@ impl VersionSet {
         }
         .map_err(|e| {
             let path = db_path.join(format!("{:06}.sst", meta.number));
-            Error::corruption(format!(
-                "failed to open new SST {} (path {}, exists_now={}): {e}",
-                meta.number,
-                path.display(),
-                path.exists()
-            ))
-            .with_source(e)
+            let note = format!("failed to open referenced SST {}", path.display());
+            if e.source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .is_some_and(|cause| cause.kind() == io::ErrorKind::NotFound)
+            {
+                Error::corruption(note).with_source(e)
+            } else {
+                e.context(note)
+            }
         })?;
         if reader.has_range_deletions() != meta.has_range_deletions {
             return Err(Error::corruption(format!(
@@ -1405,8 +1408,8 @@ mod tests {
             },
         );
         let err = vs.log_and_apply(edit).unwrap_err();
-        assert!(err.to_string().contains("failed to open new SST"));
-        assert!(err.to_string().contains("exists_now=false"));
+        assert_eq!(err.kind(), ErrorKind::Corruption);
+        assert!(err.to_string().contains("999999.sst"));
 
         // Nothing applied, not poisoned, counter intact.
         assert_eq!(vs.current().total_files(), 0);
@@ -1680,6 +1683,41 @@ mod tests {
             err.to_string().contains("overlapping key ranges"),
             "unexpected recovery error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn referenced_sst_open_preserves_io_errors() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::DB::open(crate::DbOptions::default(), dir.path()).unwrap();
+        db.put(b"a", b"value").unwrap();
+        db.close().unwrap();
+        let sst = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "sst"))
+            .unwrap();
+        let original = sst.with_extension("saved");
+        fs::rename(&sst, &original).unwrap();
+        symlink(sst.file_name().unwrap(), &sst).unwrap();
+
+        let error = crate::DB::open_read_only(dir.path()).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Io);
+        assert_eq!(
+            error
+                .source()
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        fs::remove_file(&sst).unwrap();
+        fs::rename(original, sst).unwrap();
+        let reader = crate::DB::open_read_only(dir.path()).unwrap();
+        assert_eq!(reader.get(b"a").unwrap().as_deref(), Some(&b"value"[..]));
     }
 
     #[test]
