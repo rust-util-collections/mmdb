@@ -733,7 +733,7 @@ impl DBIterator {
     ///
     /// Uses inline backward resolution: walks backward through the merger,
     /// collecting all entries for each user key, and resolves visibility
-    /// without any forward re-seek. O(1) amortized per call instead of O(K·logN).
+    /// without a forward re-seek.
     ///
     /// Internal key ordering: user_key ASC, seq DESC. When walking backward,
     /// entries for the same user_key appear in seq ascending order (low→high).
@@ -911,7 +911,8 @@ impl DBIterator {
 
     /// Move to the previous visible user key.
     ///
-    /// Uses inline backward resolution: O(1) amortized per call.
+    /// Resolving a row can traverse multiple versions and deleted keys. Each
+    /// backward step through a memtable searches its skiplist for the predecessor.
     pub fn prev(&mut self) {
         // Ensure we have a current entry to move backwards from
         self.ensure_current();
