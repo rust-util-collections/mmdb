@@ -8,7 +8,7 @@ from summarize import summarize
 
 def summary(suite, records, rounds=5):
     out = io.StringIO()
-    summarize({"suite": suite, "rounds": rounds, "binary_sha256": {}}, records, csv.writer(out))
+    summarize({"suite": suite, "rounds": rounds, "seed": 0, "binary_sha256": {}}, records, csv.writer(out))
     return list(csv.DictReader(io.StringIO(out.getvalue())))
 
 
@@ -56,6 +56,33 @@ class SummaryTest(unittest.TestCase):
         p99 = next(r for r in rows if (r["case"], r["metric"]) == ("same-db-false", "SmallPut_p99_us"))
         self.assertEqual((p99["eligible_pairs"], p99["paired_gain_pct"], p99["status"]),
                          ("4", "", "insufficient-p99-samples"))
+
+    def test_memory_tail_uses_independent_aa_and_ab_references(self):
+        records = []
+        for placement, rate in (("hot", 251), ("all", 1381)):
+            for i in range(1, 6):
+                for arm, latency in (("A1", 100), ("A2", 103), ("AB1", 150), ("q2-b10", 180)):
+                    q, b = (2, 10) if arm == "q2-b10" else (4, 6)
+                    classes = {name: {"offered": count, "completed": count, "sampled": count,
+                                      "bytes": count, "rejected": 0, "outstanding_half": 0,
+                                      "outstanding_end": 0, "arrival_p99_us": latency}
+                               for name, count in (("SmallPut", 20000), ("Read", 20000), ("Batch", 320000))}
+                    records.append({"case": f"envelope-{placement}-paced", "round": i, "binary": "control",
+                                    "mode": "memory", "arm": arm, "config": {"entropy": "true", "sync": "false"},
+                                    "settings": {"RATE": rate, "OPS": 20000, "SEED": i, "SECONDS": 0,
+                                                 "POOL_MIB": 256, "BATCH_ENTRIES": 32, "IMMUTABLES": q,
+                                                 "BUFFER_MIB": b, "PLACEMENT": placement},
+                                    "run": {"seconds": 1, "peak_kib": 555, "compaction_output_bytes": 10,
+                                            "dbs": 16, "instrumented": "false"}, "classes": classes})
+        for row in summary("memory-tail", records):
+            if row["metric"] == "SmallPut_p99_us":
+                self.assertEqual((float(row["control_median"]), float(row["paired_gain_pct"]),
+                                  float(row["aa_max_abs_pct"]), row["status"]), (150, -20, 3, "guard-regression"))
+        with self.assertRaisesRegex(ValueError, "missing or unexpected arms"):
+            summary("memory-tail", [r for r in records if r["arm"] != "AB1"])
+        records[-1]["settings"]["RATE"] = 1380
+        with self.assertRaisesRegex(ValueError, "unexpected memory-tail"):
+            summary("memory-tail", records)
 
     def test_reject_missing_pair_or_inconsistent_settings(self):
         records = handoff_trials()

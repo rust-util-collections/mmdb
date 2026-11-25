@@ -15,7 +15,7 @@ import subprocess
 from paced_load import load_kept
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument("suite", choices=["memory", "mixed", "handoff", "reopen"])
+parser.add_argument("suite", choices=["memory", "memory-tail", "mixed", "handoff", "reopen"])
 parser.add_argument("binary", type=Path)
 parser.add_argument("output", type=Path)
 parser.add_argument("--handoff-rates", nargs=2, type=int, metavar=("WAL_ASYNC", "WAL_SYNC"),
@@ -34,6 +34,8 @@ if args.rounds < 1 or args.ops < 1:
     parser.error("ops and rounds must be positive")
 if args.suite == "handoff" and args.candidate is None:
     parser.error("handoff requires --candidate")
+if args.suite == "memory-tail" and (args.rounds != 5 or args.ops != 20_000):
+    parser.error("memory-tail requires --ops 20000 and five rounds")
 
 binaries = {"control": args.binary.resolve()}
 if args.candidate:
@@ -150,6 +152,26 @@ def memory(out):
                    "IMMUTABLES": q, "SEED": args.seed + 1}, binary="metrics" if args.metrics else "control")
 
 
+def memory_tail(out):
+    # The two saved 30 MiB-envelope calibration rates are per stream. Keep
+    # both A/A processes independent of the A/B control, even on the same seed.
+    for i in range(1, args.rounds + 1):
+        placements = [("hot", 251), ("all", 1381)]
+        if i % 2 == 0:
+            placements.reverse()
+        for placement, rate in placements:
+            pairs = [[("A1", 4, 6), ("A2", 4, 6)], [("AB1", 4, 6), ("q2-b10", 2, 10)]]
+            pairs[i % 2].reverse()
+            if i % 2 == 0:
+                pairs.reverse()
+            for pair in pairs:
+                for arm, q, b in pair:
+                    trial(out, "memory", f"envelope-{placement}-paced", arm,
+                          {"RATE": rate, "PLACEMENT": placement, "POOL_MIB": 256, "BATCH_ENTRIES": 32,
+                           "IMMUTABLES": q, "BUFFER_MIB": b, "SECONDS": 0}, i)
+        print("memory tail round", i, flush=True)
+
+
 def mixed(out):
     kinds = list(itertools.product(["false", "true"], ["true", "false"]))
     rates = {}
@@ -219,4 +241,4 @@ with gzip.open(args.output,"xt") as output:
         meta["directory_compression"] = subprocess.check_output(
             ["btrfs", "property", "get", str(args.tmpdir), "compression"], text=True).strip()
     output.write(json.dumps({"metadata":meta})+"\n")
-    {"memory":memory,"mixed":mixed,"handoff":handoff,"reopen":reopen}[args.suite](output)
+    {"memory":memory,"memory-tail":memory_tail,"mixed":mixed,"handoff":handoff,"reopen":reopen}[args.suite](output)

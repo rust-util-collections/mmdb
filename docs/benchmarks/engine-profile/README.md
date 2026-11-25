@@ -74,6 +74,14 @@ python3 docs/benchmarks/engine-profile/run.py handoff ./control handoff.jsonl.gz
 python3 docs/benchmarks/engine-profile/run.py reopen ./control reopen.jsonl.gz --cpus 4-7 --tmpdir /path/to/scratch
 ```
 
+The focused memory p99 repeat uses the original uninstrumented binary. It compares depth 2 at 10 MiB with depth 4 at 6 MiB. The hot and all-active placements retain their respective 251 and 1,381 requests/s per stream from the 30 MiB-envelope calibration. Each seed runs an independent control/control pair and control/candidate pair in separate processes. The ordinary summarizer computes its noise against the first A/A arm and its gain against the separate A/B control.
+
+```sh
+python3 docs/benchmarks/engine-profile/run.py memory-tail ./control memory-tail-extension.jsonl.gz \
+    --cpus 4-7 --tmpdir /path/to/scratch --ops 20000 --seed 20461125
+python3 docs/benchmarks/engine-profile/summarize.py memory-tail-extension.jsonl.gz
+```
+
 Each compressed JSON-lines record contains the per-run settings, revision-
 specific binary digest in the header, success/rejection counts, outstanding
 work at the halfway point and at the end of the offered schedule, latencies

@@ -19,6 +19,8 @@ def require(condition, message):
 
 
 def expected_pairs(suite):
+    if suite == "memory-tail":
+        return {f"envelope-{placement}-paced": {"q2-b10"} for placement in ("hot", "all")}
     if suite == "handoff":
         return {f"{case}-{sync}": {"B"} for case in ("same-db", "writer", "reader", "writer-paced", "reader-paced")
                 for sync in ("false", "true")}
@@ -89,7 +91,7 @@ def check_pair(control, other):
         expected_control = MEMORY_ARMS[case.split("-", 1)[0]][0]
         for r in (control, other):
             actual = r["settings"]["IMMUTABLES"], r["settings"]["BUFFER_MIB"]
-            if r["arm"] in ("A1", "A2"):
+            if r["arm"] in ("A1", "A2", "AB1"):
                 require(actual == expected_control, f"unexpected control geometry {actual} in {case}")
             else:
                 require(r["arm"] == f"q{actual[0]}-b{actual[1]}", f"mislabelled geometry in {case}")
@@ -104,10 +106,10 @@ def check_pair(control, other):
 
 
 def guard(suite, case, label, values, gains, noise, qualified_load):
-    if suite == "memory" and label == "peak_kib":
+    if suite in ("memory", "memory-tail") and label == "peak_kib":
         return "within-1-GiB" if max(values) <= 1 << 20 else "over-1-GiB"
     primary = suite == "handoff" and case == "same-db-false" and label == "SmallPut_p99_us"
-    control = ((suite == "memory" and
+    control = ((suite in ("memory", "memory-tail") and
                 ((case.endswith("-paced") and label == "SmallPut_p99_us") or
                  (case.endswith("-saturation") and label == "user_bytes_s"))) or
                (suite == "handoff" and
@@ -180,6 +182,22 @@ def summarize(meta, records, writer):
     groups = defaultdict(lambda: defaultdict(dict))
     for record in records:
         validate_record(record)
+        if suite == "memory-tail":
+            placement = record["settings"]["PLACEMENT"]
+            expected_rate = {"hot": 251, "all": 1381}.get(placement)
+            settings = {"RATE": expected_rate, "OPS": 20_000, "SEED": meta["seed"] + record["round"],
+                        "SECONDS": 0, "BATCH_ENTRIES": 32, "POOL_MIB": 256}
+            require(meta["rounds"] == 5 and record["round"] in rounds and record["binary"] == "control"
+                    and record["mode"] == "memory" and expected_rate is not None
+                    and record["case"] == f"envelope-{placement}-paced"
+                    and record["config"]["entropy"] == "true" and record["config"]["sync"] == "false"
+                    and record["run"]["instrumented"] == "false" and record["run"]["dbs"] == 16
+                    and all(record["settings"].get(k) == v for k, v in settings.items()),
+                    "unexpected memory-tail settings, seed or round")
+            for name, count in (("SmallPut", 20_000), ("Read", 20_000), ("Batch", 320_000)):
+                values = record["classes"][name]
+                require(values["completed"] == count and sample_count(record, values) == count,
+                        f"incomplete memory-tail {name} trace")
         if record["round"]:
             group = groups[record["case"]][record["round"]]
             require(record["arm"] not in group, f"duplicate {record['case']} round {record['round']}")
@@ -206,6 +224,8 @@ def summarize(meta, records, writer):
         require(set(trials) == set(rounds), f"incomplete rounds in {case}")
         for i, trial in trials.items():
             wanted = {"A1", "A2"} | arms
+            if suite == "memory-tail":
+                wanted.add("AB1")
             if suite == "mixed" and i == 1 and "metrics" in meta["binary_sha256"]:
                 wanted.add("stage-timing")
             require(set(trial) == wanted, f"{case} round {i}, missing or unexpected arms: {set(trial) ^ wanted}")
@@ -213,34 +233,38 @@ def summarize(meta, records, writer):
             observed = []
             load_ok = []
             for i in rounds:
-                a, b, a2 = (trials[i][key] for key in ("A1", arm, "A2"))
+                trial = trials[i]
+                aa1, b, a2 = (trial[key] for key in ("A1", arm, "A2"))
+                a = trial.get("AB1", aa1)
+                if suite == "memory-tail":
+                    check_pair(aa1, a)
                 check_pair(a, b)
-                check_pair(a, a2)
-                observed.append(tuple(metrics(r) for r in (a, b, a2)))
-                load_ok.append(all(load_kept(r) for r in (a, b, a2)))
+                check_pair(aa1, a2)
+                observed.append(tuple(metrics(r) for r in (a, b, a2, aa1)))
+                load_ok.append(all(load_kept(r) for r in (a, b, a2, aa1)))
             for key in observed[0][0]:
-                triples = [(a[key], b[key], a2[key]) for a, b, a2 in observed]
-                eligible = sum(all(x is not None for x in row) for row in triples)
+                paired = [tuple(r[key] for r in runs) for runs in observed]
+                eligible = sum(all(x is not None for x in row) for row in paired)
                 columns = [""] * 9
                 reference_max = reference_budget = candidate_budget = matched_budget = ""
                 if eligible < len(rounds):
                     status = "insufficient-p99-samples" if key.endswith("_p99_us") else "undefined-denominator"
                 else:
-                    baseline, values, duplicates = zip(*triples)
-                    reference_max = round(max(max(baseline), max(duplicates)), 3)
-                    if suite == "memory" and key == "peak_kib":
+                    baseline, values, duplicates, noise_baseline = zip(*paired)
+                    reference_max = round(max(max(baseline), max(duplicates), max(noise_baseline)), 3)
+                    if suite in ("memory", "memory-tail") and key == "peak_kib":
                         budget_kib = 1 << 20
                         reference_budget = "within" if reference_max <= budget_kib else "over"
                         candidate_budget = "within" if max(values) <= budget_kib else "over"
                         matched_budget = "both-within" if reference_budget == candidate_budget == "within" else "limited"
                     columns[:2] = [round(median(baseline), 3), round(median(values), 3)]
                     columns[7:9] = [round(min(values), 3), round(max(values), 3)]
-                    if any(x == 0 for x in baseline):
+                    if 0 in baseline or 0 in noise_baseline:
                         status = "zero-reference"
                     else:
                         sign = 1 if key.endswith(("_bytes_s", "_ops_s")) else -1
                         gains = [sign * 100 * (b-a)/a for a, b in zip(baseline, values)]
-                        noise = max(100 * abs(a2-a)/a for a, a2 in zip(baseline, duplicates))
+                        noise = max(100 * abs(a2-a)/a for a, a2 in zip(noise_baseline, duplicates))
                         columns[2:7] = [round(median(gains), 3), round(noise, 3), sum(g > 0 for g in gains),
                                         round(min(gains), 3), round(max(gains), 3)]
                         status = guard(suite, case, key, values, gains, noise, all(load_ok))
