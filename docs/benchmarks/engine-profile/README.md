@@ -1,0 +1,53 @@
+# Engine workload profiles
+
+Run each arm as a separate optimized process on a local filesystem. The
+`engine_profile` bench creates temporary database directories under `TMPDIR`.
+It reports small puts, bulk writes, ordinary pinned gets, new snapshot reads
+and reads with one held snapshot as separate classes.
+
+```sh
+cargo +stable bench --bench engine_profile -- mixed
+MMDB_PROFILE_PLACEMENT=all MMDB_PROFILE_IMMUTABLES=2 cargo +stable bench --bench engine_profile -- memory
+cargo +stable bench --bench engine_profile -- reopen
+cargo +stable bench --bench engine_profile --features bench-metrics -- mixed
+```
+
+| Setting | Meaning |
+|---|---|
+| `MMDB_PROFILE_OPS`, `SEED` | Primary operations per stream and deterministic trace seed. All settings in this table use the `MMDB_PROFILE_` prefix. |
+| `RATE` | Offered scalar operations/s per foreground stream. Zero selects a closed-loop saturation run. Each worker replays its own scheduled arrivals, including arrivals while an earlier call is blocked. |
+| `PLACEMENT` | `hot` uses one DB for all traffic. For `mixed`, `split` moves the large batches to a second DB. For `memory`, `all` activates all 16 DBs sharing one pool. The `hot` memory case also opens and preloads 16 handles. |
+| `CONTROL` | `mixed` enables all streams, `writer` selects one scalar writer and `reader` one warm pinned reader. |
+| `BUFFER_MIB`, `IMMUTABLES`, `POOL_MIB` | Per-DB write-buffer size, immutable limit and the configured capacity of each evictable store in the shared pool. |
+| `ENTROPY`, `SYNC`, `SAMPLE` | Boolean switches for deterministic pseudorandom payloads, per-write WAL sync, and independent 50 ms memory/L0 sampling. The compiled `bench-metrics` feature separately enables thread-local stage clocks. |
+| `BATCH_ENTRIES`, `BATCH_RATIO` | Mixed default is 4,096 entries of 256 bytes in one batch per 128 foreground puts. Each memory worker uses 64-entry batches by default. |
+
+The 16-byte keys have an eight-byte prefix. All DBs preload 32,768 scalar
+rows, flush them and report the initial live set before timing. Scalar writes
+carry 128-byte values. Reported logical write bytes include the key and
+value. WAL and SST compression are separate from filesystem compression.
+The paired driver uses the engine's default uncompressed SST blocks.
+The reopen child writes deterministic rows, syncs the WAL and exits without
+dropping its handle. The parent measures writable open and verifies all rows.
+
+For paired runs, build each benchmark target with `--no-run`, save its
+executable at a distinct path, then invoke the matrix driver. The final line
+of Cargo's `--no-run` output identifies the executable. Use an uncompressed
+scratch directory for the entropy controls. Record any inherited filesystem
+compression setting separately from the mount options.
+
+```sh
+python3 docs/benchmarks/engine-profile/run.py mixed ./control mixed.jsonl.gz --metrics ./instrumented --cpus 4-7 --tmpdir /path/to/scratch
+python3 docs/benchmarks/engine-profile/run.py memory ./control memory.jsonl.gz --cpus 4-7 --tmpdir /path/to/scratch
+python3 docs/benchmarks/engine-profile/run.py handoff ./control handoff.jsonl.gz --candidate ./candidate --cpus 4-7 --tmpdir /path/to/scratch
+python3 docs/benchmarks/engine-profile/run.py reopen ./control reopen.jsonl.gz --cpus 4-7 --tmpdir /path/to/scratch
+```
+
+Each compressed JSON-lines record contains the per-run settings, revision-
+specific binary digest in the header, success/rejection counts, outstanding
+work at the halfway point and at the end of the offered schedule, latencies
+and memory/LSM measurements. Each trial drains its trace. Interpret p99 on
+a per-run basis and review each class's sample count. TLS counters belong
+to the worker executing a stage. A follower's wait overlaps time spent in
+another worker's WAL and apply stages. RSS includes the benchmark driver,
+preload and temporary allocations. [Decision protocol](../../proposals/mmdb-v5-execution-plan.md#4-measure-the-limiting-engine-operation)

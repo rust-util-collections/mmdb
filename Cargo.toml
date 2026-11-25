@@ -49,3 +49,7 @@ test-utils = []  # Exposes test helpers like DB::simulate_crash()
 [[bench]]
 name = "v5_profile"
 harness = false
+
+[[bench]]
+name = "engine_profile"
+harness = false
