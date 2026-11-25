@@ -1,10 +1,23 @@
-use std::{collections::BTreeMap, ffi::OsString, fs, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    fs,
+    path::Path,
+    process::Command,
+};
+
+fn directory_entries(path: &Path) -> BTreeSet<OsString> {
+    path.read_dir()
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect()
+}
 
 // Some supported OS/filesystem combinations lack an exclusive directory rename.
 // Exercise the retry path there and require publication on the Linux CI filesystem.
 fn export(source: &Path, dest: &Path, prefix_len: usize) -> bool {
     let parent = dest.parent().unwrap();
-    let original_count = parent.read_dir().unwrap().count();
+    let original_entries = directory_entries(parent);
     let mut export = Command::new(env!("CARGO_BIN_EXE_mmdb-v4-export"));
     export
         .arg(source)
@@ -24,7 +37,7 @@ fn export(source: &Path, dest: &Path, prefix_len: usize) -> bool {
         let retry = export.output().unwrap();
         assert!(!retry.status.success());
         assert_eq!(output.stderr, retry.stderr);
-        assert_eq!(parent.read_dir().unwrap().count(), original_count);
+        assert_eq!(directory_entries(parent), original_entries);
         return false;
     }
     assert!(
@@ -63,6 +76,11 @@ fn store_files(path: &Path) -> BTreeMap<OsString, Vec<u8>> {
             (entry.file_name(), fs::read(entry.path()).unwrap())
         })
         .collect()
+}
+
+fn assert_visible_rows(mut iter: v5::DBIterator, expected: &[(Vec<u8>, Vec<u8>)]) {
+    assert_eq!(iter.by_ref().collect::<Vec<_>>(), expected);
+    assert!(iter.error().is_none());
 }
 
 #[test]
@@ -147,18 +165,23 @@ fn eight_byte_prefix_shard_exports_visible_rows_and_reopens_writable() {
         assert_eq!(store_files(&dest), installed);
     }
     let writable = v5::DB::open(geometry.clone(), &dest).unwrap();
-    let mut rows = writable.iter().unwrap();
-    assert_eq!(rows.by_ref().collect::<Vec<_>>(), expected);
-    assert!(rows.error().is_none());
-    drop(rows);
+    assert_visible_rows(writable.iter().unwrap(), &expected);
     writable.put(b"map-0002/new", b"after export").unwrap();
     writable.close().unwrap();
     drop(writable);
     let reopened = v5::DB::open(geometry, &dest).unwrap();
-    assert_eq!(
-        reopened.get(b"map-0002/new").unwrap().as_deref(),
-        Some(b"after export".as_slice())
-    );
+    let mut final_rows = expected.to_vec();
+    final_rows.push((b"map-0002/new".to_vec(), b"after export".to_vec()));
+    assert_visible_rows(reopened.iter().unwrap(), &final_rows);
+    for (prefix, rows) in [
+        (b"map-0001", &final_rows[..3]),
+        (b"map-0002", &final_rows[3..]),
+    ] {
+        let iter = reopened
+            .iter_with_prefix(prefix, &v5::ReadOptions::default())
+            .unwrap();
+        assert_visible_rows(iter, rows);
+    }
 }
 
 #[test]
@@ -175,9 +198,11 @@ fn sst_read_error_leaves_destination_unpublished() {
     let mut bytes = fs::read(&file).unwrap();
     bytes[0] ^= 1;
     fs::write(&file, bytes).unwrap();
+    let damaged_files = store_files(&damaged);
+    let initial_entries = directory_entries(tmp.path());
     let dest = tmp.path().join("v5");
     let output = Command::new(env!("CARGO_BIN_EXE_mmdb-v4-export"))
-        .arg(damaged)
+        .arg(&damaged)
         .arg(&dest)
         .args(["3", "2"])
         .output()
@@ -189,6 +214,44 @@ fn sst_read_error_leaves_destination_unpublished() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!dest.exists());
+    assert_eq!(store_files(&damaged), damaged_files);
+    assert_eq!(directory_entries(tmp.path()), initial_entries);
+}
+
+#[test]
+fn export_cli_preserves_an_existing_destination_and_cleans_staging() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/v4.3.15");
+    let source_files = store_files(&source);
+    let tmp = tempfile::tempdir().unwrap();
+    let reject = |dest: &Path| {
+        let entries = directory_entries(tmp.path());
+        let output = Command::new(env!("CARGO_BIN_EXE_mmdb-v4-export"))
+            .arg(&source)
+            .arg(dest)
+            .args(["3", "2"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(store_files(&source), source_files);
+        assert_eq!(directory_entries(tmp.path()), entries);
+    };
+
+    let dest = tmp.path().join("existing");
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("marker"), b"original destination").unwrap();
+    let expected = store_files(&dest);
+    reject(&dest);
+    assert_eq!(store_files(&dest), expected);
+
+    #[cfg(unix)]
+    {
+        let link = tmp.path().join("dangling");
+        let missing = tmp.path().join("never-created");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+        reject(&link);
+        assert_eq!(fs::read_link(&link).unwrap(), missing);
+        assert!(!missing.exists());
+    }
 }
 
 #[test]

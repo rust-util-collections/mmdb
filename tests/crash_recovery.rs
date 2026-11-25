@@ -241,7 +241,7 @@ fn two_prefix_wipe_and_replacements_are_visible_together_after_wal_replay() {
         b"map-0001/gone",
         b"map-0001/row",
         b"map-0002/row",
-        b"map-0002/missing",
+        b"map-0002/z-late",
     ];
     let previous = [
         Some(b"stale".as_slice()),
@@ -261,6 +261,17 @@ fn two_prefix_wipe_and_replacements_are_visible_together_after_wal_replay() {
             assert_eq!(snapshot.get_pinned(key).unwrap().as_deref(), value);
             assert_eq!(snapshot.contains_key(key).unwrap(), value.is_some());
         }
+        for prefix in [b"map-0001", b"map-0002"] {
+            let mut iter = snapshot.iter_with_prefix(prefix).unwrap();
+            let rows: Vec<_> = keys
+                .into_iter()
+                .zip(expected)
+                .filter(|(k, _)| k.starts_with(prefix))
+                .filter_map(|(k, v)| Some((k.to_vec(), v?.to_vec())))
+                .collect();
+            assert_eq!(iter.by_ref().collect::<Vec<_>>(), rows);
+            assert!(iter.error().is_none());
+        }
     };
     check(&before, previous);
     let after = db.snapshot();
@@ -268,28 +279,50 @@ fn two_prefix_wipe_and_replacements_are_visible_together_after_wal_replay() {
     check(&after, published);
     drop(after);
     drop(before);
+    // Capture the acknowledged record boundary before adding an unfenced suffix.
+    let wals: Vec<_> = dir
+        .path()
+        .read_dir()
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|e| {
+            e.path().extension().is_some_and(|ext| ext == "wal") && e.metadata().unwrap().len() > 0
+        })
+        .collect();
+    assert_eq!(wals.len(), 1);
+    let active_name = wals[0].file_name();
+    let synced_end = wals[0].metadata().unwrap().len();
+    db.put(b"map-0002/z-late", b"unfenced").unwrap();
     db.simulate_crash();
+    let tail_end = fs::metadata(dir.path().join(&active_name)).unwrap().len();
+    assert!(tail_end > synced_end);
 
-    // A second image cuts the batch during its append. All three edits must
-    // replay together or all disappear, even though they span two prefixes.
-    let interrupted = tempfile::tempdir().unwrap();
-    let mut nonempty_wals = 0;
-    for entry in dir.path().read_dir().unwrap() {
-        let entry = entry.unwrap();
-        let dest = interrupted.path().join(entry.file_name());
-        let len = fs::copy(entry.path(), &dest).unwrap();
-        if dest.extension().is_some_and(|ext| ext == "wal") && len > 0 {
-            fs::OpenOptions::new()
-                .write(true)
-                .open(&dest)
-                .unwrap()
-                .set_len(len - 1)
-                .unwrap();
-            nonempty_wals += 1;
+    // Distinct interrupted appends: before the mixed batch was acknowledged,
+    // and during the later WalAsync record after that batch was acknowledged.
+    let interrupted_batch = tempfile::tempdir().unwrap();
+    let interrupted_suffix = tempfile::tempdir().unwrap();
+    for (tmp, cutoff) in [
+        (&interrupted_batch, synced_end - 1),
+        (&interrupted_suffix, tail_end - 1),
+    ] {
+        for entry in dir.path().read_dir().unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), tmp.path().join(entry.file_name())).unwrap();
         }
+        fs::OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join(&active_name))
+            .unwrap()
+            .set_len(cutoff)
+            .unwrap();
     }
-    assert_eq!(nonempty_wals, 1);
-    for (path, state) in [(interrupted.path(), previous), (dir.path(), published)] {
+    let mut complete = published;
+    complete[3] = Some(b"unfenced");
+    for (path, state) in [
+        (interrupted_batch.path(), previous),
+        (interrupted_suffix.path(), published),
+        (dir.path(), complete),
+    ] {
         let read_only = DB::open_read_only(path).unwrap();
         check(&read_only.snapshot(), state);
         read_only.close().unwrap();
