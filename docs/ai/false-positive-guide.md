@@ -17,8 +17,10 @@ Trace `MutexGuard`/`RwLockGuard` to end of scope or `drop`.
 ## FP-3: ArcSwap snapshot staleness & view-before-sequence pinning
 
 **Skip:** `super_version.load()` lagging a concurrent flush/compaction — by design.
-`ReadState::point_lookup` and `scan` pin `SuperVersion` *before* `Acquire`-loading
-`committed_sequence`, and `FlushContext::flush` keeps `oldest` in
+`ReadState::point_lookup`, `grouped_point_lookup` and `scan` pin `SuperVersion`
+before resolving visibility. A latest read loads `committed_sequence` with
+`Acquire`. One group uses the same view and sequence for all of its slots.
+`FlushContext::flush` keeps `oldest` in
 `immutable_memtables` until *after* `confirm_manifest_durable`, so memtable
 tombstone early-exit (`tomb_seq > 0`) never misses newly installed L0 SSTs.
 **Keep:** `SuperVersion` used for a latest-state mutation decision without

@@ -26,7 +26,13 @@ possible MANIFEST rotation, runs under `inner`.
 
 ## Invariants
 
-**CC1 View-before-sequence read barrier** — `ReadState::point_lookup` and `scan` load `SuperVersion` *before* loading `committed_sequence` (`Ordering::Acquire`), while writers store `committed_sequence` (`Ordering::Release`) only after all MemTable inserts finish. Prevents compaction GC from dropping versions below a newly observed sequence before the reader pins `SuperVersion`.
+**CC1 View-before-sequence read barrier** — `ReadState::point_lookup`,
+`grouped_point_lookup` and `scan` pin the `SuperVersion` before resolving
+visibility. A latest read loads `committed_sequence` with `Acquire`. An
+explicit snapshot supplies its checked sequence. The grouped lookup uses
+one view and sequence for every slot, including duplicates. Writers publish
+the sequence with `Release` after all memtable inserts. The pinned view
+keeps the reader's sources alive through concurrent compaction.
 
 **CC2 Group commit & post-commit boundary** — cap batch groups by `MAX_WRITE_BATCH_GROUP_BYTES` (always admitting entry 0), reserve contiguous sequences, append vectored WAL records in group order (`DisableWal` skipped; a fence with an outstanding target requires `sync_data()` even with 0 ops), `sync_data()` / `flush()`, insert into `active_memtable` in the same order, publish `committed_sequence` (`Release`), and advance `synced_wal_seq` on sync. Once `committed_sequence` is published, any post-commit failure (`append_error` on later batches or `submit_active()` auto-freeze error) must still return `Ok(())` to already-committed callers while latching fail-stop for subsequent calls.
 

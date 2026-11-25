@@ -127,7 +127,8 @@ hunk), skip the probe and trace coverage statically, saying so in the report.
    `LevelIterator` / `TableIterator` / `MergingIterator`, point-index
    (`partitions` / `index_leaf_block` / `find_data_block`) vs range-tombstone
    (`range_partitions` / `visit_ranges` / `covering_sequence`) leaves, `get` /
-   `get_pinned` / `contains_key` and `Snapshot` / `ArcSnapshot`,
+   `get_pinned` / `contains_key` on scalar paths, `DB::get_many_pinned` /
+   `get_many_pinned_with_options` on grouped paths, and `Snapshot` / `ArcSnapshot`,
    `WalAsync` / `WalSync` / `DisableWal` + `sync_wal()` (`WalFence`), explicit
    `flush()` vs `write_batch_group` auto-freeze, `FlushQueue::run` vs
    `set_bg_error` vs compaction `set_error`, `confirm_manifest_durable` vs
