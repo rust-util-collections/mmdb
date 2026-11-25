@@ -52,7 +52,7 @@ None.
 ### write path: `close`/`compact_range`/stop-drain holding `write_queue` across install can deadlock a group-commit leader
 - **Where**: `src/db.rs` (`close`, `compact_range`, `maybe_throttle_writes`, `wait_for_write_leader_idle`)
 - **Claim**: The new `wait_for_write_leader_idle` barrier could deadlock against a leader that needs `write_queue` to finish, or against `prune_settled_dead_keys` re-acquiring it.
-- **Reason**: The wait predicate is `leader_active`, which a leader clears only after re-acquiring `write_queue` in `write_batch_group`'s completion step and calling `write_cv.notify_all()` — so the waiter is always woken. `maybe_throttle_writes` runs before the caller enqueues or becomes leader, and every `prune_settled_dead_keys` call site (`flush`, `compact`, `compact_range`, the leader's post-wake harvest) releases the guard first, so no path re-enters the non-reentrant mutex while holding it.
+- **Reason**: The wait predicate is `leader_active`, which a leader clears only after re-acquiring `write_queue` in `enqueue_write`'s completion step (or `flush_generation` / `WriteLeaderGuard`) and calling `write_cv.notify_all()` — so the waiter is always woken. `maybe_throttle_writes` runs before the caller enqueues or becomes leader, and every `prune_settled_dead_keys` call site (`flush`, `compact`, `compact_range`, the leader's post-wake harvest) releases the guard first, so no path re-enters the non-reentrant mutex while holding it.
 
 ### WAL: `WalWriter` needs a `Drop` impl to avoid losing buffered records
 - **Where**: `src/wal/writer.rs`

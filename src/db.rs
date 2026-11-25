@@ -54,8 +54,8 @@ use crate::sst::table_builder::{
 use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
 use crate::types::{
-    self, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex,
-    tombstone_overlaps_bounds,
+    self, MAX_RANGE_DELETE_SIZE, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE,
+    SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex, tombstone_overlaps_bounds,
 };
 use crate::wal::{WalReader, WalWriter};
 use crate::{PinnedSlice, options::IterConfig};
@@ -984,7 +984,7 @@ impl DB {
 
         // Open or create VersionSet (handles MANIFEST)
         let mut versions = if read_only {
-            VersionSet::recover_read_only_with_cache(&path, Some(table_cache.clone())).ctx()?
+            VersionSet::recover_db_read_only_with_cache(&path, Some(table_cache.clone())).ctx()?
         } else if path.join("CURRENT").try_exists().ctx()? {
             // A competing creator may have finished between preflight and LOCK.
             if options.error_if_exists {
@@ -993,7 +993,7 @@ impl DB {
                     path.display()
                 )));
             }
-            VersionSet::recover_with_cache(
+            VersionSet::recover_db_with_cache(
                 &path,
                 options.num_levels,
                 options.prefix_len,
@@ -1039,10 +1039,11 @@ impl DB {
             let entry = entry.ctx()?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // Track the highest file number present on disk across WAL/SST files.
+            // Track the highest file number present on disk across WAL/SST/MANIFEST files.
             if let Some(num) = name
                 .strip_suffix(".wal")
                 .or_else(|| name.strip_suffix(".sst"))
+                .or_else(|| name.strip_prefix("MANIFEST-"))
                 .and_then(|s| s.parse::<u64>().ok())
             {
                 max_disk_file_number = max_disk_file_number.max(num);
@@ -1100,14 +1101,20 @@ impl DB {
             *mem = Arc::new(MemTable::new());
             Ok(())
         };
+        let mut last_wal_seq = 0u64;
         for wal_num in &wal_numbers {
             let wal_path = path.join(format!("{:06}.wal", wal_num));
             let mut reader = WalReader::new(&wal_path).ctx()?;
             loop {
                 match reader.read_record() {
                     Ok(Some(data)) => {
-                        Self::replay_wal_record(&data, &active_memtable, &mut max_sequence)
-                            .ctx()?;
+                        Self::replay_wal_record(
+                            &data,
+                            &active_memtable,
+                            &mut last_wal_seq,
+                            &mut max_sequence,
+                        )
+                        .ctx()?;
                         if !read_only
                             && active_memtable.approximate_size() >= options.write_buffer_size
                         {
@@ -3659,7 +3666,12 @@ impl DB {
         }
     }
 
-    fn replay_wal_record(data: &[u8], mem: &MemTable, max_sequence: &mut u64) -> Result<()> {
+    fn replay_wal_record(
+        data: &[u8],
+        mem: &MemTable,
+        last_wal_seq: &mut u64,
+        max_sequence: &mut u64,
+    ) -> Result<()> {
         if data.len() < 12 {
             return Err(Error::corruption(format!(
                 "WAL record too short: {} bytes",
@@ -3668,6 +3680,15 @@ impl DB {
         }
         let seq = u64::from_le_bytes(data[0..8].try_into().unwrap());
         let count = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        if count == 0 {
+            return Err(Error::corruption("WAL batch record has zero entries"));
+        }
+        if seq == 0 || seq <= *last_wal_seq {
+            return Err(Error::corruption(format!(
+                "WAL record sequence {seq} is not strictly greater than previous sequence {}",
+                *last_wal_seq
+            )));
+        }
         let mut offset = 12;
 
         for i in 0..count {
@@ -3686,46 +3707,62 @@ impl DB {
                     entry_seq, MAX_SEQUENCE_NUMBER
                 )));
             }
-            *max_sequence = (*max_sequence).max(entry_seq);
 
             let vt = data[offset];
             offset += 1;
-            if offset + 4 > data.len() {
+            let key_len_end = offset
+                .checked_add(4)
+                .filter(|&end| end <= data.len())
+                .ok_or_else(|| {
+                    Error::corruption(format!(
+                        "WAL record truncated reading key length at entry {i}"
+                    ))
+                })?;
+            let key_len =
+                u32::from_le_bytes(data[offset..key_len_end].try_into().unwrap()) as usize;
+            offset = key_len_end;
+            let key_end = offset
+                .checked_add(key_len)
+                .filter(|&end| end <= data.len())
+                .ok_or_else(|| {
+                    Error::corruption(format!("WAL record truncated reading key at entry {i}"))
+                })?;
+            if key_len > MAX_USER_KEY_SIZE {
                 return Err(Error::corruption(format!(
-                    "WAL record truncated reading key length at entry {}",
-                    i
+                    "WAL record key length {key_len} exceeds maximum {MAX_USER_KEY_SIZE}"
                 )));
             }
-            let key_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            offset += 4;
-            if offset + key_len > data.len() {
-                return Err(Error::corruption(format!(
-                    "WAL record truncated reading key at entry {}",
-                    i
-                )));
-            }
-            let key = &data[offset..offset + key_len];
-            offset += key_len;
+            let key = &data[offset..key_end];
+            offset = key_end;
 
             match ValueType::from_u8(vt) {
                 Some(ValueType::Value) => {
-                    if offset + 4 > data.len() {
-                        return Err(Error::corruption(format!(
-                            "WAL record truncated reading value length at entry {}",
-                            i
-                        )));
-                    }
+                    let val_len_end = offset
+                        .checked_add(4)
+                        .filter(|&end| end <= data.len())
+                        .ok_or_else(|| {
+                            Error::corruption(format!(
+                                "WAL record truncated reading value length at entry {i}"
+                            ))
+                        })?;
                     let val_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    if offset + val_len > data.len() {
+                        u32::from_le_bytes(data[offset..val_len_end].try_into().unwrap()) as usize;
+                    offset = val_len_end;
+                    let val_end = offset
+                        .checked_add(val_len)
+                        .filter(|&end| end <= data.len())
+                        .ok_or_else(|| {
+                            Error::corruption(format!(
+                                "WAL record truncated reading value at entry {i}"
+                            ))
+                        })?;
+                    if key_len.saturating_add(val_len) > MAX_WRITE_ENTRY_SIZE {
                         return Err(Error::corruption(format!(
-                            "WAL record truncated reading value at entry {}",
-                            i
+                            "WAL record entry size exceeds maximum {MAX_WRITE_ENTRY_SIZE}"
                         )));
                     }
-                    let value = &data[offset..offset + val_len];
-                    offset += val_len;
+                    let value = &data[offset..val_end];
+                    offset = val_end;
                     mem.put(key, value, entry_seq, ValueType::Value);
                 }
                 Some(ValueType::Deletion) => {
@@ -3733,23 +3770,39 @@ impl DB {
                 }
                 Some(ValueType::RangeDeletion) => {
                     // RangeDeletion: value is the end key
-                    if offset + 4 > data.len() {
-                        return Err(Error::corruption(format!(
-                            "WAL record truncated reading range-del end key length at entry {}",
-                            i
-                        )));
-                    }
+                    let val_len_end = offset
+                        .checked_add(4)
+                        .filter(|&end| end <= data.len())
+                        .ok_or_else(|| {
+                            Error::corruption(format!(
+                                "WAL record truncated reading range-del end key length at entry {i}"
+                            ))
+                        })?;
                     let val_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    if offset + val_len > data.len() {
+                        u32::from_le_bytes(data[offset..val_len_end].try_into().unwrap()) as usize;
+                    offset = val_len_end;
+                    let val_end = offset
+                        .checked_add(val_len)
+                        .filter(|&end| end <= data.len())
+                        .ok_or_else(|| {
+                            Error::corruption(format!(
+                                "WAL record truncated reading range-del end key at entry {i}"
+                            ))
+                        })?;
+                    if val_len > MAX_USER_KEY_SIZE
+                        || key_len.saturating_add(val_len) > MAX_RANGE_DELETE_SIZE
+                    {
                         return Err(Error::corruption(format!(
-                            "WAL record truncated reading range-del end key at entry {}",
-                            i
+                            "WAL range deletion size exceeds maximum {MAX_RANGE_DELETE_SIZE}"
                         )));
                     }
-                    let value = &data[offset..offset + val_len];
-                    offset += val_len;
+                    let value = &data[offset..val_end];
+                    if key >= value {
+                        return Err(Error::corruption(
+                            "WAL range deletion has empty or inverted bounds",
+                        ));
+                    }
+                    offset = val_end;
                     mem.put(key, value, entry_seq, ValueType::RangeDeletion);
                 }
                 None => {
@@ -3759,6 +3812,8 @@ impl DB {
                     )));
                 }
             }
+            *last_wal_seq = entry_seq;
+            *max_sequence = (*max_sequence).max(entry_seq);
         }
         if offset != data.len() {
             return Err(Error::corruption(format!(
@@ -6658,5 +6713,102 @@ mod tests {
             .unwrap()
             .count();
         assert_eq!(aa_count, 200);
+    }
+
+    #[test]
+    fn recovery_rejects_malformed_wal_batch_headers_and_entries() {
+        // 1. Valid post-ingest_sorted active WAL (where MANIFEST last_sequence > first WAL seq)
+        //    must still recover cleanly.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let db = open_test_db(dir.path());
+            db.put_with_options(
+                &WriteOptions::default().with_durability(DurabilityMode::WalSync),
+                b"m",
+                b"1",
+            )
+            .unwrap();
+            assert_eq!(db.ingest_sorted([(b"z", b"2")]).unwrap(), 1);
+            db.put_with_options(
+                &WriteOptions::default().with_durability(DurabilityMode::WalSync),
+                b"n",
+                b"3",
+            )
+            .unwrap();
+            db.simulate_crash();
+
+            let reopened = open_test_db(dir.path());
+            assert_eq!(reopened.get(b"m").unwrap(), Some(b"1".to_vec()));
+            assert_eq!(reopened.get(b"z").unwrap(), Some(b"2".to_vec()));
+            assert_eq!(reopened.get(b"n").unwrap(), Some(b"3".to_vec()));
+        }
+
+        // 2. Malformed WAL batch records fail closed with ErrorKind::Corruption
+        //    in both open_read_only and writable open while preserving WAL bytes.
+        let mut dup_b1 = WriteBatch::new();
+        dup_b1.put(b"k", b"v1");
+        let mut dup_b2 = WriteBatch::new();
+        dup_b2.put(b"k", b"v2");
+        let dup_records = vec![
+            [dup_b1.wal_header(1).as_slice(), &dup_b1.payload].concat(),
+            [dup_b2.wal_header(1).as_slice(), &dup_b2.payload].concat(),
+        ];
+
+        let mut zero_count = Vec::new();
+        zero_count.extend_from_slice(&1u64.to_le_bytes());
+        zero_count.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut zero_seq = Vec::new();
+        zero_seq.extend_from_slice(&0u64.to_le_bytes());
+        zero_seq.extend_from_slice(&1u32.to_le_bytes());
+        zero_seq.push(ValueType::Deletion as u8);
+        zero_seq.extend_from_slice(&1u32.to_le_bytes());
+        zero_seq.push(b'k');
+
+        let mut inverted_range = Vec::new();
+        inverted_range.extend_from_slice(&1u64.to_le_bytes());
+        inverted_range.extend_from_slice(&1u32.to_le_bytes());
+        inverted_range.push(ValueType::RangeDeletion as u8);
+        inverted_range.extend_from_slice(&1u32.to_le_bytes());
+        inverted_range.push(b'z');
+        inverted_range.extend_from_slice(&1u32.to_le_bytes());
+        inverted_range.push(b'a');
+
+        let big_key_len = (MAX_USER_KEY_SIZE + 1) as u32;
+        let mut oversized_key = Vec::with_capacity(17 + MAX_USER_KEY_SIZE + 1);
+        oversized_key.extend_from_slice(&1u64.to_le_bytes());
+        oversized_key.extend_from_slice(&1u32.to_le_bytes());
+        oversized_key.push(ValueType::Deletion as u8);
+        oversized_key.extend_from_slice(&big_key_len.to_le_bytes());
+        oversized_key.resize(oversized_key.len() + big_key_len as usize, b'x');
+
+        for records in [
+            dup_records,
+            vec![zero_count],
+            vec![zero_seq],
+            vec![inverted_range],
+            vec![oversized_key],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = open_test_db(dir.path());
+            let wal_path = {
+                let mut inner = db.inner.lock();
+                let wal = inner.wal_writer.as_mut().unwrap();
+                for rec in &records {
+                    wal.add_record(rec).unwrap();
+                }
+                wal.sync().unwrap();
+                dir.path().join(format!("{:06}.wal", inner.wal_number))
+            };
+            db.simulate_crash();
+            let before = fs::read(&wal_path).unwrap();
+            for result in [
+                DB::open_read_only(dir.path()),
+                DB::open(DbOptions::default(), dir.path()),
+            ] {
+                assert_eq!(result.err().unwrap().kind(), ErrorKind::Corruption);
+                assert_eq!(fs::read(&wal_path).unwrap(), before);
+            }
+        }
     }
 }

@@ -361,7 +361,8 @@ impl VersionSet {
         Self::recover_with_cache(db_path, num_levels, 0, None)
     }
 
-    /// Recover with an optional table cache.
+    /// Recover with an optional table cache (unit-test helper without DB WAL floor).
+    #[cfg(test)]
     pub fn recover_with_cache(
         db_path: &Path,
         num_levels: usize,
@@ -372,22 +373,48 @@ impl VersionSet {
             db_path,
             Some(DBHeader::new(num_levels, prefix_len)?),
             table_cache,
+            false,
+        )
+    }
+
+    /// Recover a database store's VersionSet, enforcing DB-level WAL floor invariants.
+    pub fn recover_db_with_cache(
+        db_path: &Path,
+        num_levels: usize,
+        prefix_len: usize,
+        table_cache: Option<Arc<TableCache>>,
+    ) -> Result<Self> {
+        Self::recover_with_cache_mode(
+            db_path,
+            Some(DBHeader::new(num_levels, prefix_len)?),
+            table_cache,
+            true,
         )
     }
 
     /// Recover an existing VersionSet without opening or repairing its
-    /// MANIFEST for append.
+    /// MANIFEST for append (unit-test helper without DB WAL floor).
+    #[cfg(test)]
     pub fn recover_read_only_with_cache(
         db_path: &Path,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
-        Self::recover_with_cache_mode(db_path, None, table_cache)
+        Self::recover_with_cache_mode(db_path, None, table_cache, false)
+    }
+
+    /// Recover an existing database store's VersionSet read-only, enforcing DB-level WAL floor invariants.
+    pub fn recover_db_read_only_with_cache(
+        db_path: &Path,
+        table_cache: Option<Arc<TableCache>>,
+    ) -> Result<Self> {
+        Self::recover_with_cache_mode(db_path, None, table_cache, true)
     }
 
     fn recover_with_cache_mode(
         db_path: &Path,
         requested: Option<DBHeader>,
         table_cache: Option<Arc<TableCache>>,
+        enforce_db_wal_floor: bool,
     ) -> Result<Self> {
         // Read CURRENT to find manifest file
         let current_path = db_path.join("CURRENT");
@@ -414,7 +441,10 @@ impl VersionSet {
             )));
         }
         let num_levels = header.levels as usize;
-        let mut next_file_number = 2u64;
+        let mut next_file_number = manifest_number
+            .checked_add(1)
+            .ok_or_else(|| Error::corruption("MANIFEST file number overflows allocator"))?
+            .max(2);
         let mut log_number = 0u64;
         let mut last_sequence = 0u64;
 
@@ -453,6 +483,16 @@ impl VersionSet {
                 next_file_number = next_file_number.max(n);
             }
             if let Some(n) = edit.log_number {
+                if n < log_number {
+                    return Err(Error::corruption(format!(
+                        "MANIFEST log_number regressed from {} to {}",
+                        log_number, n
+                    )));
+                }
+                let after_log = n
+                    .checked_add(1)
+                    .ok_or_else(|| Error::corruption("MANIFEST log_number overflows allocator"))?;
+                next_file_number = next_file_number.max(after_log);
                 log_number = n;
             }
             // Same forward-only rule: a regressed sequence would make new
@@ -513,12 +553,42 @@ impl VersionSet {
                         meta.number
                     )));
                 }
+                let after_sst = meta.number.checked_add(1).ok_or_else(|| {
+                    Error::corruption("MANIFEST SST file number overflows allocator")
+                })?;
+                next_file_number = next_file_number.max(after_sst);
                 if let Some((prev_level, _)) = live_files.insert(meta.number, (level, meta.clone()))
                 {
                     return Err(Error::corruption(format!(
                         "MANIFEST adds SST {} at level {} but it is already live at level {}",
                         meta.number, level, prev_level
                     )));
+                }
+            }
+        }
+
+        if edits_replayed == 0 {
+            return Err(Error::corruption("MANIFEST contains no version edits"));
+        }
+        if enforce_db_wal_floor && log_number == 0 && live_files.is_empty() {
+            if last_sequence != 0 {
+                return Err(Error::corruption(
+                    "MANIFEST has zero log_number alongside persisted DB state",
+                ));
+            }
+            for entry in fs::read_dir(db_path).with_ctx(|| "reading DB directory")? {
+                let entry = entry.with_ctx(|| "reading DB directory entry")?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".sst") {
+                    return Err(Error::corruption(
+                        "MANIFEST has zero log_number alongside existing SST files",
+                    ));
+                }
+                if name.ends_with(".wal") && entry.metadata().with_ctx(|| "stat WAL")?.len() > 0 {
+                    return Err(Error::corruption(
+                        "MANIFEST has zero log_number alongside non-empty WAL",
+                    ));
                 }
             }
         }
@@ -593,6 +663,11 @@ impl VersionSet {
             return Err(Error::read_only());
         }
         check_manifest_poison(&self.poisoned)?;
+        if edit.log_number == Some(u64::MAX) {
+            return Err(Error::corruption(
+                "VersionEdit log_number overflows allocator",
+            ));
+        }
 
         // Build new version from current + edit FIRST, before persisting.
         // This ensures that if an SST fails to open, the MANIFEST is not
@@ -645,6 +720,11 @@ impl VersionSet {
                     meta.number, level, self.num_levels
                 )));
             }
+            if meta.number == u64::MAX {
+                return Err(Error::corruption(
+                    "VersionEdit SST number overflows allocator",
+                ));
+            }
             if !live_numbers.insert(meta.number) {
                 return Err(Error::corruption(format!(
                     "VersionEdit adds SST {} at level {} but it is already live",
@@ -680,6 +760,13 @@ impl VersionSet {
         {
             let mut w = self.manifest_writer.lock();
             check_manifest_poison(&self.poisoned)?;
+            if let Some(n) = edit.log_number
+                && (n == u64::MAX || n < self.log_number)
+            {
+                return Err(Error::corruption(
+                    "VersionEdit log_number overflows allocator or regressed",
+                ));
+            }
             if let Some(ref mut writer) = *w
                 && let Err(e) = writer.add_record(&encoded)
             {
@@ -702,7 +789,11 @@ impl VersionSet {
             self.file_numbers.advance_to(n);
         }
         if let Some(n) = edit.log_number {
+            self.file_numbers.advance_to(n + 1);
             self.log_number = n;
+        }
+        for (_, meta) in &edit.new_files {
+            self.file_numbers.advance_to(meta.number + 1);
         }
         // Forward-only for the same reason: a stale lower sequence would let
         // newly-assigned sequence numbers collide with already-committed
@@ -1905,5 +1996,83 @@ mod tests {
                 ErrorKind::Background
             );
         });
+    }
+
+    #[test]
+    fn recovery_rejects_manifest_without_version_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        vs.edits_since_snapshot = 1000;
+        vs.maybe_compact_manifest();
+        let manifest = path.join(format!("MANIFEST-{:06}", vs.manifest_number()));
+        drop(vs);
+
+        let full = fs::read(&manifest).unwrap();
+        // Record #0 is 7-byte WAL header + 16-byte DBHeader = 23 bytes.
+        for truncated_len in [23usize, full.len() - 4] {
+            fs::write(&manifest, &full[..truncated_len]).unwrap();
+            let before = fs::read(&manifest).unwrap();
+            for result in [
+                VersionSet::recover_read_only_with_cache(path, None),
+                VersionSet::recover(path, 7),
+            ] {
+                assert_eq!(result.err().unwrap().kind(), ErrorKind::Corruption);
+                assert_eq!(fs::read(&manifest).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn file_numbers_advance_past_manifest_log_and_sst_numbers() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let manifest_path = path.join("MANIFEST-000010");
+        let sst_meta = {
+            let mut b =
+                TableBuilder::new(&path.join("000012.sst"), TableBuildOptions::default()).unwrap();
+            let ik = InternalKey::new(b"a", 1, ValueType::Value);
+            b.add(ik.as_bytes(), b"va").unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 12,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+
+        let mut writer = WalWriter::new(&manifest_path).unwrap();
+        writer
+            .add_record(&DBHeader::new(7, 0).unwrap().encode())
+            .unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_log_number(8);
+        edit.set_last_sequence(1);
+        // Deliberately omit `next_file_number` (or leave it stale below 10/12).
+        edit.set_next_file_number(4);
+        edit.add_file(1, sst_meta);
+        writer.add_record(&edit.encode()).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        fs::write(path.join("CURRENT"), b"MANIFEST-000010\n").unwrap();
+
+        let mut vs = VersionSet::recover(path, 7).unwrap();
+        assert!(vs.next_file_number() >= 13);
+        vs.edits_since_snapshot = 1000;
+        let mut meta_edit = VersionEdit::new();
+        meta_edit.set_log_number(20);
+        vs.apply_metadata(meta_edit).unwrap();
+        assert!(vs.next_file_number() >= 21);
+        let active_manifest = path.join(format!("MANIFEST-{:06}", vs.manifest_number()));
+        assert!(active_manifest.exists());
+        drop(vs);
+
+        let reopened = VersionSet::recover(path, 7).unwrap();
+        assert_eq!(reopened.current().total_files(), 1);
     }
 }
