@@ -64,7 +64,7 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 
 Guides live under `docs/ai/patterns/`. Map `tests/**` (`crash_recovery`,
 `integration`, `e2e_scenarios`, `proptest_db`, `bidi_debug`, `lazy_delete`,
-`shared_cache`, `read_only`, `arena_miri`), `benches/**`, `examples/**`,
+`shared_cache`, `grouped_reads`, `read_only`, `arena_miri`), `benches/**`, `examples/**`,
 CI/Makefile/`.gitignore`, public docs, `.agents/**`, and `docs/ai/**` to the
 subsystems they exercise or document and verify contract alignment.
 

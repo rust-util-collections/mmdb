@@ -107,6 +107,7 @@ cargo +stable test --test proptest_db
 cargo +stable test --test bidi_debug
 cargo +stable test --test lazy_delete
 cargo +stable test --test shared_cache
+cargo +stable test --test grouped_reads
 cargo +stable test --test read_only
 CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml
 ```

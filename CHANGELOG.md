@@ -2,6 +2,10 @@
 
 ## Unreleased v5
 
+- `DB::get_many_pinned` and `get_many_pinned_with_options` return one
+  ordered slot per input key at a single database view and sequence.
+  Requests accept up to 32 keys and can reuse validated SST blocks.
+
 - A valid nonempty write with `no_slowdown` reports `ErrorKind::Busy` on
   transient L0 or immutable-queue pressure. A refusal appends no WAL record
   and assigns no sequence to that batch.

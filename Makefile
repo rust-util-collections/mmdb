@@ -40,6 +40,7 @@ ci:
 	cargo test --test bidi_debug
 	cargo test --test lazy_delete
 	cargo test --test shared_cache
+	cargo test --test grouped_reads
 	cargo test --test read_only
 	CI=1 cargo test --manifest-path tools/v4-export/Cargo.toml
 
