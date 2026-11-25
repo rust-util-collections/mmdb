@@ -5,6 +5,7 @@
 //!
 //! After compaction, the old files are deleted and new files are installed.
 
+use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, remove_file};
 use std::path::Path;
@@ -22,7 +23,7 @@ use crate::error::{Error, Result, ResultExt};
 use crate::iterator::merge::{IterSource, MergingIterator};
 use crate::iterator::range_del::RangeTombstoneTracker;
 use crate::manifest::file_numbers::{FileNumbers, PendingSsts};
-use crate::manifest::version::{TableFile, Version};
+use crate::manifest::version::{LevelFiles, TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::manifest::version_set::{DirSynced, VersionSet, sync_new_sst_parent_dir};
 use crate::options::{CompactionFilterDecision, DbOptions};
@@ -75,6 +76,9 @@ pub struct CompactionTask {
     pub input_files_level: Vec<TableFile>,
     /// Files from the target level (empty for in-place bottommost rewrites).
     pub input_files_next: Vec<TableFile>,
+    /// Unselected disjoint deeper levels (`L1+`), when `input_files_level` and
+    /// `input_files_next` cover all overlapping files in `0..=target_level`.
+    pub(crate) deeper_disjoint_levels: Option<Vec<Arc<LevelFiles>>>,
 }
 
 /// Range tombstone user-key extents `[begin, end)` written to each output
@@ -288,10 +292,36 @@ struct SubCompactionTask {
 struct SubCompactionParams<'a> {
     target_level: usize,
     is_bottommost: bool,
+    deeper_disjoint_levels: Option<&'a [Arc<LevelFiles>]>,
     build_opts: &'a TableBuildOptions,
     oldest_snapshot_seq: SequenceNumber,
     pending: &'a PendingSsts<'a>,
     range_fragments: &'a [RangeFragment],
+}
+
+fn key_exists_in_disjoint_levels(
+    levels: &[Arc<LevelFiles>],
+    target_user_key: &[u8],
+) -> Result<bool> {
+    for files in levels {
+        let end = files.partition_point(|f| user_key(&f.meta.smallest_key) <= target_user_key);
+        for file in &files[end.saturating_sub(1)..end] {
+            if target_user_key < user_key(&file.meta.smallest_key)
+                || target_user_key > user_key(&file.meta.largest_key)
+            {
+                continue;
+            }
+            if file
+                .reader
+                .point_value::<usize>(target_user_key, MAX_SEQUENCE_NUMBER, false)
+                .ctx()?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Output of a single sub-compaction (new files only; deletions handled by orchestrator).
@@ -541,6 +571,7 @@ fn execute_sub_compaction_io(
     let mut carry = Vec::new();
     let mut pending_cut = false;
     let mut last_point_key: Option<Vec<u8>> = None;
+    let mut prev_raw_trailer: u64 = 0;
     let mut last_written_seq: SequenceNumber = 0;
     let mut snapshot_idx: usize = ctx.active_snapshots.len();
     let mut filter_mutated = false;
@@ -569,9 +600,30 @@ fn execute_sub_compaction_io(
             if vt == ValueType::RangeDeletion {
                 return Err(Error::corruption("range deletion in point data block"));
             }
-            if let Some(ref last) = last_point_key
-                && last.as_slice() == user_key
-            {
+            let cur_trailer = u64::from_be_bytes(ikey[ikey.len() - 8..].try_into().unwrap());
+            let same_user_key = if let Some(ref prev_uk) = last_point_key {
+                match prev_uk.as_slice().cmp(user_key) {
+                    CmpOrdering::Greater => {
+                        return Err(Error::corruption("unordered point keys in SST data block"));
+                    }
+                    CmpOrdering::Equal => {
+                        if prev_raw_trailer > cur_trailer {
+                            return Err(Error::corruption(
+                                "unordered point keys in SST data block",
+                            ));
+                        }
+                        true
+                    }
+                    CmpOrdering::Less => false,
+                }
+            } else {
+                if sub.lower_bound.as_deref().is_some_and(|lo| user_key < lo) {
+                    return Err(Error::corruption("unordered point keys in SST data block"));
+                }
+                false
+            };
+            prev_raw_trailer = cur_trailer;
+            if same_user_key {
                 while snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= last_written_seq
                 {
                     snapshot_idx -= 1;
@@ -594,7 +646,9 @@ fn execute_sub_compaction_io(
                     continue;
                 }
             } else {
-                last_point_key = Some(user_key.to_vec());
+                let buf = last_point_key.get_or_insert_with(Vec::new);
+                buf.clear();
+                buf.extend_from_slice(user_key);
                 last_written_seq = entry_seq;
                 snapshot_idx = ctx.active_snapshots.len();
 
@@ -616,8 +670,9 @@ fn execute_sub_compaction_io(
                 }
             }
 
-            // Apply compaction filter
-            if params.is_bottommost
+            // Apply compaction filter when bottommost across the entire file range,
+            // or per-key bottommost when no deeper unselected file contains `user_key`.
+            if (params.is_bottommost || params.deeper_disjoint_levels.is_some())
                 && ctx.active_snapshots.is_empty()
                 && let Some(ref filter) = ctx.options.compaction_filter
                 && vt == ValueType::Value
@@ -625,12 +680,26 @@ fn execute_sub_compaction_io(
                 match filter.filter(params.target_level, user_key, final_value.as_slice()) {
                     CompactionFilterDecision::Keep => {}
                     CompactionFilterDecision::Remove => {
-                        filter_mutated = true;
-                        continue;
+                        let key_bottommost = params.is_bottommost
+                            || !key_exists_in_disjoint_levels(
+                                params.deeper_disjoint_levels.unwrap(),
+                                user_key,
+                            )?;
+                        if key_bottommost {
+                            filter_mutated = true;
+                            continue;
+                        }
                     }
                     CompactionFilterDecision::ChangeValue(new_val) => {
-                        filter_mutated = true;
-                        *final_value = LazyValue::Inline(new_val);
+                        let key_bottommost = params.is_bottommost
+                            || !key_exists_in_disjoint_levels(
+                                params.deeper_disjoint_levels.unwrap(),
+                                user_key,
+                            )?;
+                        if key_bottommost {
+                            filter_mutated = true;
+                            *final_value = LazyValue::Inline(new_val);
+                        }
                     }
                 }
             }
@@ -853,6 +922,7 @@ impl LeveledCompaction {
             target_level: 1,
             input_files_level: input_l0,
             input_files_next: input_l1,
+            deeper_disjoint_levels: Some(version.files[2.min(version.num_levels)..].to_vec()),
         })
     }
 
@@ -904,6 +974,9 @@ impl LeveledCompaction {
             target_level: next_level,
             input_files_level: input_level,
             input_files_next: input_next,
+            deeper_disjoint_levels: Some(
+                version.files[(next_level + 1).min(version.num_levels)..].to_vec(),
+            ),
         })
     }
 
@@ -948,6 +1021,7 @@ impl LeveledCompaction {
                 target_level: 1,
                 input_files_level: input_l0,
                 input_files_next: input_l1,
+                deeper_disjoint_levels: None,
             });
         }
 
@@ -974,6 +1048,7 @@ impl LeveledCompaction {
                     target_level: next_level,
                     input_files_level: input_level,
                     input_files_next: input_next,
+                    deeper_disjoint_levels: None,
                 });
             }
         }
@@ -1001,6 +1076,7 @@ impl LeveledCompaction {
                     target_level: bottom,
                     input_files_level: input_bottom,
                     input_files_next: Vec::new(),
+                    deeper_disjoint_levels: None,
                 });
             }
         }
@@ -1131,6 +1207,7 @@ impl LeveledCompaction {
         let sub_params = SubCompactionParams {
             target_level,
             is_bottommost,
+            deeper_disjoint_levels: task.deeper_disjoint_levels.as_deref(),
             build_opts: &build_opts,
             oldest_snapshot_seq,
             pending: &pending,
@@ -1396,6 +1473,9 @@ impl LeveledCompaction {
             target_level: level,
             input_files_level: files.to_vec(),
             input_files_next: Vec::new(),
+            deeper_disjoint_levels: Some(
+                version.files[(level + 1).min(version.num_levels)..].to_vec(),
+            ),
         })
     }
 
@@ -2206,6 +2286,7 @@ mod tests {
             target_level: 2,
             input_files_level: vec![l1],
             input_files_next: vec![l2_left, l2_right],
+            deeper_disjoint_levels: None,
         };
         let splits = super::compute_split_points(&task, 2);
         assert_eq!(splits, vec![b"m".to_vec()]);
@@ -2490,6 +2571,7 @@ mod tests {
             target_level: 2,
             input_files_level: vec![source_file],
             input_files_next: target_files,
+            deeper_disjoint_levels: None,
         };
 
         let options = DbOptions {
@@ -2646,6 +2728,7 @@ mod tests {
                 target_level: 2,
                 input_files_level: vec![source_file],
                 input_files_next: target_files,
+                deeper_disjoint_levels: None,
             }
         }
 
@@ -2874,6 +2957,7 @@ mod tests {
             target_level: 2,
             input_files_level: vec![f],
             input_files_next: targets,
+            deeper_disjoint_levels: None,
         };
         let splits = compute_split_points(&task, 3);
         assert!(
@@ -3036,6 +3120,260 @@ mod tests {
         // synchronous compact() did not fail-stop background state.
         db.put(b"live", b"ok").unwrap();
         assert_eq!(db.get(b"live").unwrap().as_deref(), Some(b"ok".as_slice()));
+    }
+
+    #[test]
+    fn compact_rejects_unordered_point_keys_with_corruption() {
+        use crate::sst::block_builder::BlockBuilder;
+        use crate::sst::format::{
+            BlockHandle, CompressionType, decode_footer, encode_footer,
+            encode_index_value_with_props,
+        };
+        use crate::types::{InternalKey, ValueType};
+        use crate::{DB, ErrorKind};
+        use std::fs;
+
+        let rechecksum = |raw: &[u8]| -> Vec<u8> {
+            let mut out = raw.to_vec();
+            out.push(CompressionType::None as u8);
+            let crc = crc32fast::hash(&out);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out
+        };
+
+        // Case 1: interior user-key regression ("a"@3, "y"@2, "m"@1, "z"@1).
+        // Case 2: same-key ascending sequence inversion ("a"@3, "k"@1->"old", "k"@2->"new", "z"@1).
+        for inverted_same_key in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = DbOptions::default()
+                .with_l0_compaction_trigger(usize::MAX)
+                .with_pin_l0_first_block_and_warm_index(false)
+                .with_bloom_bits_per_key(0)
+                .with_max_subcompactions(2);
+            let db = DB::open(opts.clone(), dir.path()).unwrap();
+            db.put(b"a", &[b'v'; 128]).unwrap();
+            db.put(b"z", b"vz").unwrap();
+            db.close().unwrap();
+
+            let sst_path = fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().is_some_and(|ext| ext == "sst"))
+                .unwrap();
+            let orig = fs::read(&sst_path).unwrap();
+            let (meta_h, _) = decode_footer(orig[orig.len() - 48..].try_into().unwrap()).unwrap();
+            let meta_end = (meta_h.offset + meta_h.size + 5) as usize;
+            let orig_meta_slice = &orig[meta_h.offset as usize..meta_end];
+
+            let first_ik = InternalKey::new(b"a", 3, ValueType::Value);
+            let last_ik = InternalKey::new(b"z", 1, ValueType::Value);
+            let mut data_b = BlockBuilder::new(1);
+            data_b.add(first_ik.as_bytes(), b"va");
+            if inverted_same_key {
+                data_b.add(
+                    InternalKey::new(b"k", 1, ValueType::Value).as_bytes(),
+                    b"old",
+                );
+                data_b.add(
+                    InternalKey::new(b"k", 2, ValueType::Value).as_bytes(),
+                    b"new",
+                );
+            } else {
+                data_b.add(
+                    InternalKey::new(b"y", 2, ValueType::Value).as_bytes(),
+                    b"vy",
+                );
+                data_b.add(
+                    InternalKey::new(b"m", 1, ValueType::Value).as_bytes(),
+                    b"vm",
+                );
+            }
+            data_b.add(last_ik.as_bytes(), b"vz");
+            let raw_data = data_b.finish();
+            let framed_data = rechecksum(&raw_data);
+
+            let data_h = BlockHandle::new(0, raw_data.len() as u64);
+            let mut leaf_b = BlockBuilder::new(1);
+            let idx_val = encode_index_value_with_props(&data_h, first_ik.as_bytes(), &[]).unwrap();
+            leaf_b.add(last_ik.as_bytes(), &idx_val);
+            let raw_leaf = leaf_b.finish();
+            let framed_leaf = rechecksum(&raw_leaf);
+
+            let leaf_h = BlockHandle::new(framed_data.len() as u64, raw_leaf.len() as u64);
+            let new_meta_off = (framed_data.len() + framed_leaf.len()) as u64;
+            let new_meta_h = BlockHandle::new(new_meta_off, meta_h.size);
+
+            let mut dir_b = BlockBuilder::new(1);
+            dir_b.add(last_ik.as_bytes(), &leaf_h.encode());
+            let mut raw_dir = dir_b.finish();
+            raw_dir.extend_from_slice(&BlockHandle::default().encode());
+            let framed_dir = rechecksum(&raw_dir);
+            let dir_off = new_meta_off + orig_meta_slice.len() as u64;
+            let dir_h = BlockHandle::new(dir_off, raw_dir.len() as u64);
+
+            let mut image = Vec::new();
+            image.extend_from_slice(&framed_data);
+            image.extend_from_slice(&framed_leaf);
+            image.extend_from_slice(orig_meta_slice);
+            image.extend_from_slice(&framed_dir);
+            image.extend_from_slice(&encode_footer(&new_meta_h, &dir_h));
+            // Update MANIFEST's FileMetaData.file_size? No — pad `meta` or match exact file size?
+            // VersionSet::open_table verifies `meta.file_size == reader.file_size()`.
+            // Instead of reopening DB from MANIFEST, test execute_compaction_io directly or pad!
+            // Padding before `orig_meta_slice` to keep >= original file_size if image < orig.len():
+            if image.len() < orig.len() {
+                let pad = orig.len() - image.len();
+                let mut padded = Vec::with_capacity(orig.len());
+                padded.extend_from_slice(&framed_data);
+                padded.extend_from_slice(&framed_leaf);
+                padded.resize(padded.len() + pad, 0);
+                let padded_meta_off = padded.len() as u64;
+                padded.extend_from_slice(orig_meta_slice);
+                let padded_dir_off = padded.len() as u64;
+                padded.extend_from_slice(&framed_dir);
+                padded.extend_from_slice(&encode_footer(
+                    &BlockHandle::new(padded_meta_off, meta_h.size),
+                    &BlockHandle::new(padded_dir_off, raw_dir.len() as u64),
+                ));
+                image = padded;
+            }
+            assert_eq!(image.len(), orig.len());
+            fs::write(&sst_path, &image).unwrap();
+
+            let db = DB::open(opts, dir.path()).unwrap();
+            assert_eq!(db.get(b"k").unwrap_err().kind(), ErrorKind::Corruption);
+            let mut scan = db.iter().unwrap();
+            while scan.next().is_some() {}
+            assert_eq!(scan.error().map(|e| e.kind()), Some(ErrorKind::Corruption));
+            db.lazy_delete(b"force_rewrite");
+            assert_eq!(db.compact().unwrap_err().kind(), ErrorKind::Corruption);
+        }
+
+        // Parallel L1->L2 sub-compaction must also reject unordered restarts (`a, n, o, b, p, z`)
+        // when the right worker seeks to split point `m` without visiting `o -> b`.
+        {
+            use std::sync::{Arc, atomic::Ordering as AtomicOrdering};
+            let dir = tempfile::tempdir().unwrap();
+            let build_valid = |num: u64, pairs: &[(&[u8], &[u8])]| -> super::TableFile {
+                let path = dir.path().join(format!("{num:06}.sst"));
+                let mut b = crate::sst::table_builder::TableBuilder::new(
+                    &path,
+                    crate::sst::table_builder::TableBuildOptions {
+                        bloom_bits_per_key: 0,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                for (uk, v) in pairs {
+                    b.add(InternalKey::new(uk, 1, ValueType::Value).as_bytes(), v)
+                        .unwrap();
+                }
+                let res = b.finish().unwrap();
+                super::TableFile {
+                    meta: crate::manifest::version_edit::FileMetaData {
+                        number: num,
+                        file_size: res.file_size,
+                        smallest_key: res.smallest_key.unwrap(),
+                        largest_key: res.largest_key.unwrap(),
+                        has_range_deletions: false,
+                    },
+                    reader: Arc::new(crate::sst::table_reader::TableReader::open(&path).unwrap()),
+                }
+            };
+            let l2_left = build_valid(2, &[(b"a", b"1"), (b"m", b"2")]);
+            let l2_right = build_valid(3, &[(b"n", b"3"), (b"z", b"4")]);
+
+            let l1_path = dir.path().join("000001.sst");
+            let mut data_b = BlockBuilder::new(1);
+            let bad_keys: [&[u8]; 6] = [b"a", b"n", b"o", b"b", b"p", b"z"];
+            for uk in bad_keys {
+                data_b.add(InternalKey::new(uk, 5, ValueType::Value).as_bytes(), b"v");
+            }
+            let raw_data = data_b.finish();
+            let framed_data = rechecksum(&raw_data);
+
+            let first_ik = InternalKey::new(b"a", 5, ValueType::Value);
+            let last_ik = InternalKey::new(b"z", 5, ValueType::Value);
+            let data_h = BlockHandle::new(0, raw_data.len() as u64);
+            let mut leaf_b = BlockBuilder::new(1);
+            let idx_val = encode_index_value_with_props(&data_h, first_ik.as_bytes(), &[]).unwrap();
+            leaf_b.add(last_ik.as_bytes(), &idx_val);
+            let raw_leaf = leaf_b.finish();
+            let framed_leaf = rechecksum(&raw_leaf);
+
+            let mut meta_b = BlockBuilder::new(1);
+            meta_b.add(b"props.none", b"");
+            let raw_meta = meta_b.finish();
+            let framed_meta = rechecksum(&raw_meta);
+
+            let leaf_h = BlockHandle::new(framed_data.len() as u64, raw_leaf.len() as u64);
+            let mut dir_b = BlockBuilder::new(1);
+            dir_b.add(last_ik.as_bytes(), &leaf_h.encode());
+            let mut raw_dir = dir_b.finish();
+            raw_dir.extend_from_slice(&BlockHandle::default().encode());
+            let framed_dir = rechecksum(&raw_dir);
+
+            let meta_h = BlockHandle::new(
+                (framed_data.len() + framed_leaf.len()) as u64,
+                raw_meta.len() as u64,
+            );
+            let dir_h = BlockHandle::new(
+                (framed_data.len() + framed_leaf.len() + framed_meta.len()) as u64,
+                raw_dir.len() as u64,
+            );
+            let mut image = Vec::new();
+            image.extend_from_slice(&framed_data);
+            image.extend_from_slice(&framed_leaf);
+            image.extend_from_slice(&framed_meta);
+            image.extend_from_slice(&framed_dir);
+            image.extend_from_slice(&encode_footer(&meta_h, &dir_h));
+            fs::write(&l1_path, &image).unwrap();
+
+            let l1_file = super::TableFile {
+                meta: crate::manifest::version_edit::FileMetaData {
+                    number: 1,
+                    file_size: image.len() as u64,
+                    smallest_key: first_ik.into_bytes(),
+                    largest_key: last_ik.into_bytes(),
+                    has_range_deletions: false,
+                },
+                reader: Arc::new(crate::sst::table_reader::TableReader::open(&l1_path).unwrap()),
+            };
+            let task = super::CompactionTask {
+                level: 1,
+                target_level: 2,
+                input_files_level: vec![l1_file],
+                input_files_next: vec![l2_left, l2_right],
+                deeper_disjoint_levels: None,
+            };
+            let options = DbOptions {
+                max_subcompactions: 2,
+                ..Default::default()
+            };
+            let dir_sync = super::Mutex::new(Some(super::File::open(dir.path()).unwrap()));
+            let ctx = super::CompactionContext {
+                dir_sync: &dir_sync,
+                manifest_poisoned: &super::AtomicBool::new(false),
+                db_path: dir.path(),
+                options: &options,
+                builds: &super::SstBuilds::default(),
+                rate_limiter: None,
+                stats: None,
+                active_snapshots: &[],
+            };
+            let before = super::PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
+            let err = super::LeveledCompaction::execute_compaction_io(
+                &ctx,
+                &task,
+                &FileNumbers::new(10),
+                true,
+            )
+            .err()
+            .expect("parallel sub-compaction must fail");
+            let after = super::PARALLEL_SUB_COMPACTIONS_TAKEN.load(AtomicOrdering::Relaxed);
+            assert!(after > before, "must exercise parallel sub-compaction");
+            assert_eq!(err.kind(), ErrorKind::Corruption);
+        }
     }
 }
 

@@ -393,8 +393,7 @@ impl LevelRewrite<'_> {
             };
             if task.target_level == level
                 && task.input_files_level.len() == 1
-                && (!bottom
-                    || !snapshots.is_empty()
+                && (!snapshots.is_empty()
                     || ctx
                         .options
                         .compaction_filter
@@ -2327,8 +2326,8 @@ impl DB {
             self.table_cache
                 .prewarm(output.edit.new_files.iter().map(|(_, meta)| meta.number));
 
-            let rewritten_bottom_outputs: Vec<u64> = if task.target_level
-                == self.options.num_levels - 1
+            let rewritten_bottom_outputs: Vec<u64> = if is_bottom
+                && task.target_level == self.options.num_levels - 1
                 && !output.input_file_numbers.is_empty()
             {
                 output
@@ -3595,7 +3594,7 @@ impl DB {
             stats: Some(&self.read.stats),
             active_snapshots: &[],
         };
-        for level in 1..self.options.num_levels {
+        for level in (1..self.options.num_levels).rev() {
             self.level_rewrite().run(level, &ctx, false)?;
         }
         Ok(())

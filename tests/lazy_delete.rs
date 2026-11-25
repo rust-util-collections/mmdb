@@ -1,17 +1,17 @@
 use std::{
     sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mmdb::{CompactionFilter, CompactionFilterDecision, DB, DbOptions};
 use parking_lot::Mutex;
 
 fn wait_until_removed(db: &DB, key: &[u8], message: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while db.get(key).unwrap().is_some() {
-        assert!(std::time::Instant::now() <= deadline, "{message}");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(Instant::now() <= deadline, "{message}");
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -694,4 +694,76 @@ fn lazy_delete_batch_can_inspect_registrations_while_enumerating_keys() {
     });
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
     worker.join().unwrap();
+}
+
+#[test]
+fn compact_range_runs_bottommost_pass_after_non_bottommost_target_merge() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions::default()
+            .with_num_levels(3)
+            .with_l0_compaction_trigger(1),
+        dir.path(),
+    )
+    .unwrap();
+
+    // Place one wide SST [b"b"..b"m"] at L2 (num_levels - 1).
+    assert_eq!(
+        db.ingest_sorted([(b"b", b"old_b"), (b"m", b"old_m")])
+            .unwrap(),
+        2
+    );
+    // Create two disjoint SSTs at L1 ([b"b"..b"b"] and [b"m"..b"m"]) so the
+    // L1 -> L2 merge for [b"a", b"c") sees an unselected L1 file at b"m"
+    // (`is_bottom == false`), requiring a follow-up bottommost rewrite.
+    db.put(b"b", b"new_b").unwrap();
+    db.flush().unwrap();
+    db.put(b"m", b"new_m").unwrap();
+    db.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.get_property("num-files-at-level0").as_deref() != Some("0") {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for L0->L1 trivial moves"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    db.lazy_delete(b"b");
+    db.compact_range(Some(b"a"), Some(b"c")).unwrap();
+
+    assert_eq!(db.get(b"b").unwrap(), None);
+    assert_eq!(db.dead_key_count(), 0);
+    assert_eq!(db.get(b"m").unwrap(), Some(b"new_m".to_vec()));
+}
+
+#[test]
+fn compact_and_compact_range_full_sweep_deepest_levels_first() {
+    for use_compact_range in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default().with_num_levels(3), dir.path()).unwrap();
+        assert_eq!(
+            db.ingest_sorted([
+                (b"a" as &[u8], b"keep_a" as &[u8]),
+                (b"dup", b"old"),
+                (b"z", b"keep_z"),
+            ])
+            .unwrap(),
+            3
+        );
+        db.put(b"dup", b"new").unwrap();
+        db.flush().unwrap();
+        db.lazy_delete(b"dup");
+
+        if use_compact_range {
+            db.compact_range(None, None).unwrap();
+        } else {
+            db.compact().unwrap();
+        }
+
+        assert_eq!(db.get(b"dup").unwrap(), None);
+        assert_eq!(db.dead_key_count(), 0);
+        assert_eq!(db.get(b"a").unwrap(), Some(b"keep_a".to_vec()));
+        assert_eq!(db.get(b"z").unwrap(), Some(b"keep_z".to_vec()));
+    }
 }
