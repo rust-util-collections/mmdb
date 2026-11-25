@@ -3195,9 +3195,14 @@ impl DB {
         let freeze = inner.active_memtable.approximate_size() >= self.options.write_buffer_size;
         drop(inner);
         if freeze {
-            self.submit_active()?;
+            // Every batch in this group is already in WAL_old and visible in
+            // active_memtable via committed_sequence. A rotation or flush-queue
+            // failure latches fail-stop bg_error for subsequent operations and
+            // close(), so acknowledge the committed group rather than reporting
+            // a false write failure across the commit boundary.
+            return Ok(self.submit_active().is_ok());
         }
-        Ok(freeze)
+        Ok(false)
     }
 
     fn begin_maintenance(&self) -> Result<MaintenanceGuard<'_>> {

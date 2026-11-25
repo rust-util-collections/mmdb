@@ -621,4 +621,41 @@ mod tests {
             Some(b"value".as_slice())
         );
     }
+
+    #[test]
+    fn auto_freeze_failure_still_acknowledges_committed_write_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(options(), dir.path()).unwrap();
+        let occupied = dir.path().join(format!(
+            "{:06}.wal",
+            db.inner.lock().versions.next_file_number()
+        ));
+        fs::create_dir(&occupied).unwrap();
+
+        let payload = vec![7u8; (8 << 10) + 64];
+        let mut batch = WriteBatch::new();
+        batch.put(b"committed", &payload);
+        db.write_with_options(
+            &WriteOptions::default().with_durability(DurabilityMode::WalSync),
+            batch,
+        )
+        .expect("committed group must return Ok even when post-commit rotation fails");
+
+        assert_eq!(
+            db.get(b"committed").unwrap_err().kind(),
+            ErrorKind::Background
+        );
+        assert_eq!(
+            db.put(b"after", b"v").unwrap_err().kind(),
+            ErrorKind::Background
+        );
+        assert_eq!(db.close().unwrap_err().kind(), ErrorKind::Background);
+
+        fs::remove_dir(&occupied).unwrap();
+        let reopened = DB::open(options(), dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"committed").unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+    }
 }

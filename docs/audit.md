@@ -12,12 +12,6 @@
 
 ## Open
 
-### [MEDIUM] write path: auto-freeze failure in `write_batch_group` returns `Err` for an already-committed write group
-- **Where**: `src/db.rs:3195-3200`, `src/db.rs:2911-2926`, `src/db.rs:3225-3238`
-- **What**: Once a write group has flushed or `sync_data()`'d `WAL_old`, inserted all entries into `active_memtable`, and published `committed_sequence.store(last_seq, Ordering::Release)`, every committed request in the group must receive `Ok(())` even if post-commit rotation or flush-queue admission fails. Instead, `if freeze { self.submit_active()?; }` propagates `Err` while `(*rp).result` is `None`, and `enqueue_write` assigns `Err` to callers whose writes are already visible to readers/snapshots and durable in `WAL_old` across reopen.
-- **Why**: Unlike the `append_error` partial-commit path at `src/db.rs:3179-3193`, the `freeze` branch returns `Err` across the commit boundary when `FlushQueue::check_capacity` sees an earlier flush failure or `freeze_memtable` fails creating/syncing `WAL_new` (for example on a `WalSync` batch larger than `write_buffer_size` when `{next_wal:06}.wal` cannot be created). `failed_wal_creation_keeps_the_sealed_writer_and_generation` (`src/db/flush.rs:602-623`) writes `< write_buffer_size` and rotates via explicit `DB::flush()`, missing the `write_batch_group` auto-freeze path.
-- **Fix**: Handle `self.submit_active()` errors in `write_batch_group` after commit without propagating `Err` into committed requests' `result` slots (`submit_active` / `FlushQueue` already latch fail-stop `bg_error`), returning `Ok(false)` so committed callers receive `Ok(())` while subsequent operations and `DB::close()` fail with `ErrorKind::Background`.
-
 ### [MEDIUM] SST: partitioned index leaves are not validated against their directory partition bounds
 - **Where**: `src/sst/table_reader/mod.rs:338-388`, `src/sst/table_reader/mod.rs:660-673`, `src/sst/table_reader/iterator.rs:296-302`
 - **What**: When a corrupt SST index directory handle or re-CRC'd index leaf disagrees with `TableReader::partitions`, point lookups and iterators/compaction should surface `ErrorKind::Corruption` (matching the `range_partitions` checks in `covering_sequence` and `visit_ranges`). Instead, `find_data_block` returns `Ok(None)` when `seek_by_reuse` misses inside a selected partition, and `index_leaf` / `TableIterator` accept empty or out-of-partition leaves as clean data (`iter_error() == None`), allowing silent key loss or a `TableBuilder::add` ordering panic during compaction.
