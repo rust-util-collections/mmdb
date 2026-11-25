@@ -2,28 +2,18 @@ diff --git a/src/db.rs b/src/db.rs
 index 03cdc93..2175b5a 100644
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -224,6 +224,9 @@ impl SnapshotList {
-     }
- }
+@@ -226,2 +226,5 @@ impl SnapshotList {
 
 +// The uncontended and typical short group stay inline. Large groups spill normally.
 +type WriteGroup = smallvec::SmallVec<[*mut WriteRequest; 8]>;
 +
  /// A pending write request for group commit.
- struct WriteRequest {
-     batch: WriteBatch,
-@@ -255,7 +258,7 @@ struct WriteQueueState {
- unsafe impl Send for WriteQueueState {}
-
+@@ -257,3 +260,3 @@ unsafe impl Send for WriteQueueState {}
  impl WriteQueueState {
 -    fn drain_group(&mut self, write_buffer_size: usize) -> Vec<*mut WriteRequest> {
 +    fn drain_group(&mut self, write_buffer_size: usize) -> WriteGroup {
          const MAX_WRITE_BATCH_GROUP_BYTES: usize = 16 << 20;
-         let cap = (write_buffer_size / 2).min(MAX_WRITE_BATCH_GROUP_BYTES);
-         let mut bytes = 0usize;
-@@ -3032,7 +3035,12 @@ impl DB {
-                 }
-             }
+@@ -3034,3 +3037,8 @@ impl DB {
              wq.leader_active = false;
 -            self.write_cv.notify_all();
 +            if batch_group.as_slice() != [req_ptr]
@@ -33,66 +23,38 @@ index 03cdc93..2175b5a 100644
 +                self.write_cv.notify_all();
 +            }
          }
-         drop(wq);
-
-@@ -3050,7 +3058,7 @@ impl DB {
-     // range write covering any elementary interval, one sequence can be needed
-     // per distinct snapshot plus the group's newest visible sequence. Snapshots
+@@ -3052,3 +3060,3 @@ impl DB {
      // taken later all see that same latest range unless another write covers it.
 -    fn admit_range_stripes(&self, requests: &mut Vec<*mut WriteRequest>) {
 +    fn admit_range_stripes(&self, requests: &mut WriteGroup) {
          #[cfg(not(test))]
-         let limit = MAX_RANGE_STRIPES;
-         #[cfg(test)]
-@@ -3062,7 +3070,7 @@ impl DB {
-             return;
-         }
+@@ -3064,3 +3072,3 @@ impl DB {
          let mut full = None;
 -        requests.retain(|&ptr| {
 +        requests.retain(|&mut ptr| {
              // SAFETY: the leader has exclusive access to result, and batch is
-             // immutable until completion under the queue lock.
-             let batch = unsafe { &(*ptr).batch };
-@@ -3084,7 +3092,7 @@ impl DB {
-
-     // SST files split between user keys. Bound the root-index footprint of
+@@ -3086,3 +3094,3 @@ impl DB {
      // a single unsplittable run before assigning sequences or appending WAL.
 -    fn admit_same_key_runs(memtable: &MemTable, requests: &mut Vec<*mut WriteRequest>) {
 +    fn admit_same_key_runs(memtable: &MemTable, requests: &mut WriteGroup) {
          let group_bound = requests.iter().fold(0usize, |sum, &ptr| {
-             // SAFETY: queued batches are immutable until completion.
-             let batch = unsafe { &(*ptr).batch };
-@@ -3097,7 +3105,7 @@ impl DB {
-         }
-
+@@ -3099,3 +3107,3 @@ impl DB {
          let mut charges = std::collections::HashMap::<&[u8], usize>::new();
 -        requests.retain(|&ptr| {
 +        requests.retain(|&mut ptr| {
              // SAFETY: the owner's frame stays live until this group completes.
-             let batch = unsafe { &(*ptr).batch };
-             let suspect = |entry: &types::BatchEntry<'_>| {
-@@ -3136,7 +3144,7 @@ impl DB {
-     /// woken the group's waiters.
-     fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<bool> {
+@@ -3138,3 +3146,3 @@ impl DB {
          self.check_writable()?;
 -        let mut group = Vec::with_capacity(batch_group.len());
 +        let mut group = WriteGroup::with_capacity(batch_group.len());
          for &ptr in batch_group {
-             // SAFETY: the leader exclusively processes the queued request's fields.
-             let no_slowdown =
-@@ -3207,7 +3215,8 @@ impl DB {
-         }
-         self.sequence.store(last_group_seq + 1, Ordering::Release);
+@@ -3209,3 +3217,4 @@ impl DB {
 
 -        let mut assigned = Vec::with_capacity(batch_group.len());
 +        let mut assigned =
 +            smallvec::SmallVec::<[(*mut WriteRequest, u64); 8]>::with_capacity(batch_group.len());
          let mut append_error: Option<Error> = None;
-         let mut next_seq = first_group_seq;
-
-@@ -4315,9 +4324,9 @@ mod tests {
-             leader_active: true,
-         };
+@@ -4317,5 +4326,5 @@ mod tests {
          // Encoded sizes are 8, 8, 6, and 25 bytes. The group limit is 16.
 -        assert_eq!(wq.drain_group(32), ptrs[..2]);
 -        assert_eq!(wq.drain_group(32), ptrs[2..3]);
@@ -101,5 +63,3 @@ index 03cdc93..2175b5a 100644
 +        assert_eq!(wq.drain_group(32).as_slice(), &ptrs[2..3]);
 +        assert_eq!(wq.drain_group(32).as_slice(), &ptrs[3..]);
          assert!(wq.queue.is_empty());
-     }
-
