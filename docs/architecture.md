@@ -51,7 +51,9 @@ sequence and value type.
 The active memtable keeps range deletions in a separate list. Frozen
 memtables build a fragmented coverage index on demand. An SST point lookup
 uses the range-deletion directory and reads at most one range-deletion leaf
-in that file. Scan setup reads the overlapping ranges even when Bloom or file
+in that file. Each Version tracks the readers containing range deletions
+separately for each level. A point-only level skips this part of the lookup.
+Scan setup reads the overlapping ranges even when Bloom or file
 bounds prune the corresponding point source.
 
 [Point lookup and scan setup](../src/db/read.rs) · [Snapshot leases](../src/db/snapshot.rs) · [Merge and visibility](../src/iterator/)

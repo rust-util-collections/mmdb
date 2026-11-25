@@ -653,6 +653,14 @@ impl TableReader {
         self.filter_data.as_ref().map(AlignedBytes::byte_len)
     }
 
+    /// Smallest begin and largest exclusive end of this table's range deletions.
+    pub(crate) fn range_deletion_bounds(&self) -> Option<(&[u8], &[u8])> {
+        Some((
+            self.range_partitions.first()?.begin.as_slice(),
+            self.range_partitions.last()?.end.as_slice(),
+        ))
+    }
+
     pub(crate) fn range_partition_extents(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.range_partitions
             .iter()
@@ -706,9 +714,10 @@ impl TableReader {
         fill_cache: bool,
         mut visit: impl FnMut(&[u8], &[u8], &[[u8; 8]]),
     ) -> Result<()> {
-        let first = self
-            .range_partitions
-            .partition_point(|p| lower.is_some_and(|lo| p.end.as_slice() <= lo));
+        let first = lower.map_or(0, |lo| {
+            self.range_partitions
+                .partition_point(|p| p.end.as_slice() <= lo)
+        });
         for part in &self.range_partitions[first..] {
             if upper.is_some_and(|hi| part.begin.as_slice() >= hi) {
                 break;

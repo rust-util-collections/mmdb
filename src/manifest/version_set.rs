@@ -516,17 +516,11 @@ impl VersionSet {
         let mut version = Version::new(num_levels);
         for (level, meta) in live_files.values() {
             let file = Self::open_table(db_path, table_cache.as_deref(), meta).ctx()?;
-            Arc::make_mut(&mut version.files[*level]).push(file);
+            let files = Arc::make_mut(&mut version.files[*level]);
+            files.insert(files.len(), file);
         }
 
-        // Sort L0 by file number descending (newest first)
-        Arc::make_mut(&mut version.files[0])
-            .sort_by_key(|file| std::cmp::Reverse(file.meta.number));
-        // Sort L1+ by smallest key
-        for files in version.files.iter_mut().take(num_levels).skip(1) {
-            Arc::make_mut(files)
-                .sort_by(|a, b| compare_internal_key(&a.meta.smallest_key, &b.meta.smallest_key));
-        }
+        version.sort_recovered_files();
         // The replayed record stream passed per-record checksums, but the
         // recovered file set must still satisfy the read-path invariant.
         Self::validate_level_disjointness(&version).ctx()?;
@@ -605,9 +599,7 @@ impl VersionSet {
                     file_number, level, self.num_levels
                 )));
             }
-            let before = new_version.files[level].len();
-            Arc::make_mut(&mut new_version.files[level]).retain(|f| f.meta.number != *file_number);
-            if new_version.files[level].len() == before {
+            if !Arc::make_mut(&mut new_version.files[level]).remove_file(*file_number) {
                 return Err(Error::corruption(format!(
                     "VersionEdit deletes SST {} at level {} but no such live file exists there",
                     file_number, level

@@ -73,9 +73,17 @@ impl ReadState {
             let files = version.level_files(level);
             // Tombstone ends may extend beyond the last point in an SST.
             // Check covering deletions before resolving any point at this level.
-            for file in files.iter().filter(|f| f.meta.has_range_deletions) {
+            for reader in version.range_readers(level) {
+                if !reader
+                    .range_deletion_bounds()
+                    .is_some_and(|(begin, end)| begin <= key && key < end)
+                {
+                    continue;
+                }
+                #[cfg(test)]
+                tests::RANGE_DIRECTORY_SEARCHES.with(|n| n.set(n.get() + 1));
                 tomb_seq = tomb_seq.max(
-                    file.reader
+                    reader
                         .covering_sequence(key, sequence, options.fill_cache)
                         .ctx()?,
                 );
@@ -168,31 +176,37 @@ impl ReadState {
             if files.is_empty() {
                 continue;
             }
-            for file in files {
-                // A point Bloom miss or a last point below the lower limit
-                // cannot rule out a range deletion covering the scan.
-                if upper.is_some_and(|hi| types::user_key(&file.meta.smallest_key) >= hi) {
+            for reader in version.range_readers(level) {
+                if (lower.is_some() || upper.is_some())
+                    && !reader.range_deletion_bounds().is_some_and(|(begin, end)| {
+                        tombstone_overlaps_bounds(begin, end, lower, upper)
+                    })
+                {
                     continue;
                 }
-                if file.meta.has_range_deletions {
-                    tombstones.extend(
-                        file.reader
-                            .read_tombstones(lower, upper, sequence, options.fill_cache)
-                            .ctx()?
-                            .into_iter()
-                            .map(|(b, e, s)| (b, e, s, level)),
-                    );
-                }
-                if level == 0
-                    && !lower.is_some_and(|lo| types::user_key(&file.meta.largest_key) < lo)
-                    && prefix.is_none_or(|p| file.reader.prefix_may_match(p))
-                {
+                #[cfg(test)]
+                tests::RANGE_DIRECTORY_SEARCHES.with(|n| n.set(n.get() + 1));
+                tombstones.extend(
+                    reader
+                        .read_tombstones(lower, upper, sequence, options.fill_cache)
+                        .ctx()?
+                        .into_iter()
+                        .map(|(b, e, s)| (b, e, s, level)),
+                );
+            }
+            if level == 0 {
+                for file in files {
+                    if upper.is_some_and(|hi| types::user_key(&file.meta.smallest_key) >= hi)
+                        || lower.is_some_and(|lo| types::user_key(&file.meta.largest_key) < lo)
+                        || prefix.is_some_and(|p| !file.reader.prefix_may_match(p))
+                    {
+                        continue;
+                    }
                     let iter =
                         TableIterator::new(file.reader.clone()).with_fill_cache(options.fill_cache);
                     sources.push(IterSource::from_table_iter(iter).with_level(0));
                 }
-            }
-            if level > 0 {
+            } else {
                 let iter = LevelIterator::for_level(version.clone(), level)
                     .with_fill_cache(options.fill_cache);
                 sources.push(IterSource::from_level_iter(iter).with_level(level));
@@ -329,6 +343,91 @@ impl ReadState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static RANGE_DIRECTORY_SEARCHES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[test]
+    fn tombstone_discovery_visits_only_files_with_range_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_num_levels(2)
+            .with_target_file_size_base(1);
+        let db = DB::open(opts.clone(), dir.path()).unwrap();
+        db.ingest_sorted((0..64u8).map(|i| ([i], [i]))).unwrap();
+        assert_eq!(
+            db.get_property("num-files-at-level1").as_deref(),
+            Some("64")
+        );
+
+        let check = |db: &DB, deleted: bool| {
+            // Boundary-adjacent windows never enter the unrelated table's range directory.
+            for key in [29, 32, 40] {
+                let covered = deleted && key == 32;
+                let expected = (!covered).then_some(vec![key]);
+                let visits = usize::from(covered);
+                RANGE_DIRECTORY_SEARCHES.with(|n| n.set(0));
+                assert_eq!(db.get(&[key, 0]).unwrap(), None);
+                assert_eq!(
+                    RANGE_DIRECTORY_SEARCHES.with(|n| n.replace(0)),
+                    visits,
+                    "point miss at {key}"
+                );
+                assert_eq!(db.get(&[key]).unwrap(), expected);
+                assert_eq!(
+                    RANGE_DIRECTORY_SEARCHES.with(|n| n.replace(0)),
+                    visits,
+                    "point lookup at {key}"
+                );
+                let mut iter = db
+                    .iter_with_range(&ReadOptions::default(), Some(&[key]), Some(&[key + 1]))
+                    .unwrap();
+                assert_eq!(iter.step_next().unwrap().map(|(_, v)| v.to_vec()), expected);
+                assert_eq!(
+                    RANGE_DIRECTORY_SEARCHES.with(Cell::get),
+                    visits,
+                    "bounded scan at {key}"
+                );
+            }
+            RANGE_DIRECTORY_SEARCHES.with(|n| n.set(0));
+            let mut all = db.iter().unwrap();
+            let mut count = 0;
+            while all.step_next().unwrap().is_some() {
+                count += 1;
+            }
+            assert_eq!(count, if deleted { 54 } else { 64 });
+            assert_eq!(
+                RANGE_DIRECTORY_SEARCHES.with(Cell::get),
+                usize::from(deleted)
+            );
+        };
+        check(&db, false);
+        // The tombstone starts below the scan and covers a point in a deeper SST.
+        db.delete_range(&[30], &[40]).unwrap();
+        db.flush().unwrap();
+        check(&db, true);
+        db.close().unwrap();
+        let reopened = DB::open_read_only(dir.path()).unwrap();
+        check(&reopened, true);
+        reopened.close().unwrap();
+
+        let db = DB::open(opts, dir.path()).unwrap();
+        let old_version = db.inner.lock().versions.current();
+        db.compact().unwrap();
+        assert_eq!(old_version.range_readers(0).len(), 1);
+        assert!(
+            db.inner
+                .lock()
+                .versions
+                .current()
+                .range_readers(0)
+                .is_empty()
+        );
+        assert_eq!(db.get(&[32]).unwrap(), None);
+    }
+
     #[test]
     fn memtable_scan_copies_only_visible_overlapping_tombstones() {
         let dir = tempfile::tempdir().unwrap();
