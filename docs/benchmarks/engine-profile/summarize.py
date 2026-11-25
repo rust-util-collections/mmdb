@@ -107,6 +107,8 @@ def check_pair(control, other):
 
 def guard(suite, case, label, values, gains, noise, qualified_load):
     if suite in ("memory", "memory-tail") and label == "peak_kib":
+        if suite == "memory-tail" and not qualified_load:
+            return "offered-load-unqualified"
         return "within-1-GiB" if max(values) <= 1 << 20 else "over-1-GiB"
     primary = suite == "handoff" and case == "same-db-false" and label == "SmallPut_p99_us"
     control = ((suite in ("memory", "memory-tail") and
@@ -200,9 +202,11 @@ def summarize(meta, records, writer):
                     and record["run"]["instrumented"] == "false" and record["run"]["dbs"] == 16
                     and all(record["settings"].get(k) == v for k, v in settings.items()),
                     "unexpected memory-tail settings, seed or round")
-            for name, count in (("SmallPut", 20_000), ("Read", 20_000), ("Batch", 320_000)):
+            for name, count, bytes_per_call in (("SmallPut", 20_000, 16 + 128), ("Read", 20_000, 0),
+                                                ("Batch", 320_000, 32 * (16 + 256))):
                 values = record["classes"][name]
-                require(values["completed"] == count and sample_count(record, values) == count,
+                require(values["completed"] == count and sample_count(record, values) == count
+                        and values["bytes"] == count * bytes_per_call,
                         f"incomplete memory-tail {name} trace")
         if record["round"]:
             group = groups[record["case"]][record["round"]]

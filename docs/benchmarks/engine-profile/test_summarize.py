@@ -64,9 +64,10 @@ class SummaryTest(unittest.TestCase):
                 for arm, latency in (("A1", 100), ("A2", 103), ("AB1", 150), ("q2-b10", 180)):
                     q, b = (2, 10) if arm == "q2-b10" else (4, 6)
                     classes = {name: {"offered": count, "completed": count, "sampled": count,
-                                      "bytes": count, "rejected": 0, "outstanding_half": 0,
+                                      "bytes": total_bytes, "rejected": 0, "outstanding_half": 0,
                                       "outstanding_end": 0, "arrival_p99_us": latency}
-                               for name, count in (("SmallPut", 20000), ("Read", 20000), ("Batch", 320000))}
+                               for name, count, total_bytes in (("SmallPut", 20000, 2_880_000), ("Read", 20000, 0),
+                                                                ("Batch", 320000, 2_785_280_000))}
                     records.append({"case": f"envelope-{placement}-paced", "round": i, "binary": "control",
                                     "mode": "memory", "arm": arm,
                                     "config": {"mode": "memory", "entropy": "true", "sync": "false", "depth": q,
@@ -84,6 +85,15 @@ class SummaryTest(unittest.TestCase):
                                   float(row["aa_max_abs_pct"]), row["status"]), (150, -20, 3, "guard-regression"))
         with self.assertRaisesRegex(ValueError, "missing or unexpected arms"):
             summary("memory-tail", [r for r in records if r["arm"] != "AB1"])
+        records[-1]["classes"]["SmallPut"]["outstanding_end"] = 300
+        for rss, expected in ((555, "within"), ((1 << 20) + 1, "over")):
+            records[-1]["run"]["peak_kib"] = rss
+            rows = {r["metric"]: r for r in summary("memory-tail", records)
+                    if r["case"] == records[-1]["case"]}
+            self.assertEqual(rows["peak_kib"]["arm_rss_status"], expected)
+            self.assertEqual(float(rows["peak_kib"]["arm_max"]), rss)
+            self.assertEqual(rows["peak_kib"]["status"], "offered-load-unqualified")
+            self.assertEqual(rows["SmallPut_p99_us"]["status"], "offered-load-unqualified")
         for observed, field, wrong in ((records[-1]["config"], "depth", 4),
                                        (records[-1]["run"], "placement", "hot")):
             original = observed[field]
@@ -91,6 +101,11 @@ class SummaryTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected memory-tail"):
                 summary("memory-tail", records)
             observed[field] = original
+        batch = records[-1]["classes"]["Batch"]
+        batch["bytes"] *= 2
+        with self.assertRaisesRegex(ValueError, "incomplete memory-tail Batch"):
+            summary("memory-tail", records)
+        batch["bytes"] //= 2
         records[-1]["settings"]["RATE"] = 1380
         with self.assertRaisesRegex(ValueError, "unexpected memory-tail"):
             summary("memory-tail", records)
