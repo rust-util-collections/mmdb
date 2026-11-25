@@ -58,3 +58,8 @@ harness = false
 name = "l0_profile"
 harness = false
 required-features = ["bench-metrics"]
+
+[[bench]]
+name = "grouped_reads"
+harness = false
+required-features = ["test-utils"]

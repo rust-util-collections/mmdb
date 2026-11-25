@@ -18,6 +18,10 @@ pub type SequenceNumber = u64;
 /// Maximum valid sequence number (56-bit).
 pub const MAX_SEQUENCE_NUMBER: SequenceNumber = (1 << 56) - 1;
 
+/// Maximum number of input slots in one [`DB::get_many_pinned`](crate::DB::get_many_pinned)
+/// request. Repeated keys each occupy one slot.
+pub const MAX_GROUPED_READ_KEYS: usize = 32;
+
 /// Maximum allowed user key length for writes (8 MiB).
 ///
 /// Applies to both endpoints of a range deletion. A partitioned SST index

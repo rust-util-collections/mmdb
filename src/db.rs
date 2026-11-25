@@ -1970,6 +1970,28 @@ impl DB {
         self.read.point_lookup(options, key)
     }
 
+    /// Read up to [`MAX_GROUPED_READ_KEYS`](crate::MAX_GROUPED_READ_KEYS) keys
+    /// from one committed sequence. The result preserves input order,
+    /// repeated keys and missing values. A lookup error fails the call.
+    /// Each returned [`PinnedSlice`] may retain a whole block or memtable.
+    pub fn get_many_pinned(&self, keys: &[&[u8]]) -> Result<Vec<Option<PinnedSlice>>> {
+        self.get_many_pinned_with_options(&ReadOptions::default(), keys)
+    }
+
+    /// Read a group using the supplied snapshot and cache policy. The
+    /// snapshot, when present, must belong to this DB, including for an
+    /// empty group. On a usable handle an oversized group returns
+    /// [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument).
+    /// As with [`Self::get_pinned_with_options`], scan bounds and scan-only
+    /// predicates do not filter point reads.
+    pub fn get_many_pinned_with_options(
+        &self,
+        options: &ReadOptions<'_>,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<PinnedSlice>>> {
+        self.read.grouped_point_lookup(options, keys)
+    }
+
     /// Create a forward iterator over the entire database.
     ///
     /// Scans all keys in order. No SST pruning is applied.

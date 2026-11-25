@@ -1,6 +1,11 @@
 //! Read resources shared by the DB handle and in-flight snapshot reads.
 //! Snapshot registrations retain only a weak reference to this state.
 use super::*;
+use crate::{
+    manifest::version::TableFile, pinned::PointValue, sst::table_reader::GroupedPointBlocks,
+    types::MAX_GROUPED_READ_KEYS,
+};
+use smallvec::SmallVec;
 
 pub(super) struct ReadState {
     /// Whether this handle was opened without write capability.
@@ -34,7 +39,7 @@ pub(super) struct ReadState {
 }
 
 impl ReadState {
-    pub(super) fn point_lookup<V: crate::pinned::PointValue>(
+    pub(super) fn point_lookup<V: PointValue>(
         &self,
         options: &ReadOptions<'_>,
         key: &[u8],
@@ -43,6 +48,70 @@ impl ReadState {
         let sv = self.get_super_version();
         self.check_usable().ctx()?;
         let sequence = self.resolve_read_sequence(&sv, options.snapshot)?;
+        let value: Option<V> = self.point_lookup_in_view(&sv, options, key, sequence, |file| {
+            file.reader.point_value(key, sequence, options.fill_cache)
+        })?;
+        if let Some(v) = &value {
+            self.stats.record_read((key.len() + v.byte_len()) as u64);
+        }
+        Ok(value)
+    }
+
+    pub(super) fn grouped_point_lookup(
+        &self,
+        options: &ReadOptions<'_>,
+        keys: &[&[u8]],
+    ) -> Result<Vec<Option<PinnedSlice>>> {
+        if let [key] = keys {
+            return Ok(vec![self.point_lookup(options, key)?]);
+        }
+        let view = self.get_super_version();
+        self.check_usable().ctx()?;
+        if keys.len() > MAX_GROUPED_READ_KEYS {
+            return Err(Error::invalid_argument(format!(
+                "grouped reads support at most {MAX_GROUPED_READ_KEYS} keys"
+            )));
+        }
+        let sequence = self.resolve_read_sequence(&view, options.snapshot)?;
+        let mut slots: SmallVec<[usize; MAX_GROUPED_READ_KEYS]> = (0..keys.len()).collect();
+        slots.sort_unstable_by_key(|&slot| keys[slot]);
+        let mut blocks = GroupedPointBlocks::default();
+        let mut values: Vec<_> = (0..keys.len()).map(|_| None).collect();
+        let mut returned_bytes = 0;
+        for run in slots.chunk_by(|&a, &b| keys[a] == keys[b]) {
+            let (&first, duplicates) = run.split_first().expect("nonempty key run");
+            let key = keys[first];
+            let value = self.point_lookup_in_view(&view, options, key, sequence, |file| {
+                file.reader.grouped_point_value(
+                    file.meta.number,
+                    key,
+                    sequence,
+                    options.fill_cache,
+                    &mut blocks,
+                )
+            })?;
+            if let Some(pin) = &value {
+                returned_bytes += ((key.len() + pin.len()) * run.len()) as u64;
+                for &slot in duplicates {
+                    values[slot] = Some(pin.repin());
+                }
+            }
+            values[first] = value;
+        }
+        if returned_bytes != 0 {
+            self.stats.record_read(returned_bytes);
+        }
+        Ok(values)
+    }
+
+    fn point_lookup_in_view<V: PointValue>(
+        &self,
+        sv: &SuperVersion,
+        options: &ReadOptions<'_>,
+        key: &[u8],
+        sequence: SequenceNumber,
+        mut probe: impl FnMut(&TableFile) -> Result<Option<(Option<V>, SequenceNumber)>>,
+    ) -> Result<Option<V>> {
         let mut tomb_seq = self.max_covering_tombstone_seq(
             key,
             sequence,
@@ -50,14 +119,12 @@ impl ReadState {
             &sv.immutable_memtables,
         );
 
-        let visible = |value: Option<V>, entry_seq, covering_seq| {
+        let visible = |value, entry_seq, covering_seq| {
             if covering_seq > entry_seq {
-                return None;
+                None
+            } else {
+                value
             }
-            if let Some(v) = &value {
-                self.stats.record_read((key.len() + v.byte_len()) as u64);
-            }
-            value
         };
         for mem in std::iter::once(&sv.active_memtable).chain(&sv.immutable_memtables) {
             if let Some((value, seq)) = mem.point_value(key, sequence) {
@@ -101,11 +168,7 @@ impl ReadState {
                 {
                     continue;
                 }
-                if let Some((value, seq)) = file
-                    .reader
-                    .point_value(key, sequence, options.fill_cache)
-                    .ctx()?
-                {
+                if let Some((value, seq)) = probe(file).ctx()? {
                     if level >= 2 {
                         self.stats.maybe_sample_read_level(level);
                         self.maybe_check_read_compaction();
@@ -437,6 +500,49 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(db.get(&[32]).unwrap(), None);
+    }
+
+    #[test]
+    fn grouped_read_reports_latched_failure_before_oversized_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.set_bg_error("forced storage failure".to_owned());
+        let keys = [b"x".as_slice(); MAX_GROUPED_READ_KEYS + 1];
+        assert_eq!(
+            db.get_many_pinned(&keys).unwrap_err().kind(),
+            crate::ErrorKind::Background
+        );
+    }
+
+    #[test]
+    fn grouped_read_captures_one_view_before_concurrent_ingest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"b", b"old").unwrap();
+        let (pinned, waiting) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            let db = &db;
+            let reader = scope.spawn(move || {
+                AFTER_READ_VIEW.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        pinned.send(()).unwrap();
+                        resumed.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }));
+                });
+                db.get_many_pinned_with_options(&ReadOptions::default(), &[b"c", b"b", b"a"])
+                    .unwrap()
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            db.ingest_sorted([(b"a", b"ingest")]).unwrap();
+            db.delete(b"b").unwrap();
+            db.put(b"c", b"new").unwrap();
+            resume.send(()).unwrap();
+            let rows = reader.join().unwrap();
+            assert!(rows[0].is_none());
+            assert_eq!(rows[1].as_deref(), Some(b"old".as_slice()));
+            assert!(rows[2].is_none());
+        });
     }
 
     #[test]

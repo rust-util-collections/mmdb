@@ -45,6 +45,7 @@ sequence and value type.
 | Read operation | Sources and visibility |
 |----------------|------------------------|
 | Point lookup | Probe the active memtable and then immutable memtables newest first. Search overlapping L0 files newest first. Binary-search L1+ file ranges for at most one point candidate per level. A covering range deletion can extend beyond a file's point bounds, so the reader checks those tombstones independently |
+| Grouped point lookup | Capture one view and one sequence. Sort at most 32 input positions by key and apply the scalar point visibility rules to each, preserving caller order in the results. Equal keys share a result. The request can retain a validated index leaf and data block in each of its two most recently probed files, so two overlapping tables can share their blocks across slots |
 | Range or prefix scan | Merge memtable cursors, overlapping L0 table cursors, and a lazy per-level cursor for each nonempty deeper level. Each deeper cursor prunes files and creates per-file iterators on demand. Resolve duplicate versions and deletions at the read sequence, then apply user-key predicates |
 | Snapshot read | Resolve visibility at the registered sequence. Compaction keeps the versions needed by live snapshots. A borrowed snapshot holds a reference to its DB. An owned snapshot shares a lease with a weak reference to the read state |
 

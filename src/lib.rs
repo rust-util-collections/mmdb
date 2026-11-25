@@ -87,6 +87,13 @@ pub use pinned::PinnedSlice;
 pub use profile::{ThreadWriteProfile, take_thread_write_profile};
 pub use sst::format::CompressionType;
 pub use types::{
-    MAX_RANGE_DELETE_SIZE, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, WriteBatch,
-    WriteBatchWithIndex,
+    MAX_GROUPED_READ_KEYS, MAX_RANGE_DELETE_SIZE, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE,
+    SequenceNumber, WriteBatch, WriteBatchWithIndex,
 };
+
+/// Number of point probes into candidate SSTs by this thread in an experiment.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub fn point_table_probes() -> u64 {
+    sst::table_reader::POINT_TABLE_PROBES.with(std::cell::Cell::get)
+}

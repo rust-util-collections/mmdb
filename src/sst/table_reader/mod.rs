@@ -16,6 +16,7 @@ use smallvec::SmallVec;
 
 use crate::cache::block_cache::{BlockCache, ValidatedKind};
 use crate::error::{Error, Result, ResultExt};
+use crate::pinned::{PinnedSlice, PointValue};
 use crate::sst::block::{Block, decode_entry_reuse};
 use crate::sst::filter::AlignedBytes;
 use crate::sst::format::{
@@ -203,6 +204,42 @@ pub struct TableReader {
     block_cache: Option<Arc<BlockCache>>,
     stats: Option<Arc<DbStats>>,
     range_partitions: Vec<RangePartition>,
+}
+
+#[cfg(feature = "test-utils")]
+thread_local! {
+    pub(crate) static POINT_TABLE_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Retain a pair of cursors so alternating hits in an overlapping L0 and
+/// deeper table reuse both data blocks. Additional files evict the least
+/// recently used cursor. Scratch pins stay bounded independently of L0 size.
+#[derive(Default)]
+pub(crate) struct GroupedPointBlocks {
+    files: [PointFileBlocks; 2],
+    recent: usize,
+}
+
+#[derive(Default)]
+struct PointFileBlocks {
+    number: Option<u64>,
+    leaf: Option<(usize, Block)>,
+    data: Option<(u32, Block)>,
+}
+
+impl GroupedPointBlocks {
+    fn for_file(&mut self, number: u64) -> &mut PointFileBlocks {
+        if self.files[self.recent].number != Some(number) {
+            self.recent ^= 1;
+            if self.files[self.recent].number != Some(number) {
+                self.files[self.recent] = PointFileBlocks {
+                    number: Some(number),
+                    ..Default::default()
+                };
+            }
+        }
+        &mut self.files[self.recent]
+    }
 }
 
 impl TableReader {
@@ -640,41 +677,102 @@ impl TableReader {
         fill_cache: bool,
     ) -> Result<Option<(Option<Vec<u8>>, SequenceNumber)>> {
         Ok(self
-            .point_value::<crate::PinnedSlice>(user_key, sequence, fill_cache)?
-            .map(|(v, seq)| (v.map(crate::PinnedSlice::into_vec), seq)))
+            .point_value::<PinnedSlice>(user_key, sequence, fill_cache)?
+            .map(|(v, seq)| (v.map(PinnedSlice::into_vec), seq)))
     }
 
-    pub fn point_value<V: crate::pinned::PointValue>(
+    pub fn point_value<V: PointValue>(
         &self,
         user_key: &[u8],
         sequence: SequenceNumber,
         fill_cache: bool,
     ) -> Result<Option<(Option<V>, SequenceNumber)>> {
-        // Check bloom filter with user key
-        if let Some(ref filter) = self.filter_data
-            && !filter.may_match(user_key)
-        {
+        let Some(seek_key) = self.point_seek_key(user_key, sequence) else {
             return Ok(None);
-        }
-
-        let mut seek_key = SmallVec::<[u8; 128]>::from_slice(user_key);
-        seek_key.extend_from_slice(
-            &(!pack_sequence_and_type(sequence, ValueType::RangeDeletion)).to_be_bytes(),
-        );
-
+        };
         let Some((index_block, idx)) = self.find_data_block(&seek_key, fill_cache).ctx()? else {
             return Ok(None);
         };
-        let (sep, val, _) = index_block.decode_restart_entry(idx)?;
-        let index_entry = decode_index_entry(val).ctx()?;
+        let block = self.indexed_point_block(&index_block, idx, fill_cache)?;
+        Self::point_in_block(&block, user_key, &seek_key)
+    }
 
-        let block = self
-            .read_data_block_ordered(&index_entry.handle, index_entry.first_key, sep, fill_cache)
-            .ctx()?;
+    pub(crate) fn grouped_point_value(
+        &self,
+        file_number: u64,
+        user_key: &[u8],
+        sequence: SequenceNumber,
+        fill_cache: bool,
+        blocks: &mut GroupedPointBlocks,
+    ) -> Result<Option<(Option<PinnedSlice>, SequenceNumber)>> {
+        let Some(seek_key) = self.point_seek_key(user_key, sequence) else {
+            return Ok(None);
+        };
+        let part = self
+            .partitions
+            .partition_point(|(sep, _)| sep.compare_internal(&seek_key).is_lt());
+        if part == self.partitions.len() {
+            return Ok(None);
+        }
+        let blocks = blocks.for_file(file_number);
+        if !matches!(blocks.leaf, Some((index, _)) if index == part) {
+            let Some(leaf) = self.index_leaf_block(part, fill_cache)? else {
+                return Ok(None);
+            };
+            blocks.leaf = Some((part, leaf));
+            blocks.data = None;
+        }
+        let leaf = &blocks.leaf.as_ref().expect("index leaf set above").1;
+        let idx = Self::partition_point_index_leaf(leaf, &seek_key);
+        if idx >= leaf.num_restarts() {
+            return Err(Error::corruption("index leaf ends before its separator"));
+        }
+        if !matches!(blocks.data, Some((index, _)) if index == idx) {
+            let block = self.indexed_point_block(leaf, idx, fill_cache)?;
+            blocks.data = Some((idx, block));
+        }
+        let block = &blocks.data.as_ref().expect("data block set above").1;
+        Self::point_in_block(block, user_key, &seek_key)
+    }
 
+    #[inline]
+    fn point_seek_key(
+        &self,
+        user_key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<SmallVec<[u8; 128]>> {
+        #[cfg(feature = "test-utils")]
+        POINT_TABLE_PROBES.with(|count| count.set(count.get() + 1));
+        if self
+            .filter_data
+            .as_ref()
+            .is_some_and(|filter| !filter.may_match(user_key))
+        {
+            return None;
+        }
+        let mut seek_key = SmallVec::from_slice(user_key);
+        seek_key.extend_from_slice(
+            &(!pack_sequence_and_type(sequence, ValueType::RangeDeletion)).to_be_bytes(),
+        );
+        Some(seek_key)
+    }
+
+    #[inline]
+    fn indexed_point_block(&self, leaf: &Block, index: u32, fill_cache: bool) -> Result<Block> {
+        let (separator, raw, _) = leaf.decode_restart_entry(index)?;
+        let entry = decode_index_entry(raw).ctx()?;
+        self.read_data_block_ordered(&entry.handle, entry.first_key, separator, fill_cache)
+            .ctx()
+    }
+
+    fn point_in_block<V: PointValue>(
+        block: &Block,
+        user_key: &[u8],
+        seek_key: &[u8],
+    ) -> Result<Option<(Option<V>, SequenceNumber)>> {
         let mut encoded_ikey = SmallVec::<[u8; 128]>::new();
         match block
-            .seek_by_reuse(&seek_key, compare_internal_key, &mut encoded_ikey)
+            .seek_by_reuse(seek_key, compare_internal_key, &mut encoded_ikey)
             .ctx()?
         {
             Some(value) => {
@@ -683,7 +781,7 @@ impl TableReader {
                     return Ok(Some((
                         match vt {
                             ValueType::Value => Some(V::project(value.len(), || {
-                                crate::PinnedSlice::from_block(
+                                PinnedSlice::from_block(
                                     block.data_arc().clone(),
                                     (value.as_ptr() as usize - block.data().as_ptr() as usize)
                                         as u32,
@@ -1770,6 +1868,7 @@ mod tests {
             }
             builder.finish().unwrap();
             let reader = TableReader::open(&path).unwrap();
+            let mut grouped = super::GroupedPointBlocks::default();
             for user_key in [b"a".as_slice(), b"a\0", b"aa"] {
                 for seq in 0..=101 {
                     let expected = match seq {
@@ -1779,6 +1878,13 @@ mod tests {
                     };
                     assert_eq!(
                         reader.get_internal_with_seq(user_key, seq, false).unwrap(),
+                        expected
+                    );
+                    assert_eq!(
+                        reader
+                            .grouped_point_value(1, user_key, seq, false, &mut grouped)
+                            .unwrap()
+                            .map(|(v, seq)| (v.map(crate::PinnedSlice::into_vec), seq)),
                         expected
                     );
                 }

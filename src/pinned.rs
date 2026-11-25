@@ -49,6 +49,21 @@ impl PinnedSlice {
         Self(LazyValue::MemTable(pin))
     }
 
+    pub(crate) fn repin(&self) -> Self {
+        Self(self.0.clone())
+    }
+
+    /// Report the SST block identity and allocation charge for retention checks
+    /// in test-utils experiments. Memory addresses are used only as allocation IDs.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn sst_backing_charge(&self) -> Option<(usize, usize)> {
+        match &self.0 {
+            LazyValue::BlockRef { data, .. } => Some((Arc::as_ptr(data) as usize, data.capacity())),
+            _ => None,
+        }
+    }
+
     /// Copy the value bytes and release this pin.
     pub fn into_vec(self) -> Vec<u8> {
         self.0.into_vec()

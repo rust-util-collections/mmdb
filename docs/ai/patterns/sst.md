@@ -22,6 +22,18 @@
 
 **S8 Bounded iterator partition I/O & error latching** — `TableIterator` checks `iterate_upper_bound` and `index_pos == usize::MAX` *before* `select_partition` / `ensure_index` so out-of-bounds `seek` / `seek_for_prev` / `next` never read, cache, or fail on excluded index leaves; once `self.err` is set, every forward/backward/re-seek method stays latched.
 
+### Grouped point reads
+
+A grouped request keeps one published view and one read sequence, coalesces
+equal keys and restores the original order of its result slots. Each of the
+two request-local file cursors owns an index leaf. Each leaf belongs
+to a file number and partition. The cached data slot belongs to that same
+leaf. Replacing a file cursor or changing its partition drops the cached data
+slot before reuse.
+Check scalar and grouped results against the same snapshot, including covered
+keys outside SST point bounds, duplicate keys, misses, and a malformed block.
+Check storage writes, compaction and reopen independently of cached pins.
+
 ## Checklist
 
 - [ ] `TABLE_MAGIC_V2`, non-zero `metaindex`, head-page footer adjacency, and backward directory offset bounds checked
