@@ -61,6 +61,7 @@ mod memtable;
 pub use memtable::arena_tests::concurrent_arena_pins;
 mod options;
 mod pinned;
+mod profile;
 mod rate_limiter;
 mod sst;
 mod stats;
@@ -79,6 +80,8 @@ pub use options::{
     DbOptions, DurabilityMode, ReadOptions, SkipPointFn, WriteOptions,
 };
 pub use pinned::PinnedSlice;
+#[cfg(feature = "bench-metrics")]
+pub use profile::{ThreadWriteProfile, take_thread_write_profile};
 pub use sst::format::CompressionType;
 pub use types::{
     MAX_RANGE_DELETE_SIZE, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, WriteBatch,

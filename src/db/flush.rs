@@ -77,7 +77,11 @@ impl FlushQueue {
             if no_slowdown {
                 return Err(Error::busy("immutable memtable queue is full"));
             }
-            self.changed.wait(&mut p);
+            crate::profile::timed!(
+                immutable_wait_ns,
+                immutable_waits,
+                self.changed.wait(&mut p)
+            );
         }
     }
 
@@ -549,18 +553,23 @@ mod tests {
         db.put(b"seed", b"initial").unwrap();
         let before = db.snapshot().sequence();
         let (running, release) = pause_next_flush(&db, false);
+        #[cfg(feature = "bench-metrics")]
+        let (send_profile, profiles) = mpsc::channel();
+        let submit = |options: &WriteOptions, key: &[u8], value: &[u8]| {
+            let result = db.put_with_options(options, key, value);
+            #[cfg(feature = "bench-metrics")]
+            send_profile
+                .send(crate::take_thread_write_profile())
+                .unwrap();
+            result
+        };
+        let no_wait = WriteOptions::default().with_no_slowdown(true);
         thread::scope(|scope| {
             // Both calls pass public admission before our synthetic leader freezes
             // the generation. The real group leader must recheck capacity.
             db.write_queue.lock().leader_active = true;
-            let refused = scope.spawn(|| {
-                db.put_with_options(
-                    &WriteOptions::default().with_no_slowdown(true),
-                    b"refused",
-                    b"absent",
-                )
-            });
-            let admitted = scope.spawn(|| db.put_with_options(&synced, b"admitted", b"value"));
+            let refused = scope.spawn(|| submit(&no_wait, b"refused", b"absent"));
+            let admitted = scope.spawn(|| submit(&synced, b"admitted", b"value"));
             let queued = wait_for(|| db.write_queue.lock().queue.len() == 2);
             let freeze = db.submit_active();
             db.write_queue.lock().leader_active = false;
@@ -590,6 +599,18 @@ mod tests {
             assert_eq!(sequence_before_release, before);
             assert_eq!(active_wal(&db), wal);
             assert_eq!(fs::read(wal).unwrap(), expected_wal);
+            #[cfg(feature = "bench-metrics")]
+            {
+                let a = profiles.recv().unwrap();
+                let b = profiles.recv().unwrap();
+                assert_eq!(a.queue_waits + b.queue_waits, 2);
+                assert!(a.queue_wakeups + b.queue_wakeups >= 2);
+                assert!(a.queue_wait_ns + b.queue_wait_ns > 0);
+                assert_eq!(a.groups + b.groups, 1);
+                assert_eq!(a.max_group_requests.max(b.max_group_requests), 2);
+                assert!(a.immutable_waits + b.immutable_waits >= 1);
+                assert!(a.immutable_wait_ns + b.immutable_wait_ns > 0);
+            }
         });
         assert_eq!(db.snapshot().sequence(), before + 1);
         assert_eq!(db.get(b"refused").unwrap(), None);

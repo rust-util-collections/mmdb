@@ -259,6 +259,8 @@ impl WriteQueueState {
         const MAX_WRITE_BATCH_GROUP_BYTES: usize = 16 << 20;
         let cap = (write_buffer_size / 2).min(MAX_WRITE_BATCH_GROUP_BYTES);
         let mut bytes = 0usize;
+        #[cfg(feature = "bench-metrics")]
+        let mut group_bytes = 0;
         let count = self
             .queue
             .iter()
@@ -269,9 +271,22 @@ impl WriteQueueState {
                 let batch = unsafe { &(*request).batch };
                 bytes = bytes.saturating_add(batch.payload.len());
                 // A single batch is atomic and may exceed the group limit.
-                i == 0 || bytes <= cap
+                let admitted = i == 0 || bytes <= cap;
+                #[cfg(feature = "bench-metrics")]
+                if admitted {
+                    group_bytes = bytes as u64;
+                }
+                admitted
             })
             .count();
+        #[cfg(feature = "bench-metrics")]
+        crate::profile::record(|p| {
+            p.groups += 1;
+            p.requests += count as u64;
+            p.payload_bytes += group_bytes;
+            p.max_group_requests = p.max_group_requests.max(count as u64);
+            p.max_group_bytes = p.max_group_bytes.max(group_bytes);
+        });
         self.queue.drain(..count).collect()
     }
 }
@@ -2841,6 +2856,7 @@ impl DB {
         let l0_count = self.l0_file_count.load(Ordering::Relaxed);
 
         if l0_count >= self.options.l0_stop_trigger {
+            crate::profile::time_scope!(l0_stop_ns, l0_stops);
             // Hold write_queue across the entire stop-trigger drain so close
             // cannot take the barrier, release LOCK/caches, and let this path
             // install SST/MANIFEST afterwards. Keep the slowdown sleep outside
@@ -2853,6 +2869,8 @@ impl DB {
                 inner.versions.current().l0_file_count() >= self.options.l0_stop_trigger
             };
             if still_over {
+                #[cfg(feature = "bench-metrics")]
+                crate::profile::record(|p| p.l0_drains += 1);
                 // Slow path: drain L0, not the whole database, and do not hold
                 // db_mutex across the merge I/O. write_queue stays held for
                 // close serialization. drain_l0(false) returns Ok while another
@@ -2880,7 +2898,11 @@ impl DB {
             self.read.signal_compaction();
             // Progressive delay: more L0 files → longer sleep
             let delay_us = (l0_count - self.options.l0_slowdown_trigger + 1) as u64 * 1000;
-            thread::sleep(Duration::from_micros(delay_us));
+            crate::profile::timed!(
+                l0_slowdown_ns,
+                l0_slowdowns,
+                thread::sleep(Duration::from_micros(delay_us))
+            );
             // Refresh the cached count so a compaction finishing while we
             // slept lifts the slowdown for the next writes immediately —
             // without this, small workloads that never flush would keep
@@ -2957,12 +2979,19 @@ impl DB {
         wq.queue.push_back(req_ptr);
 
         let mut group_flushed = false;
+        #[cfg(feature = "bench-metrics")]
+        let mut waited = false;
         loop {
             if req.done {
                 break;
             }
             if wq.leader_active || wq.waiting_barriers != 0 {
-                self.write_cv.wait(&mut wq);
+                #[cfg(feature = "bench-metrics")]
+                if !waited {
+                    crate::profile::record(|p| p.queue_waits += 1);
+                    waited = true;
+                }
+                crate::profile::timed!(queue_wait_ns, queue_wakeups, self.write_cv.wait(&mut wq));
                 continue;
             }
             wq.leader_active = true;
@@ -3132,7 +3161,11 @@ impl DB {
             .sum();
         if total_ops == 0 {
             if need_sync {
-                if let Err(e) = inner.wal_writer.as_mut().expect("writable WAL").sync_data() {
+                if let Err(e) = crate::profile::timed!(
+                    wal_sync_ns,
+                    wal_syncs,
+                    inner.wal_writer.as_mut().expect("writable WAL").sync_data()
+                ) {
                     self.set_bg_error(format!("WAL fence failed: {e}"));
                     return Err(e);
                 }
@@ -3170,7 +3203,11 @@ impl DB {
             if durability != DurabilityMode::DisableWal {
                 let header = batch.wal_header(first_seq);
                 if let Some(ref mut wal) = inner.wal_writer
-                    && let Err(e) = wal.add_record_parts(&[&header, &batch.payload])
+                    && let Err(e) = crate::profile::timed!(
+                        wal_append_ns,
+                        wal_appends,
+                        wal.add_record_parts(&[&header, &batch.payload])
+                    )
                 {
                     append_error = Some(e.context("WAL write failed"));
                     break;
@@ -3189,9 +3226,9 @@ impl DB {
             match inner.wal_writer {
                 Some(ref mut wal) => {
                     let r = if need_sync {
-                        wal.sync_data()
+                        crate::profile::timed!(wal_sync_ns, wal_syncs, wal.sync_data())
                     } else {
-                        wal.flush()
+                        crate::profile::timed!(wal_flush_ns, wal_flushes, wal.flush())
                             .inspect(|_| wal.writeback_hint(self.options.wal_bytes_per_sync))
                     };
                     r.err()
@@ -3211,29 +3248,32 @@ impl DB {
             return Err(e);
         }
 
-        let mut applied_last_seq = None;
-        for &(req_ptr, first_seq) in &assigned {
-            // SAFETY: request pointers are still owned by this leader.
-            let batch = unsafe { &(*req_ptr).batch };
-            let mut batch_bytes = 0u64;
-            for (i, entry) in batch.entries().enumerate() {
-                let seq = first_seq + i as u64;
-                inner
-                    .active_memtable
-                    .put(entry.key, entry.value, seq, entry.value_type);
-                batch_bytes += entry.key.len() as u64 + entry.value.len() as u64;
+        {
+            crate::profile::time_scope!(apply_ns);
+            let mut applied_last_seq = None;
+            for &(req_ptr, first_seq) in &assigned {
+                // SAFETY: request pointers are still owned by this leader.
+                let batch = unsafe { &(*req_ptr).batch };
+                let mut batch_bytes = 0u64;
+                for (i, entry) in batch.entries().enumerate() {
+                    let seq = first_seq + i as u64;
+                    inner
+                        .active_memtable
+                        .put(entry.key, entry.value, seq, entry.value_type);
+                    batch_bytes += entry.key.len() as u64 + entry.value.len() as u64;
+                }
+                if !batch.is_empty() {
+                    applied_last_seq = Some(first_seq + batch.len() as u64 - 1);
+                    self.read.stats.record_write(batch_bytes);
+                }
             }
-            if !batch.is_empty() {
-                applied_last_seq = Some(first_seq + batch.len() as u64 - 1);
-                self.read.stats.record_write(batch_bytes);
-            }
-        }
-        if let Some(last_seq) = applied_last_seq {
-            self.read
-                .committed_sequence
-                .store(last_seq, Ordering::Release);
-            if need_sync {
-                self.synced_wal_seq.store(last_seq, Ordering::Release);
+            if let Some(last_seq) = applied_last_seq {
+                self.read
+                    .committed_sequence
+                    .store(last_seq, Ordering::Release);
+                if need_sync {
+                    self.synced_wal_seq.store(last_seq, Ordering::Release);
+                }
             }
         }
 
@@ -3314,6 +3354,7 @@ impl DB {
     // The caller owns write leadership or is closing the database. Other threads
     // may install SSTs and take snapshots while these file operations run.
     fn freeze_memtable(&self) -> Result<FrozenMemtable> {
+        crate::profile::time_scope!(freeze_ns, freezes);
         let mut standby = self.flush_queue.take_standby_wal();
         let (new_wal_number, mut old_wal) = {
             let mut inner = self.inner.lock();

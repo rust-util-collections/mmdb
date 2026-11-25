@@ -43,6 +43,7 @@ opt-level = 3
 
 [features]
 default = []
+bench-metrics = []  # Optional diagnostic instrumentation for engine profiles
 test-utils = []  # Exposes test helpers like DB::simulate_crash()
 
 [[bench]]
