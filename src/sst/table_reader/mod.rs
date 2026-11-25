@@ -538,6 +538,10 @@ impl TableReader {
         Ok(n.checked_sub(1).map_or(0, |j| u64::from_le_bytes(seqs[j])))
     }
 
+    pub(crate) fn has_data_partitions(&self) -> bool {
+        !self.partitions.is_empty()
+    }
+
     pub(crate) fn has_range_deletions(&self) -> bool {
         !self.range_partitions.is_empty()
     }

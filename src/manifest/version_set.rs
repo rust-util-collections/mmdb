@@ -17,7 +17,9 @@ use crate::manifest::file_numbers::FileNumbers;
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
 use crate::sst::table_reader::TableReader;
-use crate::types::{MAX_SEQUENCE_NUMBER, SequenceNumber, compare_internal_key, user_key};
+use crate::types::{
+    MAX_SEQUENCE_NUMBER, SequenceNumber, compare_internal_key, decode_internal_key, user_key,
+};
 use crate::wal::{WalReader, WalWriter};
 use parking_lot::Mutex;
 
@@ -215,6 +217,22 @@ impl VersionSet {
                 meta.number
             )));
         }
+        if !reader.has_data_partitions() && !reader.has_range_deletions() {
+            return Err(Error::corruption(format!(
+                "SST {} has neither data blocks nor range deletions",
+                meta.number
+            )));
+        }
+        decode_internal_key(&meta.smallest_key)
+            .with_ctx(|| format!("invalid smallest_key on SST {}", meta.number))?;
+        decode_internal_key(&meta.largest_key)
+            .with_ctx(|| format!("invalid largest_key on SST {}", meta.number))?;
+        if compare_internal_key(&meta.smallest_key, &meta.largest_key).is_gt() {
+            return Err(Error::corruption(format!(
+                "SST {} has inverted key bounds",
+                meta.number
+            )));
+        }
         Ok(TableFile {
             meta: meta.clone(),
             reader,
@@ -230,12 +248,19 @@ impl VersionSet {
     fn validate_level_disjointness(version: &Version) -> Result<()> {
         for level in 1..version.num_levels {
             let files = version.level_files(level);
+            for file in files {
+                decode_internal_key(&file.meta.smallest_key)?;
+                decode_internal_key(&file.meta.largest_key)?;
+                if compare_internal_key(&file.meta.smallest_key, &file.meta.largest_key).is_gt() {
+                    return Err(Error::corruption(format!(
+                        "SST {} has inverted key bounds at level {}",
+                        file.meta.number, level
+                    )));
+                }
+            }
             for pair in files.windows(2) {
                 let prev = &pair[0].meta;
                 let next = &pair[1].meta;
-                if prev.largest_key.is_empty() || next.smallest_key.is_empty() {
-                    continue;
-                }
                 if user_key(&prev.largest_key) >= user_key(&next.smallest_key) {
                     return Err(Error::corruption(format!(
                         "SST {} and SST {} have overlapping key ranges at level {}",
@@ -1634,5 +1659,91 @@ mod tests {
             err.to_string().contains("overlapping key ranges"),
             "unexpected recovery error: {err}"
         );
+    }
+
+    #[test]
+    fn malformed_or_inverted_file_bounds_are_rejected_on_apply_and_recovery() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let mut vs = VersionSet::create(path, 7).unwrap();
+
+        let sst_path = path.join("000010.sst");
+        let mut builder = TableBuilder::new(&sst_path, TableBuildOptions::default()).unwrap();
+        let ik_a = InternalKey::new(b"a", 1, ValueType::Value).into_bytes();
+        let ik_z = InternalKey::new(b"z", 1, ValueType::Value).into_bytes();
+        builder.add(&ik_a, b"va").unwrap();
+        builder.add(&ik_z, b"vz").unwrap();
+        let res = builder.finish().unwrap();
+
+        let cases = [
+            // Empty smallest_key
+            FileMetaData {
+                number: 10,
+                file_size: res.file_size,
+                smallest_key: Vec::new(),
+                largest_key: ik_z.clone(),
+                has_range_deletions: false,
+            },
+            // Truncated (< 8B) largest_key
+            FileMetaData {
+                number: 10,
+                file_size: res.file_size,
+                smallest_key: ik_a.clone(),
+                largest_key: b"short".to_vec(),
+                has_range_deletions: false,
+            },
+            // Invalid ValueType byte in trailer
+            FileMetaData {
+                number: 10,
+                file_size: res.file_size,
+                smallest_key: {
+                    let mut bad = ik_a.clone();
+                    *bad.last_mut().unwrap() = 0x00;
+                    bad
+                },
+                largest_key: ik_z.clone(),
+                has_range_deletions: false,
+            },
+            // Inverted smallest_key > largest_key
+            FileMetaData {
+                number: 10,
+                file_size: res.file_size,
+                smallest_key: ik_z,
+                largest_key: ik_a,
+                has_range_deletions: false,
+            },
+        ];
+
+        for bad_meta in &cases {
+            let mut edit = VersionEdit::new();
+            edit.add_file(1, bad_meta.clone());
+            let err = vs.log_and_apply(edit).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::Corruption,
+                "expected Corruption, got {err:?}"
+            );
+            assert!(!vs.is_poisoned());
+        }
+
+        // Persisted malformed bounds in MANIFEST also fail recovery with Corruption.
+        {
+            let mut bad_edit = VersionEdit::new();
+            bad_edit.add_file(1, cases[3].clone());
+            let encoded = bad_edit.encode();
+            let mut w = vs.manifest_writer.lock();
+            let writer = w.as_mut().unwrap();
+            writer.add_record(&encoded).unwrap();
+            writer.sync().unwrap();
+        }
+        drop(vs);
+        let err = match VersionSet::recover(path, 7) {
+            Ok(_) => panic!("recovery must reject inverted FileMetaData bounds"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), ErrorKind::Corruption);
     }
 }
