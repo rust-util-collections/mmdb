@@ -72,6 +72,9 @@ mod wal;
 
 // ---- Primary API ----
 pub use cache::block_cache::{BlockCache, BlockCachePool, BlockCachePoolUsage};
+#[cfg(feature = "bench-metrics")]
+#[doc(hidden)]
+pub use compaction::profile::L0CompactionProfile;
 pub use db::{ArcSnapshot, DB, DbMemoryUsage, Snapshot, SnapshotRef};
 pub use error::{Error, ErrorKind, Result, ResultExt};
 pub use iterator::{BidiIterator, DBIterator};

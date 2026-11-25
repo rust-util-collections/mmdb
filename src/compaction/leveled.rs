@@ -1124,11 +1124,18 @@ impl LeveledCompaction {
                 .is_none_or(|f| f.is_noop())
         {
             let tf = &task.input_files_level[0];
+            let dir_synced = sync_new_sst_parent_dir(ctx.dir_sync, ctx.manifest_poisoned)?;
+            #[cfg(feature = "bench-metrics")]
+            if task.level == 0
+                && let Some(stats) = ctx.stats
+            {
+                stats.l0_profile.lock().trivial_moves += 1;
+            }
             let mut edit = VersionEdit::new();
             edit.delete_file(task.level as u32, tf.meta.number);
             edit.add_file(target_level as u32, tf.meta.clone());
             return Ok(CompactionOutput {
-                dir_synced: sync_new_sst_parent_dir(ctx.dir_sync, ctx.manifest_poisoned)?,
+                dir_synced,
                 edit,
                 input_files: vec![(task.level as u32, tf.meta.clone())],
                 // Empty, NOT `{tf.meta.number}`: a trivial move relabels the
@@ -1214,9 +1221,17 @@ impl LeveledCompaction {
             range_fragments: &range_fragments,
         };
 
+        let run_range = |sub: &SubCompactionTask| {
+            #[cfg(feature = "bench-metrics")]
+            let _range = ctx
+                .stats
+                .filter(|_| task.level == 0)
+                .map(|s| super::profile::ActiveRange::enter(&s.l0_profile));
+            execute_sub_compaction_io(ctx, sub, &sub_params)
+        };
         let sub_outputs = if actual_subs <= 1 {
             // Fast path: single sub-compaction (zero overhead)
-            vec![execute_sub_compaction_io(ctx, &sub_tasks[0], &sub_params).ctx()?]
+            vec![run_range(&sub_tasks[0]).ctx()?]
         } else {
             // Parallel sub-compactions
             #[cfg(test)]
@@ -1227,7 +1242,7 @@ impl LeveledCompaction {
                     .map(|sub| {
                         s.spawn(|| {
                             let _build = ctx.builds.enter();
-                            execute_sub_compaction_io(ctx, sub, &sub_params)
+                            run_range(sub)
                         })
                     })
                     .collect();
@@ -1254,6 +1269,21 @@ impl LeveledCompaction {
             // are disjoint and extend cannot collide.
             output_tombstones.extend(sub_out.output_tombstones);
             filter_mutated |= sub_out.filter_mutated;
+        }
+
+        #[cfg(feature = "bench-metrics")]
+        if task.level == 0
+            && let Some(stats) = ctx.stats
+        {
+            let mut p = stats.l0_profile.lock();
+            p.rewrite_jobs += 1;
+            p.multiple_target_jobs += u64::from(task.input_files_next.len() > 1);
+            p.parallel_jobs += u64::from(actual_subs > 1);
+            p.input_file_bytes += all_input_files
+                .iter()
+                .map(|f| f.meta.file_size)
+                .sum::<u64>();
+            p.output_file_bytes += edit.new_files.iter().map(|(_, m)| m.file_size).sum::<u64>();
         }
 
         // Record deletions (orchestrator responsibility)

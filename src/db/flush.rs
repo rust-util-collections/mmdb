@@ -302,6 +302,13 @@ impl FlushContext {
             inner.versions.log_and_apply_synced(edit, synced).ctx()?;
             pending.keep();
             let version = inner.versions.current();
+            #[cfg(feature = "bench-metrics")]
+            {
+                let mut p = self.stats.l0_profile.lock();
+                p.peak_installed_l0_files = p
+                    .peak_installed_l0_files
+                    .max(version.l0_file_count() as u64);
+            }
             for (number, pin) in pins {
                 if let Some(tf) = version
                     .level_files(0)

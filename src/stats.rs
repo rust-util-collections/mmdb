@@ -7,6 +7,8 @@ pub(crate) const MAX_LEVELS: usize = 32;
 
 /// Tracks database statistics for monitoring and diagnostics.
 pub struct DbStats {
+    #[cfg(feature = "bench-metrics")]
+    pub(crate) l0_profile: parking_lot::Mutex<crate::compaction::profile::L0CompactionProfile>,
     /// Total bytes written by the user.
     pub bytes_written: AtomicU64,
     /// Key and value bytes returned by point lookups (`get*`); iterator
@@ -31,6 +33,8 @@ pub struct DbStats {
 impl DbStats {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "bench-metrics")]
+            l0_profile: Default::default(),
             bytes_written: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             compactions_completed: AtomicU64::new(0),

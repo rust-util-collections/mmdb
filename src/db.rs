@@ -2070,6 +2070,13 @@ impl DB {
         &self.path
     }
 
+    /// Per-DB L0 metrics for the opt-in benchmark build.
+    #[cfg(feature = "bench-metrics")]
+    #[doc(hidden)]
+    pub fn l0_compaction_profile(&self) -> crate::L0CompactionProfile {
+        *self.read.stats.l0_profile.lock()
+    }
+
     /// Get a database property.
     ///
     /// Supported properties:

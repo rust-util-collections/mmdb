@@ -53,3 +53,8 @@ harness = false
 [[bench]]
 name = "engine_profile"
 harness = false
+
+[[bench]]
+name = "l0_profile"
+harness = false
+required-features = ["bench-metrics"]
