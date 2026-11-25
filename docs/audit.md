@@ -12,12 +12,6 @@
 
 ## Open
 
-### [LOW] docs: `DB::open_read_only` and `DB::open_read_only_with_options` rustdoc contradicts v5 MANIFEST geometry recovery
-- **Where**: `src/db.rs:763-767`, `src/db.rs:793-796`
-- **What**: Public rustdoc on `DB::open_read_only` and `DB::open_read_only_with_options` should match v5 behavior (`src/lib.rs:34-35`, `README.md:418`), where `num_levels` and `prefix_len` are stored in the MANIFEST `DBHeader` and adopted automatically on read-only open. Instead, both docstrings still state `num_levels` is not stored in the MANIFEST and instruct callers to pass the writer's `num_levels`.
-- **Why**: Leftover v4 rustdoc paragraphs missed when `DBHeader` and `versions.geometry()` adoption (`src/db.rs:978-1009`) were introduced in `261a370`.
-- **Fix**: Update `src/db.rs:763-767` and `src/db.rs:793-796` to document that read-only open adopts `num_levels` and `prefix_len` from the MANIFEST `DBHeader` and ignores caller-supplied geometry/writer options.
-
 ### [LOW] build/CI: `make ci` omits `tools/v4-export` tests, CI `fmt`/`clippy` skip `tools/v4-export`, and `.gitignore` leaves `tools/v4-export/target/` untracked
 - **Where**: `Makefile:21-35`, `.github/workflows/ci.yml:21-44`, `.github/workflows/ci.yml:65`, `.gitignore:1`
 - **What**: `Makefile` `ci` (documented as `# Same gate as .github/workflows/ci.yml`) omits `cargo test --manifest-path tools/v4-export/Cargo.toml`, neither `Makefile` nor `.github/workflows/ci.yml` runs `fmt --check` or `clippy --all-targets -- -D warnings` on `tools/v4-export`, and `.gitignore` uses root-anchored `/target` so building/testing `tools/v4-export` leaves `?? tools/v4-export/target/` untracked.

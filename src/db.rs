@@ -761,10 +761,10 @@ impl DB {
     /// the existing infallible [`lazy_delete`](Self::lazy_delete) and
     /// [`lazy_delete_batch`](Self::lazy_delete_batch) methods are no-ops.
     ///
-    /// This uses [`DbOptions::default`]. Stores written with a non-default
-    /// [`DbOptions::num_levels`] should use
-    /// [`open_read_only_with_options`](Self::open_read_only_with_options) and
-    /// pass the writer's value; `num_levels` is not persisted in the MANIFEST.
+    /// This uses [`DbOptions::default`] for read/cache settings and adopts the
+    /// persisted [`DbOptions::num_levels`] and [`DbOptions::prefix_len`] from
+    /// the MANIFEST header. To customize cache or open-file settings, use
+    /// [`open_read_only_with_options`](Self::open_read_only_with_options).
     ///
     /// # Locking and consistency
     ///
@@ -791,9 +791,9 @@ impl DB {
     ///
     /// Writer-only options such as [`DbOptions::create_if_missing`],
     /// [`DbOptions::error_if_exists`], and the L0 write-throttling thresholds
-    /// are ignored. Because [`DbOptions::num_levels`] is not stored in the
-    /// MANIFEST, pass the value used by the writer when it differs from the
-    /// default.
+    /// are ignored, and [`DbOptions::num_levels`] and [`DbOptions::prefix_len`]
+    /// are adopted automatically from the persisted MANIFEST header rather than
+    /// from `options`.
     ///
     /// Recovery, supported operations, errors, and the locking/stable-snapshot
     /// contract are identical to [`open_read_only`](Self::open_read_only).
