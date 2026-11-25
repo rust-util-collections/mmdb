@@ -1,0 +1,207 @@
+diff --git a/src/compaction/leveled.rs b/src/compaction/leveled.rs
+index 2a808ff..f69bbf8 100644
+--- a/src/compaction/leveled.rs
++++ b/src/compaction/leveled.rs
+@@ -390,48 +390,19 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
+             Some(split_points[i].clone())
+         };
+
+-        // Filter target-level files to those overlapping [lower, upper)
+-        let sub_next: Vec<TableFile> = next_files
+-            .iter()
+-            .filter(|tf| {
+-                let file_smallest = user_key(&tf.meta.smallest_key);
+-                let file_largest = user_key(&tf.meta.largest_key);
+-                let above_lower = match &lower {
+-                    Some(lo) => file_largest >= lo.as_slice(),
+-                    None => true,
+-                };
+-                let below_upper = match &upper {
+-                    Some(hi) => file_smallest < hi.as_slice(),
+-                    None => true,
+-                };
+-                above_lower && below_upper
+-            })
+-            .cloned()
+-            .collect();
+-
+-        // For L0: all source files (they overlap arbitrarily).
+-        // For Ln: only files overlapping this sub-range.
+-        let sub_level: Vec<TableFile> = if task.level == 0 {
+-            task.input_files_level.clone()
+-        } else {
+-            task.input_files_level
++        // Range fragments are collected separately from the full claimed set.
++        // Each point stream only needs files whose bounds intersect this job.
++        let overlapping_points = |files: &[TableFile]| {
++            files
+                 .iter()
+-                .filter(|tf| {
+-                    let file_smallest = user_key(&tf.meta.smallest_key);
+-                    let file_largest = user_key(&tf.meta.largest_key);
+-                    let above_lower = match &lower {
+-                        Some(lo) => file_largest >= lo.as_slice(),
+-                        None => true,
+-                    };
+-                    let below_upper = match &upper {
+-                        Some(hi) => file_smallest < hi.as_slice(),
+-                        None => true,
+-                    };
+-                    above_lower && below_upper
++                .filter(|file| {
++                    file_metadata_overlaps_bounds(file, lower.as_deref(), upper.as_deref())
+                 })
+                 .cloned()
+                 .collect()
+         };
++        let sub_next = overlapping_points(next_files);
++        let sub_level = overlapping_points(&task.input_files_level);
+
+         sub_tasks.push(SubCompactionTask {
+             lower_bound: lower,
+@@ -1175,25 +1146,9 @@ impl LeveledCompaction {
+             block_property_collectors: Vec::new(),
+         };
+
+-        // Compute split points from target-level file boundaries.
+-        // L0 files overlap arbitrarily, so every sub-task would have to
+-        // include all L0 sources — redundant I/O with no benefit.
+-        // Sub-compaction is only useful for Ln→Ln+1 (level >= 1).
+-        //
+-        // Range deletions do NOT require serializing to a single sub-task:
+-        // Range tombstones below are collected
+-        // once from ALL input files and shared (by reference) with every
+-        // sub-task's `SubCompactionParams`; each sub-compaction then applies
+-        // exactly the subset overlapping its own key range (straddlers
+-        // included), so tombstone visibility stays complete for every key it
+-        // processes — the cross-sub-task sharing this data structure exists
+-        // for (INV-C2a) works correctly with `actual_subs > 1`.
+-        let max_subs = if task.level == 0 {
+-            1
+-        } else {
+-            ctx.options.max_subcompactions.max(1)
+-        };
+-        let split_points = compute_split_points(task, max_subs);
++        // Target file boundaries give disjoint user-key ranges, including for
++        // a claimed whole-L0 input. Tombstones crossing them are shared below.
++        let split_points = compute_split_points(task, ctx.options.max_subcompactions.max(1));
+         let actual_subs = split_points.len() + 1;
+
+         // Build sub-tasks
+diff --git a/src/db.rs b/src/db.rs
+index 20eb490..75f5183 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -4815,6 +4815,98 @@ mod tests {
+     /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0
+     /// was empty it ran level-size compactions inline — in the stop-trigger
+     /// path while holding `write_queue`, stalling every writer.
++    #[test]
++    fn split_l0_preserves_snapshot_stripes_and_concurrent_flush_across_boundaries() {
++        use std::sync::mpsc;
++
++        struct Collector;
++        impl crate::BlockPropertyCollector for Collector {
++            fn add(&mut self, _: &[u8]) {}
++            fn finish_block(&mut self) -> Vec<u8> {
++                Vec::new()
++            }
++            fn name(&self) -> &str {
++                "l0-merge-gate"
++            }
++        }
++
++        for subs in [1, 3] {
++            let dir = tempfile::tempdir().unwrap();
++            let gate = Arc::new(Mutex::new(None::<(mpsc::Sender<()>, mpsc::Receiver<()>)>));
++            let factory_gate = Arc::clone(&gate);
++            let opts = DbOptions::default()
++                .with_num_levels(2)
++                .with_l0_compaction_trigger(usize::MAX)
++                .with_max_subcompactions(subs)
++                .with_block_property_collectors(vec![Arc::new(move || {
++                    let barrier = factory_gate.lock().take();
++                    if let Some((entered, release)) = barrier {
++                        entered.send(()).unwrap();
++                        release.recv_timeout(Duration::from_secs(10)).unwrap();
++                    }
++                    Box::new(Collector)
++                })]);
++            let db = DB::open(opts.clone(), dir.path()).unwrap();
++            // Three separate L1 files with split points at d and k.
++            for pair in [b"ad", b"hk", b"mz"] {
++                db.ingest_sorted(pair.iter().map(|&k| ([k], [0]))).unwrap();
++            }
++            let original = db.snapshot();
++            db.delete_range(b"c", b"y").unwrap();
++            db.flush().unwrap();
++            let wiped = db.snapshot();
++            for k in [b"d", b"k", b"y"] {
++                db.put(k, &[1]).unwrap();
++            }
++            db.flush().unwrap();
++            let replaced = db.snapshot();
++
++            let (entered, picked) = mpsc::channel();
++            let (resume, release) = mpsc::channel();
++            *gate.lock() = Some((entered, release));
++            thread::scope(|threads| {
++                let job = threads.spawn(|| db.drain_l0(true));
++                picked.recv_timeout(Duration::from_secs(10)).unwrap();
++                // A newer L0 file lands while the original inputs are claimed.
++                db.put(b"k", &[2]).unwrap();
++                db.flush().unwrap();
++                resume.send(()).unwrap();
++                job.join().unwrap().unwrap();
++            });
++            #[cfg(feature = "bench-metrics")]
++            {
++                let measured = db.l0_compaction_profile();
++                assert!(measured.multiple_target_jobs > 0);
++                assert_eq!(measured.parallel_jobs > 0, subs > 1);
++                assert_eq!(measured.ranges_executed > measured.rewrite_jobs, subs > 1);
++            }
++
++            fn rows(mut iter: DBIterator) -> Vec<(u8, u8)> {
++                let mut rows = Vec::new();
++                while let Some((k, v)) = iter.step_next().unwrap() {
++                    assert_eq!((k.len(), v.len()), (1, 1));
++                    rows.push((k[0], v[0]));
++                }
++                rows
++            }
++            assert_eq!(rows(original.iter().unwrap()), b"adhkmz".map(|k| (k, 0)));
++            assert_eq!(rows(wiped.iter().unwrap()), [(b'a', 0), (b'z', 0)]);
++            assert_eq!(
++                rows(replaced.iter().unwrap()),
++                [(b'a', 0), (b'd', 1), (b'k', 1), (b'y', 1), (b'z', 0)]
++            );
++            let expected = [(b'a', 0), (b'd', 1), (b'k', 2), (b'y', 1), (b'z', 0)];
++            for (key, value) in expected {
++                assert_eq!(db.get(&[key]).unwrap(), Some(vec![value]));
++            }
++            assert_eq!(rows(db.iter().unwrap()), expected);
++            drop((original, wiped, replaced));
++            db.close().unwrap();
++            let reopened = DB::open(opts, dir.path()).unwrap();
++            assert_eq!(rows(reopened.iter().unwrap()), expected);
++        }
++    }
++
+     #[test]
+     fn drain_l0_leaves_deeper_levels_to_background_workers() {
+         let dir = tempfile::tempdir().unwrap();
+diff --git a/src/options.rs b/src/options.rs
+index 81a32a6..23b11ee 100644
+--- a/src/options.rs
++++ b/src/options.rs
+@@ -86,7 +86,8 @@ pub struct DbOptions {
+     /// RocksDB equivalent: `max_subcompactions`.
+     /// When > 1, a single compaction is split into parallel sub-tasks by key range
+     /// using target-level file boundaries as split points. The actual count is
+-    /// bounded by those boundaries; L0 compactions run serially.
++    /// bounded by distinct target-file boundaries. Jobs with fewer than two
++    /// overlapping target files run serially.
+     pub max_subcompactions: usize,
+
+     // ---- Cache behavior ----
