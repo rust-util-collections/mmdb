@@ -968,7 +968,9 @@ fn test_get_property() {
     let opts = DbOptions::default()
         .with_create_if_missing(true)
         .with_write_buffer_size(1024)
-        .with_l0_compaction_trigger(10);
+        .with_l0_compaction_trigger(100)
+        .with_l0_slowdown_trigger(100)
+        .with_l0_stop_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Initially no SST files
