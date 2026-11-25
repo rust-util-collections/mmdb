@@ -22,6 +22,8 @@ thread_local! {
     /// Makes the next `add_record` on this thread fail with this I/O kind.
     pub(crate) static FAIL_NEXT_APPEND: std::cell::Cell<Option<std::io::ErrorKind>> =
         const { std::cell::Cell::new(None) };
+    /// Counts `WalWriter::new` file-creation + dir-sync calls on the current thread.
+    pub(crate) static WAL_NEW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 struct PartsCursor<'a> {
@@ -66,6 +68,8 @@ impl WalWriter {
 
     /// Create a new WAL writer for the given file path.
     pub fn new(path: &Path) -> Result<Self> {
+        #[cfg(test)]
+        WAL_NEW_CALLS.with(|n| n.set(n.get() + 1));
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)

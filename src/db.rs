@@ -2692,6 +2692,7 @@ impl DB {
             first_error = result.err();
         }
         self.stop_background_and_detach_cache();
+        self.flush_queue.cleanup_standby_wal(&self.storage_path);
         let mut inner = self.inner.lock();
         let version = inner.versions.current();
         inner.closed_properties = Some(ClosedProperties {
@@ -3202,8 +3203,16 @@ impl DB {
             return Ok(false);
         }
 
-        let freeze = inner.active_memtable.approximate_size() >= self.options.write_buffer_size;
+        let approx_size = inner.active_memtable.approximate_size();
+        let freeze = approx_size >= self.options.write_buffer_size;
+        let arm_standby = !freeze
+            && approx_size >= self.options.write_buffer_size / 2
+            && !self.flush_queue.standby_armed.load(Ordering::Relaxed)
+            && !self.flush_queue.standby_armed.swap(true, Ordering::AcqRel);
         drop(inner);
+        if arm_standby {
+            self.flush_queue.request_standby();
+        }
         if freeze {
             // Every batch in this group is already in WAL_old and visible in
             // active_memtable via committed_sequence. A rotation or flush-queue
@@ -3255,15 +3264,37 @@ impl DB {
     // The caller owns write leadership or is closing the database. Other threads
     // may install SSTs and take snapshots while these file operations run.
     fn freeze_memtable(&self) -> Result<FrozenMemtable> {
+        let mut standby = self.flush_queue.take_standby_wal();
         let (new_wal_number, mut old_wal) = {
             let mut inner = self.inner.lock();
-            (
-                inner.versions.file_numbers.allocate()?,
-                inner.wal_writer.take().expect("writable WAL"),
-            )
+            if let Some((num, _)) = &standby
+                && *num <= inner.wal_number
+                && let Some((stale_num, stale_writer)) = standby.take()
+            {
+                drop(stale_writer);
+                let _ = fs::remove_file(self.storage_path.join(format!("{stale_num:06}.wal")));
+            }
+            let num = match &standby {
+                Some((num, _)) => *num,
+                None => inner.versions.file_numbers.allocate()?,
+            };
+            (num, inner.wal_writer.take().expect("writable WAL"))
         };
-        let path = self.storage_path.join(format!("{new_wal_number:06}.wal"));
-        let new_wal = old_wal.sync_data().and_then(|()| WalWriter::new(&path));
+        let new_wal = match old_wal.sync_data() {
+            Ok(()) => match standby.take() {
+                Some((_, ready)) => Ok(ready),
+                None => {
+                    let path = self.storage_path.join(format!("{new_wal_number:06}.wal"));
+                    WalWriter::new(&path)
+                }
+            },
+            Err(e) => {
+                if let Some((num, ready)) = standby.take() {
+                    self.flush_queue.restore_standby_wal(num, ready);
+                }
+                Err(e)
+            }
+        };
         let mut inner = self.inner.lock();
         let new_wal = match new_wal {
             Ok(w) => w,
@@ -3763,6 +3794,7 @@ impl DB {
     pub fn simulate_crash(self) {
         self.read.closed.store(true, Ordering::Release);
         self.stop_background_and_detach_cache();
+        self.flush_queue.abandon_standby_wal_for_crash();
         let mut inner = self.inner.lock();
         if let Some(wal) = inner.wal_writer.take() {
             wal.discard_buffer();
@@ -3785,6 +3817,7 @@ impl Drop for DB {
             }
         }
         self.stop_background_and_detach_cache();
+        self.flush_queue.cleanup_standby_wal(&self.storage_path);
         let mut inner = self.inner.lock();
         inner.wal_writer.take();
         inner.versions.manifest_sync_handle().lock().take();

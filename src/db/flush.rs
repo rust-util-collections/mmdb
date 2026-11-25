@@ -16,6 +16,7 @@ struct Progress {
     submitted: u64,
     durable: u64,
     pending: VecDeque<FrozenMemtable>,
+    prepare_standby: bool,
     shutdown: bool,
     error: Option<Error>,
 }
@@ -24,6 +25,8 @@ struct Progress {
 pub(super) struct FlushQueue {
     progress: Mutex<Progress>,
     changed: Condvar,
+    standby_wal: Mutex<Option<(u64, WalWriter)>>,
+    pub(super) standby_armed: AtomicBool,
     #[cfg(test)]
     before_build: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -92,38 +95,97 @@ impl FlushQueue {
     pub(super) fn stop(&self) {
         let mut p = self.progress.lock();
         p.shutdown = true;
+        p.prepare_standby = false;
         p.pending.clear();
         self.changed.notify_all();
     }
 
+    #[cfg(test)]
+    pub(super) fn has_standby(&self) -> bool {
+        self.standby_wal.lock().is_some()
+    }
+
+    pub(super) fn request_standby(&self) {
+        let mut p = self.progress.lock();
+        if !p.shutdown && p.error.is_none() && !p.prepare_standby {
+            p.prepare_standby = true;
+            self.changed.notify_all();
+        }
+    }
+
+    pub(super) fn take_standby_wal(&self) -> Option<(u64, WalWriter)> {
+        let taken = self.standby_wal.lock().take();
+        self.standby_armed.store(false, Ordering::Release);
+        taken
+    }
+
+    pub(super) fn restore_standby_wal(&self, num: u64, writer: WalWriter) {
+        let mut slot = self.standby_wal.lock();
+        if slot.is_none() {
+            *slot = Some((num, writer));
+            self.standby_armed.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn cleanup_standby_wal(&self, storage_path: &Path) {
+        if let Some((num, writer)) = self.standby_wal.lock().take() {
+            drop(writer);
+            let _ = fs::remove_file(storage_path.join(format!("{num:06}.wal")));
+        }
+        self.standby_armed.store(false, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn abandon_standby_wal_for_crash(&self) {
+        if let Some((_, writer)) = self.standby_wal.lock().take() {
+            writer.discard_buffer();
+        }
+        self.standby_armed.store(false, Ordering::Release);
+    }
+
     pub(super) fn run(&self, ctx: &FlushContext) {
+        enum Work {
+            Flush(FrozenMemtable),
+            Standby,
+        }
         loop {
-            let frozen = {
+            let work = {
                 let mut p = self.progress.lock();
                 loop {
                     if p.shutdown || p.error.is_some() {
                         return;
                     }
                     if let Some(frozen) = p.pending.pop_front() {
-                        break frozen;
+                        break Work::Flush(frozen);
+                    }
+                    if p.prepare_standby {
+                        p.prepare_standby = false;
+                        break Work::Standby;
                     }
                     self.changed.wait(&mut p);
                 }
             };
-            #[cfg(test)]
-            if let Some(hook) = self.before_build.lock().take() {
-                hook();
+            match work {
+                Work::Standby => {
+                    ctx.prepare_standby_wal(self);
+                }
+                Work::Flush(frozen) => {
+                    #[cfg(test)]
+                    if let Some(hook) = self.before_build.lock().take() {
+                        hook();
+                    }
+                    let result = catch_unwind(AssertUnwindSafe(|| ctx.flush(&frozen)))
+                        .unwrap_or_else(|_| Err(Error::background("flush worker panicked")));
+                    if let Err(e) = result {
+                        *ctx.bg_error.lock() = Some(e.to_string());
+                        ctx.has_bg_error.store(true, Ordering::Release);
+                        self.fail(e);
+                        return;
+                    }
+                    self.progress.lock().durable += 1;
+                    self.changed.notify_all();
+                }
             }
-            let result = catch_unwind(AssertUnwindSafe(|| ctx.flush(&frozen)))
-                .unwrap_or_else(|_| Err(Error::background("flush worker panicked")));
-            if let Err(e) = result {
-                *ctx.bg_error.lock() = Some(e.to_string());
-                ctx.has_bg_error.store(true, Ordering::Release);
-                self.fail(e);
-                return;
-            }
-            self.progress.lock().durable += 1;
-            self.changed.notify_all();
         }
     }
 }
@@ -156,6 +218,49 @@ pub(super) fn file_metadata((number, result): (u64, TableBuildResult)) -> FileMe
 }
 
 impl FlushContext {
+    pub(super) fn prepare_standby_wal(&self, queue: &FlushQueue) {
+        if queue.standby_wal.lock().is_some() {
+            return;
+        }
+        let Ok(standby_num) = self.inner.lock().versions.file_numbers.allocate() else {
+            queue.standby_armed.store(false, Ordering::Release);
+            return;
+        };
+        let path = self.storage_path.join(format!("{standby_num:06}.wal"));
+        let writer = match WalWriter::new(&path) {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = fs::remove_file(&path);
+                queue.standby_armed.store(false, Ordering::Release);
+                tracing::warn!(
+                    "standby WAL {:06} pre-creation failed, deferring to rotation: {}",
+                    standby_num,
+                    e
+                );
+                return;
+            }
+        };
+        let stopped = {
+            let p = queue.progress.lock();
+            p.shutdown || p.error.is_some()
+        };
+        if stopped {
+            drop(writer);
+            let _ = fs::remove_file(&path);
+            return;
+        }
+        let inner = self.inner.lock();
+        let mut slot = queue.standby_wal.lock();
+        if slot.is_some() || standby_num <= inner.wal_number {
+            drop(slot);
+            drop(inner);
+            drop(writer);
+            let _ = fs::remove_file(&path);
+            return;
+        }
+        *slot = Some((standby_num, writer));
+    }
+
     pub(super) fn flush(&self, frozen: &FrozenMemtable) -> Result<()> {
         let _build = self.builds.enter();
         let outputs = DB::write_memtable_ssts(
@@ -756,5 +861,128 @@ mod tests {
             "new L0 claim must drop before compaction_notify"
         );
         assert!(pickable, "woken compaction worker must be able to pick L0");
+    }
+
+    #[test]
+    fn standby_wal_rotates_without_leader_create_and_unlinks_unused_on_close() {
+        use crate::wal::writer::WAL_NEW_CALLS;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(options(), dir.path()).unwrap();
+        WAL_NEW_CALLS.with(|n| n.set(0));
+
+        // Crossing 50% of write_buffer_size (8 KiB -> >= 4 KiB) arms background
+        // zero-length standby WAL creation on mmdb-flush.
+        db.put(b"half", &[b'a'; 4500]).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !db.flush_queue.has_standby() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mmdb-flush did not prepare standby WAL in time"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Crossing 100% triggers freeze_memtable(), which swaps in the standby
+        // WalWriter in O(1) with zero WalWriter::new calls on the leader thread.
+        db.put(b"full", &[b'b'; 4500]).unwrap();
+        assert_eq!(
+            WAL_NEW_CALLS.with(|n| n.get()),
+            0,
+            "rotation leader must consume standby WAL without calling WalWriter::new"
+        );
+        db.flush_queue.wait(db.flush_queue.target()).unwrap();
+
+        // Prepare another standby WAL on an empty active memtable, then close():
+        // close() must unlink the unused standby WAL so no orphan .wal remains.
+        db.flush_queue.request_standby();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !db.flush_queue.has_standby() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let live_wal = db.inner.lock().wal_number;
+        db.close().unwrap();
+
+        let wals: Vec<u64> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                name.strip_suffix(".wal")?.parse::<u64>().ok()
+            })
+            .collect();
+        assert_eq!(
+            wals,
+            vec![live_wal],
+            "close() must unlink any unused standby WAL"
+        );
+
+        let ro = DB::open_read_only(dir.path()).unwrap();
+        assert_eq!(ro.get(b"half").unwrap().map(|v| v.len()), Some(4500));
+        assert_eq!(ro.get(b"full").unwrap().map(|v| v.len()), Some(4500));
+    }
+
+    #[test]
+    fn crash_with_empty_standby_wal_recovers_torn_active_tail_and_cleans_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(options(), dir.path()).unwrap();
+        let active_wal = db.inner.lock().wal_number;
+
+        // Commit durable data + cross 50% so a higher-numbered 0-byte standby WAL
+        // exists on disk alongside the active WAL.
+        db.put_with_options(
+            &WriteOptions::default().with_durability(DurabilityMode::WalSync),
+            b"durable",
+            &[b'x'; 4500],
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !db.flush_queue.has_standby() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let standby_wal = db.flush_queue.standby_wal.lock().as_ref().unwrap().0;
+        assert!(standby_wal > active_wal);
+
+        db.simulate_crash();
+
+        let active_path = dir.path().join(format!("{active_wal:06}.wal"));
+        let standby_path = dir.path().join(format!("{standby_wal:06}.wal"));
+        assert!(active_path.is_file());
+        assert_eq!(
+            fs::metadata(&standby_path).unwrap().len(),
+            0,
+            "standby WAL must be 0 bytes on disk across crash"
+        );
+
+        // Append a torn 3-byte partial header to the active WAL: recovery must
+        // still identify `active_wal` (not the 0-byte `standby_wal`) as
+        // `recoverable_tail_wal_num`.
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .append(true)
+                .open(&active_path)
+                .unwrap();
+            f.write_all(&[0xde, 0xad, 0xbe]).unwrap();
+        }
+
+        // Read-only open recovers cleanly without deleting the 0-byte standby WAL.
+        let ro = DB::open_read_only(dir.path()).unwrap();
+        assert_eq!(ro.get(b"durable").unwrap().map(|v| v.len()), Some(4500));
+        drop(ro);
+        assert!(standby_path.exists());
+
+        // Writable open recovers cleanly and unlinks the 0-byte orphan standby WAL.
+        let reopened = DB::open(options(), dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"durable").unwrap().map(|v| v.len()),
+            Some(4500)
+        );
+        assert!(
+            !standby_path.exists(),
+            "writable recovery must unlink the unused 0-byte standby WAL"
+        );
+        reopened.close().unwrap();
     }
 }
