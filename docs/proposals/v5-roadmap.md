@@ -5,6 +5,7 @@ This record follows the transition from the v4.3.15 baseline (`cecc9b3`) to the 
 - **Sections 1–6** preserve the original design against v4.3.15. Their source links point to that revision. Future-tense descriptions and example signatures capture the proposal.
 - **Section 7.1** records historical measurements of the initial v5 implementation, including its earlier affine Bloom probes. These measurements predate the final eight-probe mix, cache overflow, and direct sorted ingestion.
 - **[Section 7.2](#72-implementation-outcomes)** maps the proposed optimizations to their implementation or deferred status. It precedes the detailed historical alternatives.
+- The [joint MMDB v5 and VSDB v18 proposal](mmdb-v5-vsdb-v18-improvements.md) revisits write pipelining and value separation alongside collection changes and the two-format cutover.
 
 The cutover work recorded WAL and MANIFEST fault injection, a simulated loss of unsynced WAL pages, eight Miri seeds across two alias models, and a v4 golden-store conversion. At the initial cutover, 200,000 absent-key probes measured a 0.59% false-positive rate at 12 bits/key (v4.3.15 measured 0.86% at 10 bits/key). The 120,000-entry memtable test allocated 8,384,512 slab bytes for distinct 16-byte keys and 16-byte values. The related vsdb collection design has its own [v18 roadmap](https://github.com/rust-util-collections/vsdb/blob/fba65bb8becf8f3aa3917b0d20ada5fedb6ed7d3/docs/proposals/v18-roadmap.md).
 
@@ -350,7 +351,7 @@ The design notes below preserve the alternatives, projected gains, and constrain
 
 #### P6. Optional large-value separation (`BlobFile` / WiscKey threshold — deferred / opt-in)
 
-- **Workload crossover analysis (aligning with [COMPARISON.md](https://github.com/rust-util-collections/mmdb/blob/261a370fa87ce87d603896c547b87b698a76676f/COMPARISON.md?plain=1#L107-L112)):**
+- **Workload crossover analysis (aligning with the [comparison at 261a370](https://github.com/rust-util-collections/mmdb/blob/261a370fa87ce87d603896c547b87b698a76676f/COMPARISON.md?plain=1#L107-L112)):**
   - For `< 4 KiB` values (`vsdb` slot metadata, B+ tree interior/leaf nodes, indexes), inline SST values + `PinnedSlice` (`LazyValue::BlockRef`) achieve optimal spatial locality (`1` `pread` for both point and range scans, zero blob GC).
   - For `>= 4–16 KiB` values (`bench_value_sizes/write/65536B`), inline storage rewrites full payloads across every compaction (`~5–10×` WA) and fills 4–64 KiB data blocks with 1 value each, polluting `BlockCache`.
 - **Isolated opt-in architecture (when/if enabled via `DbOptions::blob_min_value_size: Option<usize>`):**

@@ -55,7 +55,7 @@ with prefix scans, bounded iteration, and typed errors. [Example source](example
 | Convert a v4 store and update Rust call sites | [Migrating to v5](docs/migration.md) |
 | Trace a write through the WAL, flush, recovery, and compaction, or follow a point lookup | [Storage architecture](docs/architecture.md) |
 | Find public methods, options, defaults, and error types | [Crate API](https://docs.rs/mmdb), [exports in this checkout](src/lib.rs) |
-| Map familiar RocksDB and Pebble operations to MMDB | [Feature comparison](COMPARISON.md) |
+| Evaluate the MMDB v5 and VSDB v18 improvements or compare RocksDB and Pebble | [Joint proposal](docs/proposals/mmdb-v5-vsdb-v18-improvements.md) · [Engine measurements and API comparison](docs/proposals/mmdb-v5-vsdb-v18-improvements.md#mmdb-rocksdb-and-pebble) |
 | Understand earlier design decisions and benchmark baselines | [v5 design record](docs/proposals/v5-roadmap.md), [read-only design record](docs/proposals/read-only-mode.md) |
 | Contribute or run the project's review and fix workflows | [Contributor and skill guide](AGENTS.md), [audit registry](docs/audit.md) |
 
