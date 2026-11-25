@@ -8,7 +8,8 @@
 //! in durable SSTs.
 //!
 //! Use [`DB::snapshot`] for a consistent view across reads, [`DB::get_pinned`]
-//! to retain a value's backing storage, and [`DB::iter_with_range`] for a
+//! to retain a value's backing storage, [`DB::get_many_pinned`] for a
+//! bounded group of keys at one sequence, and [`DB::iter_with_range`] for a
 //! scan with inclusive lower and exclusive upper bounds. The crate-root
 //! re-exports below define the public API.
 //!

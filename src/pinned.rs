@@ -3,7 +3,8 @@
 use crate::{memtable::MemTablePin, types::LazyValue};
 use std::{ops::Deref, sync::Arc};
 
-/// Immutable bytes returned by [`crate::DB::get_pinned`].
+/// Immutable bytes returned by [`crate::DB::get_pinned`] or by an occupied
+/// result slot in [`crate::DB::get_many_pinned`].
 ///
 /// A nonempty pin keeps its entire SST block (up to 64 MiB) or memtable arena alive,
 /// including after eviction, compaction, and database close. Those retained
