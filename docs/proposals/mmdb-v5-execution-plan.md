@@ -332,9 +332,26 @@ full-system AArch64 Linux VM, including child-process recovery and actual
 guest syscall tracing. The arena pin test also passed under Miri on x86_64.
 Performance trials use x86_64 hardware. [Validation receipt](../benchmarks/engine-profile/validation.json) · [Baseline plan review](reviews/mmdb-v5-plan/README.md#what-was-checked-during-this-review) · [Implementation reviews](reviews/mmdb-v5-implementation/README.md)
 
-For the VSDB port, hand off the accepted MMDB revision, property names with
-units and ownership, the writable-reopen/export results, the raw workload
-results with settings and run-to-run spread, and a disposition for each
-performance candidate. Physical checkpoints, external value files and
+The VSDB adapter can target the engine validated at `90b220e`. On a valid
+`no_slowdown` rejection, the caller may retry the complete batch after
+pressure clears. Count the shared cache pool once and add each member's
+reported pins and current memtables separately. For a v4 shard, preserve
+its eight-byte prefix and level geometry through export and writable reopen.
+The public grouped APIs return up to 32 ordered pins on one read view. VecDex
+can compare their effect on complete queries after the adapter port.
+[API and units](../usage.md) · [Export procedure](../migration.md) · [Grouped trials](../benchmarks/grouped-reads/README.md)
+
+For 16 handles under the 1 GiB engine budget, all measured profiles fit
+in RAM. At fixed 16 MiB, two immutables fell below the 95% all-active
+throughput floor. At a fixed 30 MiB nominal write-buffer allowance,
+two immutables with 10 MiB buffers gained 53.19% hot and 9.33% all-active
+saturation throughput against four with 6 MiB buffers. The one-hot
+candidate ended saturation with nine additional L0 files. The
+control-to-control latency variation exceeded the 5% p99 guardrail.
+Four with 6 MiB is the reference under that allowance. The adapter can
+retest two with 10 MiB on collection-level traffic. The engine retains its
+existing group-commit and L0 compaction paths. [Engine trial results](../benchmarks/engine-profile/results.md) · [L0 trial results](../benchmarks/l0-profile/README.md)
+
+Physical checkpoints, external value files and
 VSDB collection layout changes can follow a separate decision once the
 caller supplies a concrete requirement.

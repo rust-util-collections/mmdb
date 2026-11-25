@@ -3,7 +3,9 @@
 Run each arm as a separate optimized process on a local filesystem. The
 `engine_profile` bench creates temporary database directories under `TMPDIR`.
 It reports small puts, bulk writes, ordinary pinned gets, new snapshot reads
-and reads with one held snapshot as separate classes.
+and reads with one held snapshot as separate classes. The recorded trials
+show per-class latency, queue capacity effects, outstanding compaction work
+and recovery costs. [Measured results and raw runs](results.md)
 
 ```sh
 cargo +stable bench --bench engine_profile -- mixed
@@ -55,7 +57,19 @@ includes a `MMDB_PROFILE_READ_ONLY=true` arm. The parent measures open, then
 checks every recovered row. Record open-time memory separately from the
 verification scan.
 
-The [short-group candidate](short-group.patch) applies at `7b46443` in a
+For the recorded mixed, memory and writer-handoff trials, the measured
+worktree used the concurrent driver later committed at `7b46443`. To
+reconstruct the paired source from reachable commits, create a detached
+worktree at `cf40cab` and run `git restore --source=7b46443 -- benches/engine_profile`
+in it. Build that control and a copy with the short-group patch applied.
+The reconstructed candidate writer and every engine-profile Rust source
+match the original candidate checkout byte for byte. For the separate
+reopen measurements, use `bb81151`, which includes the 64 MiB preparation
+buffer and the read-only arm. Each raw suite header records which binary
+digests it used. The extended memory guard reuses the original control
+binary. The later Python evidence checks run after collection.
+
+The [short-group candidate](short-group.patch) also applies at `7b46443` in a
 separate checkout. It stores short request lists inline and skips a wakeup
 only for an uncontended leader serving itself alone. Use matching source
 and compilation settings for the control. Pass the observed asynchronous
