@@ -10,11 +10,12 @@ Derive the current list via search (`rg '\bunsafe\b' src`) rather than relying
 on static line counts:
 
 - `src/memtable/skiplist_impl.rs` — arena-allocated node storage and atomic
-  tower links (`ConcurrentSkipList` `Send`/`Sync`)
+  tower links, aligned raw slab allocation/deallocation and `Slab` ownership
+- `src/memtable/mod.rs` — `MemTablePin` retains the arena owning its immutable slice
 - `src/memtable/skiplist.rs` — level-0 cursor node reads and `Send` impl on
   `MemTableCursorIter`
-- `src/db.rs` — `DB` `Send`/`Sync` markers, cooperative `libc::flock` calls on
-  open `LOCK` descriptors, and stack-allocated `WriteRequest` pointers inside
+- `src/db.rs` — the group-commit queue’s `Send` implementation, cooperative `libc::flock` calls on
+  open `LOCK` descriptors, advisory Linux WAL writeback, and stack-allocated `WriteRequest` pointers inside
   the group-commit queue
 - `src/sst/table_reader/mod.rs` — advisory `libc::posix_fadvise` hint on an open
   SST `File` descriptor
@@ -47,13 +48,15 @@ Safe byte-slice parsing in `src/sst/block.rs`, `src/sst/format.rs`, and
 ### 3. Subsystem invariants
 
 - **Arena skiplist (`skiplist_impl.rs`, `skiplist.rs`)**:
-  - Single-writer inserts are serialized externally; arena chunks are never
-    moved or freed until the `ConcurrentSkipList` drops.
+  - The insertion guard serializes bump allocation and splice. Slabs keep a
+    fixed address until the last owning table or pin drops.
   - Node fields are fully initialized before level links publish the pointer
     with `Ordering::Release`; readers load links with `Ordering::Acquire` and
     keep `height <= MAX_HEIGHT`.
   - `MemTableCursorIter` retains `Arc<MemTable>`, keeping the skiplist and its
     arena alive for the cursor's entire lifetime across thread moves (`Send`).
+  - `cargo +nightly miri test --test arena_miri` exercises concurrent insertion,
+    traversal and pinned reads entirely in memory.
 - **Group commit & file lock (`db.rs`)**:
   - Each `*mut WriteRequest` points to a writer thread's local stack frame that
     remains parked on `write_cv` under `write_queue` until `done == true`; the

@@ -1,6 +1,11 @@
 # MMDB v5 Structural & Wire-Format Roadmap
 
-Status: proposed major-release design (`v5.0.0`), 2026-11-24. Not yet implemented; current `v4.3` contracts remain active until v5 development begins.
+Status: implemented in the v5.0.0 working tree. The design below records the v4.3 baseline. Current API and migration instructions are in the [README](../../README.md).
+
+The core accepts v5 MANIFEST and SST formats. A [standalone exporter](../../tools/v4-export/Cargo.toml) links MMDB 4.3.15 to read older stores. WAL batch framing stays byte-identical. Index and rangedel directories use linked, individually checksummed pages so an aggregate directory can grow past the single-block size limit. Read-only open adopts the persisted level count and prefix length. Writable open requires both to match.
+
+Verification includes eight Miri seeds across two alias models, WAL seal and MANIFEST fault injection, a simulated loss of unsynced WAL pages, and a v4 golden-store conversion. On the same 200,000 absent keys, v5 at 12 bits/key measured 0.59% false positives and the v4.3.15 filter at 10 bits/key measured 0.86%. The 120,000-entry arena test allocated 8,384,512 slab bytes for distinct 16-byte keys and 16-byte values. Use `cargo +stable bench --bench v5_profile` in a fresh process for latency and peak RSS under concurrent reads, writes and WAL rotation.
+
 Baseline: `cecc9b3` (`v4.3.15`), co-designed with `vsdb` v18 ([vsdb v18 roadmap](../../../vsdb/docs/proposals/v18-roadmap.md)).
 
 ## Scope boundary: what genuinely requires v5 vs. v4.x?

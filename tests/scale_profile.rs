@@ -3,12 +3,10 @@ use std::time::Instant;
 
 fn bench_at_scale(count: u64) {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        prefix_len: 8,
-        write_buffer_size: 2 * 1024 * 1024 * 1024,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_prefix_len(8)
+        .with_write_buffer_size(2 * 1024 * 1024 * 1024);
     let db = DB::open(opts, dir.path()).unwrap();
     let prefix: [u8; 8] = 42u64.to_be_bytes();
     for i in 0u64..count {

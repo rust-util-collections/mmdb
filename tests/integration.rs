@@ -6,14 +6,7 @@ use std::thread;
 use mmdb::{DB, DbOptions, ErrorKind, ReadOptions, WriteBatch, WriteOptions};
 
 fn make_db(dir: &std::path::Path) -> DB {
-    DB::open(
-        DbOptions {
-            create_if_missing: true,
-            ..Default::default()
-        },
-        dir,
-    )
-    .unwrap()
+    DB::open(DbOptions::default().with_create_if_missing(true), dir).unwrap()
 }
 
 #[test]
@@ -111,19 +104,13 @@ fn test_snapshot_isolation() {
     db.put(b"a", b"100").unwrap();
 
     // snap1: a=1, b=2
-    let r1 = ReadOptions {
-        snapshot: Some(snap1.sequence()),
-        ..Default::default()
-    };
+    let r1 = ReadOptions::default().with_snapshot(&snap1);
     assert_eq!(db.get_with_options(&r1, b"a").unwrap(), Some(b"1".to_vec()));
     assert_eq!(db.get_with_options(&r1, b"b").unwrap(), Some(b"2".to_vec()));
     assert_eq!(db.get_with_options(&r1, b"c").unwrap(), None);
 
     // snap2: a=10, b=deleted, c=3
-    let r2 = ReadOptions {
-        snapshot: Some(snap2.sequence()),
-        ..Default::default()
-    };
+    let r2 = ReadOptions::default().with_snapshot(&snap2);
     assert_eq!(
         db.get_with_options(&r2, b"a").unwrap(),
         Some(b"10".to_vec())
@@ -180,12 +167,10 @@ fn test_flush_compact_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
 
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 3,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(3);
 
     // Write, flush, compact
     {
@@ -219,11 +204,9 @@ fn test_flush_compact_reopen() {
 #[test]
 fn test_iterator_with_flush_and_compact() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write data across multiple flushes
@@ -255,12 +238,10 @@ fn test_iterator_with_flush_and_compact() {
 #[test]
 fn test_delete_then_compact() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 512,
-        num_levels: 2,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(512)
+        .with_num_levels(2);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write
@@ -313,12 +294,11 @@ fn test_delete_then_compact() {
 fn test_large_scale_write_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024, // 64 KB — forces many flushes
-        l0_compaction_trigger: 4,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024)
+        // 64 KB — forces many flushes
+        .with_l0_compaction_trigger(4);
 
     // Phase 1: write 5K keys, then close
     {
@@ -399,11 +379,9 @@ fn test_mixed_put_delete_range() {
 #[test]
 fn test_snapshot_across_flush() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024, // tiny, to make flush meaningful
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write initial data
@@ -421,10 +399,7 @@ fn test_snapshot_across_flush() {
     db.put(b"gamma", b"3").unwrap();
 
     // Snapshot should still see pre-flush values
-    let r = ReadOptions {
-        snapshot: Some(snap.sequence()),
-        ..Default::default()
-    };
+    let r = ReadOptions::default().with_snapshot(&snap);
     assert_eq!(
         db.get_with_options(&r, b"alpha").unwrap(),
         Some(b"1".to_vec())
@@ -463,18 +438,9 @@ fn test_multi_snapshot_coexistence() {
     // Phase 4 — final mutation
     db.put(b"x", b"v4").unwrap();
 
-    let r1 = ReadOptions {
-        snapshot: Some(snap1.sequence()),
-        ..Default::default()
-    };
-    let r2 = ReadOptions {
-        snapshot: Some(snap2.sequence()),
-        ..Default::default()
-    };
-    let r3 = ReadOptions {
-        snapshot: Some(snap3.sequence()),
-        ..Default::default()
-    };
+    let r1 = ReadOptions::default().with_snapshot(&snap1);
+    let r2 = ReadOptions::default().with_snapshot(&snap2);
+    let r3 = ReadOptions::default().with_snapshot(&snap3);
 
     // snap1: x=v1, y absent, z absent
     assert_eq!(
@@ -517,13 +483,11 @@ fn test_snapshot_before_compaction_and_current_after() {
     // 2. Active snapshots retain their original values through compaction
     // 3. Current view shows latest values after compaction
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 512,
-        l0_compaction_trigger: 2,
-        num_levels: 3,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(512)
+        .with_l0_compaction_trigger(2)
+        .with_num_levels(3);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write data and take snapshot
@@ -535,10 +499,7 @@ fn test_snapshot_before_compaction_and_current_after() {
     let snap = db.snapshot();
 
     // Verify snapshot works before compaction
-    let r = ReadOptions {
-        snapshot: Some(snap.sequence()),
-        ..Default::default()
-    };
+    let r = ReadOptions::default().with_snapshot(&snap);
     for i in 0..50 {
         let key = format!("key_{:04}", i);
         assert_eq!(
@@ -592,12 +553,10 @@ fn test_snapshot_before_compaction_and_current_after() {
 #[test]
 fn test_concurrent_high_pressure() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 32 * 1024,
-        l0_compaction_trigger: 4,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(32 * 1024)
+        .with_l0_compaction_trigger(4);
     let db = Arc::new(DB::open(opts, dir.path()).unwrap());
 
     let writer_threads = 4;
@@ -663,13 +622,11 @@ fn test_concurrent_high_pressure() {
 #[test]
 fn test_iterator_during_compaction() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 2,
-        num_levels: 3,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(2)
+        .with_num_levels(3);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write several rounds to generate L0 files
@@ -702,13 +659,13 @@ fn test_iterator_during_compaction() {
 
     // Finish draining the pre-compaction iterator and verify snapshot isolation.
     observed.extend(mid_scan.by_ref());
-    assert_eq!(mid_scan.error(), None);
+    assert!(mid_scan.error().is_none());
     assert_eq!(observed, expected_snapshot);
 
     // Take an iterator after compaction and verify the updated values.
     let mut post_iter = db.iter().unwrap();
     let post_compact: Vec<(Vec<u8>, Vec<u8>)> = post_iter.by_ref().collect();
-    assert_eq!(post_iter.error(), None);
+    assert!(post_iter.error().is_none());
     assert_eq!(post_compact.len(), expected_snapshot.len());
     for (idx, (k, v)) in post_compact.iter().enumerate() {
         assert_eq!(k, &expected_snapshot[idx].0);
@@ -728,12 +685,10 @@ fn test_iterator_during_compaction() {
 #[test]
 fn test_compact_range() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 8, // high trigger so we control compaction
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(8);
     let db = DB::open(opts, dir.path()).unwrap();
 
     for i in 0..100 {
@@ -778,18 +733,12 @@ fn test_compact_range() {
 fn test_write_options_disable_wal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
-    let opts = DbOptions {
-        create_if_missing: true,
-        ..Default::default()
-    };
+    let opts = DbOptions::default().with_create_if_missing(true);
 
     // Write with WAL disabled — data visible in current session
     {
         let db = DB::open(opts.clone(), &path).unwrap();
-        let wo = WriteOptions {
-            disable_wal: true,
-            ..Default::default()
-        };
+        let wo = WriteOptions::default().with_durability(mmdb::DurabilityMode::DisableWal);
         for i in 0..50 {
             let key = format!("nowal_{:04}", i);
             let val = format!("val_{}", i);
@@ -830,19 +779,14 @@ fn test_write_options_disable_wal() {
 #[test]
 fn test_write_options_no_slowdown() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        l0_compaction_trigger: usize::MAX,
-        l0_slowdown_trigger: 3,
-        l0_stop_trigger: usize::MAX,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_l0_compaction_trigger(usize::MAX)
+        .with_l0_slowdown_trigger(3)
+        .with_l0_stop_trigger(usize::MAX);
     let db = DB::open(opts, dir.path()).unwrap();
 
-    let wo = WriteOptions {
-        no_slowdown: true,
-        ..Default::default()
-    };
+    let wo = WriteOptions::default().with_no_slowdown(true);
 
     // Normal writes with no_slowdown should succeed when no pressure
     db.put_with_options(&wo, b"ns_key", b"ns_val").unwrap();
@@ -869,12 +813,10 @@ fn test_write_options_no_slowdown() {
 fn test_open_rejects_slowdown_trigger_above_stop_trigger() {
     let dir = tempfile::tempdir().unwrap();
     let err = match DB::open(
-        DbOptions {
-            create_if_missing: true,
-            l0_slowdown_trigger: 20,
-            l0_stop_trigger: 10,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_l0_slowdown_trigger(20)
+            .with_l0_stop_trigger(10),
         dir.path(),
     ) {
         Ok(_) => panic!("open must reject l0_slowdown_trigger > l0_stop_trigger"),
@@ -885,12 +827,10 @@ fn test_open_rejects_slowdown_trigger_above_stop_trigger() {
 
     // The boundary case (equal triggers) is a valid configuration.
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            l0_slowdown_trigger: 12,
-            l0_stop_trigger: 12,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_l0_slowdown_trigger(12)
+            .with_l0_stop_trigger(12),
         dir.path(),
     )
     .unwrap();
@@ -901,12 +841,10 @@ fn test_open_rejects_slowdown_trigger_above_stop_trigger() {
 fn test_db_reopen_cycle() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 4096,
-        l0_compaction_trigger: 3,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(4096)
+        .with_l0_compaction_trigger(3);
 
     let cycles = 5;
     let keys_per_cycle = 20;
@@ -962,11 +900,9 @@ fn test_db_reopen_cycle() {
 #[test]
 fn test_large_value() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 256 * 1024, // 256 KB
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(256 * 1024);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write a 100KB value
@@ -1029,12 +965,10 @@ fn test_empty_key_empty_value() {
 #[test]
 fn test_get_property() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 10, // high trigger to prevent auto-compaction
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(10);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Initially no SST files
@@ -1093,11 +1027,9 @@ fn test_get_property() {
 #[test]
 fn test_delete_range_basic() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Insert keys: a, b, c, d, e, f, g
@@ -1433,12 +1365,10 @@ fn test_bidi_range_reverse() {
 #[test]
 fn test_iter_rev_after_flush_compact() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 3,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(3);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write data across multiple flushes to spread across SST levels
@@ -1474,13 +1404,12 @@ fn test_iter_rev_after_flush_compact() {
 fn test_multi_thread_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 4 * 1024, // tiny — force many flushes
-            l0_compaction_trigger: 2,
-            max_background_compactions: 4,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(4 * 1024)
+            // tiny — force many flushes
+            .with_l0_compaction_trigger(2)
+            .with_max_background_compactions(4),
         dir.path(),
     )
     .unwrap();
@@ -1515,12 +1444,11 @@ fn test_multi_thread_compaction() {
 fn test_deferred_block_read_correctness() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 4 * 1024, // force SST creation
-            l0_compaction_trigger: 100,  // don't compact
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(4 * 1024)
+            // force SST creation
+            .with_l0_compaction_trigger(100),
         dir.path(),
     )
     .unwrap();
@@ -1570,13 +1498,11 @@ fn test_deferred_block_read_correctness() {
 fn test_prefix_scan_across_levels() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 2,
-            prefix_len: 4,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(4 * 1024)
+            .with_l0_compaction_trigger(2)
+            .with_prefix_len(4),
         dir.path(),
     )
     .unwrap();
@@ -1619,11 +1545,9 @@ fn test_prefix_scan_across_levels() {
 #[test]
 fn test_compaction_with_large_subcompaction_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let options = DbOptions {
-        max_subcompactions: usize::MAX,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let options = DbOptions::default()
+        .with_max_subcompactions(usize::MAX)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(options.clone(), dir.path()).unwrap();
     db.put(b"k", b"value").unwrap();
     db.flush().unwrap();
@@ -1649,13 +1573,11 @@ fn compaction_allocates_outputs_for_expanded_values() {
     }
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            compaction_filter: Some(std::sync::Arc::new(Expand)),
-            compression: mmdb::CompressionType::Lz4,
-            target_file_size_base: 1 << 20,
-            l0_compaction_trigger: usize::MAX,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_compaction_filter(Some(std::sync::Arc::new(Expand)))
+            .with_compression(mmdb::CompressionType::Lz4)
+            .with_target_file_size_base(1 << 20)
+            .with_l0_compaction_trigger(usize::MAX),
         dir.path(),
     )
     .unwrap();
@@ -1679,13 +1601,11 @@ fn compaction_allocates_outputs_for_expanded_values() {
 fn test_new_options_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            max_background_compactions: 4,
-            max_subcompactions: 2,
-            pin_l0_filter_and_index_blocks_in_cache: true,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_max_background_compactions(4)
+            .with_max_subcompactions(2)
+            .with_pin_l0_first_block_and_warm_index(true),
         dir.path(),
     )
     .unwrap();
@@ -1738,12 +1658,10 @@ fn test_range_delete_then_get_sequence_ordering() {
 fn test_range_delete_survives_flush() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 4 * 1024,
-            l0_compaction_trigger: 100, // don't compact
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(4 * 1024)
+            .with_l0_compaction_trigger(100),
         dir.path(),
     )
     .unwrap();
@@ -1804,12 +1722,11 @@ fn test_range_delete_survives_flush() {
 #[test]
 fn test_sst_range_tombstone_in_get_after_flush() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024 * 1024, // large to control flush manually
-        l0_compaction_trigger: 100,          // don't auto-compact
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024 * 1024)
+        // large to control flush manually
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Put key d, then delete_range [c, f), then flush both to SST
@@ -1835,12 +1752,10 @@ fn test_sst_range_tombstone_in_get_after_flush() {
 #[test]
 fn test_sst_range_tombstone_in_get_after_compact() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024 * 1024,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024 * 1024)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     db.put(b"d", b"v1").unwrap();
@@ -1858,12 +1773,10 @@ fn test_sst_range_tombstone_in_get_after_compact() {
 #[test]
 fn test_sst_range_tombstone_overridden_by_newer_put() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024 * 1024,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024 * 1024)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Put, delete_range, flush to SST
@@ -1892,12 +1805,10 @@ fn test_sst_range_tombstone_overridden_by_newer_put() {
 #[test]
 fn test_sst_range_tombstone_cross_l0_files() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024 * 1024,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024 * 1024)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Flush point entry to L0 file 1
@@ -1923,12 +1834,10 @@ fn test_sst_range_tombstone_cross_l0_files() {
 #[test]
 fn test_bounded_iter_applies_tombstones_straddling_bounds() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024 * 1024,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024 * 1024)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     for k in [b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"] {
@@ -1974,12 +1883,10 @@ fn test_bounded_iter_applies_tombstones_straddling_bounds() {
 #[test]
 fn test_prefix_iter_applies_tombstone_starting_before_prefix() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024 * 1024,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024 * 1024)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     db.put(b"p:1", b"v").unwrap();
@@ -2006,13 +1913,11 @@ fn test_prefix_iter_applies_tombstone_starting_before_prefix() {
 #[test]
 fn test_compact_range_filters_files() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
         // Large enough that each explicit flush makes exactly one L0 file.
-        write_buffer_size: 64 << 20,
-        l0_compaction_trigger: 100, // don't auto-compact
-        ..Default::default()
-    };
+        .with_write_buffer_size(64 << 20)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write keys in different ranges and flush separately
@@ -2062,12 +1967,10 @@ fn test_compact_range_filters_files() {
 #[test]
 fn test_compact_range_none_does_full_compaction() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 512,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(512)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     for i in 0..100 {
@@ -2125,12 +2028,10 @@ fn test_stats_bytes_written_and_read() {
 #[test]
 fn test_stats_flush_and_compaction() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 512,
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(512)
+        .with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     for i in 0..50 {
@@ -2426,11 +2327,9 @@ fn test_empty_range_deletion_does_not_grow_wal() {
     // No-op ranges must not be WAL-encoded; otherwise repeated empty deletes
     // never hit memtable size accounting and the active WAL grows without bound.
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 256,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(256);
     let db = DB::open(opts, dir.path()).unwrap();
     for _ in 0..5000 {
         db.delete_range(b"k", b"k").unwrap();
@@ -2457,18 +2356,16 @@ fn test_empty_range_deletion_does_not_grow_wal() {
 
 #[test]
 fn test_num_levels_validation() {
-    let mut bad_values = vec![0usize, 1, usize::MAX];
+    let mut bad_values = vec![0usize, 1, 17, usize::MAX];
     #[cfg(target_pointer_width = "64")]
     bad_values.push(u32::MAX as usize + 2);
 
     for bad in bad_values {
         let empty = tempfile::tempdir().unwrap();
         let err = match DB::open(
-            DbOptions {
-                create_if_missing: true,
-                num_levels: bad,
-                ..Default::default()
-            },
+            DbOptions::default()
+                .with_create_if_missing(true)
+                .with_num_levels(bad),
             empty.path(),
         ) {
             Ok(_) => panic!("num_levels={bad} should be rejected"),
@@ -2483,17 +2380,13 @@ fn test_num_levels_validation() {
 
     let existing = tempfile::tempdir().unwrap();
     make_db(existing.path()).close().unwrap();
-    let ro_err = match DB::open_read_only_with_options(
-        DbOptions {
-            num_levels: usize::MAX,
-            ..Default::default()
-        },
+    DB::open_read_only_with_options(
+        DbOptions::default().with_num_levels(usize::MAX),
         existing.path(),
-    ) {
-        Ok(_) => panic!("read-only open must reject num_levels=usize::MAX"),
-        Err(err) => err,
-    };
-    assert_eq!(ro_err.kind(), ErrorKind::InvalidArgument);
+    )
+    .unwrap()
+    .close()
+    .unwrap();
 }
 
 #[test]
@@ -2546,11 +2439,9 @@ fn test_startup_drains_inherited_l0_backlog() {
     // trigger (8) with compaction effectively disabled.
     {
         let db = DB::open(
-            DbOptions {
-                create_if_missing: true,
-                l0_compaction_trigger: 1000, // never compacts
-                ..Default::default()
-            },
+            DbOptions::default()
+                .with_create_if_missing(true)
+                .with_l0_compaction_trigger(1000),
             dir.path(),
         )
         .unwrap();
@@ -2570,10 +2461,7 @@ fn test_startup_drains_inherited_l0_backlog() {
     // startup signal must let background compaction drain L0 below the
     // slowdown trigger on its own.
     let db = DB::open(
-        DbOptions {
-            create_if_missing: false,
-            ..Default::default()
-        },
+        DbOptions::default().with_create_if_missing(false),
         dir.path(),
     )
     .unwrap();
@@ -2711,4 +2599,225 @@ fn empty_and_inverted_compact_range_do_not_flush_or_rewrite_spanning_ssts() {
     assert_eq!(db.get(b"a").unwrap().as_deref(), Some(b"va".as_slice()));
     assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"vm".as_slice()));
     assert_eq!(db.get(b"z").unwrap().as_deref(), Some(b"vz".as_slice()));
+}
+
+#[test]
+fn v5_manifest_geometry_precedes_repair_and_read_only_adopts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = DbOptions::default().with_num_levels(3).with_prefix_len(2);
+    let db = DB::open(opts.clone(), dir.path()).unwrap();
+    db.put(b"ab", b"value").unwrap();
+    db.close().unwrap();
+    let manifest = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let path = dir.path().join(manifest.trim());
+    let before = std::fs::read(&path).unwrap();
+    let mut tail = before.clone();
+    tail.extend([1, 2]);
+    std::fs::write(&path, &tail).unwrap();
+    for wrong in [opts.clone().with_num_levels(4), opts.with_prefix_len(3)] {
+        assert_eq!(
+            DB::open(wrong, dir.path()).err().unwrap().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), tail);
+    }
+    let ro = DB::open_read_only(dir.path()).unwrap();
+    assert_eq!(ro.get(b"ab").unwrap().unwrap(), b"value");
+    assert_eq!(std::fs::read(path).unwrap(), tail);
+}
+
+#[test]
+fn v4_golden_is_rejected_before_store_files_change() {
+    use std::{collections::BTreeMap, fs, path::Path};
+    fn files(dir: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (e.file_name(), fs::read(e.path()).unwrap())
+            })
+            .collect()
+    }
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v4.3.15");
+    let expected = files(&fixture);
+    let dir = tempfile::tempdir().unwrap();
+    for (name, bytes) in &expected {
+        fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    assert_eq!(
+        DB::open_read_only(dir.path()).err().unwrap().kind(),
+        ErrorKind::Corruption
+    );
+    assert_eq!(
+        DB::open(DbOptions::default(), dir.path())
+            .err()
+            .unwrap()
+            .kind(),
+        ErrorKind::Corruption
+    );
+    assert_eq!(files(dir.path()), expected);
+}
+
+#[test]
+fn v5_snapshot_and_pins_survive_rotation_compaction_and_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    let other = make_db(other_dir.path());
+    db.put(b"k", b"old").unwrap();
+    let shared = db.arc_snapshot();
+    let cloned = shared.clone();
+    let mem_pin = shared.read_options();
+    let pin = db.get_pinned_with_options(&mem_pin, b"k").unwrap().unwrap();
+    drop(shared);
+    db.flush().unwrap();
+    let uncached = cloned.read_options().with_fill_cache(false);
+    let block_pin = db
+        .get_pinned_with_options(&uncached, b"k")
+        .unwrap()
+        .unwrap();
+    db.delete_range(b"a", b"z").unwrap();
+    db.put(b"k", b"new").unwrap();
+    db.compact().unwrap();
+    assert_eq!(
+        db.get_with_options(&uncached, b"k").unwrap().unwrap(),
+        b"old"
+    );
+    assert!(db.contains_key_with_options(&uncached, b"k").unwrap());
+    assert_eq!(
+        other.get_with_options(&uncached, b"k").unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        other.iter_with_options(&uncached).err().unwrap().kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(cloned.get(b"k").unwrap().unwrap(), b"old");
+    assert_eq!(cloned.get_pinned(b"k").unwrap().unwrap().as_ref(), b"old");
+    assert!(cloned.contains_key(b"k").unwrap());
+    assert_eq!(
+        cloned
+            .iter_with_prefix(b"k")
+            .unwrap()
+            .step_next()
+            .unwrap()
+            .unwrap()
+            .1,
+        b"old"
+    );
+    db.close().unwrap();
+    assert_eq!(
+        db.get_with_options(&uncached, b"k").unwrap_err().kind(),
+        ErrorKind::DbClosed
+    );
+    drop(db);
+    assert_eq!(cloned.get(b"k").unwrap_err().kind(), ErrorKind::DbClosed);
+    let reopened = make_db(dir.path());
+    assert_eq!(reopened.get(b"k").unwrap().unwrap(), b"new");
+    std::thread::spawn(move || {
+        assert_eq!(pin.as_ref(), b"old");
+        assert_eq!(block_pin.into_vec(), b"old");
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn block_property_filters_apply_after_mvcc_in_both_directions() {
+    use mmdb::{BidiIterator, BlockPropertyCollector, BlockPropertyFilter};
+    use std::sync::Arc;
+    #[derive(Default)]
+    struct PrefixA(bool);
+    impl BlockPropertyCollector for PrefixA {
+        fn add(&mut self, key: &[u8]) {
+            self.0 |= key.starts_with(b"a");
+        }
+        fn finish_block(&mut self) -> Vec<u8> {
+            vec![std::mem::take(&mut self.0) as u8]
+        }
+        fn name(&self) -> &str {
+            "prefix-a"
+        }
+    }
+    impl BlockPropertyFilter for PrefixA {
+        fn should_skip(&self, props: &[u8]) -> bool {
+            props == [0]
+        }
+        fn key_matches(&self, key: &[u8]) -> bool {
+            key.starts_with(b"a")
+        }
+        fn name(&self) -> &str {
+            "prefix-a"
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions::default()
+            .with_block_property_collectors(vec![Arc::new(|| Box::new(PrefixA::default()))]),
+        dir.path(),
+    )
+    .unwrap();
+    for k in [b"a0", b"a1", b"b0", b"b1"] {
+        db.put(k, k).unwrap();
+    }
+    db.compact().unwrap();
+    let snap = db.snapshot();
+    db.put(b"b0", b"overwrite").unwrap();
+    db.delete(b"b1").unwrap();
+    db.flush().unwrap();
+    db.delete(b"a0").unwrap();
+    db.put(b"a1", b"new").unwrap();
+    db.put(b"a2", b"mem").unwrap();
+    let opts =
+        ReadOptions::default().with_block_property_filters(vec![Arc::new(PrefixA::default())]);
+    let now = db.iter_with_options(&opts).unwrap().collect::<Vec<_>>();
+    assert_eq!(
+        now,
+        [
+            (b"a1".to_vec(), b"new".to_vec()),
+            (b"a2".to_vec(), b"mem".to_vec())
+        ]
+    );
+    assert_eq!(
+        db.get_with_options(&opts, b"b0").unwrap().unwrap(),
+        b"overwrite"
+    );
+    let mut old = BidiIterator::lazy(db.iter_with_options(&opts.with_snapshot(&snap)).unwrap());
+    assert_eq!(
+        old.step_prev().unwrap(),
+        Some((b"a1".as_slice(), b"a1".as_slice()))
+    );
+    assert_eq!(
+        old.step_next().unwrap(),
+        Some((b"a0".as_slice(), b"a0".as_slice()))
+    );
+    assert!(old.step_next().unwrap().is_none());
+}
+
+#[test]
+fn lending_cursor_honors_bounds_and_explicit_seek_in_both_directions() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    for key in [b"a", b"b", b"c", b"d"] {
+        db.put(key, key).unwrap();
+    }
+    for persisted in [false, true] {
+        if persisted {
+            db.flush().unwrap();
+        }
+        let opts = ReadOptions::default()
+            .with_iterate_lower_bound(b"b")
+            .with_iterate_upper_bound(b"d");
+        let mut iter = db.iter_with_options(&opts).unwrap();
+        assert_eq!(iter.step_prev().unwrap().unwrap().0, b"c");
+        assert_eq!(iter.step_prev().unwrap().unwrap().0, b"b");
+        assert!(iter.step_prev().unwrap().is_none());
+        iter.seek_to_first();
+        assert_eq!(iter.step_prev().unwrap().unwrap().0, b"b");
+        assert_eq!(iter.step_next().unwrap().unwrap().0, b"c");
+        iter.seek(b"b");
+        assert_eq!(iter.step_next().unwrap().unwrap().0, b"b");
+        assert_eq!(iter.step_next().unwrap().unwrap().0, b"c");
+        assert_eq!(iter.step_prev().unwrap().unwrap().0, b"b");
+    }
 }

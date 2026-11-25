@@ -1,11 +1,20 @@
 //! WAL writer: appends records to a WAL file with block-based fragmentation.
 
+use smallvec::SmallVec;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, IoSlice, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{Result, ResultExt};
 use crate::wal::record::*;
+
+#[cfg(all(test, unix))]
+type SyncObserver = Box<dyn FnMut(&File, u64)>;
+
+#[cfg(all(test, unix))]
+thread_local! {
+    pub(crate) static OBSERVE_SYNC_DATA: std::cell::RefCell<Option<SyncObserver>> = const { std::cell::RefCell::new(None) };
+}
 
 #[cfg(test)]
 thread_local! {
@@ -15,11 +24,37 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+struct PartsCursor<'a> {
+    parts: &'a [&'a [u8]],
+    current: &'a [u8],
+}
+
+impl<'a> PartsCursor<'a> {
+    fn chunks(&mut self, mut length: usize) -> impl Iterator<Item = &'a [u8]> + '_ {
+        std::iter::from_fn(move || {
+            if length == 0 {
+                return None;
+            }
+            while self.current.is_empty() {
+                let (part, rest) = self.parts.split_first()?;
+                self.current = part;
+                self.parts = rest;
+            }
+            let (chunk, rest) = self.current.split_at(length.min(self.current.len()));
+            self.current = rest;
+            length -= chunk.len();
+            Some(chunk)
+        })
+    }
+}
+
 /// WAL writer. Appends records to a file, splitting across block boundaries.
 pub struct WalWriter {
     writer: BufWriter<File>,
     /// Current offset within the current block.
     block_offset: usize,
+    end_offset: u64,
+    last_writeback: u64,
 }
 
 impl WalWriter {
@@ -41,6 +76,8 @@ impl WalWriter {
         Ok(Self {
             writer: BufWriter::new(file),
             block_offset: 0,
+            end_offset: 0,
+            last_writeback: 0,
         })
     }
 
@@ -58,6 +95,8 @@ impl WalWriter {
         let mut writer = Self {
             writer: BufWriter::new(file),
             block_offset,
+            end_offset: valid_len,
+            last_writeback: valid_len,
         };
         // Make the truncation durable before anything is appended. If the
         // next record's data reached disk while the size change was still
@@ -73,49 +112,73 @@ impl WalWriter {
     ///
     /// The record may be split into multiple fragments across block boundaries.
     pub fn add_record(&mut self, payload: &[u8]) -> Result<()> {
+        self.add_record_parts(&[payload])
+    }
+
+    /// Append one logical record from borrowed chunks. Each fragment CRC
+    /// covers its type byte followed by exactly the bytes written, including
+    /// fragments that cross a chunk boundary.
+    pub fn add_record_parts(&mut self, parts: &[&[u8]]) -> Result<()> {
         #[cfg(test)]
         if let Some(kind) = FAIL_NEXT_APPEND.with(|fail| fail.take()) {
             return Err(std::io::Error::from(kind)).ctx();
         }
-        let mut left = payload;
-        let mut is_first = true;
-
+        let mut left = parts
+            .iter()
+            .try_fold(0usize, |n, p| n.checked_add(p.len()))
+            .ok_or_else(|| crate::error::Error::invalid_argument("WAL record length overflow"))?;
+        let mut cursor = PartsCursor {
+            parts,
+            current: &[],
+        };
+        let mut first = true;
         loop {
-            let leftover = BLOCK_SIZE - self.block_offset;
-
-            if leftover < HEADER_SIZE {
-                // Not enough space for a header, fill remainder with zeros
-                if leftover > 0 {
-                    let zeros = vec![0u8; leftover];
-                    self.writer.write_all(&zeros).ctx()?;
-                }
+            let remaining = BLOCK_SIZE - self.block_offset;
+            if remaining < HEADER_SIZE {
+                self.writer
+                    .write_all(&[0; HEADER_SIZE][..remaining])
+                    .ctx()?;
+                self.end_offset += remaining as u64;
                 self.block_offset = 0;
                 continue;
             }
-
-            let avail = leftover - HEADER_SIZE;
-            let fragment_len = left.len().min(avail);
-            let is_last = fragment_len == left.len();
-
-            let record_type = match (is_first, is_last) {
+            let length = left.min(remaining - HEADER_SIZE);
+            let record_type = match (first, length == left) {
                 (true, true) => RecordType::Full,
                 (true, false) => RecordType::First,
                 (false, true) => RecordType::Last,
                 (false, false) => RecordType::Middle,
             };
-
-            let fragment = &left[..fragment_len];
-            self.emit_fragment(record_type, fragment)?;
-
-            left = &left[fragment_len..];
-            is_first = false;
-
-            if is_last {
-                break;
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&[record_type as u8]);
+            let mut header = [0; HEADER_SIZE];
+            // A normal batch uses at most three slices: fragment header,
+            // sequence/count header and body. Keep these descriptors on stack.
+            let mut buffers = SmallVec::<[IoSlice<'_>; 3]>::new();
+            buffers.push(IoSlice::new(&[]));
+            for chunk in cursor.chunks(length) {
+                hasher.update(chunk);
+                buffers.push(IoSlice::new(chunk));
             }
+            encode_header(&mut header, hasher.finalize(), length as u16, record_type);
+            buffers[0] = IoSlice::new(&header);
+            let mut unwritten = buffers.as_mut_slice();
+            while !unwritten.is_empty() {
+                match self.writer.write_vectored(unwritten) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)).ctx(),
+                    Ok(bytes) => IoSlice::advance_slices(&mut unwritten, bytes),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e).ctx(),
+                }
+            }
+            self.block_offset += HEADER_SIZE + length;
+            self.end_offset += (HEADER_SIZE + length) as u64;
+            left -= length;
+            if left == 0 {
+                return Ok(());
+            }
+            first = false;
         }
-
-        Ok(())
     }
 
     /// Flush and fsync the WAL file.
@@ -129,23 +192,37 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Flush the WAL buffer (without fsync).
-    pub fn flush(&mut self) -> Result<()> {
+    /// Commit appended data after the WAL directory entry is durable.
+    pub fn sync_data(&mut self) -> Result<()> {
         self.writer.flush().ctx()?;
+        #[cfg(test)]
+        if FAIL_NEXT_SYNC.with(|fail| fail.replace(false)) {
+            return Err(std::io::Error::other("injected WAL sync failure")).ctx();
+        }
+        self.writer.get_ref().sync_data().ctx()?;
+        #[cfg(all(test, unix))]
+        OBSERVE_SYNC_DATA.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(self.writer.get_ref(), self.end_offset);
+            }
+        });
+        self.last_writeback = self.end_offset;
         Ok(())
     }
 
-    fn emit_fragment(&mut self, record_type: RecordType, data: &[u8]) -> Result<()> {
-        let length = data.len() as u16;
-        let checksum = fragment_checksum(record_type, data);
+    /// Start asynchronous writeback of completed batches before rotation.
+    pub(crate) fn writeback_hint(&mut self, interval: u64) {
+        let length = self.end_offset - self.last_writeback;
+        if interval != 0 && length >= interval {
+            #[cfg(target_os = "linux")]
+            crate::db::hint_wal_writeback(self.writer.get_ref(), self.last_writeback, length);
+            self.last_writeback = self.end_offset;
+        }
+    }
 
-        let mut header = [0u8; HEADER_SIZE];
-        encode_header(&mut header, checksum, length, record_type);
-
-        self.writer.write_all(&header).ctx()?;
-        self.writer.write_all(data).ctx()?;
-        self.block_offset += HEADER_SIZE + data.len();
-
+    /// Flush the WAL buffer (without fsync).
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush().ctx()?;
         Ok(())
     }
 
@@ -163,6 +240,32 @@ mod tests {
     use super::*;
     use crate::wal::reader::WalReader;
     use std::result::Result as StdResult;
+
+    #[test]
+    fn record_parts_match_contiguous_v4_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("flat.wal");
+        let split = dir.path().join("split.wal");
+        let header = [0x29; 12];
+        let body = vec![0x61; BLOCK_SIZE * 2 + 13];
+        let combined = [header.as_slice(), &body].concat();
+        let mut a = WalWriter::new(&flat).unwrap();
+        let mut b = WalWriter::new(&split).unwrap();
+        // Every possible boundary inside the 12-byte batch header, plus
+        // trailing space that cannot hold a complete fragment header.
+        for leftover in 0..(HEADER_SIZE + header.len() + 1) {
+            let pad = (BLOCK_SIZE * 2 - a.block_offset - HEADER_SIZE - leftover) % BLOCK_SIZE;
+            let pad = vec![0; pad];
+            a.add_record(&pad).unwrap();
+            b.add_record(&pad).unwrap();
+            a.add_record(&combined).unwrap();
+            b.add_record_parts(&[&[], &header, &[], &body, &[]])
+                .unwrap();
+        }
+        a.flush().unwrap();
+        b.flush().unwrap();
+        assert_eq!(std::fs::read(flat).unwrap(), std::fs::read(split).unwrap());
+    }
 
     #[test]
     fn test_write_and_read_single_record() {

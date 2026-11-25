@@ -18,21 +18,6 @@ None.
 
 ## Won't Fix
 
-### [LOW] SST: restart-count validation can overflow `usize` on 32-bit targets
-- **Where**: `src/sst/block.rs`
-- **What**: `(num_restarts as usize) * 4 + 4` can overflow on a 32-bit target for corrupted input.
-- **Reason**: The supported and CI target is 64-bit Linux; no 32-bit support is declared. Revisit if 32-bit targets are added.
-
-### [MEDIUM] SST: metadata for one user key can exceed a single-file limit
-- **Where**: `src/db.rs` (`write_memtable_ssts`), `src/sst/table_builder.rs` (`projected_index_size`, range-deletion accounting)
-- **What**: Output splitting waits for a user-key boundary. Four versions of one 8 MiB key under the default 4 KiB block size can exceed the index budget while remaining below the default memtable threshold. Multiple large range tombstones sharing one begin key can similarly exceed their metadata block budget. Writes can be acknowledged before flush and writable recovery reject the oversized metadata.
-- **Reason**: WAL data remains intact, and read-only recovery can inspect it. Larger `block_size` can recover the point-version case; ordinary small vsdb keys do not approach it. A general fix requires per-key admission accounting across writes/recovery or a format and lookup change permitting same-key metadata to span files. Those changes are disproportionate for this unusual key/endpoint workload; single-range admission now reserves framing and split headroom, but repeated begin keys can still exceed the aggregate budget.
-
-### [LOW] options: `num_levels` accepts large finite values up to the MANIFEST `u32` ceiling
-- **Where**: `src/options.rs`, `src/db.rs` (open-time validation)
-- **What**: Open validates `num_levels >= 2` and `u32::try_from(num_levels - 1).is_ok()`, but any large finite value below that ceiling allocates `num_levels` `Arc<Vec<TableFile>>` entries in `Version::new` and `num_levels` `IterSource` capacity slots in each `DB` iterator.
-- **Reason**: Values outside `2..=u32::MAX + 1` (such as `usize::MAX`) are rejected with `ErrorKind::InvalidArgument` before creating any database files. Within the representable `u32` range, the cost is linear and self-inflicted configuration; imposing a tighter cap now could refuse to open stores created with larger custom values. Revisit if per-level state stops being O(1).
-
 ### [LOW] lazy_delete: in-flight compaction wait test uses a fixed sleep
 - **Where**: `tests/lazy_delete.rs` (`compact_waits_for_inflight_compaction_and_removes_dead_keys`, the 200 ms delay before opening the filter gate)
 - **What**: The test releases the background compaction gate after a fixed delay instead of after `compact_range` has observed the in-flight claim. An unlucky schedule can let `compact_range` start after the release, so the wait path is not exercised; the final assertion can still pass.

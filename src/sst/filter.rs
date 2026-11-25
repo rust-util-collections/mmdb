@@ -1,179 +1,97 @@
-//! Bloom filter for SST files.
-//!
-//! Uses the "double hashing" technique from Kirsch & Mitzenmacher
-//! to generate k hash functions from two base hashes.
-
+//! Cache-line blocked Bloom filters. Each XXH3-64 probe touches one 64-byte line.
 use crate::error::{Error, Result};
 use crate::sst::META_BLOCK_HARD_LIMIT;
 
-/// A bloom filter builder + checker.
+#[repr(align(64))]
+struct Line([u8; 64]);
+
+/// The allocator honors Line's alignment even when compressed bytes were read
+/// from an unaligned file offset.
+pub(crate) struct AlignedBytes(Vec<Line>);
+
+impl AlignedBytes {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(64) {
+            return Err(Error::corruption("invalid blocked Bloom payload length"));
+        }
+        Ok(Self(
+            bytes
+                .as_chunks::<64>()
+                .0
+                .iter()
+                .copied()
+                .map(Line)
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn may_match(&self, key: &[u8]) -> bool {
+        let (line, bits) = probes(bloom_hash(key), self.0.len());
+        let data = &self.0[line].0;
+        bits.into_iter()
+            .all(|bit| data[bit / 8] & (1 << (bit % 8)) != 0)
+    }
+}
+
+fn probes(hash: u64, lines: usize) -> (usize, [usize; 8]) {
+    let line = (((hash >> 32) * lines as u64) >> 32) as usize;
+    let low = hash as u32;
+    let step = low.rotate_left(15) | 1;
+    (
+        line,
+        std::array::from_fn(|i| (low.wrapping_add(step.wrapping_mul(i as u32)) & 511) as usize),
+    )
+}
+
 pub struct BloomFilter {
-    /// Bits per key.
     bits_per_key: u32,
-    /// Number of hash functions.
-    k: u32,
 }
 
 impl BloomFilter {
-    /// Maximum payload size that keeps the probe modulus representable as u32.
-    const MAX_FILTER_BYTES: u64 = (u32::MAX / 8) as u64;
-
-    /// Create a new bloom filter policy.
     pub fn new(bits_per_key: u32) -> Self {
-        // k = ln(2) * (bits_per_key)
-        let k = ((bits_per_key as f64) * std::f64::consts::LN_2).round() as u32;
-        let k = k.clamp(1, 30);
-        Self { bits_per_key, k }
+        Self { bits_per_key }
     }
 
-    /// Build a filter for the given set of keys.
-    ///
-    /// Returns an error before allocation if the encoded filter would exceed
-    /// the SST reader's metadata-block limit.
     pub fn create_filter(&self, keys: &[&[u8]]) -> Result<Vec<u8>> {
-        let hashes: Vec<u32> = keys.iter().map(|k| bloom_hash(k)).collect();
-        self.create_filter_from_hashes(&hashes)
+        self.create_filter_from_hashes(&keys.iter().map(|k| bloom_hash(k)).collect::<Vec<_>>())
     }
 
-    /// Build a filter from precomputed [`bloom_hash`] values.
-    ///
-    /// Produces byte-identical output to [`create_filter`](Self::create_filter)
-    /// on the corresponding keys; lets long-running builders retain a 4-byte
-    /// hash per key instead of a full key copy.
-    pub fn create_filter_from_hashes(&self, hashes: &[u32]) -> Result<Vec<u8>> {
-        let filter_size = Self::checked_size("bloom filter", hashes.len(), self.bits_per_key)?;
-        let bytes = filter_size - 1;
-        let bits = (bytes as u32) * 8;
-
-        let mut filter = vec![0u8; filter_size];
-        *filter.last_mut().unwrap() = self.k as u8;
-
+    pub fn create_filter_from_hashes(&self, hashes: &[u64]) -> Result<Vec<u8>> {
+        let size = Self::checked_size("bloom filter", hashes.len(), self.bits_per_key)?;
+        let mut bytes = vec![0; size];
         for &hash in hashes {
-            let delta = hash.rotate_left(15); // rotate_left(15) == rotate_right(17)
-            let mut h = hash;
-            for _ in 0..self.k {
-                let bit_pos = h % bits;
-                filter[(bit_pos / 8) as usize] |= 1 << (bit_pos % 8);
-                h = h.wrapping_add(delta);
+            let (line, bits) = probes(hash, size / 64);
+            for bit in bits {
+                bytes[line * 64 + bit / 8] |= 1 << (bit % 8);
             }
         }
-
-        Ok(filter)
+        Ok(bytes)
     }
 
-    /// Project the encoded filter size (payload plus the trailing hash-count
-    /// byte) without allocating.
-    pub(crate) fn projected_size(key_count: usize, bits_per_key: u32) -> usize {
-        let bits = (key_count as u64)
-            .saturating_mul(bits_per_key as u64)
-            .max(64);
-        bits.div_ceil(8)
-            .min(Self::MAX_FILTER_BYTES)
-            .saturating_add(1) as usize
+    pub(crate) fn projected_size(count: usize, bits_per_key: u32) -> usize {
+        let bits = (count as u64).saturating_mul(bits_per_key as u64);
+        usize::try_from(bits.div_ceil(512).max(1).saturating_mul(64)).unwrap_or(usize::MAX)
     }
 
-    /// Validate and return the encoded size without allocating the filter.
-    pub(crate) fn checked_size(label: &str, key_count: usize, bits_per_key: u32) -> Result<usize> {
-        let projected = Self::projected_size(key_count, bits_per_key);
-        if projected > META_BLOCK_HARD_LIMIT {
+    pub(crate) fn checked_size(label: &str, count: usize, bits_per_key: u32) -> Result<usize> {
+        let size = Self::projected_size(count, bits_per_key);
+        if size > META_BLOCK_HARD_LIMIT {
             return Err(Error::invalid_argument(format!(
-                "{label} block size {projected} would exceed maximum readable block size \
-                 {META_BLOCK_HARD_LIMIT}"
+                "{label} block size {size} exceeds {META_BLOCK_HARD_LIMIT}"
             )));
         }
-        Ok(projected)
+        Ok(size)
     }
 
-    /// Check if a key might be in the filter.
-    /// Returns `true` if possibly present, `false` if definitely absent.
-    pub fn key_may_match(key: &[u8], filter: &[u8]) -> bool {
-        if filter.len() < 2 {
-            return true; // degenerate: assume present
-        }
-
-        let k = *filter.last().unwrap() as u32;
-        if k > 30 {
-            return true; // reserved for future use
-        }
-
-        let bits = ((filter.len() - 1) * 8) as u32;
-        let h = bloom_hash(key);
-        let delta = h.rotate_left(15);
-        let mut h = h;
-        for _ in 0..k {
-            let bit_pos = h % bits;
-            if filter[(bit_pos / 8) as usize] & (1 << (bit_pos % 8)) == 0 {
-                return false;
-            }
-            h = h.wrapping_add(delta);
-        }
-        true
+    #[cfg(test)]
+    pub fn key_may_match(key: &[u8], bytes: &[u8]) -> bool {
+        AlignedBytes::decode(bytes).unwrap().may_match(key)
     }
 }
 
-/// Hash used by filters written before the hash-version metaindex key
-/// existed (published mmdb <= 2.1.1). Test-only fixture support; new filters
-/// always use [`bloom_hash`].
-#[cfg(test)]
-pub(crate) fn legacy_bloom_hash(key: &[u8]) -> u32 {
-    let mut h: u32 = 0;
-    for &b in key {
-        h = h.wrapping_mul(0x5bd1e995).wrapping_add(b as u32);
-        h ^= h >> 13;
-    }
-    h
+pub(crate) fn bloom_hash(key: &[u8]) -> u64 {
+    twox_hash::XxHash3_64::oneshot(key)
 }
-
-/// Hash function for bloom filters: MurmurHash2 (`m = 0x5bd1e995`) with
-/// LevelDB's seed. It is not LevelDB's `BloomHash`.
-///
-/// The hash is recorded in the SST metaindex (`filter.hash`). Filters
-/// without that marker may have been built with the pre-MurmurHash2 function;
-/// readers must not probe them with this hash (see
-/// `TableReader::bloom_may_match`).
-pub(crate) fn bloom_hash(key: &[u8]) -> u32 {
-    let seed: u32 = 0xbc9f1d34;
-    let m: u32 = 0x5bd1e995;
-    let r: u32 = 24;
-
-    let len = key.len() as u32;
-    // Initialize with seed XOR'd with length (anti-length-extension)
-    let mut h: u32 = seed ^ len;
-
-    // Process 4-byte chunks
-    let mut i = 0;
-    while i + 4 <= key.len() {
-        let mut k = u32::from_le_bytes(key[i..i + 4].try_into().unwrap());
-        k = k.wrapping_mul(m);
-        k ^= k >> r;
-        k = k.wrapping_mul(m);
-
-        h = h.wrapping_mul(m);
-        h ^= k;
-        i += 4;
-    }
-
-    // Process remaining bytes
-    let remaining = key.len() - i;
-    if remaining >= 3 {
-        h ^= (key[i + 2] as u32) << 16;
-    }
-    if remaining >= 2 {
-        h ^= (key[i + 1] as u32) << 8;
-    }
-    if remaining >= 1 {
-        h ^= key[i] as u32;
-        h = h.wrapping_mul(m);
-    }
-
-    // Final avalanche mixing
-    h ^= h >> 13;
-    h = h.wrapping_mul(m);
-    h ^= h >> 15;
-
-    h
-}
-
 #[cfg(test)]
 mod tests {
     /// The hash is part of the persisted filter format: filters carry no
@@ -181,18 +99,34 @@ mod tests {
     /// negatives. Pin its output.
     #[test]
     fn bloom_hash_is_stable() {
-        let pinned: [(&[u8], u32); 5] = [
-            (b"", 0x471a8188),
-            (b"a", 0xe27a35ff),
-            (b"abcd", 0x07375115),
-            (b"hello", 0x057bea7f),
-            (b"key_000001", 0x6baf12e0),
+        let pinned: [(&[u8], u64); 5] = [
+            (b"", 0x2d06800538d394c2),
+            (b"a", 0xe6c632b61e964e1f),
+            (b"abcd", 0x6497a96f53a89890),
+            (b"hello", 0x9555e8555c62dcfd),
+            (b"key_000001", 0xe991a92ea8d5f3bb),
         ];
         for (key, hash) in pinned {
             assert_eq!(bloom_hash(key), hash, "key {key:?}");
         }
     }
     use super::*;
+
+    #[test]
+    fn pinned_key_and_prefix_probes() {
+        assert_eq!(
+            probes(bloom_hash(b"key_000001"), 5),
+            (4, [443, 38, 145, 252, 359, 466, 61, 168])
+        );
+        assert_eq!(
+            probes(bloom_hash(b"a"), 5),
+            (4, [31, 362, 181, 0, 331, 150, 481, 300])
+        );
+        let bytes = AlignedBytes::decode(&[0; 128]).unwrap();
+        for line in &bytes.0 {
+            assert_eq!(line.0.as_ptr() as usize % 64, 0);
+        }
+    }
 
     #[test]
     fn test_bloom_filter_basic() {
@@ -236,14 +170,14 @@ mod tests {
             BloomFilter::projected_size(key_refs.len(), 10),
             bf.create_filter(&key_refs).unwrap().len()
         );
-        assert_eq!(BloomFilter::projected_size(0, 10), 9);
+        assert_eq!(BloomFilter::projected_size(0, 10), 64);
     }
 
     #[test]
     fn test_create_filter_rejects_oversized_output() {
         use crate::error::ErrorKind;
 
-        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8) as u32;
+        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8 + 1) as u32;
         let err = BloomFilter::new(bits_per_key)
             .create_filter(&[b"k"])
             .unwrap_err();
@@ -257,7 +191,7 @@ mod tests {
         let bf = BloomFilter::new(10);
         let keys: Vec<Vec<u8>> = (0..500).map(|i| format!("key_{i}").into_bytes()).collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        let hashes: Vec<u32> = key_refs.iter().map(|k| bloom_hash(k)).collect();
+        let hashes: Vec<u64> = key_refs.iter().map(|k| bloom_hash(k)).collect();
 
         assert_eq!(
             bf.create_filter(&key_refs).unwrap(),
@@ -276,35 +210,35 @@ mod tests {
 
     #[test]
     fn test_bloom_filter_many_keys() {
-        let bf = BloomFilter::new(10);
+        let bf = BloomFilter::new(12);
         let keys: Vec<Vec<u8>> = (0..10000)
             .map(|i| format!("key_{:06}", i).into_bytes())
             .collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        let filter = bf.create_filter(&key_refs).unwrap();
+        let filter = AlignedBytes::decode(&bf.create_filter(&key_refs).unwrap()).unwrap();
 
         // All keys should match
         for key in &keys {
-            assert!(BloomFilter::key_may_match(key, &filter));
+            assert!(filter.may_match(key));
         }
 
         // Check FP rate
         let mut fp = 0;
-        for i in 10000..20000 {
+        for i in 10000..210000 {
             let key = format!("key_{:06}", i);
-            if BloomFilter::key_may_match(key.as_bytes(), &filter) {
+            if filter.may_match(key.as_bytes()) {
                 fp += 1;
             }
         }
-        let fp_rate = fp as f64 / 10000.0;
-        assert!(fp_rate < 0.02, "FP rate too high: {:.4}", fp_rate);
+        let fp_rate = fp as f64 / 200000.0;
+        eprintln!("blocked Bloom empirical FPR = {fp_rate:.4}");
+        assert!(fp_rate < 0.012, "FP rate too high: {:.4}", fp_rate);
     }
 
     #[test]
     fn test_bloom_bits_per_key_zero() {
         // bits_per_key=0 should still produce a valid (minimal) filter
         let bf = BloomFilter::new(0);
-        assert_eq!(bf.k, 1, "k should be clamped to minimum of 1");
 
         let keys: Vec<&[u8]> = vec![b"aaa", b"bbb", b"ccc"];
         let filter = bf.create_filter(&keys).unwrap();
@@ -327,7 +261,6 @@ mod tests {
         // bits_per_key=100 should work and have very low FP rate
         let bf = BloomFilter::new(100);
         // k is clamped to max 30
-        assert!(bf.k <= 30, "k should be clamped to max 30, got {}", bf.k);
 
         let keys: Vec<Vec<u8>> = (0..100)
             .map(|i| format!("key_{:04}", i).into_bytes())

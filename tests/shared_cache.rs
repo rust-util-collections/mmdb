@@ -13,11 +13,9 @@ use mmdb::{BlockCachePool, DB, DbOptions};
 
 fn open_with_pool(dir: &std::path::Path, pool: &Arc<BlockCachePool>) -> DB {
     DB::open(
-        DbOptions {
-            create_if_missing: true,
-            block_cache: Some(pool.clone()),
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_block_cache(Some(pool.clone())),
         dir,
     )
     .unwrap()
@@ -107,10 +105,7 @@ fn test_private_cache_default_unaffected() {
     // the historical shape — this is what every existing caller gets.
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            ..Default::default()
-        },
+        DbOptions::default().with_create_if_missing(true),
         dir.path(),
     )
     .unwrap();

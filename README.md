@@ -42,7 +42,7 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | Leveled compaction with trivial move | Implemented |
 | Multi-threaded background compaction | Implemented |
 | Streaming compaction of point entries | Implemented |
-| MVCC snapshots via sequence numbers | Implemented |
+| MVCC snapshots with DB-bound leases | Implemented |
 | Forward/backward/prefix/range iterators | Implemented |
 | Compression: None, LZ4, Zstd (per-level) | Implemented |
 | Write backpressure (slowdown/stop) | Implemented |
@@ -53,11 +53,15 @@ In typical configurations, MMDB's scan throughput and point-read latency are com
 | DB properties/statistics (reads, writes, flushes, compaction) | Implemented |
 | Typed errors with full propagation traces | Implemented |
 
-`max_immutable_memtables` is retained as an accepted-but-unused compatibility
-option. The write path freezes at most one MemTable at a time and flushes it
-before the next group proceeds, so there is no multi-entry immutable-MemTable
-queue for that value to bound. Other options are wired to their documented
-behavior.
+`max_immutable_memtables` bounds the number of frozen write buffers awaiting
+durable installation (default 4). Reads check the newest buffer first. A
+dedicated worker writes the oldest buffer to L0, syncs its MANIFEST edit and
+retires its WAL. A full queue blocks normal writes and returns `ErrorKind::Busy`
+to writes with `no_slowdown`. `DB::flush()` waits for all writes preceding
+its generation to reach SSTs. `DB::sync_wal()` makes prior WAL-enabled writes
+durable without creating SSTs or appending a fence record. On Linux,
+`wal_bytes_per_sync` controls asynchronous writeback before WAL rotation
+(default 2 MiB, 0 disables hints).
 
 ---
 
@@ -97,15 +101,30 @@ behavior.
 ### Write Path
 
 1. Encode as InternalKey (`user_key + !pack(sequence, type)` — inverted big-endian for descending sequence order)
-2. Append to WAL (group commit: the leader batches multiple writers into one append and one flush, using a single fsync when any grouped write requests `sync`)
+2. Append to WAL (group commit: the leader batches multiple writers into one append and one flush, using a single data sync when a grouped write requests `WalSync`)
 3. Insert into active MemTable (concurrent skiplist)
 4. When MemTable exceeds `write_buffer_size`, freeze and flush to L0 SST
 5. Signal background compaction threads so L0 is drained when it reaches `l0_compaction_trigger`
 
+WriteBatch keeps its entries in one reusable WAL-encoded buffer.
+`WriteBatch::with_capacity(bytes)` reserves space for the body.
+`put_prefixed`, `delete_prefixed`, and `delete_range_prefixed` append the
+prefix and suffix directly. Each range endpoint obeys `MAX_USER_KEY_SIZE`.
+Submitting an invalid batch returns `InvalidArgument` before any entry is
+written. The indexed batch's `into_batch()` also reports that error.
+
+MemTable nodes store their variable-height tower, internal key, and value
+in aligned slabs. A node above 256 KiB gets a dedicated slab. The flush
+threshold counts allocated slab bytes and range-tombstone endpoint storage.
+Writes to a single user key in one active memtable share a 32 MiB metadata
+budget, charged per version as the separator length plus 40 bytes. A range
+deletion uses its longer endpoint for this charge. Flush releases the budget
+for subsequent writes to that key.
+
 ### Read Path
 
 1. Active MemTable (newest writes)
-2. The frozen MemTable, while its flush is in progress
+2. Immutable MemTables, newest generation first
 3. L0 SST files (newest first, per-file bloom filter + range check)
 4. L1+ SST files (LevelIterator with lazy file opening, binary search by key range)
 
@@ -125,9 +144,9 @@ Key optimizations:
 - **Cursor-based block iteration**: Decodes entries one-at-a-time from raw block data — no per-block Vec allocation
 - **Deferred block read**: SST index stores `first_key` per block; Seek positions without reading data blocks
 - **Sequential readahead**: `posix_fadvise(WILLNEED)` after detecting sequential block access
-- With L0 pinning and caching enabled, a flush reads and pins the first data block of each new L0 SST. Compaction releases those pins. Each table reader holds its own index, filters, and cached range tombstones.
+- With L0 pinning and caching enabled, a flush reads and pins the first data block of each new L0 SST. Compaction releases those pins. Each table reader holds the index and range-deletion partition directories and the aligned Bloom filters.
 - **Range tombstones**: Iterators query a prebuilt interval index. Compaction tracks overlapping deletions in a heap ordered by sequence.
-- **Lazy index loading**: Index entries are parsed on first use
+- **Partitioned index**: An iterator holds its current index leaf. Point reads binary-search the directory and fetch one leaf through the block cache.
 - **Atomic L0 counter**: Write-throttle checks use an atomic counter, avoiding mutex contention on writes
 
 ### SST Format
@@ -138,18 +157,20 @@ Data Block 1: ...
 ...
 Filter Block: [whole-key bloom filter bits]        (when bloom filters are enabled and the file has keys)
 Prefix Filter Block: [prefix bloom bits]           (when prefix blooms are configured and the file has keys)
-Range Del Block: [range tombstones]                (when the file contains any)
+Range deletion leaves: exclusive end -> interval begin and visible sequence numbers
+Range deletion directory: maximum end -> leaf handle and minimum begin
 Metaindex Block: ["filter.bloom" -> handle,
-                  "filter.hash" -> bloom hash version,
+                  "filter.format" -> 2,
                   "filter.prefix" -> handle,
                   "filter.prefix_len" -> prefix length,
-                  "rangedelblock" -> handle]        (entries present only when applicable)
-Index Block: [last_key -> BlockHandle + first_key per block]
-Footer (48 bytes): [metaindex_handle, index_handle, padding, magic]
+                  "rangedelblock" -> range deletion directory]
+Index leaves: separator -> data block handle, first key and block properties
+Index directory: upper separator -> index leaf handle
+Footer (48 bytes): [metaindex_handle, index_directory_handle, padding, TABLE_MAGIC_V2]
 ```
 
-Files written before the dedicated range-deletion block may instead keep
-range tombstones inline in the data blocks; the reader supports both layouts.
+The key and prefix Bloom filters use XXH3-64 with seed zero. All eight probes touch one aligned 64-byte line. Index and range-deletion leaves target 64 KiB and can grow to fit a single large entry. Large directories span checksummed pages that the reader loads at open. Adjacent index partitions for one user key share the user-key bytes in memory. A point query checks at most one range-deletion leaf per SST. Flush and compaction clip crossing tombstones at output boundaries and preserve a sequence for each live snapshot stripe.
+
 
 ---
 
@@ -169,7 +190,7 @@ src/
 +-- stats.rs                # Database statistics
 +-- memtable/
 |   +-- mod.rs              # MemTable (put/get/iter with approximate_size tracking)
-|   +-- skiplist.rs         # OrdInternalKey + skiplist + MemTableCursorIter (O(1) iteration)
+|   +-- skiplist.rs         # Borrowed internal-key lookup and streaming MemTable cursors
 |   +-- skiplist_impl.rs    # Lock-free skiplist implementation (raw pointers, arena allocation)
 +-- wal/
 |   +-- writer.rs           # WAL append with block-based fragmentation
@@ -221,6 +242,11 @@ impl DB {
     pub fn put_with_options(&self, options: &WriteOptions, key: &[u8], value: &[u8]) -> Result<()>;
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    pub fn get_pinned(&self, key: &[u8]) -> Result<Option<PinnedSlice>>;
+    pub fn get_pinned_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<PinnedSlice>>;
+    pub fn contains_key(&self, key: &[u8]) -> Result<bool>;
+    pub fn contains_key_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<bool>;
+    pub fn sync_wal(&self) -> Result<()>;
     pub fn delete(&self, key: &[u8]) -> Result<()>;
     pub fn delete_with_options(&self, options: &WriteOptions, key: &[u8]) -> Result<()>;
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()>;
@@ -266,6 +292,7 @@ impl DB {
 
     /// RAII snapshot — automatically released on drop.
     pub fn snapshot(&self) -> Snapshot<'_>;
+    pub fn arc_snapshot(&self) -> ArcSnapshot;
 
     pub fn flush(&self) -> Result<()>;
     pub fn compact(&self) -> Result<()>;
@@ -291,30 +318,74 @@ impl DBIterator {
     pub fn seek_to_last(&mut self);
     pub fn prev(&mut self);
     pub fn next_prefix(&mut self, prefix_len: usize); // O(log N) jump
-    pub fn error(&self) -> Option<String>;       // I/O error that ended iteration (sticky)
+    pub fn error(&self) -> Option<&Error>;
+    pub fn step_next(&mut self) -> Result<Option<(&[u8], &[u8])>>;
+    pub fn step_prev(&mut self) -> Result<Option<(&[u8], &[u8])>>;
 }
 
 impl Snapshot<'_> {
-    // RAII guard: released automatically on drop.
     pub fn sequence(&self) -> SequenceNumber;
-    pub fn read_options(&self) -> ReadOptions;  // pre-configured for this snapshot
-}
-
-struct ReadOptions {
-    pub snapshot: Option<SequenceNumber>,      // from Snapshot::sequence()
-    pub fill_cache: bool,                      // false = scans don't evict hot blocks
-    pub skip_point: Option<SkipPointFn>,
-    pub block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
-    pub iterate_lower_bound: Option<Vec<u8>>,  // inclusive
-    pub iterate_upper_bound: Option<Vec<u8>>,  // exclusive
-}
-
-struct WriteOptions {
-    pub sync: bool,        // fsync WAL before acknowledging
-    pub disable_wal: bool, // skip WAL (data may be lost on crash)
-    pub no_slowdown: bool, // error instead of sleeping when throttled
+    pub fn read_options(&self) -> ReadOptions<'_>;
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    pub fn get_pinned(&self, key: &[u8]) -> Result<Option<PinnedSlice>>;
+    pub fn contains_key(&self, key: &[u8]) -> Result<bool>;
+    pub fn iter(&self) -> Result<DBIterator>;
 }
 ```
+
+A borrowed `Snapshot` keeps its registered versions available until drop.
+Use `DB::arc_snapshot()` to share that registration across threads. Read
+through either snapshot directly or pass `snapshot.read_options()` to its database. The last clone of an
+`ArcSnapshot` releases the registration. Reading from a closed database
+returns `DbClosed`, and reading an open snapshot on another database returns
+`InvalidArgument`.
+
+`get_pinned` returns a borrowed view backed by a retained SST block or
+memtable arena. Pins can outlive cache eviction and database close. A small
+value can keep an entire block (up to 64 MiB) or arena alive outside the
+normal storage budgets. Call `into_vec()` to retain only the value bytes.
+
+Both iterator types support lending `step_next` and `step_prev`. Each step
+returns a typed error immediately if reading or resolving the row fails,
+including lookahead into the following block. On a `BidiIterator` the two
+steps consume opposite ends of the remaining range.
+
+## Migrating a v4 store
+
+v5 reads the database format, level count (2 through 16), and prefix length
+from the first MANIFEST record. A writable reopen requires the same geometry.
+To migrate a stable v4 store into a fresh v5 directory, run the exporter
+from this checkout. Choose a destination outside the source directory.
+The arguments below use three levels and two prefix
+bytes. Omit both numbers for the v4 defaults of seven and zero.
+
+```sh
+cargo +stable run --manifest-path tools/v4-export/Cargo.toml -- /data/v4 /data/v5 3 2
+```
+
+The exporter opens the source read-only with MMDB 4.3.15, replays residual
+WALs, streams visible key/value pairs, checks the final iterator error, and
+closes the v5 database before publishing the destination. For v4 stores with
+more than sixteen levels it writes sixteen v5 levels. Snapshot registrations
+and physical SST/WAL history live only in the source. Use the vsdb logical
+exporter when migrating vsdb collection formats.
+
+For Rust callers moving to v5:
+
+- Construct options with `Default` or a preset and chain `with_*` setters.
+  Iteration bounds accept owned buffers and borrowed slices.
+- Select `DurabilityMode::{WalAsync, WalSync, DisableWal}` on `WriteOptions`.
+  `DB::sync_wal()` fences preceding WAL writes without adding a record.
+- Pass a live snapshot handle to `with_snapshot`. Both snapshot types also
+  provide `read_options()`.
+- Collect block properties from the user keys of all values and deletions.
+  Keep each collector name's meaning stable. A filter may skip a block only
+  when every collected key fails its `key_matches` predicate. The iterator
+  checks that predicate on the resolved row. Point reads ignore scan filters.
+- Use the prefixed batch methods to append a prefix and key directly to the
+  WAL payload. `WriteBatchWithIndex::range_tombstones()` iterates borrowed
+  endpoints and write positions. Propagate `into_batch()?` to check admission.
+- Use `pin_l0_first_block_and_warm_index` for L0 pinning.
 
 ## Read-only databases
 
@@ -343,10 +414,8 @@ fn inspect(path: &Path) -> mmdb::Result<()> {
 }
 ```
 
-Use `DB::open_read_only_with_options` to configure read/cache behavior. In
-particular, `num_levels` is not persisted in the MANIFEST: a store written
-with a non-default value should be opened with the same value (this is required
-when a live SST occupies level 7 or higher).
+Use `DB::open_read_only_with_options` to configure read and cache behavior.
+Read-only recovery adopts the stored level count and prefix length.
 
 ```rust
 use std::path::Path;
@@ -355,11 +424,7 @@ use mmdb::{DB, DbOptions};
 
 fn open_custom(path: &Path) -> mmdb::Result<DB> {
     DB::open_read_only_with_options(
-        DbOptions {
-            num_levels: 10,
-            block_cache_capacity: 256 * 1024 * 1024,
-            ..DbOptions::default()
-        },
+        DbOptions::default().with_block_cache_capacity(256 * 1024 * 1024),
         path,
     )
 }
@@ -369,7 +434,7 @@ fn open_custom(path: &Path) -> mmdb::Result<DB> {
 |---------------------------------|----------|
 | `get*`, iterators, snapshots, properties | Fully supported |
 | `close` and drop | Release resources without changing the store |
-| `put*`, `delete*`, `write*`, `flush`, `compact*` | Return `ErrorKind::ReadOnly` before side effects |
+| `put*`, `delete*`, `write*`, `sync_wal`, `flush`, `compact*` | Return `ErrorKind::ReadOnly` before side effects |
 | `lazy_delete*` | No-op (the existing infallible API cannot return an error) |
 
 On Unix, an existing `LOCK` file is opened without write access and held with
@@ -388,7 +453,7 @@ incomplete reads.
 All fallible APIs return `mmdb::Result<T> = Result<T, mmdb::Error>`.
 
 `Error` carries a typed [`ErrorKind`] (`Io`, `Corruption`, `InvalidArgument`,
-`DbClosed`, `ReadOnly`, `Background`) for programmatic matching, plus a full
+`DbClosed`, `ReadOnly`, `Busy`, `Background`) for programmatic matching, plus a full
 propagation trace — the origin `file:line:column` and one frame per `.ctx()` /
 `.with_ctx(..)` hop — and preserves the underlying source error (e.g.
 `std::io::Error`) for `std::error::Error::source()` downcasting.
@@ -416,17 +481,14 @@ group-commit waiters without stringification.
 ## Configuration
 
 ```rust
-let opts = DbOptions {
-    write_buffer_size: 64 * 1024 * 1024,    // 64 MB memtable
-    block_cache_capacity: 256 * 1024 * 1024, // 256 MB block cache
-    block_size: 16384,                        // 16 KB blocks
-    l0_compaction_trigger: 8,
-    compression: CompressionType::Lz4,
-    bloom_bits_per_key: 10,
-    max_background_compactions: 4,            // parallel compaction
-    pin_l0_filter_and_index_blocks_in_cache: true,
-    ..Default::default()
-};
+let opts = DbOptions::default()
+    .with_write_buffer_size(64 * 1024 * 1024)
+    .with_block_cache_capacity(256 * 1024 * 1024)
+    .with_block_size(16384)
+    .with_l0_compaction_trigger(8)
+    .with_compression(CompressionType::Lz4)
+    .with_bloom_bits_per_key(12)
+    .with_max_background_compactions(4);
 
 // Or use a preset profile:
 let opts = DbOptions::write_heavy();  // 128MB memtable, 4 compaction threads, LZ4

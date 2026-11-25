@@ -6,7 +6,7 @@
 Writers → group-commit leader → WAL + MemTable (serialized)
 Readers → ArcSwap<SuperVersion> (lock-free) → MemTable + SST
 BG compact → SST I/O unlocked; VersionSet under lock
-Flush → write-path auto / flush() / compact_range / close
+Flush → seal WAL outside inner → publish frozen generation → FIFO worker → durable MANIFEST
 ```
 
 | Primitive | Where | Role |
@@ -29,18 +29,18 @@ write-queue, cache, notify locks). No reverse edges. Normal write/compact: no
 
 **CC2 ArcSwap publish** — fully init referenced data → `store` → old SV stays valid until guards drop.
 
-**CC3 Group commit** — collect → contiguous seq → WAL in order → fsync if any
-`sync` else flush (skip WAL if `disable_wal`) → MemTable same order → publish
+**CC3 Group commit** — collect → contiguous seq → WAL in order → sync_data for
+`WalSync` or a pending fence (skip appends for `DisableWal`) → MemTable same order → publish
 `committed_sequence` (Release) → notify. Barrier for lock-free readers: never expose
 seq before inserts finish.
 
-**CC4 BG unlocked I/O** — pick under lock → I/O unlocked → apply under lock.
-Compact threads never freeze/flush memtables. Auto-flush / flush / compact_range:
-drop lock for SST write. `close`/freeze_and_flush may hold lock (shutdown).
-
-`drain_l0`: short pick → unlocked merge → short install → unlocked MANIFEST sync
-(from flush post-trigger and `maybe_throttle_writes` stop). `force_merge_level`
-may hold lock for admin merge I/O — never from ordinary write path.
+**CC4 BG unlocked I/O** — pick under lock → build, sync SSTs and their directory
+outside the lock → install under lock → confirm MANIFEST durability before unlink.
+The flush worker retains the oldest immutable generation and its WAL through
+confirmation. Readers visit immutable generations newest first. Full-level
+rewrites claim their inputs. An L0 in-place rewrite races a freeze or flush
+install when its recorded install epoch changes. Discard its output and pick an
+L0-to-L1 compaction against the current files.
 
 `drain_l0` errors: flush post-trigger non-fatal unless fail-stop (`VersionSet::poisoned`) — durability is already complete; stop-trigger → fail-stop; in-drain MANIFEST sync fail → set BG error then propagate.
 

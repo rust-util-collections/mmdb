@@ -1,14 +1,17 @@
 //! DBIterator: a user-facing iterator that merges all sources, resolves
 //! sequence numbers, and skips tombstones.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
-use crate::iterator::merge::{IterSource, MergingIterator};
-use crate::iterator::range_del::FragmentedRangeTombstoneList;
+use crate::iterator::{
+    merge::{IterSource, MergingIterator},
+    range_del::FragmentedRangeTombstoneList,
+};
 use crate::types::{
     LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
     decode_internal_key,
 };
+use crate::{Error, options::IterConfig};
 
 type IKeyCompareFn = fn(&[u8], &[u8]) -> Ordering;
 
@@ -35,13 +38,7 @@ pub struct DBIterator {
     /// checks in any direction. Loaded upfront at creation time from all
     /// sources' cached tombstones — no inline collection or full-scan preload.
     range_tombstones: FragmentedRangeTombstoneList,
-    /// If set, iteration stops when user key no longer starts with this prefix.
-    prefix: Option<Vec<u8>>,
-    /// If set, iteration stops when user key >= this bound (exclusive upper bound).
-    /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
-    iterate_upper_bound: Option<Vec<u8>>,
-    /// If set, inclusive lower bound on user keys.
-    iterate_lower_bound: Option<Vec<u8>>,
+    config: Arc<IterConfig>,
     /// Overshoot buffer for backward iteration: when collecting entries for one
     /// user key, we may read the first entry of the *previous* user key. This
     /// field retains the entry and its source for visibility and level checks.
@@ -62,7 +59,7 @@ pub struct DBIterator {
     /// Semantic corruption while decoding an internal key (short trailer /
     /// unknown type). Surfaced via [`Self::error`] so callers do not treat it
     /// as normal exhaustion.
-    key_decode_error: Option<String>,
+    key_decode_error: Option<Error>,
     /// Set when `next_prefix` jumps past a prefix that has no lexicographic
     /// successor (all `0xFF`, or `prefix_len == 0`). Keeps later `advance()`
     /// and `next_prefix()` calls exhausted until an explicit seek repositions.
@@ -77,31 +74,7 @@ impl DBIterator {
     /// Build a DB iterator from multiple sorted Vec sources of internal key-value pairs.
     #[cfg(test)]
     pub(crate) fn new(sources: Vec<Vec<(Vec<u8>, Vec<u8>)>>, sequence: SequenceNumber) -> Self {
-        let iter_sources: Vec<IterSource> = sources.into_iter().map(IterSource::new).collect();
-
-        let merger =
-            MergingIterator::new(iter_sources, ikey_compare as fn(&[u8], &[u8]) -> Ordering);
-
-        Self {
-            merger,
-            sequence,
-            has_batch_overlay: false,
-            last_user_key: Vec::new(),
-            has_last_key: false,
-            current: None,
-            needs_advance: true,
-            range_tombstones: FragmentedRangeTombstoneList::empty(),
-            prefix: None,
-            iterate_upper_bound: None,
-            iterate_lower_bound: None,
-            prev_overshoot: None,
-            backward_positioned: false,
-            skip_point: None,
-            last_seek_key: None,
-            clean_read: true,
-            key_decode_error: None,
-            prefix_exhausted: false,
-        }
+        Self::from_sources(sources.into_iter().map(IterSource::new).collect(), sequence)
     }
 
     /// Build a DB iterator from pre-built IterSource objects (supports streaming).
@@ -117,9 +90,7 @@ impl DBIterator {
             current: None,
             needs_advance: true,
             range_tombstones: FragmentedRangeTombstoneList::empty(),
-            prefix: None,
-            iterate_upper_bound: None,
-            iterate_lower_bound: None,
+            config: IterConfig::empty(),
             prev_overshoot: None,
             backward_positioned: false,
             skip_point: None,
@@ -130,35 +101,20 @@ impl DBIterator {
         }
     }
 
-    /// Build a DB iterator with prefix-bounded iteration.
-    /// Iteration stops when user key no longer starts with `prefix`.
+    #[cfg(test)]
     pub(crate) fn from_sources_with_prefix(
         sources: Vec<IterSource>,
         sequence: SequenceNumber,
         prefix: Vec<u8>,
     ) -> Self {
-        let merger = MergingIterator::new(sources, ikey_compare as fn(&[u8], &[u8]) -> Ordering);
-
-        Self {
-            merger,
-            sequence,
-            has_batch_overlay: false,
-            last_user_key: Vec::new(),
-            has_last_key: false,
-            current: None,
-            needs_advance: true,
-            range_tombstones: FragmentedRangeTombstoneList::empty(),
-            prefix: Some(prefix),
-            iterate_upper_bound: None,
-            iterate_lower_bound: None,
-            prev_overshoot: None,
-            backward_positioned: false,
-            skip_point: None,
-            last_seek_key: None,
-            clean_read: true,
-            key_decode_error: None,
-            prefix_exhausted: false,
-        }
+        let upper = crate::types::prefix_successor(&prefix);
+        let mut iter = Self::from_sources(sources, sequence);
+        iter.set_config(Arc::new(IterConfig {
+            lower: Some(prefix),
+            upper,
+            ..Default::default()
+        }));
+        iter
     }
 
     /// Set pre-collected range tombstones. Called by the DB layer after
@@ -204,51 +160,36 @@ impl DBIterator {
 
     fn effective_forward_target(&self, target: &[u8]) -> Vec<u8> {
         let mut effective = target;
-        if let Some(lb) = self.iterate_lower_bound.as_deref()
+        if let Some(lb) = self.config.lower.as_deref()
             && effective < lb
         {
             effective = lb;
-        }
-        if let Some(prefix) = self.prefix.as_deref()
-            && effective < prefix
-        {
-            effective = prefix;
         }
         effective.to_vec()
     }
 
     /// Tighten the inclusive lower bound, retaining the existing upper bound.
     pub(crate) fn set_lower_bound(&mut self, bound: Vec<u8>) {
-        let lower = match self.iterate_lower_bound.take() {
-            Some(previous) => previous.max(bound),
+        let mut config = (*self.config).clone();
+        config.lower = Some(match config.lower.take() {
+            Some(old) => old.max(bound),
             None => bound,
-        };
-        self.set_bounds(Some(lower), self.iterate_upper_bound.clone());
+        });
+        self.set_config(Arc::new(config));
     }
 
-    /// Set an exclusive upper bound on user keys.
-    /// Iteration stops when user key >= this bound.
-    /// Models RocksDB's `ReadOptions::iterate_upper_bound`.
     pub(crate) fn set_upper_bound(&mut self, bound: Vec<u8>) {
-        self.merger
-            .set_bounds(self.iterate_lower_bound.as_deref(), Some(&bound));
-        self.iterate_upper_bound = Some(bound);
-        if self.has_failed() {
-            self.halt_on_error();
-            return;
-        }
-        // Invalidate any buffered entry — it may now be beyond the new bound.
-        self.current = None;
-        self.needs_advance = true;
-        self.prev_overshoot = None;
-        self.prefix_exhausted = false;
+        let mut config = (*self.config).clone();
+        config.upper = Some(bound);
+        self.set_config(Arc::new(config));
     }
 
-    /// Set both lower (inclusive) and upper (exclusive) bounds on user keys.
-    pub(crate) fn set_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
-        self.merger.set_bounds(lower.as_deref(), upper.as_deref());
-        self.iterate_lower_bound = lower;
-        self.iterate_upper_bound = upper;
+    pub(crate) fn set_config(&mut self, config: Arc<IterConfig>) {
+        self.merger.set_config(config.clone());
+        if !config.filters.is_empty() {
+            self.clean_read = false;
+        }
+        self.config = config;
         if self.has_failed() {
             self.halt_on_error();
             return;
@@ -278,9 +219,9 @@ impl DBIterator {
     /// the iterator's lifetime; later seeks do not resume it.
     /// Use after iteration returns `None` to distinguish normal exhaustion
     /// from I/O or semantic corruption failures.
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<&Error> {
         self.key_decode_error
-            .clone()
+            .as_ref()
             .or_else(|| self.merger.error())
     }
 
@@ -386,7 +327,7 @@ impl DBIterator {
                 let (ikey_ref, source) = self.merger.peek_key()?;
                 match decode_internal_key(ikey_ref) {
                     Err(e) => {
-                        self.key_decode_error = Some(e.to_string());
+                        self.key_decode_error = Some(e);
                         self.halt_on_error();
                         return None;
                     }
@@ -397,23 +338,13 @@ impl DBIterator {
                             let uk_len = ikey_ref.len() - 8;
 
                             // Lower bound check
-                            if let Some(ref lb) = self.iterate_lower_bound
+                            if let Some(ref lb) = self.config.lower
                                 && ikey_ref[..uk_len] < **lb
                             {
                                 Action::Skip
                             }
-                            // Prefix boundary check
-                            else if let Some(ref pfx) = self.prefix
-                                && !ikey_ref[..uk_len].starts_with(pfx)
-                            {
-                                if &ikey_ref[..uk_len] < pfx.as_slice() {
-                                    Action::Skip
-                                } else {
-                                    return None;
-                                }
-                            }
                             // Upper bound check
-                            else if let Some(ref ub) = self.iterate_upper_bound
+                            else if let Some(ref ub) = self.config.upper
                                 && ikey_ref[..uk_len] >= **ub
                             {
                                 return None;
@@ -479,8 +410,8 @@ impl DBIterator {
                     }
                     let (mut ikey, value) = self.merger.take_entry()?;
                     ikey.truncate(uk_len);
-                    if let Some(ref sp) = self.skip_point
-                        && sp(&ikey)
+                    if self.skip_point.as_ref().is_some_and(|sp| sp(&ikey))
+                        || !self.config.matches(&ikey)
                     {
                         continue;
                     }
@@ -489,8 +420,8 @@ impl DBIterator {
                 Action::Take { uk_len } => {
                     let (mut ikey, value) = self.merger.take_entry()?;
                     ikey.truncate(uk_len);
-                    if let Some(ref sp) = self.skip_point
-                        && sp(&ikey)
+                    if self.skip_point.as_ref().is_some_and(|sp| sp(&ikey))
+                        || !self.config.matches(&ikey)
                     {
                         continue;
                     }
@@ -526,7 +457,7 @@ impl DBIterator {
             let (ikey_ref, source) = self.merger.peek_key()?;
             let (seq, vt) = match decode_internal_key(ikey_ref) {
                 Err(e) => {
-                    self.key_decode_error = Some(e.to_string());
+                    self.key_decode_error = Some(e);
                     self.halt_on_error();
                     return None;
                 }
@@ -540,26 +471,15 @@ impl DBIterator {
             }
 
             // Lower bound
-            if let Some(ref lb) = self.iterate_lower_bound
+            if let Some(ref lb) = self.config.lower
                 && ikey_ref[..uk_len] < **lb
             {
                 self.merger.advance_entry();
                 continue;
             }
 
-            // Prefix boundary
-            if let Some(ref pfx) = self.prefix
-                && !ikey_ref[..uk_len].starts_with(pfx)
-            {
-                if &ikey_ref[..uk_len] < pfx.as_slice() {
-                    self.merger.advance_entry();
-                    continue;
-                }
-                return None;
-            }
-
             // Upper bound
-            if let Some(ref ub) = self.iterate_upper_bound
+            if let Some(ref ub) = self.config.upper
                 && ikey_ref[..uk_len] >= **ub
             {
                 return None;
@@ -614,6 +534,47 @@ impl DBIterator {
         self.current.is_some()
     }
 
+    /// Consume and borrow the next visible row. A source error encountered
+    /// during lookahead takes precedence over the candidate row.
+    pub fn step_next(&mut self) -> crate::Result<Option<(&[u8], &[u8])>> {
+        self.lend_next(true)
+    }
+
+    pub(super) fn lend_next(&mut self, checked: bool) -> crate::Result<Option<(&[u8], &[u8])>> {
+        self.ensure_current();
+        self.lend_current(checked)
+    }
+
+    fn lend_current(&mut self, checked: bool) -> crate::Result<Option<(&[u8], &[u8])>> {
+        if checked && let Some(error) = self.error().cloned() {
+            self.halt_on_error();
+            return Err(error);
+        }
+        self.needs_advance = self.current.is_some();
+        Ok(self
+            .current
+            .as_ref()
+            .map(|(key, value)| (key.as_slice(), value.as_slice())))
+    }
+
+    /// Borrow the previous visible row. On a new cursor the first reverse
+    /// step starts at the end. After a seek it consumes the positioned row.
+    pub fn step_prev(&mut self) -> crate::Result<Option<(&[u8], &[u8])>> {
+        if self.needs_advance {
+            if let Some((key, _)) = self.current.take() {
+                self.resolve_prev_user_key(Some(&key));
+            } else if self.has_last_key {
+                let key = self.last_user_key.clone();
+                self.resolve_prev_user_key(Some(&key));
+            } else if self.last_seek_key.is_some() {
+                self.ensure_current();
+            } else {
+                self.seek_to_last();
+            }
+        }
+        self.lend_current(true)
+    }
+
     pub fn valid(&mut self) -> bool {
         self.ensure_current()
     }
@@ -658,13 +619,22 @@ impl DBIterator {
         self.backward_positioned = false;
     }
 
+    /// Position sources for their first forward read without making a public
+    /// seek. An initial reverse step may still choose the end of the window.
+    pub(crate) fn prime_lower_bound(&mut self) {
+        if self.config.lower.is_some() {
+            self.seek_to_first();
+            self.last_seek_key = None;
+        }
+    }
+
     pub fn seek_to_first(&mut self) {
         if self.has_failed() {
             self.halt_on_error();
             return;
         }
         self.prefix_exhausted = false;
-        if self.prefix.is_some() || self.iterate_lower_bound.is_some() {
+        if self.config.lower.is_some() {
             self.seek(b"");
             return;
         }
@@ -673,25 +643,8 @@ impl DBIterator {
         self.needs_advance = true;
         self.current = None;
         self.prev_overshoot = None;
-        self.last_seek_key = None;
+        self.last_seek_key = Some(Vec::new());
         self.backward_positioned = false;
-    }
-
-    /// The shortest key strictly greater than every key sharing this iterator's
-    /// prefix (the exclusive upper bound of the prefix range). Returns `None`
-    /// when no prefix is set, or the prefix is all `0xFF` (no finite successor).
-    fn prefix_successor(&self) -> Option<Vec<u8>> {
-        let mut succ = self.prefix.clone()?;
-        let mut i = succ.len();
-        while i > 0 {
-            i -= 1;
-            if succ[i] < 0xFF {
-                succ[i] += 1;
-                succ.truncate(i + 1);
-                return Some(succ);
-            }
-        }
-        None
     }
 
     /// Seek to the last visible user key <= target.
@@ -705,12 +658,9 @@ impl DBIterator {
         }
         self.prefix_exhausted = false;
 
-        let upper_clamps_target = self
-            .iterate_upper_bound
-            .as_deref()
-            .is_some_and(|ub| ub <= target);
-        let (mut seek_key, mut bound) = if upper_clamps_target {
-            let ub = self.iterate_upper_bound.as_deref().unwrap();
+        let upper_clamps_target = self.config.upper.as_deref().is_some_and(|ub| ub <= target);
+        let (seek_key, bound) = if upper_clamps_target {
+            let ub = self.config.upper.as_deref().unwrap();
             (
                 InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion),
                 ub.to_vec(),
@@ -720,17 +670,6 @@ impl DBIterator {
             bound.push(0x00);
             (InternalKey::new(target, 0, ValueType::Deletion), bound)
         };
-
-        // Clamp the backward seek to the prefix range. Without this, a target
-        // beyond the prefix (e.g. prefix "a", target "zz") would seek onto a
-        // larger non-prefix key ("z1"), where the prefix guard stops the backward
-        // walk and misses valid prefix keys below it ("a1").
-        if let Some(succ) = self.prefix_successor()
-            && succ.as_slice() < bound.as_slice()
-        {
-            seek_key = InternalKey::new(&succ, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
-            bound = succ;
-        }
 
         // Use merger backward seek to find the last internal key below the effective bound.
         self.merger.seek_for_prev(seek_key.as_bytes());
@@ -784,7 +723,7 @@ impl DBIterator {
             while let Some((ikey, value, source)) = iter_entry.take() {
                 let (uk_owned, seq, vt) = match decode_internal_key(&ikey) {
                     Err(e) => {
-                        self.key_decode_error = Some(e.to_string());
+                        self.key_decode_error = Some(e);
                         self.halt_on_error();
                         return;
                     }
@@ -803,20 +742,8 @@ impl DBIterator {
                     continue;
                 }
 
-                // Prefix guard: only keys strictly below `prefix` terminate a
-                // backward scan; non-matching keys above `prefix` are skipped.
-                if let Some(ref pfx) = self.prefix
-                    && !uk.starts_with(pfx)
-                {
-                    if uk < pfx.as_slice() {
-                        break;
-                    }
-                    iter_entry = self.merger.prev_entry();
-                    continue;
-                }
-
                 // Lower bound guard
-                if let Some(ref lb) = self.iterate_lower_bound
+                if let Some(ref lb) = self.config.lower
                     && uk < lb.as_slice()
                 {
                     break;
@@ -903,8 +830,8 @@ impl DBIterator {
                                 continue;
                             }
                             // Check skip_point callback
-                            if let Some(ref sp) = self.skip_point
-                                && sp(&uk)
+                            if self.skip_point.as_ref().is_some_and(|sp| sp(&uk))
+                                || !self.config.matches(&uk)
                             {
                                 current_bound = Some(cuk);
                                 continue;
@@ -967,16 +894,7 @@ impl DBIterator {
         self.prefix_exhausted = false;
 
         // Determine the effective upper bound for backward seek.
-        let mut resolve_bound = self.iterate_upper_bound.clone();
-        if let Some(succ) = self.prefix_successor()
-            && resolve_bound.as_ref().is_none_or(|bound| succ < *bound)
-        {
-            // Prefix-bounded: seek backward from the prefix successor (the exclusive
-            // upper bound of the prefix range), correctly truncated so a key just
-            // past the prefix cannot shadow valid prefix keys.
-            resolve_bound = Some(succ);
-        }
-
+        let resolve_bound = self.config.upper.clone();
         if let Some(ref ub) = resolve_bound {
             // Upper-bound constrained: seek backward from upper bound.
             let seek_key = InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
@@ -1059,7 +977,6 @@ mod tests {
             TableBuildOptions {
                 block_size: 1,
                 bloom_bits_per_key: 0,
-                internal_keys: true,
                 ..Default::default()
             },
         )
@@ -1127,7 +1044,7 @@ mod tests {
             !entries.iter().any(|(k, _)| k == b"k"),
             "deleted key surfaced from a deeper level: {entries:?}"
         );
-        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
+        assert!(iter.error().is_some_and(|e| e.to_string().contains("CRC")));
 
         let sources = vec![
             IterSource::from_table_iter(TableIterator::new(
@@ -1186,7 +1103,7 @@ mod tests {
         iter.advance();
         assert!(!iter.valid(), "iteration resumed after a read error");
         assert!(
-            iter.error().is_some_and(|e| e.contains("CRC")),
+            iter.error().is_some_and(|e| e.to_string().contains("CRC")),
             "read error lost after internal re-seek; yielded {seen:?}"
         );
         assert!(
@@ -1224,7 +1141,7 @@ mod tests {
             "an older version stood in for the unreadable newer one"
         );
         assert!(!iter.valid());
-        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
+        assert!(iter.error().is_some_and(|e| e.to_string().contains("CRC")));
     }
 
     /// Regression: seek-using-next steps a source toward the target. When a
@@ -1250,7 +1167,7 @@ mod tests {
         // Stepping from a1 toward a5 reads the unreadable a2 block.
         iter.seek(b"a5");
         assert!(!iter.valid(), "seek skipped past an unreadable block");
-        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
+        assert!(iter.error().is_some_and(|e| e.to_string().contains("CRC")));
     }
 
     #[test]
@@ -1943,7 +1860,7 @@ mod tests {
         let mut iter = DBIterator::new(sources, 100);
         assert!(iter.next().is_none());
         let err = iter.error().expect("decode error");
-        assert!(err.contains("too short"), "got {err}");
+        assert!(err.to_string().contains("too short"), "got {err}");
 
         // Unknown type byte must not be coerced to Deletion (false absence).
         let packed = (5u64 << 8) | 0xEE;
@@ -1953,7 +1870,7 @@ mod tests {
         let mut iter = DBIterator::new(sources, 100);
         assert!(iter.next().is_none());
         let err = iter.error().expect("type error");
-        assert!(err.contains("invalid value_type"), "got {err}");
+        assert!(err.to_string().contains("invalid value_type"), "got {err}");
     }
 
     #[test]
@@ -2058,6 +1975,35 @@ mod tests {
     }
 
     #[test]
+    fn lending_lookahead_returns_typed_error_instead_of_candidate() {
+        use crate::{BidiIterator, ErrorKind, sst::table_reader::TableIterator};
+        let dir = tempfile::tempdir().unwrap();
+        let file = sst_with_corrupt_block(
+            &dir.path().join("000001.sst"),
+            &[
+                make_entry(b"a", 2, ValueType::Value, b"va"),
+                make_entry(b"b", 1, ValueType::Value, b"vb"),
+            ],
+            1,
+        );
+        let cursor = || {
+            DBIterator::from_sources(
+                vec![IterSource::from_table_iter(TableIterator::new(
+                    file.reader.clone(),
+                ))],
+                2,
+            )
+        };
+        let mut db = cursor();
+        assert_eq!(db.step_next().unwrap_err().kind(), ErrorKind::Corruption);
+        assert!(!db.valid());
+        assert_eq!(db.step_prev().unwrap_err().kind(), ErrorKind::Corruption);
+        let mut bidi = BidiIterator::lazy(cursor());
+        assert_eq!(bidi.step_next().unwrap_err().kind(), ErrorKind::Corruption);
+        assert_eq!(bidi.step_prev().unwrap_err().kind(), ErrorKind::Corruption);
+    }
+
+    #[test]
     fn cursor_api_preserves_resolved_entry_when_readahead_hits_corrupt_next_block() {
         use crate::iterator::bidi_iter::BidiIterator;
         use crate::sst::table_reader::TableIterator;
@@ -2085,7 +2031,7 @@ mod tests {
         assert_eq!(iter.value(), Some(&b"va"[..]));
         iter.advance();
         assert!(!iter.valid());
-        assert!(iter.error().is_some_and(|e| e.contains("CRC")));
+        assert!(iter.error().is_some_and(|e| e.to_string().contains("CRC")));
 
         // 2. BidiIterator::lazy after valid() must still yield the unconsumed front entry
         let mut iter2 = DBIterator::from_sources(
@@ -2098,7 +2044,7 @@ mod tests {
         let mut bidi = BidiIterator::lazy(iter2);
         assert_eq!(bidi.next(), Some((b"a".to_vec(), b"va".to_vec())));
         assert_eq!(bidi.next(), None);
-        assert!(bidi.error().is_some_and(|e| e.contains("CRC")));
+        assert!(bidi.error().is_some_and(|e| e.to_string().contains("CRC")));
 
         // 3. next_prefix() after valid() must halt instead of clearing the failure
         let mut iter3 = DBIterator::from_sources(
@@ -2108,7 +2054,7 @@ mod tests {
         assert!(iter3.valid());
         iter3.next_prefix(0);
         assert!(!iter3.valid());
-        assert!(iter3.error().is_some_and(|e| e.contains("CRC")));
+        assert!(iter3.error().is_some_and(|e| e.to_string().contains("CRC")));
     }
 
     #[test]

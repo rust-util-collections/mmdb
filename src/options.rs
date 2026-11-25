@@ -1,15 +1,20 @@
 //! Configuration options for MMDB.
 
-use std::{fmt, sync::Arc};
+use std::{
+    borrow::Cow,
+    fmt,
+    sync::{Arc, LazyLock},
+};
 
+use crate::db::SnapshotRef;
 use crate::sst::format::CompressionType;
-use crate::types::SequenceNumber;
 
 /// Callback that returns `true` for user keys that should be skipped during iteration.
 pub type SkipPointFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
 
 /// Database-level options.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct DbOptions {
     /// Create the database if it does not already exist.
     ///
@@ -21,13 +26,10 @@ pub struct DbOptions {
     pub error_if_exists: bool,
     /// Size of a single MemTable in bytes before it is frozen.
     pub write_buffer_size: usize,
-    /// Currently unused compatibility option.
-    ///
-    /// MemTable freezes are flushed synchronously by the write path, so there
-    /// is no immutable-MemTable queue for this value to bound. The field remains
-    /// accepted for configuration compatibility and may be implemented or
-    /// removed in a future major release.
+    /// Maximum number of frozen memtables awaiting durable installation.
     pub max_immutable_memtables: usize,
+    /// Byte interval for advisory WAL writeback. Zero disables the hint.
+    pub wal_bytes_per_sync: u64,
     /// Number of L0 files that triggers compaction.
     pub l0_compaction_trigger: usize,
     /// Target size for SST files in bytes.
@@ -36,8 +38,7 @@ pub struct DbOptions {
     pub max_bytes_for_level_base: u64,
     /// Multiplier between levels.
     pub max_bytes_for_level_multiplier: f64,
-    /// Maximum number of levels (including L0). Must be >= 2 and fit in
-    /// MANIFEST `u32` level indices.
+    /// Persisted number of levels, including L0. Valid values are 2 through 16.
     pub num_levels: usize,
     /// Block size for SST data blocks.
     pub block_size: usize,
@@ -87,13 +88,8 @@ pub struct DbOptions {
     pub max_subcompactions: usize,
 
     // ---- Cache behavior ----
-    /// Eagerly warm the index-entry cache and pin each newly-flushed L0
-    /// file's first data block in the block cache (never evict). Default:
-    /// true. Unlike RocksDB's option of the same name, index and filter
-    /// blocks are never stored in `block_cache` — they are always held as
-    /// direct `TableReader` fields regardless of this setting.
-    /// RocksDB equivalent (name only, not behavior): `pin_l0_filter_and_index_blocks_in_cache`.
-    pub pin_l0_filter_and_index_blocks_in_cache: bool,
+    /// Warm the index and pin the first data block of newly installed L0 files.
+    pub pin_l0_first_block_and_warm_index: bool,
 
     /// Factories for block property collectors. Each factory is called once per SST
     /// file build to produce a fresh collector instance.
@@ -104,13 +100,9 @@ pub struct DbOptions {
     /// reaches this threshold, a background sweep is automatically
     /// scheduled: every populated level is force-rewritten through the
     /// compaction filter so the registered keys are physically removed
-    /// even when no organic compaction is pending. Each level rewrite
-    /// holds the DB mutex for its full duration, so new snapshots stall
-    /// for that rewrite. The sweep does not hold the write queue: writers
-    /// stall only while the mutex is held and can proceed between levels.
-    /// [`DB::compact`](crate::DB::compact) holds the write queue for the entire call as well as
-    /// the DB mutex for each level rewrite, so it stalls writers longer,
-    /// not shorter. Default: `0` (disabled).
+    /// even when no organic compaction is pending. The worker builds SSTs
+    /// outside the DB mutex, then validates its inputs and active snapshots
+    /// before installation. Default: 0 (disabled).
     pub lazy_delete_compaction_threshold: usize,
     /// Optional shared block-cache pool. `None` (the default) gives this
     /// DB a private cache sized by `block_cache_capacity` — the
@@ -130,6 +122,7 @@ impl Default for DbOptions {
             error_if_exists: false,
             write_buffer_size: 64 * 1024 * 1024, // 64 MB
             max_immutable_memtables: 4,
+            wal_bytes_per_sync: 2 << 20,
             l0_compaction_trigger: 4,
             target_file_size_base: 64 * 1024 * 1024, // 64 MB
             max_bytes_for_level_base: 256 * 1024 * 1024, // 256 MB
@@ -137,7 +130,7 @@ impl Default for DbOptions {
             num_levels: 7,
             block_size: 4096,
             block_restart_interval: 16,
-            bloom_bits_per_key: 10,
+            bloom_bits_per_key: 12,
             compression: CompressionType::None,
             block_cache_capacity: 64 * 1024 * 1024, // 64 MB
             max_open_files: 1000,
@@ -149,7 +142,7 @@ impl Default for DbOptions {
             compaction_filter: None,
             max_background_compactions: 1,
             max_subcompactions: 1,
-            pin_l0_filter_and_index_blocks_in_cache: true,
+            pin_l0_first_block_and_warm_index: true,
             block_property_collectors: Vec::new(),
             lazy_delete_compaction_threshold: 0,
             block_cache: None,
@@ -171,6 +164,7 @@ impl fmt::Debug for DbOptions {
                 "max_bytes_for_level_multiplier",
                 &self.max_bytes_for_level_multiplier,
             )
+            .field("wal_bytes_per_sync", &self.wal_bytes_per_sync)
             .field("num_levels", &self.num_levels)
             .field("block_size", &self.block_size)
             .field("block_restart_interval", &self.block_restart_interval)
@@ -196,8 +190,8 @@ impl fmt::Debug for DbOptions {
             )
             .field("max_subcompactions", &self.max_subcompactions)
             .field(
-                "pin_l0_filter_and_index_blocks_in_cache",
-                &self.pin_l0_filter_and_index_blocks_in_cache,
+                "pin_l0_first_block_and_warm_index",
+                &self.pin_l0_first_block_and_warm_index,
             )
             .field(
                 "block_property_collectors",
@@ -239,7 +233,7 @@ impl DbOptions {
             l0_compaction_trigger: 2,
             block_cache_capacity: 256 * 1024 * 1024, // 256 MB
             bloom_bits_per_key: 14,
-            pin_l0_filter_and_index_blocks_in_cache: true,
+            pin_l0_first_block_and_warm_index: true,
             ..Default::default()
         }
     }
@@ -247,16 +241,10 @@ impl DbOptions {
 
 /// Options for read operations.
 #[derive(Clone)]
-pub struct ReadOptions {
-    /// If set, reads will use this snapshot sequence number. Values above the
-    /// current committed sequence are clamped to it, so a snapshot can never
-    /// observe uncommitted or partially-applied writes.
-    ///
-    /// Obtain a registered sequence via [`crate::DB::snapshot`] (see
-    /// [`crate::Snapshot::read_options`]); a raw sequence number that is not
-    /// registered as a snapshot may see its data garbage-collected by
-    /// compaction.
-    pub snapshot: Option<SequenceNumber>,
+#[non_exhaustive]
+pub struct ReadOptions<'a> {
+    /// Registered snapshot from the same open database.
+    pub snapshot: Option<SnapshotRef<'a>>,
     /// Whether a block-cache miss inserts the block into the cache. Default: true.
     ///
     /// Set to `false` for large scans (analytics, backups, bulk exports) so
@@ -271,14 +259,14 @@ pub struct ReadOptions {
     /// Inclusive lower bound on user keys for iteration. Keys < this are skipped.
     /// Enforced by DBIterator — no manual bound checking needed.
     /// RocksDB equivalent: `iterate_lower_bound`.
-    pub iterate_lower_bound: Option<Vec<u8>>,
+    pub iterate_lower_bound: Option<Cow<'a, [u8]>>,
     /// Exclusive upper bound on user keys for iteration. Keys >= this are skipped.
     /// Enforced by DBIterator — no manual bound checking needed.
     /// RocksDB equivalent: `iterate_upper_bound`.
-    pub iterate_upper_bound: Option<Vec<u8>>,
+    pub iterate_upper_bound: Option<Cow<'a, [u8]>>,
 }
 
-impl Default for ReadOptions {
+impl Default for ReadOptions<'_> {
     fn default() -> Self {
         Self {
             snapshot: None,
@@ -291,7 +279,7 @@ impl Default for ReadOptions {
     }
 }
 
-impl fmt::Debug for ReadOptions {
+impl fmt::Debug for ReadOptions<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadOptions")
             .field("snapshot", &self.snapshot)
@@ -304,13 +292,24 @@ impl fmt::Debug for ReadOptions {
     }
 }
 
+/// Durability of an acknowledged batch.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum DurabilityMode {
+    /// Append to the WAL and flush userspace buffers before acknowledgement.
+    #[default]
+    WalAsync,
+    /// Confirm WAL data durability before acknowledgement.
+    WalSync,
+    /// Apply only to memory. A crash before a durable flush may lose this batch.
+    DisableWal,
+}
+
 /// Options for write operations.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct WriteOptions {
-    /// If true, fsync the WAL before acknowledging the write.
-    pub sync: bool,
-    /// If true, skip writing to the WAL (data may be lost on crash).
-    pub disable_wal: bool,
+    /// WAL policy for this batch.
+    pub durability: DurabilityMode,
     /// If true, return an error instead of sleeping when writes are throttled.
     pub no_slowdown: bool,
 }
@@ -346,6 +345,10 @@ pub enum CompactionFilterDecision {
 ///   do not by themselves pause filtering.
 /// - The entry is a `Value`. `Deletion` and `RangeDeletion` entries are never
 ///   passed to the filter.
+///
+/// Callbacks may read their database. A callback that calls a write, WAL fence,
+/// flush, explicit compaction, or close on the same database receives
+/// [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument).
 pub trait CompactionFilter: Send + Sync {
     fn filter(&self, level: usize, key: &[u8], value: &[u8]) -> CompactionFilterDecision;
 
@@ -375,20 +378,171 @@ impl fmt::Debug for dyn CompactionFilter {
 /// the SST's index budget with keys and framing: the builder reserves space
 /// below the reader's 64 MiB decompressed block limit. Excessive generated
 /// metadata makes the flush or compaction return `InvalidArgument`.
+///
+/// Callbacks may read their database. A callback that calls a write, WAL fence,
+/// flush, explicit compaction, or close on the same database receives
+/// [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument).
 pub trait BlockPropertyCollector: Send + Sync {
-    /// Called for each key-value pair added to the current data block.
-    fn add(&mut self, key: &[u8], value: &[u8]);
+    /// Called with the user key of every point value or point deletion in the block.
+    fn add(&mut self, user_key: &[u8]);
     /// Called when a data block is flushed. Returns serialized properties
     /// for this block. The collector is then reset for the next block.
     fn finish_block(&mut self) -> Vec<u8>;
-    /// Unique name identifying this collector type.
+    /// Stable name identifying the property encoding and semantics for the store lifetime.
     fn name(&self) -> &str;
 }
 
 /// Filters data blocks based on collected properties during iteration.
 pub trait BlockPropertyFilter: Send + Sync {
-    /// Return true if this block should be SKIPPED (does not match the query).
+    /// Test the visible user key after MVCC resolution. Point reads ignore this filter.
+    fn key_matches(&self, user_key: &[u8]) -> bool;
+
+    /// May return true only if every key collected in the block fails `key_matches`.
     fn should_skip(&self, properties: &[u8]) -> bool;
     /// Name must match the corresponding BlockPropertyCollector's name.
     fn name(&self) -> &str;
+}
+
+/// Owned once per scan, shared by all physical sources.
+#[derive(Clone, Default)]
+pub(crate) struct IterConfig {
+    pub prefix: Option<Arc<[u8]>>,
+    pub lower: Option<Vec<u8>>,
+    pub upper: Option<Vec<u8>>,
+    pub filters: Arc<[Arc<dyn BlockPropertyFilter>]>,
+}
+
+impl IterConfig {
+    pub fn new(
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        filters: &[Arc<dyn BlockPropertyFilter>],
+    ) -> Self {
+        Self {
+            prefix: None,
+            lower: lower.map(<[u8]>::to_vec),
+            upper: upper.map(<[u8]>::to_vec),
+            filters: filters.into(),
+        }
+    }
+
+    pub fn empty() -> Arc<Self> {
+        static EMPTY: LazyLock<Arc<IterConfig>> = LazyLock::new(Arc::default);
+        EMPTY.clone()
+    }
+
+    pub fn matches(&self, key: &[u8]) -> bool {
+        self.filters.iter().all(|f| f.key_matches(key))
+    }
+}
+
+macro_rules! option_builder {
+    ($method:ident, $field:ident, $ty:ty) => {
+        #[doc = concat!("Set [`", stringify!($field), "`](Self::", stringify!($field), ").")]
+        #[must_use]
+        pub fn $method(mut self, value: $ty) -> Self {
+            self.$field = value;
+            self
+        }
+    };
+}
+
+impl DbOptions {
+    option_builder!(with_create_if_missing, create_if_missing, bool);
+    option_builder!(with_error_if_exists, error_if_exists, bool);
+    option_builder!(with_write_buffer_size, write_buffer_size, usize);
+    option_builder!(with_max_immutable_memtables, max_immutable_memtables, usize);
+    option_builder!(with_wal_bytes_per_sync, wal_bytes_per_sync, u64);
+    option_builder!(with_l0_compaction_trigger, l0_compaction_trigger, usize);
+    option_builder!(with_target_file_size_base, target_file_size_base, u64);
+    option_builder!(with_max_bytes_for_level_base, max_bytes_for_level_base, u64);
+    option_builder!(
+        with_max_bytes_for_level_multiplier,
+        max_bytes_for_level_multiplier,
+        f64
+    );
+    option_builder!(with_num_levels, num_levels, usize);
+    option_builder!(with_block_size, block_size, usize);
+    option_builder!(with_block_restart_interval, block_restart_interval, usize);
+    option_builder!(with_bloom_bits_per_key, bloom_bits_per_key, u32);
+    option_builder!(with_compression, compression, CompressionType);
+    option_builder!(with_block_cache_capacity, block_cache_capacity, u64);
+    option_builder!(with_max_open_files, max_open_files, u64);
+    option_builder!(with_l0_slowdown_trigger, l0_slowdown_trigger, usize);
+    option_builder!(with_l0_stop_trigger, l0_stop_trigger, usize);
+    option_builder!(
+        with_rate_limiter_bytes_per_sec,
+        rate_limiter_bytes_per_sec,
+        u64
+    );
+    option_builder!(with_prefix_len, prefix_len, usize);
+    option_builder!(
+        with_compression_per_level,
+        compression_per_level,
+        Vec<CompressionType>
+    );
+    option_builder!(
+        with_compaction_filter,
+        compaction_filter,
+        Option<Arc<dyn CompactionFilter>>
+    );
+    option_builder!(
+        with_max_background_compactions,
+        max_background_compactions,
+        usize
+    );
+    option_builder!(with_max_subcompactions, max_subcompactions, usize);
+    option_builder!(
+        with_pin_l0_first_block_and_warm_index,
+        pin_l0_first_block_and_warm_index,
+        bool
+    );
+    option_builder!(
+        with_block_property_collectors,
+        block_property_collectors,
+        Vec<Arc<dyn Fn() -> Box<dyn BlockPropertyCollector> + Send + Sync>>
+    );
+    option_builder!(
+        with_lazy_delete_compaction_threshold,
+        lazy_delete_compaction_threshold,
+        usize
+    );
+    option_builder!(
+        with_block_cache,
+        block_cache,
+        Option<Arc<crate::cache::block_cache::BlockCachePool>>
+    );
+}
+
+impl<'a> ReadOptions<'a> {
+    /// Read at a registered snapshot.
+    #[must_use]
+    pub fn with_snapshot(mut self, snapshot: impl Into<SnapshotRef<'a>>) -> Self {
+        self.snapshot = Some(snapshot.into());
+        self
+    }
+    option_builder!(with_fill_cache, fill_cache, bool);
+    option_builder!(with_skip_point, skip_point, Option<SkipPointFn>);
+    option_builder!(
+        with_block_property_filters,
+        block_property_filters,
+        Vec<Arc<dyn BlockPropertyFilter>>
+    );
+    /// Set [`iterate_lower_bound`](Self::iterate_lower_bound).
+    #[must_use]
+    pub fn with_iterate_lower_bound(mut self, value: impl Into<Cow<'a, [u8]>>) -> Self {
+        self.iterate_lower_bound = Some(value.into());
+        self
+    }
+    /// Set [`iterate_upper_bound`](Self::iterate_upper_bound).
+    #[must_use]
+    pub fn with_iterate_upper_bound(mut self, value: impl Into<Cow<'a, [u8]>>) -> Self {
+        self.iterate_upper_bound = Some(value.into());
+        self
+    }
+}
+
+impl WriteOptions {
+    option_builder!(with_durability, durability, DurabilityMode);
+    option_builder!(with_no_slowdown, no_slowdown, bool);
 }

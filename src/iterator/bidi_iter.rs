@@ -1,128 +1,162 @@
-//! BidiIterator: a bidirectional iterator that implements `DoubleEndedIterator`.
-//!
-//! Supports two modes:
-//! - **Materialized**: pre-sorted entries for immediate bidirectional access
-//! - **Lazy**: wraps a `DBIterator` for streaming forward iteration.
-//!   First `next_back()` uses `seek_to_last()` (O(log N)).
-//!   Direction switches re-seek between the consumed front/back keys, and
-//!   subsequent calls stream with O(1) memory.
+//! Streaming double-ended iteration over the unconsumed key range.
 
-use std::mem;
+use crate::{DBIterator, Error, Result};
 
-use crate::iterator::db_iter::DBIterator;
-
-/// A bidirectional iterator over (user_key, value) pairs.
+/// A double-ended iterator over visible user keys and values.
 pub struct BidiIterator {
     inner: BidiInner,
 }
 
-struct LazyBidiState {
-    db_iter: Box<DBIterator>,
-    /// Last key returned by `next()`, used to stop backward iteration.
-    last_fwd_key: Option<Vec<u8>>,
-    /// Last key returned by `next_back()`, used to stop forward iteration.
-    last_back_key: Option<Vec<u8>>,
-}
-
 enum BidiInner {
-    /// Pre-materialized entries with front/back cursors.
     Materialized {
         entries: Vec<(Vec<u8>, Vec<u8>)>,
         front: usize,
         back: usize,
     },
-    /// Lazy streaming via DBIterator. Forward `next()` is zero-overhead
-    /// (no clone into consumed buffer). Backward access on first `next_back()`
-    /// uses `seek_to_last()` (O(log N)).
     Lazy {
-        db_iter: Box<DBIterator>,
-        /// When true, skip backward support (pure forward streaming).
+        cursor: Box<DBIterator>,
         forward_only: bool,
-        /// Number of entries consumed via next() (for correct front cursor on materialize).
-        fwd_count: usize,
+        backward: bool,
+        /// Exclusive upper frontier after consuming a row from the back.
+        back: Option<Vec<u8>>,
     },
-    /// After first next_back() via seek_to_last(), subsequent next_back() calls
-    /// use db_iter.prev() for O(1) memory streaming backward.
-    LazyBackStarted(LazyBidiState),
-    /// After calling next() while in LazyBackStarted, the db_iter is re-seeked
-    /// forward between the consumed front/back keys. Both frontiers are retained
-    /// so a later `next_back()` can re-seek and resume backward streaming.
-    LazyFwdResumed(LazyBidiState),
 }
 
 impl BidiIterator {
-    /// Create from a pre-sorted, deduplicated list of (user_key, value) pairs.
+    /// Create from sorted, deduplicated entries.
     pub fn new(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        let len = entries.len();
         Self {
             inner: BidiInner::Materialized {
+                back: entries.len(),
                 entries,
                 front: 0,
-                back: len,
             },
         }
     }
 
-    /// Create a lazy streaming iterator over the DBIterator's remaining entries.
-    /// Inspected but unconsumed entries and any current seek position are preserved.
+    /// Stream the remaining window of an already positioned database iterator.
     pub fn lazy(db_iter: DBIterator) -> Self {
-        Self {
-            inner: BidiInner::Lazy {
-                db_iter: Box::new(db_iter),
-                forward_only: false,
-                fwd_count: 0,
-            },
-        }
+        Self::stream(db_iter, false)
     }
 
-    /// Create a forward-only lazy streaming iterator.
-    /// `next_back()` returns `None`.
+    /// Stream forward only. Reverse steps report exhaustion.
     pub fn lazy_forward(db_iter: DBIterator) -> Self {
+        Self::stream(db_iter, true)
+    }
+
+    fn stream(cursor: DBIterator, forward_only: bool) -> Self {
         Self {
             inner: BidiInner::Lazy {
-                db_iter: Box::new(db_iter),
-                forward_only: true,
-                fwd_count: 0,
+                cursor: Box::new(cursor),
+                forward_only,
+                backward: false,
+                back: None,
             },
         }
     }
 
-    /// Number of remaining entries. Only accurate in materialized mode.
+    /// Exact remaining count for materialized iterators. Lazy iterators return zero.
     pub fn remaining(&self) -> usize {
-        match &self.inner {
-            BidiInner::Materialized { front, back, .. } => back.saturating_sub(*front),
-            _ => 0,
-        }
+        self.size_hint().0
     }
 
-    /// Whether the iterator has been exhausted.
-    ///
-    /// For materialized iterators this reports true exhaustion. For lazy
-    /// iterators the remaining work is not tracked for a shared `&self`
-    /// query, so this always returns `false` (same limitation as
-    /// [`Self::remaining`]).
+    /// True when a materialized iterator has consumed its entire range.
     pub fn is_empty(&self) -> bool {
-        match &self.inner {
-            BidiInner::Materialized { front, back, .. } => front >= back,
-            _ => false,
-        }
+        self.size_hint().1 == Some(0)
     }
 
-    /// Return the first error from the underlying source iterator, or a
-    /// key-decode corruption observed while filtering entries. Always
-    /// `None` for a materialized iterator (built from an already-collected
-    /// `Vec`, so there is no further I/O that can fail).
-    ///
-    /// Call after `next()`/`next_back()` returns `None` to distinguish
-    /// normal exhaustion from an I/O or corruption failure that stopped
-    /// iteration early — the lazy variants otherwise look identical to a
-    /// cleanly exhausted range, mirroring [`DBIterator::error`].
-    pub fn error(&self) -> Option<String> {
+    /// First error encountered by the underlying database cursor.
+    pub fn error(&self) -> Option<&Error> {
         match &self.inner {
             BidiInner::Materialized { .. } => None,
-            BidiInner::Lazy { db_iter, .. } => db_iter.error(),
-            BidiInner::LazyBackStarted(state) | BidiInner::LazyFwdResumed(state) => {
-                state.db_iter.error()
+            BidiInner::Lazy { cursor, .. } => cursor.error(),
+        }
+    }
+
+    /// Consume the front row of the remaining window and borrow its bytes.
+    pub fn step_next(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.front(true)
+    }
+
+    fn front(&mut self, checked: bool) -> Result<Option<(&[u8], &[u8])>> {
+        match &mut self.inner {
+            BidiInner::Materialized {
+                entries,
+                front,
+                back,
+            } => {
+                if front >= back {
+                    return Ok(None);
+                }
+                let (key, value) = &entries[*front];
+                *front += 1;
+                Ok(Some((key, value)))
+            }
+            BidiInner::Lazy {
+                cursor,
+                backward,
+                back,
+                ..
+            } => {
+                if *backward {
+                    if let Some(bound) = back {
+                        cursor.set_upper_bound(bound.clone());
+                    }
+                    cursor.seek_to_first();
+                    *backward = false;
+                }
+                cursor.lend_next(checked)
+            }
+        }
+    }
+
+    /// Consume the back row of the remaining window and borrow its bytes.
+    pub fn step_prev(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        match &mut self.inner {
+            BidiInner::Materialized {
+                entries,
+                front,
+                back,
+            } => {
+                if front >= back {
+                    return Ok(None);
+                }
+                *back -= 1;
+                let (key, value) = &entries[*back];
+                Ok(Some((key, value)))
+            }
+            BidiInner::Lazy {
+                cursor,
+                backward,
+                back,
+                forward_only,
+            } => {
+                if let Some(error) = cursor.error() {
+                    return Err(error.clone());
+                }
+                if *forward_only {
+                    return Ok(None);
+                }
+                if !*backward {
+                    // Preserve the next unconsumed forward key, including any
+                    // initial seek position, before repositioning to the back.
+                    let Some(first) = cursor.key().map(<[u8]>::to_vec) else {
+                        return cursor.error().map_or(Ok(None), |e| Err(e.clone()));
+                    };
+                    cursor.set_lower_bound(first);
+                    if let Some(last) = back {
+                        cursor.set_upper_bound(last.clone());
+                    }
+                    cursor.seek_to_last();
+                    *backward = true;
+                }
+                let row = cursor.step_prev()?;
+                if let Some((key, _)) = row {
+                    let frontier = back.get_or_insert_with(Vec::new);
+                    frontier.clear();
+                    frontier.extend_from_slice(key);
+                }
+                Ok(row)
             }
         }
     }
@@ -130,81 +164,15 @@ impl BidiIterator {
 
 impl Iterator for BidiIterator {
     type Item = (Vec<u8>, Vec<u8>);
-
     fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.inner {
-            BidiInner::Materialized {
-                entries,
-                front,
-                back,
-            } => {
-                if *front < *back {
-                    let item = entries[*front].clone();
-                    *front += 1;
-                    Some(item)
-                } else {
-                    None
-                }
-            }
-            BidiInner::Lazy {
-                db_iter, fwd_count, ..
-            } => {
-                let entry = db_iter.next()?;
-                *fwd_count += 1;
-                Some(entry)
-            }
-            BidiInner::LazyBackStarted(_) => {
-                // Switch to streaming forward — O(1) memory, no collect().
-                let placeholder = BidiInner::Materialized {
-                    entries: Vec::new(),
-                    front: 0,
-                    back: 0,
-                };
-                let old = mem::replace(&mut self.inner, placeholder);
-                if let BidiInner::LazyBackStarted(mut state) = old {
-                    // Tighten the upper bound before re-seeking so no consumed
-                    // backward entry can be returned from the front.
-                    if let Some(ref back_key) = state.last_back_key {
-                        state.db_iter.set_upper_bound(back_key.clone());
-                    }
-
-                    // Re-seek forward past the last consumed forward key.
-                    match &state.last_fwd_key {
-                        Some(key) => {
-                            state.db_iter.seek(key);
-                            // Skip last_fwd_key itself (already returned via next()).
-                            if state.db_iter.valid() && state.db_iter.key() == Some(key.as_slice())
-                            {
-                                state.db_iter.advance();
-                            }
-                        }
-                        None => {
-                            // Never called next() before backward mode — start from beginning.
-                            state.db_iter.seek_to_first();
-                        }
-                    }
-
-                    // Stream forward — no materialization needed.
-                    self.inner = BidiInner::LazyFwdResumed(state);
-                    self.next()
-                } else {
-                    unreachable!()
-                }
-            }
-            BidiInner::LazyFwdResumed(state) => {
-                let entry = state.db_iter.next()?;
-                state.last_fwd_key = Some(entry.0.clone());
-                Some(entry)
-            }
-        }
+        self.front(false)
+            .ok()
+            .flatten()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
     }
-
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.inner {
-            BidiInner::Materialized { front, back, .. } => {
-                let r = back.saturating_sub(*front);
-                (r, Some(r))
-            }
+            BidiInner::Materialized { front, back, .. } => (back - front, Some(back - front)),
             _ => (0, None),
         }
     }
@@ -212,149 +180,10 @@ impl Iterator for BidiIterator {
 
 impl DoubleEndedIterator for BidiIterator {
     fn next_back(&mut self) -> Option<Self::Item> {
-        match &mut self.inner {
-            BidiInner::Materialized {
-                entries,
-                front,
-                back,
-            } => {
-                if *back > *front {
-                    *back -= 1;
-                    Some(entries[*back].clone())
-                } else {
-                    None
-                }
-            }
-            BidiInner::Lazy { forward_only, .. } if *forward_only => None,
-            BidiInner::Lazy { db_iter, .. } => {
-                // Resolve the remaining front without consuming it. last_user_key
-                // also names inspected entries and cannot be an exclusive bound.
-                // Returning here on exhaustion retains the iterator and its error.
-                let first_remaining = db_iter.key()?.to_vec();
-                db_iter.set_lower_bound(first_remaining);
-                // First next_back(): use seek_to_last() for O(log N) access.
-                // This is the hot path for vsdb's `last()` = `iter().next_back()`.
-                let placeholder = BidiInner::Materialized {
-                    entries: Vec::new(),
-                    front: 0,
-                    back: 0,
-                };
-                let old = mem::replace(&mut self.inner, placeholder);
-                let BidiInner::Lazy { mut db_iter, .. } = old else {
-                    unreachable!()
-                };
-
-                db_iter.seek_to_last();
-                // Every path below restores `db_iter` into `LazyBackStarted`
-                // before returning — including exhaustion/error and the
-                // defensive key()/value() mismatch — so a later `error()`
-                // call can still report an I/O or corruption failure that
-                // stopped the seek early, instead of that failure looking
-                // identical to a legitimately empty range (which losing
-                // `db_iter` via an early `?` return would otherwise do).
-                if !db_iter.valid() {
-                    self.inner = BidiInner::LazyBackStarted(LazyBidiState {
-                        db_iter,
-                        last_fwd_key: None,
-                        last_back_key: None,
-                    });
-                    return None;
-                }
-                let Some(k) = db_iter.key().map(|k| k.to_vec()) else {
-                    // valid() == true should always mean key() is Some;
-                    // treat any inconsistency as no data instead of losing
-                    // `db_iter`.
-                    self.inner = BidiInner::LazyBackStarted(LazyBidiState {
-                        db_iter,
-                        last_fwd_key: None,
-                        last_back_key: None,
-                    });
-                    return None;
-                };
-                let Some(v) = db_iter.value().map(|v| v.to_vec()) else {
-                    self.inner = BidiInner::LazyBackStarted(LazyBidiState {
-                        db_iter,
-                        last_fwd_key: None,
-                        last_back_key: Some(k),
-                    });
-                    return None;
-                };
-                self.inner = BidiInner::LazyBackStarted(LazyBidiState {
-                    db_iter,
-                    last_fwd_key: None,
-                    last_back_key: Some(k.clone()),
-                });
-
-                Some((k, v))
-            }
-            BidiInner::LazyFwdResumed(_) => {
-                // Re-seek to the back frontier instead of materializing the
-                // remaining window. Direction switches stay O(1) in memory.
-                let placeholder = BidiInner::Materialized {
-                    entries: Vec::new(),
-                    front: 0,
-                    back: 0,
-                };
-                let old = mem::replace(&mut self.inner, placeholder);
-                let BidiInner::LazyFwdResumed(mut state) = old else {
-                    unreachable!()
-                };
-
-                if let Some(ref back_key) = state.last_back_key {
-                    state.db_iter.set_upper_bound(back_key.clone());
-                }
-                state.db_iter.seek_to_last();
-                // As in the `Lazy` branch above, every path below restores
-                // `state` (and its `db_iter`) into `LazyBackStarted` before
-                // returning, so `error()` can still see a failure that
-                // stopped this seek early.
-                if !state.db_iter.valid() {
-                    self.inner = BidiInner::LazyBackStarted(state);
-                    return None;
-                }
-
-                let Some(k) = state.db_iter.key().map(|k| k.to_vec()) else {
-                    self.inner = BidiInner::LazyBackStarted(state);
-                    return None;
-                };
-                if let Some(fwd_key) = state.last_fwd_key.as_deref()
-                    && k.as_slice() <= fwd_key
-                {
-                    self.inner = BidiInner::LazyBackStarted(state);
-                    return None;
-                }
-                let Some(v) = state.db_iter.value().map(|v| v.to_vec()) else {
-                    self.inner = BidiInner::LazyBackStarted(state);
-                    return None;
-                };
-                state.last_back_key = Some(k.clone());
-                self.inner = BidiInner::LazyBackStarted(state);
-                Some((k, v))
-            }
-            BidiInner::LazyBackStarted(state) => {
-                // Second+ next_back(): stream backward via db_iter.prev().
-                // O(1) memory — no materialization needed.
-                state.db_iter.prev();
-                if state.db_iter.valid() {
-                    let k = state.db_iter.key()?.to_vec();
-                    let v = state.db_iter.value()?.to_vec();
-                    // Stop if backward cursor has crossed the forward frontier.
-                    // Keep last_back_key unchanged — it's the correct upper bound
-                    // for a subsequent next() materialization.
-                    if let Some(fk) = state.last_fwd_key.as_deref()
-                        && k.as_slice() <= fk
-                    {
-                        return None;
-                    }
-                    state.last_back_key = Some(k.clone());
-                    Some((k, v))
-                } else {
-                    // Keep last_back_key — it's the correct upper bound for a
-                    // subsequent next() so it won't re-stream consumed entries.
-                    None
-                }
-            }
-        }
+        self.step_prev()
+            .ok()
+            .flatten()
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
     }
 }
 
@@ -506,11 +335,17 @@ mod tests {
         let mut it = make_lazy_bidi(&[b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h"]);
 
         assert_eq!(it.next_back().unwrap().0, b"h");
-        assert!(matches!(it.inner, BidiInner::LazyBackStarted(_)));
+        assert!(matches!(it.inner, BidiInner::Lazy { backward: true, .. }));
         assert_eq!(it.next().unwrap().0, b"a");
-        assert!(matches!(it.inner, BidiInner::LazyFwdResumed(_)));
+        assert!(matches!(
+            it.inner,
+            BidiInner::Lazy {
+                backward: false,
+                ..
+            }
+        ));
         assert_eq!(it.next_back().unwrap().0, b"g");
-        assert!(matches!(it.inner, BidiInner::LazyBackStarted(_)));
+        assert!(matches!(it.inner, BidiInner::Lazy { backward: true, .. }));
         assert_eq!(it.next().unwrap().0, b"b");
         assert_eq!(it.next_back().unwrap().0, b"f");
         assert_eq!(it.next().unwrap().0, b"c");
@@ -573,7 +408,7 @@ mod tests {
         let err = it
             .error()
             .expect("the decode error must survive the reverse transition");
-        assert!(err.contains("too short"), "got {err}");
+        assert!(err.to_string().contains("too short"), "got {err}");
     }
 
     /// Same bug, hit on the second `next_back()` after a direction switch
@@ -610,13 +445,19 @@ mod tests {
 
         // 1st next_back(): seek_to_last() lands on "z" — decodes fine.
         assert_eq!(it.next_back().unwrap().0, b"z");
-        assert!(matches!(it.inner, BidiInner::LazyBackStarted(_)));
+        assert!(matches!(it.inner, BidiInner::Lazy { backward: true, .. }));
         assert!(it.error().is_none());
 
         // next(): re-seeks forward below "z", lands on "a" — decodes fine,
         // transitions to LazyFwdResumed.
         assert_eq!(it.next().unwrap().0, b"a");
-        assert!(matches!(it.inner, BidiInner::LazyFwdResumed(_)));
+        assert!(matches!(
+            it.inner,
+            BidiInner::Lazy {
+                backward: false,
+                ..
+            }
+        ));
         assert!(it.error().is_none());
 
         // 2nd next_back(): LazyFwdResumed's handler re-seeks to the largest
@@ -626,6 +467,6 @@ mod tests {
         let err = it
             .error()
             .expect("the decode error must survive the second next_back()'s reverse transition");
-        assert!(err.contains("invalid value_type"), "got {err}");
+        assert!(err.to_string().contains("invalid value_type"), "got {err}");
     }
 }

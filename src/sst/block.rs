@@ -77,7 +77,10 @@ impl Block {
             return Err(Error::corruption("block too short"));
         }
         let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
-        let restarts_size = (num_restarts as usize) * 4 + 4; // restart array + count
+        let restarts_size = (num_restarts as usize)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(|| Error::corruption("restart count overflow"))?;
         if num_restarts == 0 {
             return Err(Error::corruption("bad restart count"));
         }
@@ -166,9 +169,9 @@ impl Block {
         &self,
         target: &[u8],
         compare: F,
-        key: &mut Vec<u8>,
+        key: &mut impl KeyBuffer,
     ) -> Result<Option<&[u8]>> {
-        key.clear();
+        key.replace_suffix(0, &[]);
         if self.restart_offset == 0 {
             return Ok(None);
         }
@@ -180,7 +183,7 @@ impl Block {
             let mid = left + (right - left) / 2;
             let rp = self.restart_point(mid) as usize;
 
-            key.clear();
+            key.replace_suffix(0, &[]);
             decode_entry_reuse(self.entry_data(), rp, key)?;
             if compare(key, target) == Ordering::Less {
                 left = mid + 1;
@@ -197,7 +200,7 @@ impl Block {
         };
 
         let mut offset = start;
-        key.clear();
+        key.replace_suffix(0, &[]);
 
         while offset < self.restart_offset {
             let (value_start, value_len, next_off) =
@@ -408,6 +411,22 @@ fn decode_entry_at(
     Ok((key, value, value_end))
 }
 
+pub(crate) trait KeyBuffer: std::ops::Deref<Target = [u8]> {
+    fn replace_suffix(&mut self, shared: usize, suffix: &[u8]);
+}
+impl KeyBuffer for Vec<u8> {
+    fn replace_suffix(&mut self, shared: usize, suffix: &[u8]) {
+        self.truncate(shared);
+        self.extend_from_slice(suffix);
+    }
+}
+impl KeyBuffer for smallvec::SmallVec<[u8; 128]> {
+    fn replace_suffix(&mut self, shared: usize, suffix: &[u8]) {
+        self.truncate(shared);
+        self.extend_from_slice(suffix);
+    }
+}
+
 /// Decode one entry at `offset`, reusing `key_buf` for the key (zero-alloc for key).
 /// Returns (value_start, value_len, next_offset) — value is a slice into `data`.
 /// The key is reconstructed in-place in `key_buf`.
@@ -418,7 +437,7 @@ fn decode_entry_at(
 pub(crate) fn decode_entry_reuse(
     data: &[u8],
     offset: usize,
-    key_buf: &mut Vec<u8>,
+    key_buf: &mut impl KeyBuffer,
 ) -> Result<(usize, usize, usize)> {
     if offset > data.len() {
         return Err(Error::corruption("block entry offset past end of data"));
@@ -458,8 +477,7 @@ pub(crate) fn decode_entry_reuse(
     }
 
     // Reconstruct key in-place: truncate to shared prefix, append unshared suffix
-    key_buf.truncate(shared);
-    key_buf.extend_from_slice(&data[pos..key_end]);
+    key_buf.replace_suffix(shared, &data[pos..key_end]);
     let value_start = key_end;
 
     Ok((value_start, vlen, value_end))

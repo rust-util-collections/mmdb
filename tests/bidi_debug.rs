@@ -4,10 +4,7 @@ use mmdb::{DB, DbOptions};
 fn debug_bidi_reverse() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            ..Default::default()
-        },
+        DbOptions::default().with_create_if_missing(true),
         dir.path(),
     )
     .unwrap();

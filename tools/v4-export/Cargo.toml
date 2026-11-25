@@ -1,0 +1,10 @@
+[package]
+name = "mmdb-v4-export"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+v4 = { package = "mmdb", version = "=4.3.15" }
+v5 = { package = "mmdb", path = "../.." }
+tempfile = "3.27.0"

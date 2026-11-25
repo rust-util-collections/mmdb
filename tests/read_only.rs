@@ -88,6 +88,7 @@ fn read_only_replays_residual_wal_and_leaves_store_unchanged() {
     assert_read_only(db.write(batch).unwrap_err());
     assert_read_only(db.write(WriteBatch::new()).unwrap_err());
     assert_read_only(db.flush().unwrap_err());
+    assert_read_only(db.sync_wal().unwrap_err());
     assert_read_only(db.compact().unwrap_err());
     assert_read_only(db.compact_range(None, None).unwrap_err());
 
@@ -142,13 +143,11 @@ fn read_only_ignores_writer_only_open_options() {
     drop(db);
 
     let db = DB::open_read_only_with_options(
-        DbOptions {
-            create_if_missing: true,
-            error_if_exists: true,
-            l0_slowdown_trigger: 100,
-            l0_stop_trigger: 1,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_error_if_exists(true)
+            .with_l0_slowdown_trigger(100)
+            .with_l0_stop_trigger(1),
         dir.path(),
     )
     .unwrap();
@@ -174,14 +173,7 @@ fn directory_lock_reopen_does_not_see_stale_flock() {
         let second = DB::open_read_only(path).unwrap();
         drop(first);
         drop(second);
-        let writer = DB::open(
-            DbOptions {
-                create_if_missing: false,
-                ..Default::default()
-            },
-            path,
-        )
-        .unwrap();
+        let writer = DB::open(DbOptions::default().with_create_if_missing(false), path).unwrap();
         writer.close().unwrap();
     }
 }
@@ -197,25 +189,12 @@ fn read_only_handles_share_lock_and_exclude_writers() {
 
     let first = DB::open_read_only(path).unwrap();
     let second = DB::open_read_only(path).unwrap();
-    let writer = DB::open(
-        DbOptions {
-            create_if_missing: false,
-            ..Default::default()
-        },
-        path,
-    );
+    let writer = DB::open(DbOptions::default().with_create_if_missing(false), path);
     assert!(writer.is_err(), "LOCK_EX must conflict with shared readers");
 
     drop(first);
     drop(second);
-    let writer = DB::open(
-        DbOptions {
-            create_if_missing: false,
-            ..Default::default()
-        },
-        path,
-    )
-    .unwrap();
+    let writer = DB::open(DbOptions::default().with_create_if_missing(false), path).unwrap();
     let reader = DB::open_read_only(path);
     assert!(reader.is_err(), "LOCK_SH must conflict with a live writer");
     writer.close().unwrap();
@@ -306,8 +285,17 @@ fn read_only_uses_no_store_mutating_syscalls() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path();
-    let db = DB::open(DbOptions::default(), path).unwrap();
+    let path = dir.path().join("current");
+    let old_path = dir.path().join("previous");
+    fs::create_dir(&old_path).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v4.3.15");
+    for entry in fs::read_dir(fixture).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name() != "LOCK" {
+            fs::copy(entry.path(), old_path.join(entry.file_name())).unwrap();
+        }
+    }
+    let db = DB::open(DbOptions::default(), &path).unwrap();
     db.put(b"probe", b"value").unwrap();
     db.simulate_crash();
 
@@ -328,7 +316,8 @@ fn read_only_uses_no_store_mutating_syscalls() {
             "--ignored",
             "--nocapture",
         ])
-        .env("MMDB_READ_ONLY_PROBE_PATH", path)
+        .env("MMDB_READ_ONLY_PROBE_PATH", &path)
+        .env("MMDB_READ_ONLY_OLD_PATH", old_path)
         .output()
         .unwrap();
     assert!(
@@ -339,7 +328,7 @@ fn read_only_uses_no_store_mutating_syscalls() {
     );
 
     let trace = fs::read_to_string(trace_file.path()).unwrap();
-    let store = path.to_string_lossy();
+    let store = dir.path().to_string_lossy();
     for line in trace.lines() {
         assert!(
             !store_mutating_syscall(line, &store),
@@ -358,6 +347,13 @@ fn read_only_syscall_probe_child() {
     assert_eq!(
         db.get(b"probe").unwrap().as_deref(),
         Some(b"value".as_ref())
+    );
+    assert!(db.contains_key(b"probe").unwrap());
+    assert_eq!(db.sync_wal().unwrap_err().kind(), ErrorKind::ReadOnly);
+    let old = std::env::var_os("MMDB_READ_ONLY_OLD_PATH").unwrap();
+    assert_eq!(
+        DB::open_read_only(old).err().unwrap().kind(),
+        ErrorKind::Corruption
     );
     drop(db);
 }

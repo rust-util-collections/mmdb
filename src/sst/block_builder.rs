@@ -70,6 +70,10 @@ impl BlockBuilder {
         self.buffer
     }
 
+    pub fn last_key(&self) -> &[u8] {
+        &self.last_key
+    }
+
     /// Current estimated size of the block.
     pub fn estimated_size(&self) -> usize {
         self.buffer.len() + self.restarts.len() * 4 + 4

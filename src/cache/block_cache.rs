@@ -321,9 +321,8 @@ impl BlockCache {
 
     /// Insert a pinned block — never evicted by LRU.
     /// Used to pin the first data block (smallest key) of an L0 file, so the
-    /// merging iterator's initial `peek()` is always a cache hit. Index and
-    /// filter blocks are held directly as fields on `TableReader` and never
-    /// pass through this cache at all.
+    /// merging iterator's initial `peek()` is always a cache hit. Index leaves use ordinary cache admission.
+    /// Filter lines and partition directories are retained by the table reader.
     pub fn insert_pinned(
         &self,
         file_number: u64,

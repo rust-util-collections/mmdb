@@ -2,9 +2,9 @@
 //!
 //! Uses a min-heap for O(N·log K) performance instead of O(N·K) linear scan.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
-use crate::types::LazyValue;
+use crate::{Error, options::IterConfig, types::LazyValue};
 
 pub use crate::iterator::source::{IterSource, SeekableIterator};
 
@@ -40,7 +40,7 @@ pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
     /// failed source must not be treated as exhausted (older versions from
     /// other sources would stand in for its unread entries), and later seeks
     /// are skipped so a source's own reset cannot clear the failure.
-    error: Option<String>,
+    error: Option<Error>,
 }
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
@@ -64,7 +64,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// Returns true once the merged stream has failed.
     fn latch_source_error(&mut self, idx: usize) -> bool {
         if self.error.is_none() {
-            self.error = self.sources[idx].iter_error();
+            self.error = self.sources[idx].iter_error().cloned();
         }
         if self.error.is_some() {
             self.heap_size = 0;
@@ -631,9 +631,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
     /// Set iteration bounds and propagate them to all sub-iterators.
     /// `lower` is inclusive, `upper` is exclusive (user keys).
-    pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
+    pub fn set_config(&mut self, config: Arc<IterConfig>) {
         for source in self.sources.iter_mut() {
-            source.set_bounds(lower, upper);
+            source.set_config(config.clone());
         }
     }
 
@@ -650,9 +650,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     /// stays reported for the iterator's lifetime.
     /// Use after iteration returns `None` to distinguish normal exhaustion
     /// from I/O failures.
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<&Error> {
         if self.error.is_some() {
-            return self.error.clone();
+            return self.error.as_ref();
         }
         for source in &self.sources {
             if let Some(e) = source.iter_error() {
@@ -686,7 +686,6 @@ mod tests {
                     &path,
                     TableBuildOptions {
                         block_size: 1,
-                        internal_keys: true,
                         ..Default::default()
                     },
                 )
@@ -923,7 +922,6 @@ mod tests {
                 TableBuildOptions {
                     block_size: 1,
                     bloom_bits_per_key: 0,
-                    internal_keys: true,
                     ..Default::default()
                 },
             )

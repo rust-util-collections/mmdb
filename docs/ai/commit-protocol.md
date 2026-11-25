@@ -84,6 +84,7 @@ cargo +stable test --test bidi_debug
 cargo +stable test --test lazy_delete
 cargo +stable test --test shared_cache
 cargo +stable test --test read_only
+cargo +stable test --manifest-path tools/v4-export/Cargo.toml
 ```
 
 Notes on gate execution:

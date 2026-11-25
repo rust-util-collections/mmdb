@@ -9,11 +9,9 @@ use mmdb::CompressionType;
 use mmdb::{DB, DbOptions, WriteBatch, WriteOptions};
 
 fn make_opts() -> DbOptions {
-    DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 2048,
-        ..Default::default()
-    }
+    DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(2048)
 }
 
 #[test]
@@ -76,10 +74,7 @@ fn test_crash_after_single_write() {
         db.put(b"key1", b"value1").unwrap();
         // Ensure WAL is flushed
         db.put_with_options(
-            &mmdb::WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &mmdb::WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"key2",
             b"value2",
         )
@@ -199,10 +194,7 @@ fn test_crash_with_batch_writes() {
 
         // Sync WAL explicitly
         db.put_with_options(
-            &mmdb::WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &mmdb::WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"sync_marker",
             b"ok",
         )
@@ -249,12 +241,10 @@ fn test_recovery_with_lz4_compression() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
 
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        compression: CompressionType::Lz4,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_compression(CompressionType::Lz4);
 
     {
         let db = DB::open(opts.clone(), &path).unwrap();
@@ -283,21 +273,16 @@ fn test_crash_partial_wal_record() {
 
     // Phase 1: write two synced records, then crash
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        // Keep the physical records inspected below together in the active WAL.
+        let db = DB::open(make_opts().with_write_buffer_size(64 << 20), &path).unwrap();
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"good1",
             b"value1",
         )
         .unwrap();
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"good2",
             b"value2",
         )
@@ -342,21 +327,16 @@ fn test_torn_wal_tail_ignores_empty_higher_recovery_orphan() {
     let path = dir.path().to_path_buf();
 
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        // Keep the physical records inspected below together in the active WAL.
+        let db = DB::open(make_opts().with_write_buffer_size(64 << 20), &path).unwrap();
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"good1",
             b"value1",
         )
         .unwrap();
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"good2",
             b"value2",
         )
@@ -400,13 +380,11 @@ fn test_crash_midlog_wal_corruption_fails_open() {
 
     // Phase 1: write three synced records, then crash
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        // Keep the physical records inspected below together in the active WAL.
+        let db = DB::open(make_opts().with_write_buffer_size(64 << 20), &path).unwrap();
         for i in 0..3 {
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 format!("mid_key{}", i).as_bytes(),
                 format!("mid_value{}", i).as_bytes(),
             )
@@ -466,16 +444,10 @@ fn changed_synced_fragment_header_preserves_wal_on_failed_recovery() {
                 continue;
             }
             let dir = tempfile::tempdir().unwrap();
-            let opts = DbOptions {
-                write_buffer_size: 64 << 20,
-                ..make_opts()
-            };
+            let opts = make_opts().with_write_buffer_size(64 << 20);
             let db = DB::open(opts.clone(), dir.path()).unwrap();
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 b"k",
                 &vec![0; value_len],
             )
@@ -528,17 +500,11 @@ fn test_zero_type_on_synced_zero_fragment_fails_open() {
     const WAL_HEADER_SIZE: usize = 7;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
-    let opts = DbOptions {
-        write_buffer_size: 64 << 20,
-        ..make_opts()
-    };
+    let opts = make_opts().with_write_buffer_size(64 << 20);
     {
         let db = DB::open(opts.clone(), &path).unwrap();
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"k",
             &[0u8; 40_000],
         )
@@ -581,13 +547,11 @@ fn test_crash_zeroed_midlog_wal_fragment_fails_open() {
     let path = dir.path().to_path_buf();
 
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        // Keep the physical records inspected below together in the active WAL.
+        let db = DB::open(make_opts().with_write_buffer_size(64 << 20), &path).unwrap();
         for i in 0..3 {
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 format!("zero_gap_key{i}").as_bytes(),
                 format!("zero_gap_value{i}").as_bytes(),
             )
@@ -648,13 +612,11 @@ fn test_enlarged_middle_wal_length_fails_open() {
     let path = dir.path().to_path_buf();
 
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        // Keep the physical records inspected below together in the active WAL.
+        let db = DB::open(make_opts().with_write_buffer_size(64 << 20), &path).unwrap();
         for i in 0..3 {
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 format!("len_key{i}").as_bytes(),
                 format!("len_value{i}").as_bytes(),
             )
@@ -708,13 +670,11 @@ fn test_earlier_wal_corrupt_tail_fails_open_when_newer_wal_exists() {
     let path = dir.path().to_path_buf();
 
     {
-        let db = DB::open(make_opts(), &path).unwrap();
+        // Keep the physical records inspected below together in the active WAL.
+        let db = DB::open(make_opts().with_write_buffer_size(64 << 20), &path).unwrap();
         db.flush().unwrap();
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"newer_wal_key",
             b"newer_wal_value",
         )
@@ -818,10 +778,7 @@ fn test_missing_referenced_sst_fails_open() {
             let key = format!("flush_key_{:04}", i);
             let val = format!("flush_val_{:040}", i);
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -872,11 +829,9 @@ fn test_large_data_crash_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
 
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024, // larger buffer so we don't auto-flush constantly
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024);
 
     // Phase 1: write 500 keys with sync, then crash
     {
@@ -885,10 +840,7 @@ fn test_large_data_crash_recovery() {
             let key = format!("bigkey_{:06}", i);
             let val = format!("bigval_{:06}", i);
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -925,10 +877,7 @@ fn test_multiple_crash_recover_cycles() {
             let key = format!("cycle1_key_{:04}", i);
             let val = format!("cycle1_val_{:04}", i);
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -956,10 +905,7 @@ fn test_multiple_crash_recover_cycles() {
             let key = format!("cycle2_key_{:04}", i);
             let val = format!("cycle2_val_{:04}", i);
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -997,10 +943,7 @@ fn test_multiple_crash_recover_cycles() {
             let key = format!("cycle3_key_{:04}", i);
             let val = format!("cycle3_val_{:04}", i);
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -1040,10 +983,7 @@ fn test_sync_guarantees() {
             let key = format!("sync_key_{:04}", i);
             let val = format!("sync_val_{:04}", i);
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -1074,10 +1014,10 @@ fn test_disable_wal_data_loss() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
     // A large buffer rules out an auto-flush persisting the no-WAL writes.
-    let opts = || DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 << 20,
-        ..Default::default()
+    let opts = || {
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(64 << 20)
     };
 
     // Write some durable data first, then write with disable_wal, then crash
@@ -1086,10 +1026,7 @@ fn test_disable_wal_data_loss() {
 
         // Durable write
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"durable_key",
             b"durable_val",
         )
@@ -1100,10 +1037,7 @@ fn test_disable_wal_data_loss() {
             let key = format!("nowal_key_{:04}", i);
             let val = format!("nowal_val_{:04}", i);
             db.put_with_options(
-                &WriteOptions {
-                    disable_wal: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::DisableWal),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -1166,10 +1100,7 @@ fn test_crash_after_compaction() {
             let key = format!("post_compact_key_{:04}", i);
             let val = format!("post_compact_val_{:04}", i);
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key.as_bytes(),
                 val.as_bytes(),
             )
@@ -1212,7 +1143,7 @@ fn test_crash_after_compaction() {
 
 /// Regression test for orphan cleanup of MANIFEST-rotation temp files:
 /// the CURRENT publish step writes per-attempt `CURRENT.tmp.<N>` files
-/// (pre-4.1.1 versions wrote a fixed `CURRENT.tmp`), and a crash between
+/// and a crash between
 /// the temp write and the atomic rename leaves one behind. Reopen must
 /// sweep both spellings — and must not touch unrelated files.
 #[test]
@@ -1227,10 +1158,9 @@ fn test_reopen_removes_stale_current_tmp_files() {
         db.flush().unwrap();
     }
 
-    // Plant crash leftovers: the modern per-attempt name, the legacy fixed
-    // name, and an unrelated file that the sweep must NOT remove.
+    // Only numbered staging files are owned by MANIFEST rotation.
     fs::write(path.join("CURRENT.tmp.12345"), b"MANIFEST-000042\n").unwrap();
-    fs::write(path.join("CURRENT.tmp"), b"MANIFEST-000041\n").unwrap();
+    fs::write(path.join("CURRENT.tmp.notes"), b"keep").unwrap();
     fs::write(path.join("unrelated.txt"), b"keep me").unwrap();
 
     // Reopen: recovery's orphan sweep runs before backgrounds start.
@@ -1244,8 +1174,8 @@ fn test_reopen_removes_stale_current_tmp_files() {
         "stale per-attempt CURRENT.tmp.<N> must be removed on reopen"
     );
     assert!(
-        !path.join("CURRENT.tmp").exists(),
-        "legacy fixed-name CURRENT.tmp must still be removed on reopen"
+        path.join("CURRENT.tmp.notes").exists(),
+        "unrelated temporary files must survive"
     );
     assert!(
         path.join("unrelated.txt").exists(),
@@ -1261,10 +1191,7 @@ fn enlarged_payload_preserves_later_wal_writes() {
         let db = DB::open(DbOptions::default(), dir.path()).unwrap();
         for key in [b"a", b"b", b"c"] {
             db.put_with_options(
-                &WriteOptions {
-                    sync: true,
-                    ..Default::default()
-                },
+                &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
                 key,
                 b"value\0\0",
             )
@@ -1300,10 +1227,7 @@ fn earlier_wal_truncated_after_block_trailer_fails_closed_while_tail_wal_recover
     // 8 (seq) + 4 (count) + 1 (type) + 4 (key_len) + 1 ("a") + 4 (val_len) = 22 bytes.
     // Physical record = 7 (WAL header) + 22 + val_len = 32764 => val_len = 32735.
     let val_a = vec![b'x'; 32768 - 4 - 7 - 22];
-    let sync = WriteOptions {
-        sync: true,
-        ..Default::default()
-    };
+    let sync = WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync);
     db.put_with_options(&sync, b"a", &val_a).unwrap();
     db.put_with_options(&sync, b"b", b"in_block_1").unwrap();
     db.simulate_crash();

@@ -1,5 +1,13 @@
 //! Core DB implementation with WAL, MemTable, SST, MANIFEST, and Iterator.
 
+mod flush;
+mod read;
+mod snapshot;
+use flush::{FlushContext, FlushQueue};
+use read::ReadState;
+use snapshot::NEXT_DB_ID;
+pub use snapshot::{ArcSnapshot, Snapshot, SnapshotRef};
+
 use std::{
     collections::{HashSet, VecDeque},
     fs::{self, OpenOptions},
@@ -27,25 +35,28 @@ use crate::iterator::level_iter::LevelIterator;
 use crate::iterator::merge::IterSource;
 use crate::manifest::file_numbers::{FileNumbers, PendingSsts};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
-use crate::manifest::version_set::{VersionSet, confirm_manifest_durable};
+use crate::manifest::version_set::{VersionSet, confirm_manifest_durable, sync_new_sst_parent_dir};
 use crate::memtable::MemTable;
 use crate::memtable::skiplist::MemTableCursorIter;
 use crate::options::{
-    CompactionFilter, CompactionFilterDecision, DbOptions, ReadOptions, WriteOptions,
+    CompactionFilter, CompactionFilterDecision, DbOptions, DurabilityMode, ReadOptions,
+    WriteOptions,
 };
 use crate::rate_limiter::RateLimiter;
 use crate::sst::SstBuilds;
 use crate::sst::filter::BloomFilter;
 use crate::sst::table_builder::{
-    META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuildResult, TableBuilder,
+    MAX_RANGE_STRIPES, META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuildResult,
+    TableBuilder,
 };
-use crate::sst::table_reader::{PreparedBlockPin, TableIterator};
+use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
 use crate::types::{
-    self, MAX_RANGE_DELETE_SIZE, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE,
-    SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex, tombstone_overlaps_bounds,
+    self, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, WriteBatch, WriteBatchWithIndex,
+    tombstone_overlaps_bounds,
 };
 use crate::wal::{WalReader, WalWriter};
+use crate::{PinnedSlice, options::IterConfig};
 
 /// Maximum number of dead-key registrations probed for auto-pruning after
 /// each flush. Bounds the extra read work per pass; the probes run off the
@@ -120,10 +131,6 @@ impl DeadKeySweepScheduler {
             == DeadKeySweepState::Pending
     }
 
-    fn is_idle(&self) -> bool {
-        DeadKeySweepState::from_raw(self.state.load(Ordering::Acquire)) == DeadKeySweepState::Idle
-    }
-
     fn try_start(&self) -> bool {
         self.state
             .compare_exchange(
@@ -170,18 +177,26 @@ impl DeadKeySweepScheduler {
 
 /// Tracks active snapshots so compaction doesn't delete data still needed by readers.
 struct SnapshotList {
-    snapshots: parking_lot::Mutex<Vec<SequenceNumber>>,
+    snapshots: Mutex<Vec<SequenceNumber>>,
+    count: AtomicUsize,
+    #[cfg(test)]
+    range_stripe_limit: AtomicUsize,
 }
 
 impl SnapshotList {
     fn new() -> Self {
         Self {
-            snapshots: parking_lot::Mutex::new(Vec::new()),
+            snapshots: Mutex::new(Vec::new()),
+            count: AtomicUsize::new(0),
+            #[cfg(test)]
+            range_stripe_limit: AtomicUsize::new(MAX_RANGE_STRIPES),
         }
     }
 
     fn acquire(&self, seq: SequenceNumber) -> SequenceNumber {
-        self.snapshots.lock().push(seq);
+        let mut snapshots = self.snapshots.lock();
+        snapshots.push(seq);
+        self.count.store(snapshots.len(), Ordering::Relaxed);
         seq
     }
 
@@ -189,12 +204,14 @@ impl SnapshotList {
         let mut v = self.snapshots.lock();
         if let Some(pos) = v.iter().position(|&s| s == seq) {
             v.swap_remove(pos);
+            self.count.store(v.len(), Ordering::Relaxed);
         }
     }
 
     fn as_sorted_vec(&self) -> Vec<SequenceNumber> {
         let mut v = self.snapshots.lock().clone();
         v.sort_unstable();
+        v.dedup();
         v
     }
 
@@ -206,17 +223,53 @@ impl SnapshotList {
 /// A pending write request for group commit.
 struct WriteRequest {
     batch: WriteBatch,
-    sync: bool,
-    disable_wal: bool,
+    kind: WriteRequestKind,
+    no_slowdown: bool,
+    durability: DurabilityMode,
     result: Option<Result<()>>,
     done: bool,
+}
+
+#[derive(Clone, Copy)]
+enum WriteRequestKind {
+    Batch,
+    WalFence { target_seq: u64 },
 }
 
 /// Group commit queue state. The `leader_active` flag prevents new arrivals
 /// from becoming false "leaders" while the real leader holds `inner` lock.
 struct WriteQueueState {
+    waiting_barriers: usize,
     queue: VecDeque<*mut WriteRequest>,
     leader_active: bool,
+}
+
+// SAFETY: each pointer refers to a queued writer's live stack frame. The
+// writer stays in enqueue_write until the leader sets done under write_queue.
+// Only the leader accesses result before then. Unlocked access projects the
+// immutable input fields directly, allowing waiters to check done under lock.
+unsafe impl Send for WriteQueueState {}
+
+impl WriteQueueState {
+    fn drain_group(&mut self, write_buffer_size: usize) -> Vec<*mut WriteRequest> {
+        const MAX_WRITE_BATCH_GROUP_BYTES: usize = 16 << 20;
+        let cap = (write_buffer_size / 2).min(MAX_WRITE_BATCH_GROUP_BYTES);
+        let mut bytes = 0usize;
+        let count = self
+            .queue
+            .iter()
+            .enumerate()
+            .take_while(|&(i, &request)| {
+                // SAFETY: the owner's stack frame remains live and its batch is
+                // immutable until the leader completes the request.
+                let batch = unsafe { &(*request).batch };
+                bytes = bytes.saturating_add(batch.payload.len());
+                // A single batch is atomic and may exceed the group limit.
+                i == 0 || bytes <= cap
+            })
+            .count();
+        self.queue.drain(..count).collect()
+    }
 }
 
 /// State captured during the freeze phase of a flush.
@@ -227,6 +280,8 @@ struct FrozenMemtable {
     file_numbers: Arc<FileNumbers>,
     old_wal_number: u64,
     new_wal_number: u64,
+    last_sequence: u64,
+    snapshots: Vec<u64>,
 }
 
 /// Atomically install a fresh SuperVersion into the given `ArcSwap`.
@@ -235,7 +290,7 @@ struct FrozenMemtable {
 fn refresh_super_version(target: &ArcSwap<SuperVersion>, inner: &DBInner) {
     target.store(Arc::new(SuperVersion {
         active_memtable: inner.active_memtable.clone(),
-        immutable_memtables: inner.immutable_memtables.clone(),
+        immutable_memtables: inner.immutable_memtables.iter().cloned().collect(),
         version: inner.versions.current(),
     }));
 }
@@ -252,7 +307,6 @@ fn l0_build_opts(options: &DbOptions) -> TableBuildOptions {
         block_size: options.block_size,
         block_restart_interval: options.block_restart_interval,
         bloom_bits_per_key: options.bloom_bits_per_key,
-        internal_keys: true,
         compression,
         prefix_len: options.prefix_len,
         block_property_collectors: options
@@ -263,31 +317,139 @@ fn l0_build_opts(options: &DbOptions) -> TableBuildOptions {
     }
 }
 
-/// Run one dead-key sweep step on `level`. Returns `false`, without merging,
-/// when L0 must wait for a pending flush.
-///
-/// A flush allocates L0 file numbers during the build and installs them after
-/// an unlocked SST write. Rewriting L0 in between would give older data higher
-/// file numbers than the pending flush output; recovery orders L0 by file
-/// number, so point reads would return the older value after reopen.
-fn sweep_dead_keys_at_level(
-    ctx: &CompactionContext<'_>,
-    level: usize,
-    inner: &mut DBInner,
-    table_cache: &Arc<TableCache>,
-    block_cache: &Arc<BlockCache>,
-) -> Result<bool> {
-    if level == 0 && !inner.immutable_memtables.is_empty() {
-        return Ok(false);
+/// State shared by explicit full-level rewrites and the background sweep.
+struct LevelRewrite<'a> {
+    inner: &'a Mutex<DBInner>,
+    snapshots: &'a SnapshotList,
+    claims: &'a Arc<CompactionClaims>,
+    table_cache: &'a Arc<TableCache>,
+    block_cache: &'a Arc<BlockCache>,
+    super_version: &'a ArcSwap<SuperVersion>,
+    l0_count: &'a AtomicUsize,
+}
+
+impl LevelRewrite<'_> {
+    fn run(&self, level: usize, ctx: &CompactionContext<'_>, mut move_l0: bool) -> Result<bool> {
+        let _build = ctx.builds.enter();
+        loop {
+            let (task, numbers, snapshots, bottom, epoch, claim) = {
+                let inner = self.inner.lock();
+                let version = inner.versions.current();
+                if level == 0 && !inner.immutable_memtables.is_empty() && !move_l0 {
+                    return Ok(false);
+                }
+                let mut claimed = self.claims.lock();
+                let task = if level == 0 && move_l0 {
+                    LeveledCompaction::pick_l0_compaction(&version, &claimed)
+                } else {
+                    LeveledCompaction::full_level_task(&version, level)
+                };
+                let Some(task) = task else {
+                    if move_l0 && level == 0 && version.l0_file_count() != 0 {
+                        drop(claimed);
+                        drop(inner);
+                        self.claims.wait_until_empty();
+                        continue;
+                    }
+                    return Ok(level != 0 || inner.immutable_memtables.is_empty());
+                };
+                let inputs: Vec<_> = task
+                    .input_files_level
+                    .iter()
+                    .chain(&task.input_files_next)
+                    .cloned()
+                    .collect();
+                let selected: Vec<_> = inputs.iter().map(|tf| tf.meta.number).collect();
+                if selected.iter().any(|n| claimed.contains(n)) {
+                    drop(claimed);
+                    drop(inner);
+                    self.claims.wait_until_empty();
+                    continue;
+                }
+                let snapshots = self.snapshots.as_sorted_vec();
+                let bottom = LeveledCompaction::is_bottommost_level(
+                    &version,
+                    level,
+                    ctx.options.num_levels,
+                    &inputs,
+                );
+                claimed.extend(selected.iter().copied());
+                let claim = CompactionClaim {
+                    claims: self.claims.clone(),
+                    numbers: selected,
+                };
+                (
+                    task,
+                    inner.versions.file_numbers.clone(),
+                    snapshots,
+                    bottom,
+                    inner.l0_install_epoch,
+                    claim,
+                )
+            };
+            if task.target_level == level
+                && task.input_files_level.len() == 1
+                && (!bottom
+                    || !snapshots.is_empty()
+                    || ctx
+                        .options
+                        .compaction_filter
+                        .as_ref()
+                        .is_none_or(|f| f.is_noop()))
+            {
+                return Ok(true);
+            }
+            let ctx = CompactionContext {
+                active_snapshots: &snapshots,
+                ..*ctx
+            };
+            let output = LeveledCompaction::execute_compaction_io(&ctx, &task, &numbers, bottom)?;
+            self.table_cache
+                .prewarm(output.edit.new_files.iter().map(|(_, m)| m.number));
+            let (cleanup, manifest) = {
+                let mut inner = self.inner.lock();
+                if level == 0 && task.target_level == 0 && epoch != inner.l0_install_epoch {
+                    drop(inner);
+                    // A flush can allocate an older file number than our output.
+                    // Discard the rewrite, then repick a move into L1 where file
+                    // numbers do not determine read order.
+                    for (_, m) in output.edit.new_files {
+                        self.table_cache.evict(m.number);
+                        let _ = fs::remove_file(ctx.db_path.join(format!("{:06}.sst", m.number)));
+                    }
+                    drop(claim);
+                    move_l0 = true;
+                    continue;
+                }
+                let cleanup = LeveledCompaction::install_compaction(
+                    output,
+                    &mut inner.versions,
+                    Some(self.table_cache),
+                    Some(self.block_cache),
+                    ctx.db_path,
+                    ctx.stats,
+                    !self.snapshots.is_empty(),
+                )?;
+                if cleanup.installed && level == 0 {
+                    for tf in &task.input_files_level {
+                        self.block_cache.unpin_file(tf.meta.number);
+                    }
+                }
+                self.l0_count
+                    .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
+                refresh_super_version(self.super_version, &inner);
+                (cleanup, inner.versions.manifest_sync_handle())
+            };
+            if !cleanup.installed {
+                continue;
+            }
+            confirm_manifest_durable(&manifest, ctx.manifest_poisoned)?;
+            LeveledCompaction::run_post_compaction_cleanup(&cleanup, ctx.db_path);
+            // Retry the sweep after the outstanding generation publishes its
+            // L0 files. This move may also have introduced work at L1.
+            return Ok(!move_l0);
+        }
     }
-    LeveledCompaction::force_merge_level(
-        ctx,
-        level,
-        &mut inner.versions,
-        Some(table_cache),
-        Some(block_cache),
-    )?;
-    Ok(true)
 }
 
 /// The `LOCK` file holding the directory flock. Dropping it calls `LOCK_UN`
@@ -376,41 +538,44 @@ impl Drop for CompactionClaim {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn hint_wal_writeback(file: &fs::File, offset: u64, length: u64) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the borrowed fd stays open through the syscall. This advisory
+    // call never substitutes for sync_data at a durability boundary.
+    unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            offset as i64,
+            length as i64,
+            libc::SYNC_FILE_RANGE_WRITE,
+        );
+    }
+}
+
 /// The core database handle.
 pub struct DB {
+    read: Arc<ReadState>,
     path: PathBuf,
     storage_path: PathBuf,
     options: DbOptions,
-    /// Whether this handle was opened without write capability.
-    read_only: bool,
     inner: Arc<Mutex<DBInner>>,
     /// Global sequence number (next to assign).
     sequence: Arc<AtomicU64>,
-    /// Last sequence number committed and visible to readers/snapshots.
-    committed_sequence: Arc<AtomicU64>,
     /// Write queue and condvar for group commit.
     write_queue: Mutex<WriteQueueState>,
     write_cv: Condvar,
-    closed: AtomicBool,
-    /// Fast-check flag for background errors (avoids Mutex lock on every read).
-    has_bg_error: Arc<AtomicBool>,
-    /// Background error (e.g. WAL sync failure). Once set, all subsequent
-    /// operations are rejected. Models RocksDB's background error state.
-    bg_error: Arc<Mutex<Option<String>>>,
-    /// Shared view of `VersionSet::poisoned` (see `poison_flag`). Lets
-    /// `check_usable` fail fast on a poisoned MANIFEST without locking
-    /// `inner`, and lets sync sites that go through `manifest_sync_handle`
-    /// poison the writer when durability cannot be confirmed.
-    manifest_poisoned: Arc<AtomicBool>,
+    flush_queue: Arc<FlushQueue>,
+    flush_worker: Mutex<Option<JoinHandle<()>>>,
+    synced_wal_seq: AtomicU64,
+    maintenance: Mutex<MaintenanceState>,
+    maintenance_cv: Condvar,
     block_cache: Arc<BlockCache>,
     table_cache: Arc<TableCache>,
     builds: Arc<SstBuilds>,
     rate_limiter: Arc<RateLimiter>,
-    stats: Arc<DbStats>,
     /// Shutdown flag for compaction threads.
     compaction_shutdown: Arc<AtomicBool>,
-    /// Notification condvar for compaction threads: (has_work, condvar).
-    compaction_notify: Arc<(Mutex<bool>, Condvar)>,
     /// Background compaction thread handles.
     compaction_handles: Mutex<Vec<JoinHandle<()>>>,
     /// File numbers currently claimed by an in-progress compaction pick
@@ -427,15 +592,6 @@ pub struct DB {
     /// Cached L0 file count for fast write-throttle checks.
     /// Updated after flush/compaction. Avoids locking `inner` on every write.
     l0_file_count: Arc<AtomicUsize>,
-    /// Lock-free read snapshot (SuperVersion).
-    /// Readers do a single atomic load. Writers swap atomically after
-    /// memtable/version changes — no RwLock contention.
-    super_version: Arc<ArcSwap<SuperVersion>>,
-    /// Read-triggered compaction hints accumulated from the get path, with
-    /// at most one pending hint per sampled level while workers are busy.
-    read_compaction_hints: Arc<Mutex<Vec<CompactionHint>>>,
-    /// Counter for periodic read-compaction checks.
-    read_counter: AtomicU64,
     /// Tracks active snapshots for compaction safety.
     snapshot_list: Arc<SnapshotList>,
     /// Directory lock (`LOCK` file): on Unix, exclusive for writable handles,
@@ -457,26 +613,25 @@ pub struct DB {
     dead_key_prune_cursor: AtomicUsize,
 }
 
-// SAFETY: the raw `*mut WriteRequest` pointers held in `write_queue` reference
-// stack frames of writer threads that remain blocked on `write_cv` (waiting for
-// `done`) for the pointers' entire lifetime. Pointers are published and drained
-// under the write_queue lock. Access is split by field: an owner reads only its
-// own `done`, and only under the write_queue lock (a wakeup meant for an
-// earlier group can make it do so while its request is in flight); the single
-// active leader reads `batch`, `sync`, and `disable_wal` and writes `result`
-// without the lock — the owner reads `result` only after `done` — and sets
-// `done` only under the lock. Unlocked, the leader therefore writes fields
-// through raw places and never forms a `&mut` to a whole request.
-// SAFETY: DB's shared mutable state is behind Arc + parking_lot locks or atomics;
-// raw request pointers are stack-local to write_queue waiters and never stored in DB.
-unsafe impl Send for DB {}
-// SAFETY: all cross-thread access is synchronized by locks/atomics; public methods
-// do not expose interior raw pointers or unsynchronized mutable references.
-unsafe impl Sync for DB {}
+#[derive(Default)]
+struct MaintenanceState {
+    closing: bool,
+    active: usize,
+}
+
+struct MaintenanceGuard<'a>(&'a DB);
+
+impl Drop for MaintenanceGuard<'_> {
+    fn drop(&mut self) {
+        self.0.maintenance.lock().active -= 1;
+        self.0.maintenance_cv.notify_all();
+    }
+}
 
 struct DBInner {
     active_memtable: Arc<MemTable>,
-    immutable_memtables: Vec<Arc<MemTable>>,
+    immutable_memtables: VecDeque<Arc<MemTable>>,
+    l0_install_epoch: u64,
     wal_writer: Option<WalWriter>,
     wal_number: u64,
     versions: VersionSet,
@@ -527,24 +682,6 @@ impl CompactionFilter for LazyDeleteFilter {
         // trivial move is still removed by a later compaction that re-examines
         // the relocated file, so allowing the move here is safe.
         self.user_filter.as_ref().is_none_or(|f| f.is_noop()) && self.dead_keys.read().is_empty()
-    }
-}
-
-/// Append the `(begin, end, seq)` tombstones that can cover a key inside the
-/// `[lower, upper)` window to `dst`, tagged with their source `level`.
-/// Shared by every bounded iterator constructor so a future tombstone source
-/// cannot miss the bounds filter.
-fn collect_tombstones_overlapping_bounds<K: AsRef<[u8]> + Into<Vec<u8>>>(
-    dst: &mut Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
-    src: impl IntoIterator<Item = (K, K, SequenceNumber)>,
-    level: usize,
-    lower: Option<&[u8]>,
-    upper: Option<&[u8]>,
-) {
-    for (b, e, s) in src {
-        if tombstone_overlaps_bounds(b.as_ref(), e.as_ref(), lower, upper) {
-            dst.push((b.into(), e.into(), s, level));
-        }
     }
 }
 
@@ -680,22 +817,13 @@ impl DB {
             requested_path.clone()
         };
 
-        // A leveled LSM needs at least L0 plus one lower level (`num_levels >= 2`),
-        // and VersionEdit encodes level numbers as `u32` (`0..num_levels`).
-        // Rejecting out-of-range values here returns `InvalidArgument` before
-        // creating directories, LOCK, MANIFEST, or CURRENT.
-        let alloc_bytes_ok = options
-            .num_levels
-            .checked_mul(mem::size_of::<Arc<Vec<crate::manifest::version::TableFile>>>())
-            .is_some_and(|bytes| bytes <= isize::MAX as usize);
-        if options.num_levels < 2
-            || u32::try_from(options.num_levels - 1).is_err()
-            || !alloc_bytes_ok
+        if !read_only
+            && (!(2..=16).contains(&options.num_levels)
+                || u32::try_from(options.prefix_len).is_err())
         {
-            return Err(Error::invalid_argument(format!(
-                "num_levels must be >= 2 and fit in u32 level indices, got {}",
-                options.num_levels
-            )));
+            return Err(Error::invalid_argument(
+                "num_levels must be in 2..=16 and prefix_len must fit u32",
+            ));
         }
 
         // The slowdown window must precede the stop trigger. With
@@ -710,6 +838,11 @@ impl DB {
             )));
         }
 
+        if !read_only && options.max_immutable_memtables == 0 {
+            return Err(Error::invalid_argument(
+                "max_immutable_memtables must be positive",
+            ));
+        }
         let num_compaction_threads = if read_only {
             0
         } else {
@@ -843,12 +976,7 @@ impl DB {
 
         // Open or create VersionSet (handles MANIFEST)
         let mut versions = if read_only {
-            VersionSet::recover_read_only_with_cache(
-                &path,
-                options.num_levels,
-                Some(table_cache.clone()),
-            )
-            .ctx()?
+            VersionSet::recover_read_only_with_cache(&path, Some(table_cache.clone())).ctx()?
         } else if path.join("CURRENT").try_exists().ctx()? {
             // A competing creator may have finished between preflight and LOCK.
             if options.error_if_exists {
@@ -857,17 +985,28 @@ impl DB {
                     path.display()
                 )));
             }
-            VersionSet::recover_with_cache(&path, options.num_levels, Some(table_cache.clone()))
-                .ctx()?
+            VersionSet::recover_with_cache(
+                &path,
+                options.num_levels,
+                options.prefix_len,
+                Some(table_cache.clone()),
+            )
+            .ctx()?
         } else if options.create_if_missing {
-            VersionSet::create_with_cache(&path, options.num_levels, Some(table_cache.clone()))
-                .ctx()?
+            VersionSet::create_with_cache(
+                &path,
+                options.num_levels,
+                options.prefix_len,
+                Some(table_cache.clone()),
+            )
+            .ctx()?
         } else {
             return Err(Error::invalid_argument(format!(
                 "DB does not exist: {}",
                 path.display()
             )));
         };
+        (options.num_levels, options.prefix_len) = versions.geometry();
         let mut max_sequence = versions.last_sequence();
 
         // Recover from any WAL files not yet flushed
@@ -920,6 +1059,25 @@ impl DB {
                 }
             }
         });
+        // Stage bounded recovery outputs until every relevant WAL has been
+        // validated. A crash before the single install replays the original WALs.
+        let mut recovery_outputs = Vec::new();
+        let file_numbers = versions.file_numbers.clone();
+        let recovery_path = path.clone();
+        let staged = PendingSsts::new(&recovery_path, &file_numbers);
+        let mut spill = |mem: &mut Arc<MemTable>| -> Result<()> {
+            let outputs = Self::write_memtable_ssts(
+                mem,
+                &path,
+                &|| l0_build_opts(&options),
+                &file_numbers,
+                &[],
+            )?;
+            staged.track(outputs.iter().map(|(n, _)| *n));
+            recovery_outputs.extend(outputs.into_iter().map(flush::file_metadata));
+            *mem = Arc::new(MemTable::new());
+            Ok(())
+        };
         for wal_num in &wal_numbers {
             let wal_path = path.join(format!("{:06}.wal", wal_num));
             let mut reader = WalReader::new(&wal_path).ctx()?;
@@ -928,6 +1086,11 @@ impl DB {
                     Ok(Some(data)) => {
                         Self::replay_wal_record(&data, &active_memtable, &mut max_sequence)
                             .ctx()?;
+                        if !read_only
+                            && active_memtable.approximate_size() >= options.write_buffer_size
+                        {
+                            spill(&mut active_memtable)?;
+                        }
                     }
                     Ok(None) => break,
                     // A torn tail (crash mid-append) can surface as a corrupt
@@ -971,6 +1134,11 @@ impl DB {
                     }
                 }
             }
+            // Admission bounds apply to each original memtable independently.
+            // Do not merge a same-key run across generations during replay.
+            if !read_only && !active_memtable.is_empty() {
+                spill(&mut active_memtable)?;
+            }
         }
 
         let (wal_writer, wal_number) = if read_only {
@@ -986,50 +1154,21 @@ impl DB {
             let wal_path = path.join(format!("{:06}.wal", wal_number));
             let wal_writer = WalWriter::new(&wal_path).ctx()?;
 
-            // If we recovered data from WALs, flush it to SST before deleting
-            // the old WALs. This ensures the data persists even if we crash again
-            // before writing to the new WAL.
-            if !wal_numbers.is_empty() && active_memtable.approximate_size() > 0 {
-                let make_opts = || l0_build_opts(&options);
-                let outputs = Self::write_memtable_ssts(
-                    &active_memtable,
-                    &path,
-                    &make_opts,
-                    &versions.file_numbers,
-                )
-                .ctx()?;
-
-                let mut edit = VersionEdit::new();
-                edit.set_log_number(wal_number);
-                edit.set_last_sequence(max_sequence);
-                edit.set_next_file_number(versions.next_file_number());
-                for (sst_number, build_result) in outputs {
-                    edit.add_file(
-                        0,
-                        FileMetaData {
-                            number: sst_number,
-                            file_size: build_result.file_size,
-                            smallest_key: build_result.smallest_key.unwrap_or_default(),
-                            largest_key: build_result.largest_key.unwrap_or_default(),
-                            has_range_deletions: build_result.has_range_deletions,
-                        },
-                    );
-                }
-                versions.log_and_apply(edit).ctx()?;
-                versions.sync_manifest().ctx()?;
-
-                // Reset the memtable — data is now safely in SST
-                active_memtable = Arc::new(MemTable::new());
+            let mut edit = VersionEdit::new();
+            edit.set_log_number(wal_number);
+            edit.set_last_sequence(max_sequence);
+            edit.set_next_file_number(versions.next_file_number());
+            if recovery_outputs.is_empty() {
+                versions.apply_metadata(edit).ctx()?;
             } else {
-                // No recovered data: still record the new log number so the old
-                // WALs are skipped on the next open.
-                let mut edit = VersionEdit::new();
-                edit.set_log_number(wal_number);
-                edit.set_next_file_number(versions.next_file_number());
-                edit.set_last_sequence(max_sequence);
-                versions.log_and_apply(edit).ctx()?;
-                versions.sync_manifest().ctx()?;
+                let synced = sync_new_sst_parent_dir(&path, &versions.poison_flag())?;
+                for meta in recovery_outputs {
+                    edit.add_file(0, meta);
+                }
+                versions.log_and_apply_synced(edit, synced).ctx()?;
+                staged.keep();
             }
+            versions.sync_manifest().ctx()?;
 
             // Safe to clean up obsolete files now — the new log_number is durable
             // (so old WALs will never be replayed even if we crash here) and the
@@ -1048,7 +1187,8 @@ impl DB {
 
         let inner = Arc::new(Mutex::new(DBInner {
             active_memtable,
-            immutable_memtables: Vec::new(),
+            immutable_memtables: VecDeque::new(),
+            l0_install_epoch: 0,
             wal_writer,
             wal_number,
             versions,
@@ -1081,14 +1221,16 @@ impl DB {
             let l0 = Arc::new(AtomicUsize::new(g.versions.current().l0_file_count()));
             let sv = Arc::new(ArcSwap::from_pointee(SuperVersion {
                 active_memtable: g.active_memtable.clone(),
-                immutable_memtables: g.immutable_memtables.clone(),
+                immutable_memtables: g.immutable_memtables.iter().cloned().collect(),
                 version: g.versions.current(),
             }));
             (l0, sv)
         };
         let read_compaction_hints = Arc::new(Mutex::new(Vec::<CompactionHint>::new()));
         let snapshot_list = Arc::new(SnapshotList::new());
+        let flush_queue = Arc::new(FlushQueue::default());
         for i in 0..num_compaction_threads {
+            let bg_flush_queue = flush_queue.clone();
             let bg_inner = Arc::clone(&inner);
             let bg_path = path.clone();
             let bg_options = options.clone();
@@ -1115,10 +1257,12 @@ impl DB {
                     // Helper: set background error and log it.
                     let set_error = |msg: String| {
                         tracing::error!("{}", msg);
+                        bg_flush_queue.fail(Error::background(msg.clone()));
                         *bg_error_msg.lock() = Some(msg);
                         bg_has_error.store(true, Ordering::Release);
                     };
 
+                    let mut retry_l0 = false;
                     loop {
                         // Wait for notification
                         {
@@ -1207,6 +1351,7 @@ impl DB {
                                                 // Phase 2: I/O (no lock)
                                                 let ctx = CompactionContext {
                                                     db_path: &bg_path,
+                                                    manifest_poisoned: &bg_manifest_poisoned,
                                                     options: &bg_options,
                                                     builds: &bg_builds,
                                                     rate_limiter: Some(&bg_rate_limiter),
@@ -1238,10 +1383,7 @@ impl DB {
                                                         .map(|(_, meta)| meta.number),
                                                 );
 
-                                                // Phase 3: install (short lock; log_and_apply
-                                                // still does a directory fsync when new
-                                                // files were added, but the per-file SST
-                                                // open above is now warm)
+                                                // Phase 3: validate and install the directory-synced outputs.
                                                 let cleanup = {
                                                     let mut inner = bg_inner.lock();
                                                     let cleanup =
@@ -1377,6 +1519,7 @@ impl DB {
                                     // Phase 2: I/O (no lock held)
                                     let ctx = CompactionContext {
                                         db_path: &bg_path,
+                                        manifest_poisoned: &bg_manifest_poisoned,
                                         options: &bg_options,
                                         builds: &bg_builds,
                                         rate_limiter: Some(&bg_rate_limiter),
@@ -1397,9 +1540,7 @@ impl DB {
                                         output.edit.new_files.iter().map(|(_, meta)| meta.number),
                                     );
 
-                                    // Phase 3: install (short lock; log_and_apply still
-                                    // does a directory fsync when new files were added,
-                                    // but the per-file SST open above is now warm)
+                                    // Phase 3: validate and install the directory-synced outputs.
                                     let cleanup = {
                                         let mut inner = bg_inner.lock();
                                         let cleanup = LeveledCompaction::install_compaction(
@@ -1475,36 +1616,35 @@ impl DB {
                                             bg_dead_key_sweep.finish(true);
                                             return Ok(());
                                         }
-                                        let mut inner = bg_inner.lock();
-                                        let active_snaps = bg_snapshot_list.as_sorted_vec();
-                                        blocked_by_snapshot |= !active_snaps.is_empty();
+                                        blocked_by_snapshot |= !bg_snapshot_list.is_empty();
                                         let ctx = CompactionContext {
                                             db_path: &bg_path,
+                                            manifest_poisoned: &bg_manifest_poisoned,
                                             options: &bg_options,
                                             builds: &bg_builds,
                                             rate_limiter: Some(&bg_rate_limiter),
                                             stats: Some(&bg_stats),
-                                            active_snapshots: &active_snaps,
+                                            active_snapshots: &[],
                                         };
-                                        let swept = sweep_dead_keys_at_level(
-                                            &ctx,
-                                            level,
-                                            &mut inner,
-                                            &bg_table_cache,
-                                            &bg_block_cache,
-                                        )
-                                        .map_err(|e| {
-                                            format!("dead-key sweep error at L{}: {}", level, e)
-                                        })?;
-                                        if !swept {
-                                            deferred_l0 = true;
-                                            continue;
+                                        let rewrite = LevelRewrite {
+                                            inner: &bg_inner,
+                                            snapshots: &bg_snapshot_list,
+                                            claims: &bg_compacting_files,
+                                            table_cache: &bg_table_cache,
+                                            block_cache: &bg_block_cache,
+                                            super_version: &bg_sv,
+                                            l0_count: &bg_l0_count,
+                                        };
+                                        let swept = rewrite
+                                            .run(level, &ctx, level == 0 && retry_l0)
+                                            .map_err(|e| {
+                                                format!("dead-key sweep error at L{level}: {e}")
+                                            })?;
+                                        if level == 0 {
+                                            deferred_l0 = !swept;
+                                            retry_l0 = !swept && !retry_l0;
                                         }
-                                        bg_l0_count.store(
-                                            inner.versions.current().l0_file_count(),
-                                            Ordering::Relaxed,
-                                        );
-                                        refresh_super_version(&bg_sv, &inner);
+                                        blocked_by_snapshot |= !bg_snapshot_list.is_empty();
                                     }
                                     #[cfg(test)]
                                     if deferred_l0 {
@@ -1595,41 +1735,64 @@ impl DB {
         }
 
         let db = Self {
+            read: Arc::new(ReadState {
+                read_only,
+                committed_sequence,
+                closed: AtomicBool::new(false),
+                db_id: NEXT_DB_ID
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                    .expect("database ID space exhausted"),
+                has_bg_error,
+                bg_error,
+                manifest_poisoned,
+                stats,
+                compaction_notify,
+                super_version,
+                read_compaction_hints,
+                read_counter: AtomicU64::new(0),
+            }),
             path: requested_path,
             storage_path: path,
             options,
-            read_only,
             inner,
             sequence: sequence_start.clone(),
-            committed_sequence,
             write_queue: Mutex::new(WriteQueueState {
+                waiting_barriers: 0,
                 queue: VecDeque::new(),
                 leader_active: false,
             }),
             write_cv: Condvar::new(),
-            closed: AtomicBool::new(false),
-            has_bg_error,
-            bg_error,
-            manifest_poisoned,
+            flush_queue: flush_queue.clone(),
+            flush_worker: Mutex::new(None),
+            synced_wal_seq: AtomicU64::new(max_sequence),
+            maintenance: Mutex::new(MaintenanceState::default()),
+            maintenance_cv: Condvar::new(),
+
             block_cache,
             table_cache,
             builds,
             rate_limiter,
-            stats,
             compaction_shutdown,
-            compaction_notify,
             compaction_handles: Mutex::new(compaction_handles),
             compacting_files,
             l0_file_count,
-            super_version,
-            read_compaction_hints,
-            read_counter: AtomicU64::new(0),
+
             snapshot_list,
             lock_file: Mutex::new(lock_file),
             dead_keys,
             dead_key_sweep,
             dead_key_prune_cursor: AtomicUsize::new(0),
         };
+
+        if !read_only {
+            let ctx = db.flush_context();
+            *db.flush_worker.lock() = Some(
+                thread::Builder::new()
+                    .name("mmdb-flush".into())
+                    .spawn(move || flush_queue.run(&ctx))
+                    .ctx()?,
+            );
+        }
 
         // Kick the background compaction threads once at startup. A DB
         // opened with a pre-existing L0 backlog (e.g. WAL-recovery SSTs
@@ -1641,7 +1804,7 @@ impl DB {
         // `pick_compaction` and goes back to sleep if there is nothing
         // to do, so an unconditional signal is free.
         if !read_only {
-            db.signal_compaction();
+            db.read.signal_compaction();
         }
 
         Ok(db)
@@ -1675,7 +1838,11 @@ impl DB {
     }
 
     /// Delete all keys in the range [begin, end).
-    /// The combined endpoint length must not exceed [`MAX_RANGE_DELETE_SIZE`].
+    /// The combined endpoint length must not exceed [`crate::MAX_RANGE_DELETE_SIZE`].
+    /// When 6,290,928 distinct snapshot sequences are live, every batch containing
+    /// a nonempty range deletion returns [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument)
+    /// before WAL append. This reserves room for the latest visible deletion and
+    /// both maximum-length endpoints in a single range-deletion leaf.
     pub fn delete_range(&self, begin: &[u8], end: &[u8]) -> Result<()> {
         self.delete_range_with_options(&WriteOptions::default(), begin, end)
     }
@@ -1702,6 +1869,7 @@ impl DB {
         batch: WriteBatch,
     ) -> Result<()> {
         self.check_writable().ctx()?;
+        batch.check_valid().ctx()?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -1713,158 +1881,33 @@ impl DB {
     }
 
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Pin the files/memtables before selecting visibility: compaction
-        // may otherwise remove the captured sequence before we retain its data.
-        let sv = self.get_super_version();
-        self.check_usable().ctx()?;
-        let seq = self.resolve_read_sequence(options.snapshot);
-        let (active_mem, imm_mems, version) =
-            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
+        Ok(self
+            .get_pinned_with_options(options, key)?
+            .map(PinnedSlice::into_vec))
+    }
 
-        // Find the highest-seq range tombstone covering this key (across all memtables).
-        // This is needed to compare against any point entry we find.
-        let mut max_tomb_seq = self.max_covering_tombstone_seq(key, seq, active_mem, imm_mems);
+    /// Look up a visible value and retain its backing memory.
+    pub fn get_pinned(&self, key: &[u8]) -> Result<Option<PinnedSlice>> {
+        self.get_pinned_with_options(&ReadOptions::default(), key)
+    }
 
-        // 1. Active MemTable
-        if let Some((result, entry_seq)) = active_mem.get_with_seq(key, seq) {
-            // If a range tombstone with higher seq exists, it deletes this entry
-            if max_tomb_seq > entry_seq {
-                return Ok(None);
-            }
-            if let Some(ref v) = result {
-                self.stats.record_read(key.len() as u64 + v.len() as u64);
-            }
-            return Ok(result);
-        }
+    /// Check visibility at the current committed sequence without copying the value.
+    pub fn contains_key(&self, key: &[u8]) -> Result<bool> {
+        self.contains_key_with_options(&ReadOptions::default(), key)
+    }
 
-        // 2. Immutable MemTables (newest first)
-        for imm in imm_mems {
-            if let Some((result, entry_seq)) = imm.get_with_seq(key, seq) {
-                if max_tomb_seq > entry_seq {
-                    return Ok(None);
-                }
-                if let Some(ref v) = result {
-                    self.stats.record_read(key.len() as u64 + v.len() as u64);
-                }
-                return Ok(result);
-            }
-        }
+    /// Check existence using the supplied snapshot and cache policy.
+    pub fn contains_key_with_options(&self, options: &ReadOptions<'_>, key: &[u8]) -> Result<bool> {
+        Ok(self.read.point_lookup::<usize>(options, key)?.is_some())
+    }
 
-        // 3. If no point entry in memtables but a tombstone covers the key,
-        // the key is deleted (tombstone covers entries in older SSTs too).
-        if max_tomb_seq > 0 {
-            return Ok(None);
-        }
-
-        // 4. L0 SST files (newest first, may overlap).
-        // A single memtable flush can be split into several L0 files cut at
-        // user-key boundaries; those files are numbered in ascending key order,
-        // and a range tombstone is written only to the file holding its start
-        // key (it is not fragmented into later split files). A tombstone in a
-        // lower-numbered file can therefore cover point keys living in a
-        // higher-numbered file from the same flush. Because L0 is scanned
-        // newest-first (descending file number), that point key would be found
-        // and returned before the tombstone-bearing file is ever visited. So
-        // accumulate covering tombstone sequences across ALL L0 files before
-        // doing any point lookup, mirroring the L1+ branch and the iterator
-        // path. (File number does not track sequence order within one split
-        // flush, so the per-file early-out is unsound here.)
-        let l0_files = version.level_files(0);
-        for tf in l0_files {
-            if tf.meta.has_range_deletions {
-                let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq).ctx()?;
-                max_tomb_seq = max_tomb_seq.max(file_tomb_seq);
-            }
-        }
-        for tf in l0_files {
-            if key < types::user_key(&tf.meta.smallest_key)
-                || key > types::user_key(&tf.meta.largest_key)
-            {
-                continue;
-            }
-            if let Some((result, entry_seq)) = tf
-                .reader
-                .get_internal_with_seq(key, seq, options.fill_cache)
-                .ctx()?
-            {
-                if max_tomb_seq > entry_seq {
-                    return Ok(None);
-                }
-                if let Some(ref v) = result {
-                    self.stats.record_read(key.len() as u64 + v.len() as u64);
-                }
-                return Ok(result);
-            }
-        }
-
-        // 5. L1+ SST files (sorted by smallest_key, no overlap within level)
-        for level in 1..version.num_levels {
-            let files = version.level_files(level);
-            if files.is_empty() {
-                continue;
-            }
-
-            // Check range tombstones in all files at this level that have them.
-            // We cannot filter by file key bounds because range tombstones can
-            // extend past the file's largest_key (table builder bounds only
-            // reflect point keys and tombstone start keys, not end keys).
-            for tf in files {
-                if tf.meta.has_range_deletions {
-                    let file_tomb_seq = tf.reader.max_covering_tombstone_seq(key, seq).ctx()?;
-                    max_tomb_seq = max_tomb_seq.max(file_tomb_seq);
-                }
-            }
-
-            // Binary search: find the latest file whose smallest user_key <= key.
-            // Files are sorted by smallest_key (internal key), which has user_key prefix.
-            let idx = files.partition_point(|tf| {
-                let sk = &tf.meta.smallest_key;
-                let smallest_uk = if sk.len() >= 8 {
-                    &sk[..sk.len() - 8]
-                } else {
-                    sk.as_slice()
-                };
-                smallest_uk <= key
-            });
-
-            // The candidate file is at idx-1 (last file whose smallest_key <= key)
-            if idx == 0 {
-                continue;
-            }
-            let tf = &files[idx - 1];
-            let lk = &tf.meta.largest_key;
-            let file_largest = if lk.len() >= 8 {
-                &lk[..lk.len() - 8]
-            } else {
-                lk.as_slice()
-            };
-            if key <= file_largest
-                && let Some((result, entry_seq)) = tf
-                    .reader
-                    .get_internal_with_seq(key, seq, options.fill_cache)
-                    .ctx()?
-            {
-                if max_tomb_seq > entry_seq {
-                    return Ok(None);
-                }
-                // Sample reads at level >= 2 for read-triggered compaction.
-                if level >= 2 {
-                    self.stats.maybe_sample_read_level(level);
-                    self.maybe_check_read_compaction();
-                }
-                if let Some(ref v) = result {
-                    self.stats.record_read(key.len() as u64 + v.len() as u64);
-                }
-                return Ok(result);
-            }
-        }
-
-        // If a range tombstone was found in SSTs but no point entry, key is deleted
-        if max_tomb_seq > 0 {
-            return Ok(None);
-        }
-
-        Ok(None)
+    /// Read using the supplied snapshot and cache policy. The returned pin owns its backing storage.
+    pub fn get_pinned_with_options(
+        &self,
+        options: &ReadOptions<'_>,
+        key: &[u8],
+    ) -> Result<Option<PinnedSlice>> {
+        self.read.point_lookup(options, key)
     }
 
     /// Create a forward iterator over the entire database.
@@ -1924,189 +1967,8 @@ impl DB {
         lower_bound: Option<&[u8]>,
         upper_bound: Option<&[u8]>,
     ) -> Result<DBIterator> {
-        let (lower_bound, upper_bound) = intersect_iter_bounds(options, lower_bound, upper_bound);
-
-        // Pin the files/memtables before selecting visibility: compaction
-        // may otherwise remove the captured sequence before we retain its data.
-        let sv = self.get_super_version();
-        self.check_usable().ctx()?;
-        let seq = self.resolve_read_sequence(options.snapshot);
-        if lower_bound
-            .zip(upper_bound)
-            .is_some_and(|(lo, hi)| lo >= hi)
-        {
-            return Ok(DBIterator::from_sources(Vec::new(), seq));
-        }
-        let (active_mem, imm_mems, version) =
-            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
-
-        let est_sources = 1 + imm_mems.len() + version.level_files(0).len() + version.num_levels;
-        let mut sources: Vec<IterSource> = Vec::with_capacity(est_sources);
-        let mut any_range_deletions = false;
-
-        // Active memtable — cursor-based streaming iterator.
-        {
-            if active_mem.has_range_deletions() {
-                any_range_deletions = true;
-            }
-            let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_memtable(cursor).with_level(0));
-        }
-
-        // Immutable memtables
-        for imm in imm_mems {
-            if imm.has_range_deletions() {
-                any_range_deletions = true;
-            }
-            let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_memtable(cursor).with_level(0));
-        }
-
-        // SST files — only include files whose key range overlaps [lower_bound, upper_bound].
-        // L0 files can overlap each other so we check each individually.
-        // L1+ files are sorted and non-overlapping — use a single LevelIterator per level.
-        for tf in version.level_files(0) {
-            // Range tombstones in this file may cover keys in lower levels
-            // even when the file itself is pruned from the merge sources
-            // below (file metadata only reflects tombstone *start* keys), so
-            // the flag must be set before any pruning decision.
-            if tf.meta.has_range_deletions {
-                any_range_deletions = true;
-            }
-            // Check if this file's key range overlaps the bound range.
-            if let Some(lo) = lower_bound
-                && types::user_key(&tf.meta.largest_key) < lo
-            {
-                continue;
-            }
-            if let Some(hi) = upper_bound
-                && types::user_key(&tf.meta.smallest_key) >= hi
-            {
-                continue;
-            }
-            let mut iter =
-                TableIterator::new(tf.reader.clone()).with_fill_cache(options.fill_cache);
-            if !options.block_property_filters.is_empty() {
-                iter = iter.with_block_filters(options.block_property_filters.clone());
-            }
-            sources.push(IterSource::from_table_iter(iter).with_level(0));
-        }
-        for level in 1..version.num_levels {
-            let files = version.level_files(level);
-            if files.is_empty() {
-                continue;
-            }
-            if !any_range_deletions {
-                for tf in files {
-                    if tf.meta.has_range_deletions {
-                        any_range_deletions = true;
-                        break;
-                    }
-                }
-            }
-            let mut level_iter = LevelIterator::for_level(Arc::clone(version), level)
-                .with_fill_cache(options.fill_cache)
-                .with_range_hints(
-                    lower_bound.map(|s| s.to_vec()),
-                    upper_bound.map(|e| e.to_vec()),
-                );
-            if !options.block_property_filters.is_empty() {
-                level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
-            }
-            sources.push(IterSource::from_level_iter(level_iter).with_level(level));
-        }
-
-        let mut db_iter = DBIterator::from_sources(sources, seq);
-
-        // Collect all range tombstones upfront from per-source caches.
-        // This enables O(log T) binary search for any key in any direction,
-        // replacing the old inline-collection + full-scan preload approach.
-        // Tombstones that cannot cover any key within the effective bounds
-        // are dropped here, so the retained set scales with the scan range
-        // rather than with every range deletion in the database.
-        if any_range_deletions {
-            let bounds_lo = lower_bound;
-            let bounds_hi = upper_bound;
-            // Collect tombstones with level info for cross-level pruning.
-            // A tombstone from level L may cover keys at level L or deeper;
-            // one strictly deeper than a key's source level never covers it.
-            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
-            // Memtable tombstones are at level 0 (highest priority).
-            if active_mem.has_range_deletions() {
-                collect_tombstones_overlapping_bounds(
-                    &mut all_tombstones,
-                    active_mem.get_range_tombstones(),
-                    0,
-                    bounds_lo,
-                    bounds_hi,
-                );
-            }
-            for imm in imm_mems {
-                if imm.has_range_deletions() {
-                    collect_tombstones_overlapping_bounds(
-                        &mut all_tombstones,
-                        imm.get_range_tombstones(),
-                        0,
-                        bounds_lo,
-                        bounds_hi,
-                    );
-                }
-            }
-            // L0 files are also at level 0.
-            for tf in version.level_files(0) {
-                if tf.meta.has_range_deletions {
-                    collect_tombstones_overlapping_bounds(
-                        &mut all_tombstones,
-                        tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
-                        0,
-                        bounds_lo,
-                        bounds_hi,
-                    );
-                }
-            }
-            for level in 1..version.num_levels {
-                for tf in version.level_files(level) {
-                    if tf.meta.has_range_deletions {
-                        // Only skip files whose smallest_key is past the
-                        // upper bound.  We cannot use largest_key < lower_bound
-                        // to skip because range tombstones can extend past the
-                        // file's largest_key.
-                        if let Some(hi) = upper_bound
-                            && types::user_key(&tf.meta.smallest_key) >= hi
-                        {
-                            continue;
-                        }
-                        collect_tombstones_overlapping_bounds(
-                            &mut all_tombstones,
-                            tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
-                            level,
-                            bounds_lo,
-                            bounds_hi,
-                        );
-                    }
-                }
-            }
-            if !all_tombstones.is_empty() {
-                db_iter.set_range_tombstones_with_levels(all_tombstones);
-            }
-        }
-        let has_lower = lower_bound.is_some();
-        if has_lower || upper_bound.is_some() {
-            db_iter.set_bounds(
-                lower_bound.map(<[u8]>::to_vec),
-                upper_bound.map(<[u8]>::to_vec),
-            );
-        }
-        if let Some(ref sp) = options.skip_point {
-            db_iter.set_skip_point(Arc::clone(sp));
-        }
-        // Memtable and L0 sources start at their first entry and ignore the
-        // lower bound; position at it instead of discarding every entry below
-        // it one at a time on the first `next()`.
-        if has_lower {
-            db_iter.seek_to_first();
-        }
-        Ok(db_iter)
+        self.read
+            .scan(options, lower_bound, upper_bound, None, None)
     }
 
     /// Create a prefix-bounded iterator with full options support.
@@ -2134,196 +1996,9 @@ impl DB {
     /// Set `ReadOptions::iterate_lower_bound` / `iterate_upper_bound` to further
     /// restrict iteration to a sub-range inside the prefix.
     pub fn iter_with_prefix(&self, prefix: &[u8], options: &ReadOptions) -> Result<DBIterator> {
-        let sv = self.get_super_version();
-        self.check_usable().ctx()?;
-        let seq = self.resolve_read_sequence(options.snapshot);
-        // Compute prefix upper bound once, share across all uses.
-        let prefix_owned: Arc<[u8]> = Arc::from(prefix);
-        let prefix_upper = {
-            let mut upper = prefix.to_vec();
-            let mut carry = true;
-            for byte in upper.iter_mut().rev() {
-                if carry {
-                    if *byte == 0xFF {
-                        *byte = 0x00;
-                    } else {
-                        *byte += 1;
-                        carry = false;
-                    }
-                }
-            }
-            if carry { None } else { Some(upper) }
-        };
-
-        let (lower_bound, upper_bound) =
-            intersect_iter_bounds(options, Some(prefix), prefix_upper.as_deref());
-        if lower_bound
-            .zip(upper_bound)
-            .is_some_and(|(lo, hi)| lo >= hi)
-        {
-            return Ok(DBIterator::from_sources(Vec::new(), seq));
-        }
-        let (active_mem, imm_mems, version) =
-            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
-
-        // Pre-size sources: 1 active + N_imm + N_L0 + N_levels (avoids realloc)
-        let est_sources = 1 + imm_mems.len() + version.level_files(0).len() + version.num_levels;
-        let mut sources: Vec<IterSource> = Vec::with_capacity(est_sources);
-        let mut any_range_deletions = false;
-
-        // Active memtable
-        {
-            if active_mem.has_range_deletions() {
-                any_range_deletions = true;
-            }
-            let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_memtable(cursor).with_level(0));
-        }
-
-        // Immutable memtables
-        for imm in imm_mems {
-            if imm.has_range_deletions() {
-                any_range_deletions = true;
-            }
-            let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_memtable(cursor).with_level(0));
-        }
-
-        // SST files — skip files via range pruning + prefix bloom.
-        // L0: per-file filtering (files may overlap).
-        for tf in version.level_files(0) {
-            // Set the tombstone flag before any pruning: a pruned file's
-            // range tombstones may still cover in-range keys in lower levels
-            // (metadata and prefix blooms only reflect point keys and
-            // tombstone *start* keys).
-            if tf.meta.has_range_deletions {
-                any_range_deletions = true;
-            }
-            if lower_bound.is_some_and(|lo| types::user_key(&tf.meta.largest_key) < lo) {
-                continue;
-            }
-            if let Some(hi) = upper_bound
-                && types::user_key(&tf.meta.smallest_key) >= hi
-            {
-                continue;
-            }
-            if !tf.reader.prefix_may_match(prefix) {
-                continue;
-            }
-            let mut iter =
-                TableIterator::new(tf.reader.clone()).with_fill_cache(options.fill_cache);
-            if !options.block_property_filters.is_empty() {
-                iter = iter.with_block_filters(options.block_property_filters.clone());
-            }
-            sources.push(IterSource::from_table_iter(iter).with_level(0));
-        }
-        // L1+: one LevelIterator per level with lazy file opening.
-        for level in 1..version.num_levels {
-            let files = version.level_files(level);
-            if files.is_empty() {
-                continue;
-            }
-            if !any_range_deletions {
-                for tf in files {
-                    if tf.meta.has_range_deletions {
-                        any_range_deletions = true;
-                        break;
-                    }
-                }
-            }
-            let mut level_iter = LevelIterator::for_level(Arc::clone(version), level)
-                .with_fill_cache(options.fill_cache)
-                .with_prefix(prefix_owned.to_vec())
-                .with_range_hints(
-                    lower_bound.map(<[u8]>::to_vec),
-                    upper_bound.map(<[u8]>::to_vec),
-                );
-            if !options.block_property_filters.is_empty() {
-                level_iter = level_iter.with_block_filters(options.block_property_filters.clone());
-            }
-            sources.push(IterSource::from_level_iter(level_iter).with_level(level));
-        }
-
-        let mut iter = DBIterator::from_sources_with_prefix(sources, seq, prefix_owned.to_vec());
-
-        // Collect all range tombstones with level info for cross-level pruning.
-        // The iterator only yields keys within [prefix, prefix_upper), so
-        // tombstones that cannot cover that range are dropped here.
-        if any_range_deletions {
-            let bounds_lo = lower_bound;
-            let bounds_hi = upper_bound;
-            let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
-            if active_mem.has_range_deletions() {
-                collect_tombstones_overlapping_bounds(
-                    &mut all_tombstones,
-                    active_mem.get_range_tombstones(),
-                    0,
-                    bounds_lo,
-                    bounds_hi,
-                );
-            }
-            for imm in imm_mems {
-                if imm.has_range_deletions() {
-                    collect_tombstones_overlapping_bounds(
-                        &mut all_tombstones,
-                        imm.get_range_tombstones(),
-                        0,
-                        bounds_lo,
-                        bounds_hi,
-                    );
-                }
-            }
-            for tf in version.level_files(0) {
-                if tf.meta.has_range_deletions {
-                    collect_tombstones_overlapping_bounds(
-                        &mut all_tombstones,
-                        tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
-                        0,
-                        bounds_lo,
-                        bounds_hi,
-                    );
-                }
-            }
-            for level in 1..version.num_levels {
-                for tf in version.level_files(level) {
-                    if tf.meta.has_range_deletions {
-                        // Only skip files whose smallest_key is past the prefix
-                        // upper bound.  We cannot use largest_key < prefix
-                        // to skip because range tombstones can extend past
-                        // the file's largest_key.
-                        if let Some(hi) = upper_bound
-                            && types::user_key(&tf.meta.smallest_key) >= hi
-                        {
-                            continue;
-                        }
-                        collect_tombstones_overlapping_bounds(
-                            &mut all_tombstones,
-                            tf.reader.cached_range_tombstones().ctx()?.iter_tombstones(),
-                            level,
-                            bounds_lo,
-                            bounds_hi,
-                        );
-                    }
-                }
-            }
-            if !all_tombstones.is_empty() {
-                iter.set_range_tombstones_with_levels(all_tombstones);
-            }
-        }
-
-        iter.set_bounds(
-            lower_bound.map(<[u8]>::to_vec),
-            upper_bound.map(<[u8]>::to_vec),
-        );
-
-        if let Some(ref sp) = options.skip_point {
-            iter.set_skip_point(Arc::clone(sp));
-        }
-
-        // Seek to the prefix start or the tighter options lower bound.
-        iter.seek(lower_bound.unwrap_or(prefix));
-
-        Ok(iter)
+        let upper = types::prefix_successor(prefix);
+        self.read
+            .scan(options, Some(prefix), upper.as_deref(), Some(prefix), None)
     }
 
     /// Create a forward iterator that merges uncommitted batch writes with the
@@ -2332,106 +2007,14 @@ impl DB {
     /// in operation order. Later commits in the active memtable stay hidden,
     /// including commits with the same sequence as an overlay entry.
     pub fn iter_with_batch(&self, batch: &WriteBatchWithIndex) -> Result<DBIterator> {
-        if batch.is_empty() {
-            return self.iter();
-        }
-        let sv = self.get_super_version();
-        self.check_usable().ctx()?;
-        let seq = self.current_sequence();
-        let batch_base_seq = MAX_SEQUENCE_NUMBER
-            .checked_sub(batch.operation_count() - 1)
-            .filter(|base| *base > seq)
-            .ok_or_else(|| Error::invalid_argument("sequence number space exhausted"))?;
-        let batch_entries = batch.sorted_entries(batch_base_seq).ctx()?;
-
-        let (active_mem, imm_mems, version) =
-            (&sv.active_memtable, &sv.immutable_memtables, &sv.version);
-
-        let est_sources = 2 + imm_mems.len() + version.level_files(0).len() + version.num_levels;
-        let mut sources: Vec<IterSource> = Vec::with_capacity(est_sources);
-
-        // Batch source first (highest priority due to higher sequence numbers).
-        sources.push(IterSource::new(batch_entries).with_level(0));
-
-        // Active memtable.
-        {
-            let cursor = MemTableCursorIter::new(active_mem.clone());
-            sources.push(IterSource::from_memtable(cursor).with_level(0));
-        }
-
-        // Immutable memtables.
-        for imm in imm_mems.iter() {
-            let cursor = MemTableCursorIter::new(Arc::clone(imm));
-            sources.push(IterSource::from_memtable(cursor).with_level(0));
-        }
-
-        // SST files: L0 individually, L1+ via LevelIterator.
-        for tf in version.level_files(0) {
-            let iter = TableIterator::new(tf.reader.clone());
-            sources.push(IterSource::from_table_iter(iter).with_level(0));
-        }
-        for level in 1..version.num_levels {
-            let files = version.level_files(level);
-            if files.is_empty() {
-                continue;
-            }
-            let level_iter = LevelIterator::for_level(Arc::clone(version), level);
-            sources.push(IterSource::from_level_iter(level_iter).with_level(level));
-        }
-
-        let mut db_iter = DBIterator::from_sources(sources, seq);
-        db_iter.include_batch_source();
-
-        // Batch tombstones can shadow any database source. Freeze the
-        // database tombstones at the captured sequence before combining them.
-        let mut all_tombstones: Vec<(Vec<u8>, Vec<u8>, u64, usize)> = Vec::new();
-        // Batch range tombstones use position-based sequences (preserving write order).
-        for &(ref b, ref e, pos) in batch.range_tombstones() {
-            all_tombstones.push((b.clone(), e.clone(), batch_base_seq + pos, 0));
-        }
-        if active_mem.has_range_deletions() {
-            for (b, e, s) in active_mem.get_range_tombstones() {
-                if s <= seq {
-                    all_tombstones.push((b, e, s, 0));
-                }
-            }
-        }
-        for imm in imm_mems.iter() {
-            if imm.has_range_deletions() {
-                for (b, e, s) in imm.get_range_tombstones() {
-                    if s <= seq {
-                        all_tombstones.push((b, e, s, 0));
-                    }
-                }
-            }
-        }
-        for tf in version.level_files(0) {
-            if tf.meta.has_range_deletions {
-                let ts = tf.reader.get_range_tombstones().ctx()?;
-                for (b, e, s) in ts {
-                    if s <= seq {
-                        all_tombstones.push((b, e, s, 0));
-                    }
-                }
-            }
-        }
-        for level in 1..version.num_levels {
-            for tf in version.level_files(level) {
-                if tf.meta.has_range_deletions {
-                    let ts = tf.reader.get_range_tombstones().ctx()?;
-                    for (b, e, s) in ts {
-                        if s <= seq {
-                            all_tombstones.push((b, e, s, level));
-                        }
-                    }
-                }
-            }
-        }
-        if !all_tombstones.is_empty() {
-            db_iter.set_range_tombstones_with_levels(all_tombstones);
-        }
-
-        Ok(db_iter)
+        batch.check_valid().ctx()?;
+        self.read.scan(
+            &ReadOptions::default(),
+            None,
+            None,
+            None,
+            (!batch.is_empty()).then_some(batch),
+        )
     }
 
     pub(crate) fn snapshot_seq(&self) -> SequenceNumber {
@@ -2442,15 +2025,20 @@ impl DB {
         // inputs whose maximum sequence is <= this snapshot's sequence (so the
         // snapshot can never need a version the compaction might garbage-collect).
         let _inner = self.inner.lock();
-        let seq = self.current_sequence();
+        let seq = self.read.current_sequence();
         self.snapshot_list.acquire(seq)
     }
 
     /// Acquire a snapshot with RAII guard. The snapshot is automatically released
     /// when the `Snapshot` is dropped — no manual `release_snapshot()` needed.
     pub fn snapshot(&self) -> Snapshot<'_> {
-        let seq = self.snapshot_seq();
-        Snapshot { db: self, seq }
+        Snapshot::register(self)
+    }
+
+    /// Register a snapshot whose clones can travel between threads and outlive this handle.
+    /// Supply its read options to this database for reads at the registered sequence.
+    pub fn arc_snapshot(&self) -> ArcSnapshot {
+        ArcSnapshot::register(self)
     }
 
     /// Release a previously acquired snapshot so compaction can reclaim its data.
@@ -2458,7 +2046,7 @@ impl DB {
     pub(crate) fn release_snapshot(&self, seq: SequenceNumber) {
         self.snapshot_list.release(seq);
         if self.dead_key_sweep.retry_after_snapshot_release() {
-            self.signal_compaction();
+            self.read.signal_compaction();
         }
     }
 
@@ -2519,43 +2107,58 @@ impl DB {
                 );
                 Some(if needed { "1" } else { "0" }.to_string())
             }
-            "stats.bytes_written" => {
-                Some(self.stats.bytes_written.load(Ordering::Relaxed).to_string())
-            }
-            "stats.bytes_read" => Some(self.stats.bytes_read.load(Ordering::Relaxed).to_string()),
+            "stats.bytes_written" => Some(
+                self.read
+                    .stats
+                    .bytes_written
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
+            "stats.bytes_read" => Some(
+                self.read
+                    .stats
+                    .bytes_read
+                    .load(Ordering::Relaxed)
+                    .to_string(),
+            ),
             "stats.compactions_completed" => Some(
-                self.stats
+                self.read
+                    .stats
                     .compactions_completed
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
             "stats.compaction_bytes_written" => Some(
-                self.stats
+                self.read
+                    .stats
                     .compaction_bytes_written
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
             "stats.flushes_completed" => Some(
-                self.stats
+                self.read
+                    .stats
                     .flushes_completed
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
             "stats.block_cache_hits" => Some(
-                self.stats
+                self.read
+                    .stats
                     .block_cache_hits
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
             "stats.block_cache_misses" => Some(
-                self.stats
+                self.read
+                    .stats
                     .block_cache_misses
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
             "stats.cache_hit_rate" => {
-                let hits = self.stats.block_cache_hits.load(Ordering::Relaxed) as f64;
-                let misses = self.stats.block_cache_misses.load(Ordering::Relaxed) as f64;
+                let hits = self.read.stats.block_cache_hits.load(Ordering::Relaxed) as f64;
+                let misses = self.read.stats.block_cache_misses.load(Ordering::Relaxed) as f64;
                 let total = hits + misses;
                 if total > 0.0 {
                     Some(format!("{:.4}", hits / total))
@@ -2580,39 +2183,15 @@ impl DB {
     /// L0 stop trigger and the background thread's fail-stop policy.
     pub fn flush(&self) -> Result<()> {
         self.check_writable().ctx()?;
+        let _maintenance = self.begin_maintenance()?;
+        self.flush_generation().ctx()?;
+        if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger
+            && let Err(e) = self.drain_l0(false)
         {
-            let mut wq = self.write_queue.lock(); // serialize with writers
-            // Group-commit leaders drop this mutex for WAL/SST I/O while only
-            // keeping `leader_active`; wait so empty-active is not observed
-            // mid auto-flush (install still pending).
-            self.wait_for_write_leader_idle(&mut wq);
-            self.check_writable().ctx()?;
-            let mut inner = self.inner.lock();
-            if inner.active_memtable.is_empty() {
-                return Ok(());
+            if let Some(fatal) = self.read.fail_stop_error() {
+                return Err(fatal);
             }
-            let frozen = self.freeze_memtable_sync(&mut inner).ctx()?;
-            drop(inner); // release lock during SST write
-            self.flush_and_install_frozen(&frozen).ctx()?;
-            let old_wal = frozen.old_wal_number;
-            self.post_flush_cleanup(old_wal).ctx()?;
-            if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger
-                && let Err(e) = self.drain_l0(false)
-            {
-                // Fatal states: a background error was recorded (e.g. a failed
-                // MANIFEST sync inside drain_l0) or the MANIFEST writer is
-                // poisoned. Both mean the engine must fail-stop, so propagate.
-                let fatal = self.has_bg_error.load(Ordering::Acquire)
-                    || self.manifest_poisoned.load(Ordering::Acquire);
-                if fatal {
-                    return Err(e).ctx();
-                }
-                // Non-fatal: the failed step was rejected wholesale before
-                // anything was persisted (log_and_apply's error contract) and
-                // its output files were already cleaned up. The flush itself —
-                // the caller's durability request — has fully succeeded.
-                tracing::warn!("post-flush L0 drain failed (will retry): {}", e);
-            }
+            tracing::warn!("post-flush L0 drain failed (will retry): {}", e);
         }
         // Off the writer-serializing lock: harvest dead-key registrations
         // that compactions since the previous flush have fully applied.
@@ -2631,12 +2210,9 @@ impl DB {
     /// directly.
     pub fn compact(&self) -> Result<()> {
         self.check_writable().ctx()?;
-        {
-            let mut wq = self.write_queue.lock();
-            self.wait_for_write_leader_idle(&mut wq);
-            self.check_writable().ctx()?;
-            self.force_compact_all().ctx()?;
-        }
+        let _maintenance = self.begin_maintenance()?;
+        self.flush_queue.wait(self.flush_queue.target())?;
+        self.force_compact_all().ctx()?;
         // Full pass done — every settled registration is now prunable.
         self.prune_settled_dead_keys(None, None, None);
         Ok(())
@@ -2650,31 +2226,11 @@ impl DB {
             return Ok(());
         }
 
-        // Hold write_queue across every flush/install phase so close cannot
-        // observe an empty active barrier mid-range job, release LOCK/caches,
-        // and let this call install SST/MANIFEST afterwards. Re-check closed
-        // under the same guard before the first mutation.
-        let mut wq = self.write_queue.lock();
-        self.wait_for_write_leader_idle(&mut wq);
-        self.check_writable().ctx()?;
+        let _maintenance = self.begin_maintenance()?;
+        self.flush_generation().ctx()?;
 
-        // First flush memtable to ensure all data is in SSTs
-        {
-            let mut inner = self.inner.lock();
-            if !inner.active_memtable.is_empty() {
-                let frozen = self.freeze_memtable_sync(&mut inner).ctx()?;
-                drop(inner);
-                self.flush_and_install_frozen(&frozen).ctx()?;
-                let old_wal = frozen.old_wal_number;
-                self.post_flush_cleanup(old_wal).ctx()?;
-            }
-        }
-
-        // No range specified: same full-compaction path as compact(), while
-        // still holding write_queue (compact() would re-lock and deadlock).
         if begin.is_none() && end.is_none() {
             self.force_compact_all().ctx()?;
-            drop(wq);
             self.prune_settled_dead_keys(None, None, None);
             return Ok(());
         }
@@ -2719,28 +2275,19 @@ impl DB {
                         // with the inputs just picked, so no concurrently-acquired
                         // snapshot can be missed.
                         let active_snaps = self.snapshot_list.as_sorted_vec();
-                        // Claim the inputs so concurrent background threads
-                        // don't redundantly pick and fully re-process the same
-                        // files while this unlocked I/O runs. The pick itself
-                        // stays claim-blind (`pick_compaction_for_range` takes
-                        // no claimed-set): an explicit range compaction must
-                        // consider every overlapping file, even one a
-                        // background thread is currently rewriting —
-                        // `install_compaction`'s stale-input check settles any
-                        // race safely, and a discarded install just re-picks.
-                        // Filter out numbers already claimed by a background
-                        // thread: double-claiming would let this claim's Drop
-                        // release the other thread's claim while it still runs.
-                        let claimed_inputs: Vec<u64> = {
-                            let mut claimed = self.compacting_files.lock();
-                            let nums: Vec<u64> = all_inputs
-                                .iter()
-                                .map(|f| f.meta.number)
-                                .filter(|n| !claimed.contains(n))
-                                .collect();
-                            claimed.extend(nums.iter().copied());
-                            nums
-                        };
+                        // The flush worker also holds new L0 files claimed until its
+                        // immutable generation retires. Never compact a file that is
+                        // still shadowed by that memtable.
+                        let claimed_inputs: Vec<_> =
+                            all_inputs.iter().map(|tf| tf.meta.number).collect();
+                        let mut claimed = self.compacting_files.lock();
+                        if claimed_inputs.iter().any(|n| claimed.contains(n)) {
+                            drop(claimed);
+                            drop(inner);
+                            self.compacting_files.wait_until_empty();
+                            continue;
+                        }
+                        claimed.extend(claimed_inputs.iter().copied());
                         Some((
                             task,
                             file_numbers,
@@ -2765,10 +2312,11 @@ impl DB {
 
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
+                manifest_poisoned: &self.read.manifest_poisoned,
                 options: &self.options,
                 builds: &self.builds,
                 rate_limiter: Some(&self.rate_limiter),
-                stats: Some(&self.stats),
+                stats: Some(&self.read.stats),
                 active_snapshots: &active_snaps,
             };
             let output =
@@ -2802,7 +2350,7 @@ impl DB {
                     Some(&self.table_cache),
                     Some(&self.block_cache),
                     &self.storage_path,
-                    Some(&self.stats),
+                    Some(&self.read.stats),
                     !self.snapshot_list.is_empty(),
                 )
                 .ctx()?;
@@ -2842,7 +2390,7 @@ impl DB {
             // Sync manifest + delete old SSTs outside the main lock
             if let Err(e) = {
                 let manifest_handle = self.inner.lock().versions.manifest_sync_handle();
-                confirm_manifest_durable(&manifest_handle, &self.manifest_poisoned)
+                confirm_manifest_durable(&manifest_handle, &self.read.manifest_poisoned)
             } {
                 // The edit is applied in memory but its durability could
                 // not be confirmed — the same fail-stop condition as
@@ -2856,7 +2404,6 @@ impl DB {
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.storage_path);
         }
 
-        drop(wq);
         // A range-scoped pass can only newly settle registrations inside
         // [begin, end): only those are probed. Out-of-range settled keys are
         // harvested by later capped flush passes or a full compact().
@@ -2880,14 +2427,9 @@ impl DB {
     /// later compactions reach that data, exactly as with
     /// [`compact`](Self::compact).
     ///
-    /// **Warning:** each level's sweep rewrite holds the DB mutex for its
-    /// full duration, so new snapshots stall for that rewrite. The sweep
-    /// does not hold the write queue; writers stall only while the mutex
-    /// is held. [`compact`](Self::compact) holds the write queue for the
-    /// whole call and the DB mutex for each level rewrite, so it does not
-    /// shorten the writer stall. Only opt in (set a nonzero threshold) if
-    /// the snapshot stall is acceptable; see
-    /// `DbOptions::lazy_delete_compaction_threshold`.
+    /// Each level's sweep claims its input files, releases the DB mutex
+    /// during SST construction, then verifies the inputs before install.
+    /// Snapshots taken during a filter rewrite retain their original values.
     ///
     /// **Note:** The key remains readable via `get()` until compaction
     /// physically removes it. Use regular `delete()` if immediate
@@ -2911,7 +2453,7 @@ impl DB {
     ///
     /// This method is a no-op when the DB was opened read-only.
     pub fn lazy_delete(&self, key: &[u8]) {
-        if self.read_only {
+        if self.read.read_only {
             return;
         }
         let threshold = self.options.lazy_delete_compaction_threshold;
@@ -2932,10 +2474,10 @@ impl DB {
     /// At or above `lazy_delete_compaction_threshold` (default: `0`, i.e.
     /// disabled — opt-in only), a batch containing any newly registered key
     /// queues a background sweep — see [`lazy_delete`](Self::lazy_delete) for
-    /// its exact semantics and the write-stall tradeoff of opting in.
+    /// the scheduling and snapshot semantics.
     /// This method is a no-op when the DB was opened read-only.
     pub fn lazy_delete_batch(&self, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
-        if self.read_only {
+        if self.read.read_only {
             return;
         }
         let threshold = self.options.lazy_delete_compaction_threshold;
@@ -2959,7 +2501,7 @@ impl DB {
     /// physically removed.
     fn request_dead_key_sweep(&self) {
         self.dead_key_sweep.queue();
-        self.signal_compaction();
+        self.read.signal_compaction();
     }
 
     /// Remove dead-key registrations that have been fully applied.
@@ -3119,43 +2661,26 @@ impl DB {
         // All close callers wait for worker shutdown and the directory unlock.
         // Workers never acquire this guard, including during their final install.
         let mut directory_lock = self.lock_file.lock();
-        // Serialize with every mutate path that holds `write_queue` across
-        // unlocked SST/MANIFEST I/O (`write_batch_group` leaders, stop-trigger
-        // drain, compact_range, flush, compact). Set `closed` only after the
-        // queue is ours and no leader is mid-install, so those paths cannot
-        // observe closed, abandon the barrier, and still install after
-        // LOCK/caches are released below.
+        if self.read.closed.swap(true, Ordering::AcqRel) {
+            return self.read.fail_stop_error().map_or(Ok(()), Err);
+        }
+        {
+            let mut maintenance = self.maintenance.lock();
+            maintenance.closing = true;
+            while maintenance.active != 0 {
+                self.maintenance_cv.wait(&mut maintenance);
+            }
+        }
         let mut wq = self.write_queue.lock();
         self.wait_for_write_leader_idle(&mut wq);
-        if self
-            .closed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(());
-        }
-
-        let mut inner = self.inner.lock();
-
-        let mut first_error: Option<Error> = None;
-
-        if !self.read_only
-            && !inner.active_memtable.is_empty()
-            && let Err(e) = self.freeze_and_flush(&mut inner)
-        {
-            first_error = Some(e);
-        }
-
-        if !self.read_only
-            && let Some(ref mut wal) = inner.wal_writer
-            && let Err(e) = wal.sync()
-            && first_error.is_none()
-        {
-            first_error = Some(e);
-        }
-
-        drop(inner);
         drop(wq);
+        let mut first_error = self.read.fail_stop_error();
+        if first_error.is_none() && !self.read.read_only {
+            let result = self
+                .submit_active()
+                .and_then(|target| self.flush_queue.wait(target));
+            first_error = result.err();
+        }
         self.stop_background_and_detach_cache();
         let mut inner = self.inner.lock();
         let version = inner.versions.current();
@@ -3175,7 +2700,7 @@ impl DB {
         directory_lock.take();
 
         if first_error.is_none() {
-            first_error = self.fail_stop_error();
+            first_error = self.read.fail_stop_error();
         }
 
         match first_error {
@@ -3192,25 +2717,26 @@ impl DB {
     /// admin paths that interpret empty-active or release the directory lock
     /// must wait here while holding `write_queue`.
     fn wait_for_write_leader_idle(&self, wq: &mut MutexGuard<'_, WriteQueueState>) {
-        while wq.leader_active {
-            self.write_cv.wait(wq);
+        if wq.leader_active {
+            // Give flush/close a turn at the next group boundary even while
+            // new writes keep arriving. The caller still holds the queue lock
+            // when it claims the barrier or installs its own leadership.
+            wq.waiting_barriers += 1;
+            while wq.leader_active {
+                self.write_cv.wait(wq);
+            }
+            wq.waiting_barriers -= 1;
+            self.write_cv.notify_all();
         }
-    }
-
-    /// Signal background compaction threads (non-blocking).
-    fn signal_compaction(&self) {
-        if self.read_only {
-            return;
-        }
-        let (lock, cvar) = &*self.compaction_notify;
-        let mut has_work = lock.lock();
-        *has_work = true;
-        cvar.notify_one();
     }
 
     fn stop_background_and_detach_cache(&self) {
+        self.flush_queue.stop();
+        if let Some(worker) = self.flush_worker.lock().take() {
+            let _ = worker.join();
+        }
         {
-            let (lock, cvar) = &*self.compaction_notify;
+            let (lock, cvar) = &*self.read.compaction_notify;
             let _guard = lock.lock();
             self.compaction_shutdown.store(true, Ordering::Release);
             cvar.notify_all();
@@ -3221,131 +2747,31 @@ impl DB {
         self.block_cache.detach();
     }
 
-    /// Find the highest sequence number among range tombstones covering `key`
-    /// that are visible at the given read sequence.
-    /// Returns 0 if no covering tombstone exists.
-    /// Uses the dedicated range tombstone collection for O(T) lookup instead
-    /// of O(N) full memtable scan.
-    fn max_covering_tombstone_seq(
-        &self,
-        key: &[u8],
-        seq: SequenceNumber,
-        active_mem: &MemTable,
-        imm_mems: &[Arc<MemTable>],
-    ) -> SequenceNumber {
-        let mut max_seq: SequenceNumber = 0;
-
-        let s = active_mem.max_covering_tombstone_seq(key, seq);
-        if s > max_seq {
-            max_seq = s;
-        }
-        for imm in imm_mems {
-            let s = imm.max_covering_tombstone_seq(key, seq);
-            if s > max_seq {
-                max_seq = s;
-            }
-        }
-        max_seq
-    }
-
-    /// Get the current SuperVersion snapshot — single atomic load, truly lock-free.
-    fn get_super_version(&self) -> arc_swap::Guard<Arc<SuperVersion>> {
-        #[cfg(test)]
-        if let Some(hook) = BEFORE_READ_VIEW.with(|h| h.borrow_mut().take()) {
-            hook();
-        }
-        self.super_version.load()
-    }
-
     /// Refresh the SuperVersion from current inner state.
     /// Called after memtable freeze, flush, or compaction.
     fn install_super_version(&self, inner: &DBInner) {
-        refresh_super_version(&self.super_version, inner);
+        refresh_super_version(&self.read.super_version, inner);
     }
 
     /// Record a background error, setting the fast-path flag and the detailed message.
     /// All subsequent `check_usable()` calls will return this error.
     fn set_bg_error(&self, msg: String) {
-        *self.bg_error.lock() = Some(msg);
-        self.has_bg_error.store(true, Ordering::Release);
-    }
-
-    fn fail_stop_error(&self) -> Option<Error> {
-        if self.has_bg_error.load(Ordering::Acquire)
-            && let Some(ref msg) = *self.bg_error.lock()
-        {
-            return Some(Error::background(msg.clone()));
-        }
-        if self.manifest_poisoned.load(Ordering::Acquire) {
-            return Some(Error::background(
-                "MANIFEST writer poisoned by an earlier write failure; \
-                 reopen the database to recover"
-                    .to_string(),
-            ));
-        }
-        None
-    }
-
-    /// Periodically check read-level samples and generate compaction hints.
-    /// Called every 1024 reads from get_with_options.
-    fn maybe_check_read_compaction(&self) {
-        if self.read_only {
-            return;
-        }
-        let count = self.read_counter.fetch_add(1, Ordering::Relaxed);
-        if !count.is_multiple_of(1024) {
-            return;
-        }
-        self.check_read_compaction();
-    }
-
-    /// Take read-level samples and convert them into compaction hints.
-    fn check_read_compaction(&self) {
-        let samples = self.stats.take_read_level_samples();
-        let mut hints = self.read_compaction_hints.lock();
-        for (level, &count) in samples.iter().enumerate() {
-            if count > 0 && level >= 2 && !hints.iter().any(|hint| hint.level == level) {
-                hints.push(CompactionHint { level });
-            }
-        }
-        if !hints.is_empty() {
-            self.signal_compaction();
-        }
-    }
-
-    fn check_usable(&self) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(Error::db_closed());
-        }
-        if let Some(error) = self.fail_stop_error() {
-            return Err(error);
-        }
-        Ok(())
+        self.flush_queue.fail(Error::background(msg.clone()));
+        *self.read.bg_error.lock() = Some(msg);
+        self.read.has_bg_error.store(true, Ordering::Release);
     }
 
     fn check_writable(&self) -> Result<()> {
-        self.check_usable()?;
-        if self.read_only {
+        if self.builds.contains_current_thread() {
+            return Err(Error::invalid_argument(
+                "cannot mutate a store from its own SST build callback",
+            ));
+        }
+        self.read.check_usable()?;
+        if self.read.read_only {
             return Err(Error::read_only());
         }
         Ok(())
-    }
-
-    fn current_sequence(&self) -> SequenceNumber {
-        self.committed_sequence.load(Ordering::Acquire)
-    }
-
-    /// Resolve a caller-supplied read snapshot, clamping it to the committed
-    /// sequence. A future sequence (e.g. `u64::MAX`) must not observe entries
-    /// from batches that are still being applied to the memtable — the group
-    /// commit leader publishes `committed_sequence` only after a batch is
-    /// fully inserted, and readers are lock-free, so an unclamped future
-    /// snapshot could see a batch half-applied. Snapshots obtained from
-    /// `snapshot_seq()` are always <= the committed sequence, so the clamp
-    /// never weakens a legitimate snapshot.
-    fn resolve_read_sequence(&self, snapshot: Option<SequenceNumber>) -> SequenceNumber {
-        let committed = self.current_sequence();
-        snapshot.map_or(committed, |s| s.min(committed))
     }
 
     /// Apply write backpressure based on L0 file count.
@@ -3390,7 +2816,7 @@ impl DB {
             // state can be entered without any prior signal (e.g. an L0
             // backlog inherited from a previous process at open, before the
             // startup kick has drained it), and signalling is idempotent.
-            self.signal_compaction();
+            self.read.signal_compaction();
             // Progressive delay: more L0 files → longer sleep
             let delay_us = (l0_count - self.options.l0_slowdown_trigger + 1) as u64 * 1000;
             thread::sleep(Duration::from_micros(delay_us));
@@ -3406,61 +2832,16 @@ impl DB {
         Ok(())
     }
 
-    fn write_batch_inner(&self, mut batch: WriteBatch, write_options: &WriteOptions) -> Result<()> {
-        // Elide empty/inverted range deletes before seq assignment and WAL
-        // encode. MemTable::put already no-ops them for correctness, but they
-        // would still occupy WAL space and never grow approximate_size, so a
-        // stream of them would never rotate the log.
-        batch.entries.retain(|e| {
-            !(e.value_type == ValueType::RangeDeletion
-                && e.value
-                    .as_ref()
-                    .is_none_or(|end| e.key.as_slice() >= end.as_slice()))
-        });
+    fn write_batch_inner(&self, batch: WriteBatch, write_options: &WriteOptions) -> Result<()> {
+        batch.check_valid().ctx()?;
         if batch.is_empty() {
             return Ok(());
         }
 
-        // The WAL record format stores the batch entry count as a u32
-        // (encode_wal_record); a larger batch would silently truncate the
-        // count and drop entries on recovery. Not reachable with realistic
-        // memory budgets, but the encoding invariant is validated explicitly
-        // so a malformed batch fails the write instead of corrupting replay.
-        if batch.entries.len() > u32::MAX as usize {
-            return Err(Error::invalid_argument(format!(
-                "write batch entry count {} exceeds the WAL record maximum {}",
-                batch.entries.len(),
-                u32::MAX
-            )));
-        }
-        // Validate entry sizes up front. Oversized keys/values would be
-        // accepted into the WAL and memtable but could never be flushed into
-        // a readable SST (the reader caps blocks at 64 MiB and the index
-        // block stores every data block's boundary keys twice) — rejecting at
-        // write time keeps the failure retryable instead of wedging flush.
-        for entry in &batch.entries {
-            if entry.key.len() > MAX_USER_KEY_SIZE {
-                return Err(Error::invalid_argument(format!(
-                    "key size {} exceeds maximum {}",
-                    entry.key.len(),
-                    MAX_USER_KEY_SIZE
-                )));
-            }
-            let val_len = entry.value.as_ref().map_or(0, |v| v.len());
-            let limit = if entry.value_type == ValueType::RangeDeletion {
-                MAX_RANGE_DELETE_SIZE
-            } else {
-                MAX_WRITE_ENTRY_SIZE
-            };
-            if entry.key.len().saturating_add(val_len) > limit {
-                return Err(Error::invalid_argument(format!(
-                    "entry size {} (key + value) exceeds maximum {}",
-                    entry.key.len() + val_len,
-                    limit
-                )));
-            }
-        }
-
+        self.flush_queue.check_capacity(
+            self.options.max_immutable_memtables,
+            write_options.no_slowdown,
+        )?;
         if write_options.no_slowdown {
             // A no_slowdown write fails fast whenever a blocking path would
             // engage. Open-time validation guarantees
@@ -3477,14 +2858,35 @@ impl DB {
             self.maybe_throttle_writes().ctx()?;
         }
 
-        let mut req = WriteRequest {
+        self.enqueue_write(WriteRequest {
             batch,
-            sync: write_options.sync,
-            disable_wal: write_options.disable_wal,
+            kind: WriteRequestKind::Batch,
+            no_slowdown: write_options.no_slowdown,
+            durability: write_options.durability,
             result: None,
             done: false,
-        };
-        let req_ptr: *mut WriteRequest = &mut req;
+        })
+    }
+
+    /// Make earlier WAL-enabled writes durable without adding a record or advancing MVCC.
+    pub fn sync_wal(&self) -> Result<()> {
+        self.check_writable()?;
+        let target_seq = self.read.current_sequence();
+        if self.synced_wal_seq.load(Ordering::Acquire) >= target_seq {
+            return Ok(());
+        }
+        self.enqueue_write(WriteRequest {
+            kind: WriteRequestKind::WalFence { target_seq },
+            no_slowdown: false,
+            batch: WriteBatch::new(),
+            durability: DurabilityMode::DisableWal,
+            result: None,
+            done: false,
+        })
+    }
+
+    fn enqueue_write(&self, mut req: WriteRequest) -> Result<()> {
+        let req_ptr = &raw mut req;
 
         // Enqueue and check if we should become the leader.
         // The leader_active flag prevents new arrivals from becoming false
@@ -3493,55 +2895,38 @@ impl DB {
         let mut wq = self.write_queue.lock();
         wq.queue.push_back(req_ptr);
 
-        // Wait until either: our request is done (leader processed it), or
-        // no leader is active (we should become the leader).
-        while !req.done && wq.leader_active {
-            self.write_cv.wait(&mut wq);
-        }
-        if req.done {
-            return req.result.take().unwrap_or(Ok(()));
-        }
-
-        // Become the leader. The flag ensures only one thread reaches here.
-        debug_assert!(!wq.leader_active);
-        wq.leader_active = true;
-
         let mut group_flushed = false;
         loop {
-            let batch_group: Vec<*mut WriteRequest> = wq.queue.drain(..).collect();
+            if req.done {
+                break;
+            }
+            if wq.leader_active || wq.waiting_barriers != 0 {
+                self.write_cv.wait(&mut wq);
+                continue;
+            }
+            wq.leader_active = true;
+            let batch_group = wq.drain_group(self.options.write_buffer_size);
             drop(wq); // release queue lock while doing I/O
 
             let result = self.write_batch_group(&batch_group);
             group_flushed |= matches!(result, Ok(true));
 
             // Signal everyone in this batch
-            let mut wq_inner = self.write_queue.lock();
+            wq = self.write_queue.lock();
             for &rp in &batch_group {
                 // SAFETY: all request pointers came from queue entries whose
                 // callers are blocked until this leader sets `done`.
-                let r = unsafe { &mut *rp };
-                if r.result.is_none() {
-                    // Error is Clone: every follower receives the leader's
-                    // full typed error chain, not a stringified copy.
-                    r.result = match &result {
-                        Ok(_) => Some(Ok(())),
-                        Err(e) => Some(Err(e.clone())),
-                    };
+                unsafe {
+                    if (*rp).result.is_none() {
+                        (*rp).result = Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
+                    }
+                    (*rp).done = true;
                 }
-                r.done = true;
             }
+            wq.leader_active = false;
             self.write_cv.notify_all();
-
-            // Check for stragglers
-            if wq_inner.queue.is_empty() {
-                wq_inner.leader_active = false;
-                self.write_cv.notify_all(); // wake stragglers to compete for leadership
-                drop(wq_inner);
-                break;
-            }
-            // More work arrived — loop as leader
-            wq = wq_inner;
         }
+        drop(wq);
 
         // Leadership released and every waiter woken: harvest dead-key
         // registrations settled by compactions since the previous flush.
@@ -3553,24 +2938,146 @@ impl DB {
         req.result.take().unwrap_or(Ok(()))
     }
 
+    // Snapshot registration and group publication both hold inner. At the last
+    // range write covering any elementary interval, one sequence can be needed
+    // per distinct snapshot plus the group's newest visible sequence. Snapshots
+    // taken later all see that same latest range unless another write covers it.
+    fn admit_range_stripes(&self, requests: &mut Vec<*mut WriteRequest>) {
+        #[cfg(not(test))]
+        let limit = MAX_RANGE_STRIPES;
+        #[cfg(test)]
+        let limit = self
+            .snapshot_list
+            .range_stripe_limit
+            .load(Ordering::Relaxed);
+        if self.snapshot_list.count.load(Ordering::Relaxed) < limit {
+            return;
+        }
+        let mut full = None;
+        requests.retain(|&ptr| {
+            // SAFETY: the leader has exclusive access to result, and batch is
+            // immutable until completion under the queue lock.
+            let batch = unsafe { &(*ptr).batch };
+            if batch
+                .entries()
+                .any(|entry| entry.value_type == ValueType::RangeDeletion)
+                && *full.get_or_insert_with(|| self.snapshot_list.as_sorted_vec().len() >= limit)
+            {
+                unsafe {
+                    (*ptr).result = Some(Err(Error::invalid_argument(
+                        "too many distinct live snapshot sequences for a range-deletion SST leaf",
+                    )))
+                };
+                return false;
+            }
+            true
+        });
+    }
+
+    // SST files split between user keys. Bound the root-index footprint of
+    // a single unsplittable run before assigning sequences or appending WAL.
+    fn admit_same_key_runs(memtable: &MemTable, requests: &mut Vec<*mut WriteRequest>) {
+        let group_bound = requests.iter().fold(0usize, |sum, &ptr| {
+            // SAFETY: queued batches are immutable until completion.
+            let batch = unsafe { &(*ptr).batch };
+            sum.saturating_add(batch.payload.len())
+                .saturating_add(batch.len().saturating_mul(40))
+        });
+        if memtable.max_metadata_charge().saturating_add(group_bound) <= META_BLOCK_SPLIT_THRESHOLD
+        {
+            return;
+        }
+
+        let mut charges = std::collections::HashMap::<&[u8], usize>::new();
+        requests.retain(|&ptr| {
+            // SAFETY: the owner's frame stays live until this group completes.
+            let batch = unsafe { &(*ptr).batch };
+            let suspect = |entry: &types::BatchEntry<'_>| {
+                memtable
+                    .metadata_charge_bound(entry.key)
+                    .saturating_add(group_bound)
+                    > META_BLOCK_SPLIT_THRESHOLD
+            };
+            for (index, entry) in batch.entries().filter(suspect).enumerate() {
+                let total = charges
+                    .entry(entry.key)
+                    .or_insert_with(|| memtable.same_key_metadata(entry.key));
+                if total.saturating_add(entry.metadata_charge()) > META_BLOCK_SPLIT_THRESHOLD {
+                    // Roll back only this rejected batch so peer requests
+                    // still see every previously admitted operation.
+                    for applied in batch.entries().filter(suspect).take(index) {
+                        *charges.get_mut(applied.key).unwrap() -= applied.metadata_charge();
+                    }
+                    // SAFETY: only the active leader writes result before done.
+                    unsafe {
+                        (*ptr).result = Some(Err(Error::invalid_argument(
+                            "same-key metadata exceeds SST partition index budget",
+                        )))
+                    };
+                    return false;
+                }
+                *total += entry.metadata_charge();
+            }
+            true
+        });
+    }
+
     /// Process a batch group: assign sequences, write+flush WAL, then publish to MemTable.
     /// Returns `true` when the group's writes triggered a memtable flush, so
     /// the leader can harvest settled dead-key registrations after it has
     /// woken the group's waiters.
     fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<bool> {
         self.check_writable()?;
-        let mut need_sync = false;
+        let mut group = Vec::with_capacity(batch_group.len());
+        for &ptr in batch_group {
+            // SAFETY: the leader exclusively processes the queued request's fields.
+            let no_slowdown =
+                unsafe { matches!((*ptr).kind, WriteRequestKind::Batch) && (*ptr).no_slowdown };
+            if no_slowdown
+                && let Err(e) = self
+                    .flush_queue
+                    .check_capacity(self.options.max_immutable_memtables, true)
+            {
+                // SAFETY: only the active leader writes this field until completion.
+                unsafe { (*ptr).result = Some(Err(e)) };
+            } else {
+                group.push(ptr);
+            }
+        }
+        // SAFETY: kind is immutable while its owner waits for completion.
+        if group
+            .iter()
+            .any(|&ptr| matches!(unsafe { (*ptr).kind }, WriteRequestKind::Batch))
+        {
+            self.flush_queue
+                .check_capacity(self.options.max_immutable_memtables, false)?;
+        }
+        let mut need_sync = group.iter().any(|&ptr| {
+            // SAFETY: the queued request remains live and kind is immutable.
+            matches!(unsafe { (*ptr).kind }, WriteRequestKind::WalFence { target_seq } if target_seq > self.synced_wal_seq.load(Ordering::Acquire))
+        });
         let mut inner = self.inner.lock();
 
+        self.admit_range_stripes(&mut group);
+        Self::admit_same_key_runs(&inner.active_memtable, &mut group);
+        let batch_group = group.as_slice();
         let total_ops: u64 = batch_group
             .iter()
             .map(|&req_ptr| {
                 // SAFETY: request pointers remain valid until the leader marks
                 // them done; callers wait on the write queue for that signal.
-                unsafe { (&*req_ptr).batch.len() as u64 }
+                unsafe { (*req_ptr).batch.len() as u64 }
             })
             .sum();
         if total_ops == 0 {
+            if need_sync {
+                if let Err(e) = inner.wal_writer.as_mut().expect("writable WAL").sync_data() {
+                    self.set_bg_error(format!("WAL fence failed: {e}"));
+                    return Err(e);
+                }
+                self.synced_wal_seq
+                    .store(self.read.current_sequence(), Ordering::Release);
+            }
             return Ok(false);
         }
 
@@ -3594,33 +3101,38 @@ impl DB {
 
         for &req_ptr in batch_group {
             // SAFETY: request pointers are owned by waiting writer stack frames
-            // and are only accessed by the active leader until completion.
-            let r = unsafe { &*req_ptr };
+            // and these fields are immutable while queued.
+            let (batch, durability) = unsafe { (&(*req_ptr).batch, (*req_ptr).durability) };
             let first_seq = next_seq;
-            next_seq += r.batch.len() as u64;
+            next_seq += batch.len() as u64;
 
-            if !r.disable_wal {
-                let wal_record = Self::encode_wal_record(first_seq, &r.batch);
+            if durability != DurabilityMode::DisableWal {
+                let header = batch.wal_header(first_seq);
                 if let Some(ref mut wal) = inner.wal_writer
-                    && let Err(e) = wal.add_record(&wal_record)
+                    && let Err(e) = wal.add_record_parts(&[&header, &batch.payload])
                 {
                     append_error = Some(e.context("WAL write failed"));
                     break;
                 }
             }
             assigned.push((req_ptr, first_seq));
-            need_sync |= r.sync;
+            need_sync |= durability == DurabilityMode::WalSync;
         }
 
         // Single fsync for all batches
         let any_wal = assigned.iter().any(|&(p, _)| {
             // SAFETY: request pointers are still owned by this leader.
-            !unsafe { &*p }.disable_wal
+            unsafe { (*p).durability != DurabilityMode::DisableWal }
         });
-        let wal_sync_err = if any_wal {
+        let wal_sync_err = if any_wal || need_sync {
             match inner.wal_writer {
                 Some(ref mut wal) => {
-                    let r = if need_sync { wal.sync() } else { wal.flush() };
+                    let r = if need_sync {
+                        wal.sync_data()
+                    } else {
+                        wal.flush()
+                            .inspect(|_| wal.writeback_hint(self.options.wal_bytes_per_sync))
+                    };
                     r.err()
                 }
                 None => None,
@@ -3641,26 +3153,27 @@ impl DB {
         let mut applied_last_seq = None;
         for &(req_ptr, first_seq) in &assigned {
             // SAFETY: request pointers are still owned by this leader.
-            let r = unsafe { &*req_ptr };
+            let batch = unsafe { &(*req_ptr).batch };
             let mut batch_bytes = 0u64;
-            for (i, entry) in r.batch.entries.iter().enumerate() {
+            for (i, entry) in batch.entries().enumerate() {
                 let seq = first_seq + i as u64;
-                inner.active_memtable.put(
-                    &entry.key,
-                    entry.value.as_deref().unwrap_or(&[]),
-                    seq,
-                    entry.value_type,
-                );
-                batch_bytes +=
-                    entry.key.len() as u64 + entry.value.as_ref().map_or(0, |v| v.len()) as u64;
+                inner
+                    .active_memtable
+                    .put(entry.key, entry.value, seq, entry.value_type);
+                batch_bytes += entry.key.len() as u64 + entry.value.len() as u64;
             }
-            if !r.batch.is_empty() {
-                applied_last_seq = Some(first_seq + r.batch.len() as u64 - 1);
+            if !batch.is_empty() {
+                applied_last_seq = Some(first_seq + batch.len() as u64 - 1);
+                self.read.stats.record_write(batch_bytes);
             }
-            self.stats.record_write(batch_bytes);
         }
         if let Some(last_seq) = applied_last_seq {
-            self.committed_sequence.store(last_seq, Ordering::Release);
+            self.read
+                .committed_sequence
+                .store(last_seq, Ordering::Release);
+            if need_sync {
+                self.synced_wal_seq.store(last_seq, Ordering::Release);
+            }
         }
 
         if let Some(e) = append_error {
@@ -3679,326 +3192,106 @@ impl DB {
             return Ok(false);
         }
 
-        // Check memtable size threshold — release lock during SST I/O
-        let mut flush_wal: Option<u64> = None;
-        if inner.active_memtable.approximate_size() >= self.options.write_buffer_size {
-            match self.freeze_memtable_sync(&mut inner) {
-                Ok(frozen) => {
-                    let old_wal = frozen.old_wal_number;
-                    drop(inner); // release lock for slow SST write
-                    match self.flush_frozen_memtable(&frozen) {
-                        Ok(build_results) => {
-                            let output_numbers: Vec<u64> =
-                                build_results.iter().map(|(n, _)| *n).collect();
-                            let prepared_pins = self.prepare_l0_block_pins(&output_numbers);
-                            let mut inner = self.inner.lock(); // reacquire
-                            match self.install_flush(
-                                &mut inner,
-                                &frozen,
-                                build_results,
-                                prepared_pins,
-                            ) {
-                                Ok(()) => flush_wal = Some(old_wal),
-                                Err(e) => {
-                                    // Clean up orphan SST files: log_and_apply did not
-                                    // persist the edit, so these files must be deleted.
-                                    for num in &output_numbers {
-                                        let path =
-                                            self.storage_path.join(format!("{:06}.sst", num));
-                                        let _ = fs::remove_file(&path);
-                                    }
-                                    // The frozen memtable is still live in
-                                    // `immutable_memtables` and its WAL is intact, but a
-                                    // later successful flush would advance `log_number`
-                                    // past this WAL (stale reads + lost recovery). Fail-stop.
-                                    self.set_bg_error(format!("flush install failed: {}", e));
-                                }
-                            }
-                            drop(inner);
-                        }
-                        Err(e) => {
-                            // Same hazard as an install failure: the unflushed memtable
-                            // must not be skipped by a later flush. Fail-stop so its WAL
-                            // stays recoverable and no stale state is published.
-                            self.set_bg_error(format!("auto-flush SST write failed: {}", e));
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.set_bg_error(format!("auto-flush freeze failed: {}", e));
-                    drop(inner);
-                }
-            }
-        } else {
-            drop(inner);
-        }
-
-        if let Some(old_wal) = flush_wal {
-            if let Err(e) = self.post_flush_cleanup(old_wal) {
-                // post_flush_cleanup already fail-stops (set_bg_error) on
-                // manifest-sync failure; just log here since this path
-                // can't propagate a Result to a caller.
-                tracing::warn!("post-flush cleanup failed for WAL {}: {}", old_wal, e);
-            }
-            self.signal_compaction();
-        }
-
-        Ok(flush_wal.is_some())
-    }
-
-    /// Freeze+flush in one call (holds lock throughout).
-    /// Used by `close()` where the lock is already held
-    /// and releasing it would complicate the caller.
-    fn freeze_and_flush(&self, inner: &mut DBInner) -> Result<()> {
-        let frozen = self.freeze_memtable_sync(inner).ctx()?;
-        // After a successful freeze the immutable memtable + its WAL are live; any
-        // failure before the install + manifest sync complete must fail-stop, or a
-        // later flush could advance log_number past this WAL (stale reads + lost
-        // recovery on restart).
-        let build_results = match self.flush_frozen_memtable(&frozen) {
-            Ok(r) => r,
-            Err(e) => {
-                self.set_bg_error(format!("flush SST write failed: {}", e));
-                return Err(e);
-            }
-        };
-        let output_numbers: Vec<u64> = build_results.iter().map(|(n, _)| *n).collect();
-        let prepared_pins = self.prepare_l0_block_pins(&output_numbers);
-        if let Err(e) = self.install_flush(inner, &frozen, build_results, prepared_pins) {
-            // Clean up orphan SST files produced by the failed flush install.
-            for num in &output_numbers {
-                let path = self.storage_path.join(format!("{:06}.sst", num));
-                let _ = fs::remove_file(&path);
-            }
-            self.set_bg_error(format!("flush install failed: {}", e));
-            return Err(e);
-        }
-        // Sync inline (close path, not performance-critical)
-        if let Err(e) = inner.versions.sync_manifest() {
-            self.set_bg_error(format!("flush manifest sync failed: {}", e));
-            return Err(e);
-        }
-        let old_wal_path = self
-            .storage_path
-            .join(format!("{:06}.wal", frozen.old_wal_number));
-        if let Err(e) = fs::remove_file(&old_wal_path) {
-            tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
-        }
-        Ok(())
-    }
-
-    /// Flush a frozen memtable to SST and install it, fail-stopping on any failure.
-    /// Used by the explicit `flush()` / `compact_range()` paths, which release the
-    /// DB lock during the SST write. A failure after the freeze leaves the frozen
-    /// memtable live in `immutable_memtables`; without fail-stop a later successful
-    /// flush would advance `log_number` past this memtable's WAL.
-    fn flush_and_install_frozen(&self, frozen: &FrozenMemtable) -> Result<()> {
-        let build_results = match self.flush_frozen_memtable(frozen) {
-            Ok(r) => r,
-            Err(e) => {
-                self.set_bg_error(format!("flush SST write failed: {}", e));
-                return Err(e);
-            }
-        };
-        let output_numbers: Vec<u64> = build_results.iter().map(|(n, _)| *n).collect();
-        let prepared_pins = self.prepare_l0_block_pins(&output_numbers);
-        let mut inner = self.inner.lock();
-        if let Err(e) = self.install_flush(&mut inner, frozen, build_results, prepared_pins) {
-            drop(inner);
-            // Clean up orphan SST files: log_and_apply did not persist the edit.
-            for num in &output_numbers {
-                let path = self.storage_path.join(format!("{:06}.sst", num));
-                let _ = fs::remove_file(&path);
-            }
-            self.set_bg_error(format!("flush install failed: {}", e));
-            return Err(e);
-        }
+        let freeze = inner.active_memtable.approximate_size() >= self.options.write_buffer_size;
         drop(inner);
-        // A dead-key sweep that deferred L0 for this flush retries on wake.
-        // A pass that is still running may already have deferred and only
-        // becomes Pending after this check, so wake for it too.
-        if !self.dead_key_sweep.is_idle() {
-            self.signal_compaction();
+        if freeze {
+            self.submit_active()?;
         }
-        Ok(())
+        Ok(freeze)
     }
 
-    /// Phase 1 (under lock, fast): swap memtable and create WAL.
-    /// Returns the FrozenMemtable for synchronous processing without queueing for background threads.
-    fn freeze_memtable_sync(&self, inner: &mut DBInner) -> Result<FrozenMemtable> {
-        let new_wal_number = inner.versions.file_numbers.allocate().ctx()?;
-        let new_wal_path = self.storage_path.join(format!("{:06}.wal", new_wal_number));
-        let new_wal = WalWriter::new(&new_wal_path).ctx()?;
+    fn begin_maintenance(&self) -> Result<MaintenanceGuard<'_>> {
+        let mut state = self.maintenance.lock();
+        if state.closing {
+            return Err(Error::db_closed());
+        }
+        self.check_writable()?;
+        state.active += 1;
+        Ok(MaintenanceGuard(self))
+    }
+
+    fn flush_generation(&self) -> Result<()> {
+        let mut wq = self.write_queue.lock();
+        self.wait_for_write_leader_idle(&mut wq);
+        self.check_writable()?;
+        wq.leader_active = true;
+        drop(wq);
+        let target = self.submit_active();
+        self.write_queue.lock().leader_active = false;
+        self.write_cv.notify_all();
+        self.flush_queue.wait(target?)
+    }
+
+    fn submit_active(&self) -> Result<u64> {
+        if self.inner.lock().active_memtable.is_empty() {
+            return Ok(self.flush_queue.target());
+        }
+        self.flush_queue
+            .check_capacity(self.options.max_immutable_memtables, false)?;
+        match self.freeze_memtable() {
+            Ok(frozen) => Ok(self.flush_queue.submit(frozen)),
+            Err(e) => {
+                self.set_bg_error(format!("WAL seal or creation failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    // The caller owns write leadership or is closing the database. Other threads
+    // may install SSTs and take snapshots while these file operations run.
+    fn freeze_memtable(&self) -> Result<FrozenMemtable> {
+        let (new_wal_number, mut old_wal) = {
+            let mut inner = self.inner.lock();
+            (
+                inner.versions.file_numbers.allocate()?,
+                inner.wal_writer.take().expect("writable WAL"),
+            )
+        };
+        let path = self.storage_path.join(format!("{new_wal_number:06}.wal"));
+        let new_wal = old_wal.sync_data().and_then(|()| WalWriter::new(&path));
+        let mut inner = self.inner.lock();
+        let new_wal = match new_wal {
+            Ok(w) => w,
+            Err(e) => {
+                inner.wal_writer = Some(old_wal);
+                return Err(e);
+            }
+        };
         let old_mem = mem::replace(&mut inner.active_memtable, Arc::new(MemTable::new()));
         old_mem.mark_immutable();
-        let old_wal_number = inner.wal_number;
+        let old_wal_number = mem::replace(&mut inner.wal_number, new_wal_number);
         inner.wal_writer = Some(new_wal);
-        inner.wal_number = new_wal_number;
-        inner.immutable_memtables.push(old_mem.clone());
-
-        self.install_super_version(inner);
-
+        inner.immutable_memtables.push_front(old_mem.clone());
+        inner.l0_install_epoch += 1;
+        let last_sequence = self.read.current_sequence();
+        self.synced_wal_seq.store(last_sequence, Ordering::Release);
+        self.install_super_version(&inner);
         Ok(FrozenMemtable {
             old_mem,
-            file_numbers: inner.versions.file_numbers.clone(),
             old_wal_number,
             new_wal_number,
+            last_sequence,
+            file_numbers: inner.versions.file_numbers.clone(),
+            snapshots: self.snapshot_list.as_sorted_vec(),
         })
     }
 
-    /// Phase 2 (no lock needed, slow I/O): write SSTs from frozen memtable.
-    fn flush_frozen_memtable(
-        &self,
-        frozen: &FrozenMemtable,
-    ) -> Result<Vec<(u64, TableBuildResult)>> {
-        // Block-property collectors are user code. A panic unwinding out of
-        // here would skip every caller's fail-stop arm (leaving
-        // `leader_active` set, or a frozen memtable whose WAL a later flush
-        // skips), so report it as an error instead.
-        let _build = self.builds.enter();
-        let written = catch_unwind(AssertUnwindSafe(|| {
-            Self::write_memtable_ssts(
-                &frozen.old_mem,
-                &self.storage_path,
-                &|| self.flush_build_opts(),
-                &frozen.file_numbers,
-            )
-        }));
-        let results = match written {
-            Ok(results) => results?,
-            Err(panic_payload) => {
-                let msg = if let Some(s) = panic_payload.downcast_ref::<String>() {
-                    s.as_str()
-                } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                    s
-                } else {
-                    "unknown payload"
-                };
-                return Err(Error::background(format!("flush panicked: {}", msg)));
-            }
-        };
-        // Pre-warm the table cache for the new SSTs while unlocked, so
-        // install_flush's log_and_apply (which opens each new file to
-        // install its reader) hits a warm cache instead of parsing
-        // footers/indexes while db_mutex is held.
-        self.table_cache
-            .prewarm(results.iter().map(|(number, _)| *number));
-        Ok(results)
-    }
-
-    /// Read, checksum, and decompress each listed file's first data block
-    /// for L0 pinning. Does not itself take `inner` — the caller controls
-    /// whether the DB lock is held. Meant to be called from the same
-    /// unlocked phase as `flush_frozen_memtable`, right before the short
-    /// locked `install_flush` call, so a legal block up to the ~64 MiB
-    /// max write-entry size is read unlocked and `install_flush` only has
-    /// to publish these already-prepared blocks, a cheap in-memory cache
-    /// insert. That holds for the auto-flush and `flush_and_install_frozen`
-    /// callers; `freeze_and_flush` (used only by `close()`) still calls
-    /// this while holding `inner`, per CC4's documented
-    /// `close`/`freeze_and_flush`-may-hold-lock exception — same as the
-    /// pre-split code on that path. Returns an empty `Vec` (no-op) when
-    /// `pin_l0_filter_and_index_blocks_in_cache` is disabled.
-    fn prepare_l0_block_pins(&self, file_numbers: &[u64]) -> Vec<(u64, PreparedBlockPin)> {
-        if !self.options.pin_l0_filter_and_index_blocks_in_cache {
-            return Vec::new();
+    fn flush_context(&self) -> FlushContext {
+        FlushContext {
+            inner: self.inner.clone(),
+            storage_path: self.storage_path.clone(),
+            options: self.options.clone(),
+            builds: self.builds.clone(),
+            stats: self.read.stats.clone(),
+            table_cache: self.table_cache.clone(),
+            claims: self.compacting_files.clone(),
+            super_version: self.read.super_version.clone(),
+            l0_file_count: self.l0_file_count.clone(),
+            compaction_notify: self.read.compaction_notify.clone(),
+            manifest_poisoned: self.read.manifest_poisoned.clone(),
+            has_bg_error: self.read.has_bg_error.clone(),
+            bg_error: self.read.bg_error.clone(),
         }
-        file_numbers
-            .iter()
-            .filter_map(|&number| {
-                // Cache hit: `flush_frozen_memtable`'s prewarm (or an
-                // earlier iteration of this same loop's own get_reader
-                // call) already opened and cached this reader.
-                let reader = self.table_cache.get_reader(number).ok()?;
-                let prepared = reader.prepare_first_block_pin()?;
-                Some((number, prepared))
-            })
-            .collect()
-    }
-
-    /// Phase 3 (under lock, fast): install flush result into version.
-    fn install_flush(
-        &self,
-        inner: &mut DBInner,
-        frozen: &FrozenMemtable,
-        build_results: Vec<(u64, TableBuildResult)>,
-        prepared_pins: Vec<(u64, PreparedBlockPin)>,
-    ) -> Result<()> {
-        let mut edit = VersionEdit::new();
-        edit.set_log_number(frozen.new_wal_number);
-        edit.set_next_file_number(inner.versions.next_file_number());
-        edit.set_last_sequence(self.current_sequence());
-        for (number, build_result) in build_results {
-            edit.add_file(
-                0, // L0
-                FileMetaData {
-                    number,
-                    file_size: build_result.file_size,
-                    smallest_key: build_result.smallest_key.unwrap_or_default(),
-                    largest_key: build_result.largest_key.unwrap_or_default(),
-                    has_range_deletions: build_result.has_range_deletions,
-                },
-            );
-        }
-        inner.versions.log_and_apply(edit).ctx()?;
-        self.stats.record_flush();
-        inner
-            .immutable_memtables
-            .retain(|m| !Arc::ptr_eq(m, &frozen.old_mem));
-
-        // Publish each already-read/checksummed/decompressed first block
-        // (prepared by `prepare_l0_block_pins`, unlocked on all but the
-        // `close()` path — see that function's doc comment) into the
-        // shared cache — an in-memory map insert only, no I/O, so this
-        // stays cheap under the lock regardless of block size.
-        if !prepared_pins.is_empty() {
-            let version = inner.versions.current();
-            for (number, prepared) in prepared_pins {
-                if let Some(tf) = version
-                    .level_files(0)
-                    .iter()
-                    .find(|tf| tf.meta.number == number)
-                {
-                    tf.reader.publish_prepared_pin(prepared);
-                }
-            }
-        }
-
-        self.l0_file_count
-            .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
-        self.install_super_version(inner);
-
-        // WAL deletion is deferred: callers must sync the manifest first,
-        // then delete the old WAL file outside the main lock.
-        Ok(())
-    }
-
-    /// Sync the manifest and delete the old WAL after install_flush.
-    /// Must be called outside the main lock.
-    ///
-    /// By the time this runs, `install_flush` has already applied the
-    /// VersionEdit and removed the memtable from `immutable_memtables`, so
-    /// the only remaining risk is manifest durability: a later successful
-    /// flush would advance `log_number` past this WAL (stale reads + lost
-    /// recovery), so a sync failure here fail-stops via `set_bg_error` for
-    /// every caller (explicit `flush()`/`compact_range()`, and the hot
-    /// auto-flush path, which cannot otherwise propagate this failure to
-    /// any caller since the enclosing write still needs to return `Ok`).
-    fn post_flush_cleanup(&self, old_wal_number: u64) -> Result<()> {
-        let manifest_handle = self.inner.lock().versions.manifest_sync_handle();
-        if let Err(e) = confirm_manifest_durable(&manifest_handle, &self.manifest_poisoned) {
-            // Poison first: a later "successful" sync could falsely
-            // report durability of the records this sync failed to
-            // persist (fsyncgate). confirm_manifest_durable emits poison
-            // for fresh sync errors; already-poisoned rotation is fail-closed.
-            self.set_bg_error(format!("post-flush manifest sync failed: {}", e));
-            return Err(e).ctx();
-        }
-        let old_wal_path = self.storage_path.join(format!("{:06}.wal", old_wal_number));
-        if let Err(e) = fs::remove_file(&old_wal_path) {
-            tracing::warn!("failed to remove old WAL {}: {}", old_wal_path.display(), e);
-        }
-        Ok(())
     }
 
     /// Drain L0 down below its compaction trigger. Follows the same
@@ -4099,10 +3392,11 @@ impl DB {
             // Phase 2: I/O (no lock held)
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
+                manifest_poisoned: &self.read.manifest_poisoned,
                 options: &force_opts,
                 builds: &self.builds,
                 rate_limiter: Some(&self.rate_limiter),
-                stats: Some(&self.stats),
+                stats: Some(&self.read.stats),
                 active_snapshots: &active_snaps,
             };
             let output =
@@ -4123,7 +3417,7 @@ impl DB {
                     Some(&self.table_cache),
                     Some(&self.block_cache),
                     &self.storage_path,
-                    Some(&self.stats),
+                    Some(&self.read.stats),
                     !self.snapshot_list.is_empty(),
                 )
                 .ctx()?;
@@ -4152,7 +3446,7 @@ impl DB {
             // Phase 4: sync manifest + delete old SSTs (no lock)
             if let Err(e) = {
                 let manifest_handle = self.inner.lock().versions.manifest_sync_handle();
-                confirm_manifest_durable(&manifest_handle, &self.manifest_poisoned)
+                confirm_manifest_durable(&manifest_handle, &self.read.manifest_poisoned)
             } {
                 // The edit is applied in memory but its durability could
                 // not be confirmed — the same condition the background
@@ -4167,22 +3461,24 @@ impl DB {
         }
         // The drained L0 data may have pushed L1+ over budget.
         if installed {
-            self.signal_compaction();
+            self.read.signal_compaction();
         }
         Ok(())
     }
 
-    /// Drain L0, then force-merge every level down to as few files as
-    /// possible. This is the full, deliberate compaction used by the
-    /// explicit, user-invoked `compact()` / `compact_range(None, None)`
-    /// entry points — NOT by the inline write-throttle path or `flush()`,
-    /// which only need `drain_l0` to relieve L0 backpressure. The lock is
-    /// released between `drain_l0` and each level (and between levels), so
-    /// this does not hold `db_mutex` for the whole operation in one shot,
-    /// though each individual level's merge I/O is still performed under
-    /// lock (`force_merge_level` requires `&mut VersionSet` throughout) —
-    /// acceptable here since this path is administrative, not the write hot
-    /// path that `drain_l0` was split out to protect.
+    fn level_rewrite(&self) -> LevelRewrite<'_> {
+        LevelRewrite {
+            inner: &self.inner,
+            snapshots: &self.snapshot_list,
+            claims: &self.compacting_files,
+            table_cache: &self.table_cache,
+            block_cache: &self.block_cache,
+            super_version: &self.read.super_version,
+            l0_count: &self.l0_file_count,
+        }
+    }
+
+    /// Drain L0 then rewrite each populated level outside the DB mutex.
     fn force_compact_all(&self) -> Result<()> {
         // Settle in-flight background compactions first. Their merge streams
         // were filtered when they were picked, so decisions may predate
@@ -4192,59 +3488,19 @@ impl DB {
         // stale-filtered data after this full pass has returned.
         self.compacting_files.wait_until_empty();
         self.drain_l0(true)?;
-        let force_opts = DbOptions {
-            l0_compaction_trigger: 1,
-            ..self.options.clone()
+        let ctx = CompactionContext {
+            db_path: &self.storage_path,
+            manifest_poisoned: &self.read.manifest_poisoned,
+            options: &self.options,
+            builds: &self.builds,
+            rate_limiter: Some(&self.rate_limiter),
+            stats: Some(&self.read.stats),
+            active_snapshots: &[],
         };
         for level in 1..self.options.num_levels {
-            let mut inner = self.inner.lock();
-            let active_snaps = self.snapshot_list.as_sorted_vec();
-            let ctx = CompactionContext {
-                db_path: &self.storage_path,
-                options: &force_opts,
-                builds: &self.builds,
-                rate_limiter: Some(&self.rate_limiter),
-                stats: Some(&self.stats),
-                active_snapshots: &active_snaps,
-            };
-            LeveledCompaction::force_merge_level(
-                &ctx,
-                level,
-                &mut inner.versions,
-                Some(&self.table_cache),
-                Some(&self.block_cache),
-            )
-            .ctx()?;
-            self.l0_file_count
-                .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
-            self.install_super_version(&inner);
+            self.level_rewrite().run(level, &ctx, false)?;
         }
         Ok(())
-    }
-
-    fn encode_wal_record(sequence: u64, batch: &WriteBatch) -> Vec<u8> {
-        // Pre-size: 8 (seq) + 4 (count) + per-entry (1 type + 4 key_len + key + 4 val_len + val)
-        let estimated = 12
-            + batch
-                .entries
-                .iter()
-                .map(|e| 1 + 4 + e.key.len() + 4 + e.value.as_ref().map_or(0, |v| v.len()))
-                .sum::<usize>();
-        let mut buf = Vec::with_capacity(estimated);
-        buf.extend_from_slice(&sequence.to_le_bytes());
-        buf.extend_from_slice(&(batch.len() as u32).to_le_bytes());
-        for entry in &batch.entries {
-            buf.push(entry.value_type as u8);
-            buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&entry.key);
-            if entry.value_type == ValueType::Value || entry.value_type == ValueType::RangeDeletion
-            {
-                let val = entry.value.as_deref().unwrap_or(&[]);
-                buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
-                buf.extend_from_slice(val);
-            }
-        }
-        buf
     }
 
     /// Remove files in the DB directory that recovery has proven dead:
@@ -4253,9 +3509,8 @@ impl DB {
     /// - `.sst` files absent from the recovered version — crash orphans from
     ///   an interrupted flush/compaction, or compaction inputs whose deletion
     ///   edit was durable but whose unlink never ran,
-    /// - `MANIFEST-*` files other than the current one, plus `CURRENT.tmp` /
-    ///   `CURRENT.tmp.<N>` — leftovers from an interrupted MANIFEST rotation
-    ///   (the unsuffixed form is only produced by pre-4.1.1 versions).
+    /// - `MANIFEST-*` files other than the current one, plus
+    ///   numbered `CURRENT.tmp.<N>` files from interrupted MANIFEST publication.
     ///
     /// Called from `open()` after the recovered state (including the fresh
     /// `log_number`) is durable in the MANIFEST, while the directory LOCK is
@@ -4294,9 +3549,8 @@ impl DB {
             {
                 num != versions.manifest_number()
             } else {
-                // Keep the unsuffixed literal: dirs written by pre-4.1.1
-                // versions may still hold a plain `CURRENT.tmp`.
-                name == "CURRENT.tmp" || name.starts_with("CURRENT.tmp.")
+                name.strip_prefix("CURRENT.tmp.")
+                    .is_some_and(|n| n.parse::<u64>().is_ok())
             };
             if obsolete {
                 let file_path = entry.path();
@@ -4425,10 +3679,6 @@ impl DB {
     }
 
     /// Build options for flush outputs (always L0).
-    fn flush_build_opts(&self) -> TableBuildOptions {
-        l0_build_opts(&self.options)
-    }
-
     /// Write a memtable to one or more SST files, splitting at user-key
     /// boundaries whenever projected single-block metadata reaches
     /// `META_BLOCK_SPLIT_THRESHOLD` (the SST reader rejects
@@ -4443,10 +3693,12 @@ impl DB {
         db_path: &Path,
         make_opts: &dyn Fn() -> TableBuildOptions,
         file_numbers: &FileNumbers,
+        snapshots: &[u64],
     ) -> Result<Vec<(u64, TableBuildResult)>> {
         let pending = PendingSsts::new(db_path, file_numbers);
         let mut results: Vec<(u64, TableBuildResult)> = Vec::new();
         let mut builder: Option<(u64, TableBuilder)> = None;
+        let mut carry = Vec::new();
         let mut pending_cut = false;
         let mut last_uk: Vec<u8> = Vec::new();
 
@@ -4458,15 +3710,18 @@ impl DB {
             }
             if pending_cut
                 && uk_changed
-                && let Some((num, b)) = builder.take()
+                && let Some((num, mut b)) = builder.take()
             {
+                carry = b.clip_at(types::user_key(key));
                 results.push((num, b.finish().ctx()?));
                 pending_cut = false;
             }
             if builder.is_none() {
                 let num = pending.allocate().ctx()?;
                 let sst_path = db_path.join(format!("{:06}.sst", num));
-                builder = Some((num, TableBuilder::new(&sst_path, make_opts()).ctx()?));
+                let mut output = TableBuilder::new(&sst_path, make_opts()).ctx()?;
+                output.start_output(snapshots, mem::take(&mut carry));
+                builder = Some((num, output));
             }
             let (_, b) = builder.as_mut().unwrap();
             b.add(key, value).ctx()?;
@@ -4488,7 +3743,7 @@ impl DB {
     /// Simulate a crash: shut down background threads without flushing memtable.
     /// Useful for testing WAL recovery without lingering background compaction threads.
     pub fn simulate_crash(self) {
-        self.closed.store(true, Ordering::Release);
+        self.read.closed.store(true, Ordering::Release);
         self.stop_background_and_detach_cache();
         let mut inner = self.inner.lock();
         if let Some(wal) = inner.wal_writer.take() {
@@ -4502,8 +3757,8 @@ impl DB {
 
 impl Drop for DB {
     fn drop(&mut self) {
-        if !self.closed.load(Ordering::Acquire) {
-            self.closed.store(true, Ordering::Release);
+        if !self.read.closed.load(Ordering::Acquire) {
+            self.read.closed.store(true, Ordering::Release);
             if let Some(ref mut wal) = self.inner.lock().wal_writer {
                 // Note: WAL sync errors in Drop cannot be propagated to the caller.
                 // Users should call db.close() explicitly to detect and handle sync errors.
@@ -4516,36 +3771,6 @@ impl Drop for DB {
         inner.versions.manifest_sync_handle().lock().take();
         drop(inner);
         self.lock_file.lock().take();
-    }
-}
-
-/// RAII snapshot guard. Automatically releases the snapshot when dropped.
-///
-/// Use `DB::snapshot()` to create one. The snapshot's sequence number can be
-/// passed to `ReadOptions::snapshot` for consistent reads.
-pub struct Snapshot<'a> {
-    db: &'a DB,
-    seq: SequenceNumber,
-}
-
-impl Snapshot<'_> {
-    /// The sequence number for this snapshot.
-    pub fn sequence(&self) -> SequenceNumber {
-        self.seq
-    }
-
-    /// Return `ReadOptions` pre-configured to read at this snapshot.
-    pub fn read_options(&self) -> ReadOptions {
-        ReadOptions {
-            snapshot: Some(self.seq),
-            ..ReadOptions::default()
-        }
-    }
-}
-
-impl Drop for Snapshot<'_> {
-    fn drop(&mut self) {
-        self.db.release_snapshot(self.seq);
     }
 }
 
@@ -4582,7 +3807,7 @@ mod tests {
             if with_range {
                 db.put(b"zz", b"last").unwrap();
             }
-            assert_eq!(db.current_sequence(), MAX_SEQUENCE_NUMBER);
+            assert_eq!(db.read.current_sequence(), MAX_SEQUENCE_NUMBER);
             assert_eq!(
                 db.iter_with_batch(&WriteBatchWithIndex::new())
                     .unwrap()
@@ -4598,7 +3823,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let options = DbOptions {
-            pin_l0_filter_and_index_blocks_in_cache: false,
+            pin_l0_first_block_and_warm_index: false,
             l0_compaction_trigger: usize::MAX,
             l0_slowdown_trigger: usize::MAX,
             l0_stop_trigger: usize::MAX,
@@ -4610,7 +3835,7 @@ mod tests {
             db.flush().unwrap();
         }
         let options = ReadOptions {
-            iterate_upper_bound: Some(b"p".to_vec()),
+            iterate_upper_bound: Some(b"p".as_slice().into()),
             ..Default::default()
         };
         WILLNEED_HINTS.with(|count| count.set(0));
@@ -4627,7 +3852,7 @@ mod tests {
     fn effective_bounds_preserve_cross_file_tombstones_and_empty_seeks() {
         let dir = tempfile::tempdir().unwrap();
         let options = DbOptions {
-            pin_l0_filter_and_index_blocks_in_cache: false,
+            pin_l0_first_block_and_warm_index: false,
             l0_compaction_trigger: usize::MAX,
             l0_slowdown_trigger: usize::MAX,
             l0_stop_trigger: usize::MAX,
@@ -4644,8 +3869,8 @@ mod tests {
         db.delete_range(b"a", b"p:3").unwrap();
         db.flush().unwrap();
         let options = ReadOptions {
-            iterate_lower_bound: Some(b"p:2".to_vec()),
-            iterate_upper_bound: Some(b"p:4".to_vec()),
+            iterate_lower_bound: Some(b"p:2".as_slice().into()),
+            iterate_upper_bound: Some(b"p:4".as_slice().into()),
             ..Default::default()
         };
         let collect = |iter: DBIterator| iter.map(|(key, _)| key).collect::<Vec<_>>();
@@ -4665,7 +3890,7 @@ mod tests {
             Vec::<Vec<u8>>::new()
         );
         let old_options = ReadOptions {
-            snapshot: Some(snapshot.sequence()),
+            snapshot: Some((&snapshot).into()),
             ..options.clone()
         };
         assert_eq!(
@@ -4674,7 +3899,7 @@ mod tests {
         );
         assert_eq!(db.get(b"p:2").unwrap(), None);
 
-        let misses = db.stats.block_cache_misses.load(Ordering::Relaxed);
+        let misses = db.read.stats.block_cache_misses.load(Ordering::Relaxed);
         for (prefix, lower, upper) in [
             (b"p:".as_slice(), b"z".as_slice(), b"zz".as_slice()),
             (b"p:", b"", b"a"),
@@ -4683,8 +3908,8 @@ mod tests {
             (b"\xff", b"", b"\xff"),
         ] {
             let options = ReadOptions {
-                iterate_lower_bound: Some(lower.to_vec()),
-                iterate_upper_bound: Some(upper.to_vec()),
+                iterate_lower_bound: Some(lower.into()),
+                iterate_upper_bound: Some(upper.into()),
                 ..Default::default()
             };
             let mut iter = db.iter_with_prefix(prefix, &options).unwrap();
@@ -4699,7 +3924,79 @@ mod tests {
             assert!(!iter.valid());
             assert!(iter.error().is_none());
         }
-        assert_eq!(db.stats.block_cache_misses.load(Ordering::Relaxed), misses);
+        assert_eq!(
+            db.read.stats.block_cache_misses.load(Ordering::Relaxed),
+            misses
+        );
+    }
+
+    #[test]
+    fn range_write_admission_reserves_latest_stripe_and_rejects_only_its_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.snapshot_list
+            .range_stripe_limit
+            .store(3, Ordering::Relaxed);
+
+        db.delete_range(b"a", b"z").unwrap();
+        let duplicates: Vec<_> = (0..9).map(|_| db.snapshot()).collect();
+        db.delete_range(b"a", b"z").unwrap();
+        let _second = db.arc_snapshot();
+        db.delete_range(b"a", b"z").unwrap();
+        let _third = db.snapshot();
+        let seq = db.read.current_sequence();
+        let wal = dir
+            .path()
+            .join(format!("{:06}.wal", db.inner.lock().wal_number));
+        let before = fs::read(&wal).unwrap();
+        assert_eq!(
+            db.delete_range(b"a", b"z").unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(db.read.current_sequence(), seq);
+        assert_eq!(fs::read(&wal).unwrap(), before);
+
+        let mut mixed = WriteBatch::new();
+        mixed.put(b"rejected", b"value");
+        mixed.delete_range(b"a", b"z");
+        let mut point = WriteBatch::new();
+        point.put(b"admitted", b"value");
+        let mut requests = [mixed, point].map(|batch| WriteRequest {
+            batch,
+            kind: WriteRequestKind::Batch,
+            no_slowdown: false,
+            durability: DurabilityMode::WalAsync,
+            result: None,
+            done: false,
+        });
+        db.write_batch_group(&requests.each_mut().map(std::ptr::from_mut))
+            .unwrap();
+        assert_eq!(
+            requests[0].result.take().unwrap().unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(db.read.current_sequence(), seq + 1);
+        assert!(db.get(b"rejected").unwrap().is_none());
+        assert_eq!(
+            db.get(b"admitted").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+
+        // A fourth snapshot created after the final range delete can only
+        // observe the same latest covering sequence as the third snapshot.
+        let late = db.snapshot();
+        db.flush().unwrap();
+        let version = db.inner.lock().versions.current();
+        let ranges = version.level_files(0)[0]
+            .reader
+            .get_range_tombstones()
+            .unwrap();
+        let mut seqs: Vec<_> = ranges.into_iter().map(|(_, _, s)| s).collect();
+        seqs.sort_unstable();
+        assert_eq!(seqs, vec![1, 2, 3]);
+        drop(late);
+        drop(duplicates);
+        db.delete_range(b"a", b"z").unwrap();
     }
 
     #[test]
@@ -4714,7 +4011,7 @@ mod tests {
         let wal_before = fs::read(&wal_path).unwrap();
         let mut batch = WriteBatch::new();
         batch.put(b"new", b"value");
-        batch.delete_range(b"a", &vec![b'z'; MAX_RANGE_DELETE_SIZE]);
+        batch.delete_range(b"a", &vec![b'z'; types::MAX_RANGE_DELETE_SIZE]);
         assert_eq!(
             db.write(batch).unwrap_err().kind(),
             ErrorKind::InvalidArgument
@@ -4730,12 +4027,108 @@ mod tests {
     }
 
     #[test]
+    fn group_byte_limit_preserves_fifo_and_admits_an_oversized_head() {
+        let mut requests = [3, 3, 1, 20].map(|length| {
+            let mut batch = WriteBatch::new();
+            batch.delete(&vec![0; length]);
+            WriteRequest {
+                batch,
+                kind: WriteRequestKind::Batch,
+                no_slowdown: false,
+                durability: DurabilityMode::WalAsync,
+                done: false,
+                result: None,
+            }
+        });
+        let ptrs = requests.each_mut().map(std::ptr::from_mut);
+        let mut wq = WriteQueueState {
+            waiting_barriers: 0,
+            queue: ptrs.into(),
+            leader_active: true,
+        };
+        // Encoded sizes are 8, 8, 6, and 25 bytes. The group limit is 16.
+        assert_eq!(wq.drain_group(32), ptrs[..2]);
+        assert_eq!(wq.drain_group(32), ptrs[2..3]);
+        assert_eq!(wq.drain_group(32), ptrs[3..]);
+        assert!(wq.queue.is_empty());
+    }
+
+    #[test]
+    fn oversized_same_key_run_rejected_before_wal_then_flush_recovers() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            write_buffer_size: 128 << 20,
+            ..Default::default()
+        };
+        let db = DB::open(options.clone(), temp.path()).unwrap();
+        let key = vec![1; types::MAX_USER_KEY_SIZE];
+        let mut batch = WriteBatch::new();
+        for _ in 0..3 {
+            batch.put(&key, b"value");
+        }
+        db.write(batch).unwrap();
+        let seq = db.read.current_sequence();
+        let path = temp
+            .path()
+            .join(format!("{:06}.wal", db.inner.lock().wal_number));
+        let wal_bytes = fs::metadata(&path).unwrap().len();
+        let mut batch = WriteBatch::new();
+        batch.put(b"peer", b"new");
+        batch.delete(&key);
+        assert_eq!(
+            db.write(batch).unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(db.read.current_sequence(), seq);
+        assert_eq!(fs::metadata(path).unwrap().len(), wal_bytes);
+        assert!(db.get(b"peer").unwrap().is_none());
+        db.flush().unwrap();
+        db.delete(&key).unwrap();
+        db.close().unwrap();
+        let reopened = DB::open(options, temp.path()).unwrap();
+        assert!(reopened.get(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_keeps_long_same_key_runs_in_separate_wal_generations() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            write_buffer_size: 256 << 20,
+            l0_compaction_trigger: usize::MAX,
+            ..Default::default()
+        };
+        let db = DB::open(options.clone(), temp.path()).unwrap();
+        let first_wal = db.inner.lock().wal_number;
+        db.simulate_crash();
+        let key = vec![b'k'; types::MAX_USER_KEY_SIZE];
+        // Each generation is within the admission budget. Their union
+        // exceeds it, while remaining below the recovery buffer threshold.
+        for generation in 0..2 {
+            let mut batch = WriteBatch::new();
+            for _ in 0..3 {
+                batch.put(&key, &[generation as u8]);
+            }
+            let path = temp
+                .path()
+                .join(format!("{:06}.wal", first_wal + generation));
+            let mut wal = WalWriter::new(&path).unwrap();
+            wal.add_record_parts(&[&batch.wal_header(generation * 3 + 1), &batch.payload])
+                .unwrap();
+            wal.sync_data().unwrap();
+        }
+        let db = DB::open(options, temp.path()).unwrap();
+        assert_eq!(db.read.current_sequence(), 6);
+        assert_eq!(db.get(&key).unwrap().as_deref(), Some(&[1][..]));
+        assert_eq!(db.inner.lock().versions.current().l0_file_count(), 2);
+    }
+
+    #[test]
     fn boundary_range_delete_flushes_with_existing_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let options = DbOptions {
             write_buffer_size: 512 * 1024 * 1024,
             block_cache_capacity: 0,
-            pin_l0_filter_and_index_blocks_in_cache: false,
+            pin_l0_first_block_and_warm_index: false,
             l0_compaction_trigger: usize::MAX,
             ..Default::default()
         };
@@ -4744,15 +4137,13 @@ mod tests {
             db.put(key, b"value").unwrap();
         }
         let snapshot = db.snapshot();
-        // The first two tombstones leave metadata exactly one byte below
-        // the split threshold. The boundary entry must still fit that file.
-        let budget = META_BLOCK_SPLIT_THRESHOLD - 1;
-        for (begin, projected) in [(b'a', budget / 2), (b'b', budget - budget / 2)] {
-            let end = vec![begin; projected - 8 - 64 - 1];
+        // Each endpoint can be as large as MAX_USER_KEY_SIZE. Multiple
+        // such tombstones force rollover of the range metadata leaves.
+        for begin in *b"abc" {
+            let mut end = vec![begin; types::MAX_USER_KEY_SIZE];
+            end[1] = u8::MAX;
             db.delete_range(&[begin], &end).unwrap();
         }
-        db.delete_range(b"c", &vec![b'c'; MAX_RANGE_DELETE_SIZE - 1])
-            .unwrap();
         db.flush().unwrap();
         for key in [b"a1", b"b1", b"c1"] {
             assert_eq!(db.get(key).unwrap(), None);
@@ -4793,7 +4184,7 @@ mod tests {
             );
             // Keep the race deterministic: this test drives compaction itself.
             {
-                let (lock, cv) = &*db.compaction_notify;
+                let (lock, cv) = &*db.read.compaction_notify;
                 let _guard = lock.lock();
                 db.compaction_shutdown.store(true, Ordering::Release);
                 cv.notify_all();
@@ -4818,7 +4209,7 @@ mod tests {
             }
             db.put(b"m", b"old").unwrap();
             db.flush().unwrap();
-            let old_seq = db.current_sequence();
+            let old_seq = db.read.current_sequence();
             let writer = db.clone();
             BEFORE_READ_VIEW.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || {
@@ -4835,10 +4226,7 @@ mod tests {
                     }));
                 }));
             });
-            let options = ReadOptions {
-                snapshot: Some(u64::MAX),
-                ..Default::default()
-            };
+            let options = ReadOptions::default();
             let value = match constructor {
                 0 => db.get_with_options(&options, b"m").unwrap(),
                 _ => {
@@ -4911,7 +4299,7 @@ mod tests {
         let unsynced = db.put(b"a", b"1");
         let synced = db.put_with_options(
             &WriteOptions {
-                sync: true,
+                durability: DurabilityMode::WalSync,
                 ..Default::default()
             },
             b"b",
@@ -4925,7 +4313,7 @@ mod tests {
     /// Join the compaction workers so a test drives compaction itself.
     fn stop_background_workers(db: &DB) {
         {
-            let (lock, cv) = &*db.compaction_notify;
+            let (lock, cv) = &*db.read.compaction_notify;
             let _guard = lock.lock();
             db.compaction_shutdown.store(true, Ordering::Release);
             cv.notify_all();
@@ -4961,8 +4349,8 @@ mod tests {
             }
         }
         // Publish the samples after the last periodic poll before draining.
-        db.check_read_compaction();
-        let pending = mem::take(&mut *db.read_compaction_hints.lock());
+        db.read.check_read_compaction();
+        let pending = mem::take(&mut *db.read.read_compaction_hints.lock());
         assert_eq!(
             pending.len(),
             2,
@@ -4973,7 +4361,7 @@ mod tests {
         for _ in 0..1024 {
             db.get(b"a").unwrap();
         }
-        let pending = db.read_compaction_hints.lock();
+        let pending = db.read.read_compaction_hints.lock();
         assert_eq!(pending.len(), 1, "new samples must requeue a drained level");
         assert_eq!(pending[0].level, 2);
     }
@@ -5002,7 +4390,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = DB::open(
             DbOptions {
-                bloom_bits_per_key: 536_838_137,
+                bloom_bits_per_key: (crate::sst::META_BLOCK_HARD_LIMIT as u32) * 8 + 1,
                 ..Default::default()
             },
             dir.path(),
@@ -5031,7 +4419,7 @@ mod tests {
         db.simulate_crash();
 
         let db = DB::open(options, dir.path()).unwrap();
-        let version = db.get_super_version().version.clone();
+        let version = db.read.get_super_version().version.clone();
         let file = &version.level_files(0)[0];
         let first_block = file.reader.cached_index_entries().unwrap()[0].handle;
         let mut trailer_type = [0u8; 1];
@@ -5077,7 +4465,7 @@ mod tests {
         }
         db.flush().unwrap();
         db.compact().unwrap();
-        let version = db.get_super_version().version.clone();
+        let version = db.read.get_super_version().version.clone();
         let reader = &version
             .level_files(1)
             .first()
@@ -5108,12 +4496,10 @@ mod tests {
                 ValueType::Value,
             );
         }
-        let make_opts = || TableBuildOptions {
-            internal_keys: true,
-            ..Default::default()
-        };
+        let make_opts = || TableBuildOptions::default();
         let (outputs, allocations) = crate::test_alloc::measure(|| {
-            DB::write_memtable_ssts(&mem, dir.path(), &make_opts, &FileNumbers::new(1)).unwrap()
+            DB::write_memtable_ssts(&mem, dir.path(), &make_opts, &FileNumbers::new(1), &[])
+                .unwrap()
         });
         assert!(!outputs.is_empty());
         assert!(
@@ -5187,7 +4573,7 @@ mod tests {
         )
         .unwrap();
         {
-            let (lock, cv) = &*db.compaction_notify;
+            let (lock, cv) = &*db.read.compaction_notify;
             let _guard = lock.lock();
             db.compaction_shutdown.store(true, Ordering::Release);
             cv.notify_all();
@@ -5351,7 +4737,7 @@ mod tests {
         entered_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("first compaction job never reached the filter");
-        let completed_before = db.stats.compactions_completed.load(Ordering::Relaxed);
+        let completed_before = db.read.stats.compactions_completed.load(Ordering::Relaxed);
 
         let closer = {
             let db = Arc::clone(&db);
@@ -5382,7 +4768,7 @@ mod tests {
         drop(reopened);
 
         assert_eq!(
-            db.stats.compactions_completed.load(Ordering::Relaxed),
+            db.read.stats.compactions_completed.load(Ordering::Relaxed),
             completed_before + 1,
             "close must stop after the in-flight job"
         );
@@ -5399,7 +4785,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let options = DbOptions {
             block_size: 256,
-            pin_l0_filter_and_index_blocks_in_cache: false,
+            pin_l0_first_block_and_warm_index: false,
             l0_compaction_trigger: usize::MAX,
             l0_slowdown_trigger: usize::MAX,
             l0_stop_trigger: usize::MAX,
@@ -5514,8 +4900,8 @@ mod tests {
 
         struct PanicOnBoom;
         impl BlockPropertyCollector for PanicOnBoom {
-            fn add(&mut self, key: &[u8], _value: &[u8]) {
-                if types::user_key(key) == b"boom" {
+            fn add(&mut self, key: &[u8]) {
+                if key == b"boom" {
                     panic!("collector rejected boom");
                 }
             }
@@ -5567,7 +4953,7 @@ mod tests {
             let db = DB::open(options.clone(), dir.path()).unwrap();
             // This test drives the sweep step itself.
             {
-                let (lock, cv) = &*db.compaction_notify;
+                let (lock, cv) = &*db.read.compaction_notify;
                 let _guard = lock.lock();
                 db.compaction_shutdown.store(true, Ordering::Release);
                 cv.notify_all();
@@ -5581,28 +4967,22 @@ mod tests {
             db.flush().unwrap();
             db.put(b"k", b"v2").unwrap();
 
-            let frozen = {
-                let mut inner = db.inner.lock();
-                db.freeze_memtable_sync(&mut inner).unwrap()
-            };
+            let frozen = db.freeze_memtable().unwrap();
             let snapshots = Vec::new();
             let ctx = CompactionContext {
                 db_path: &db.storage_path,
+                manifest_poisoned: &db.read.manifest_poisoned,
                 options: &db.options,
                 builds: &db.builds,
                 rate_limiter: Some(&db.rate_limiter),
-                stats: Some(&db.stats),
+                stats: Some(&db.read.stats),
                 active_snapshots: &snapshots,
             };
             {
-                let mut inner = db.inner.lock();
-                let swept =
-                    sweep_dead_keys_at_level(&ctx, 0, &mut inner, &db.table_cache, &db.block_cache)
-                        .unwrap();
+                let swept = db.level_rewrite().run(0, &ctx, false).unwrap();
                 assert!(!swept, "L0 sweep must wait for the in-flight flush");
             }
-            db.flush_and_install_frozen(&frozen).unwrap();
-            db.post_flush_cleanup(frozen.old_wal_number).unwrap();
+            db.flush_context().flush(&frozen).unwrap();
             assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
             db.close().unwrap();
         }
@@ -5620,21 +5000,18 @@ mod tests {
         let db = open_test_db(dir.path());
         stop_background_workers(&db);
         db.put(b"k", b"v").unwrap();
-        let frozen = {
-            let mut inner = db.inner.lock();
-            db.freeze_memtable_sync(&mut inner).unwrap()
-        };
+        let frozen = db.freeze_memtable().unwrap();
         // The pass has seen the in-flight flush and skipped L0.
         db.dead_key_sweep.queue();
         assert!(db.dead_key_sweep.try_start());
-        *db.compaction_notify.0.lock() = false;
+        *db.read.compaction_notify.0.lock() = false;
 
-        db.flush_and_install_frozen(&frozen).unwrap();
+        db.flush_context().flush(&frozen).unwrap();
         db.dead_key_sweep.finish(true);
 
         assert!(db.dead_key_sweep.is_pending());
         assert!(
-            *db.compaction_notify.0.lock(),
+            *db.read.compaction_notify.0.lock(),
             "the deferred sweep must have a queued wake"
         );
     }
@@ -5662,13 +5039,9 @@ mod tests {
             )
             .unwrap();
             db.put(b"k", b"v").unwrap();
-            let frozen = {
-                let mut inner = db.inner.lock();
-                db.freeze_memtable_sync(&mut inner).unwrap()
-            };
+            let frozen = db.freeze_memtable().unwrap();
             let complete_flush = || {
-                db.flush_and_install_frozen(&frozen).unwrap();
-                db.post_flush_cleanup(frozen.old_wal_number).unwrap();
+                db.flush_context().flush(&frozen).unwrap();
             };
             let wait_for_passes = |count| {
                 let deadline = Instant::now() + Duration::from_secs(10);
@@ -5698,7 +5071,7 @@ mod tests {
                 // Worker A is parked before finish; only worker B can complete
                 // this pass, consuming the notification without starting a sweep.
                 let consumed = wait_for_passes(2);
-                let wake_queued = *db.compaction_notify.0.lock();
+                let wake_queued = *db.read.compaction_notify.0.lock();
                 release_tx.send(()).unwrap();
                 assert!(consumed, "second worker did not consume the notification");
                 assert!(!wake_queued, "notification was not consumed before finish");
@@ -5894,14 +5267,7 @@ mod tests {
         }
     }
 
-    /// Regression: on the explicit `flush()` path, L0 first-block pinning
-    /// (default on) must not read, checksum, and decompress the block
-    /// while holding `inner` (`close()`'s `freeze_and_flush` is a
-    /// documented exception — see `prepare_l0_block_pins`). Park the
-    /// flush thread inside `prepare_first_block_pin` (before it opens the
-    /// file) via `PREPARE_FIRST_BLOCK_PIN_HOOK`, and confirm a direct
-    /// `try_lock` on `inner` from another thread succeeds immediately
-    /// instead of waiting behind it.
+    /// L0 first-block reads run outside the DB mutex in the flush worker.
     #[test]
     fn flush_first_block_pin_read_does_not_hold_inner_lock() {
         use crate::sst::table_reader::PREPARE_FIRST_BLOCK_PIN_HOOK;
@@ -5915,23 +5281,20 @@ mod tests {
             let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
             let (checked_tx, checked_rx) = std::sync::mpsc::channel::<bool>();
 
-            // `db.flush()` below runs directly on this thread (not
-            // spawned), so the hook — armed here — fires on this same
-            // thread and shares this thread's thread-local storage. It
-            // signals it has reached the read point this fix moved off
-            // the locked path, then waits (bounded) for the checker
-            // thread's verdict before letting the real read proceed.
-            PREPARE_FIRST_BLOCK_PIN_HOOK.with(|h| {
-                *h.borrow_mut() = Some(Box::new(move || {
-                    reached_tx.send(()).unwrap();
-                    let acquired = checked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-                    assert!(
-                        acquired,
-                        "a direct try_lock on `inner` failed while the first-block \
+            // Arm the worker's thread-local reader hook before it begins the build.
+            db.flush_queue.on_next_build(move || {
+                PREPARE_FIRST_BLOCK_PIN_HOOK.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move || {
+                        reached_tx.send(()).unwrap();
+                        let acquired = checked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        assert!(
+                            acquired,
+                            "a direct try_lock on `inner` failed while the first-block \
                          pin read was in flight — the lock must not be held during \
                          that I/O"
-                    );
-                }));
+                        );
+                    }));
+                })
             });
 
             scope.spawn(move || {
@@ -6054,11 +5417,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = open_test_db(dir.path());
         db.put(b"key", b"v1").unwrap();
-        let snap = db.snapshot_seq();
+        let snap = db.snapshot();
         db.put(b"key", b"v2").unwrap();
         assert_eq!(db.get(b"key").unwrap(), Some(b"v2".to_vec()));
         let opts = ReadOptions {
-            snapshot: Some(snap),
+            snapshot: Some((&snap).into()),
             ..Default::default()
         };
         assert_eq!(
@@ -6176,13 +5539,9 @@ mod tests {
         );
     }
 
-    /// `close` must not release the directory lock while a group-commit leader
-    /// is still inside auto-flush. The concurrent close tests join that leader
-    /// before they reopen, so they still pass if `wait_for_write_leader_idle`
-    /// is removed. This parks the flush itself and requires `close` to stay
-    /// blocked until the flush returns.
+    /// A parked auto-flush lets the writer return while close waits for durability.
     #[test]
-    fn close_stays_blocked_while_auto_flush_holds_the_leader() {
+    fn close_waits_for_flush_after_the_writer_returns() {
         use crate::options::BlockPropertyCollector;
 
         struct FlushGate {
@@ -6190,8 +5549,8 @@ mod tests {
             release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
         }
         impl BlockPropertyCollector for FlushGate {
-            fn add(&mut self, key: &[u8], _value: &[u8]) {
-                if types::user_key(key) != b"gate" {
+            fn add(&mut self, key: &[u8]) {
+                if key != b"gate" {
                     return;
                 }
                 let Some(release) = self.release.lock().take() else {
@@ -6239,20 +5598,17 @@ mod tests {
         stop_background_workers(&db);
 
         let writer = Arc::clone(&db);
-        let put_done = Arc::new(AtomicBool::new(false));
-        let put_flag = Arc::clone(&put_done);
+        let (put_tx, put_rx) = std::sync::mpsc::channel();
         let put = thread::spawn(move || {
             writer.put(b"gate", &[b'v'; 2048]).unwrap();
-            put_flag.store(true, Ordering::Release);
+            put_tx.send(()).unwrap();
         });
         entered_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("auto-flush never reached the collector");
-        assert!(
-            !put_done.load(Ordering::Acquire),
-            "put returned before its auto-flush left the collector"
-        );
-
+            .expect("flush worker did not enter collector");
+        put_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("WAL writer stalled behind SST build");
         let close_done = Arc::new(AtomicBool::new(false));
         let close_flag = Arc::clone(&close_done);
         let closing = Arc::clone(&db);
@@ -6569,7 +5925,7 @@ mod tests {
         };
         let db = Arc::new(DB::open(opts, dir.path()).unwrap());
         let wo = WriteOptions {
-            disable_wal: true,
+            durability: DurabilityMode::DisableWal,
             ..Default::default()
         };
         let stop = Arc::new(AtomicBool::new(false));
@@ -6628,7 +5984,7 @@ mod tests {
     fn test_close_reports_poisoned_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let db = open_test_db(dir.path());
-        db.manifest_poisoned.store(true, Ordering::Release);
+        db.read.manifest_poisoned.store(true, Ordering::Release);
 
         let err = db.close().unwrap_err();
         // A failed MANIFEST write fail-stops a recoverable store; it is not
@@ -6755,7 +6111,7 @@ mod tests {
             if let Some(ref mut wal) = db.inner.lock().wal_writer {
                 wal.sync().unwrap();
             }
-            db.closed.store(true, Ordering::Release);
+            db.read.closed.store(true, Ordering::Release);
         }
 
         {
@@ -6803,7 +6159,7 @@ mod tests {
         let db = open_test_db(dir.path());
         let mut batch = WriteBatch::new();
         batch.put(b"key", b"value");
-        let mut record = DB::encode_wal_record(1, &batch);
+        let mut record = [batch.wal_header(1).as_slice(), &batch.payload].concat();
         record.push(0);
         let wal_path = {
             let mut inner = db.inner.lock();
@@ -6845,7 +6201,7 @@ mod tests {
             if let Some(ref mut wal) = db.inner.lock().wal_writer {
                 wal.sync().unwrap();
             }
-            db.closed.store(true, Ordering::Release);
+            db.read.closed.store(true, Ordering::Release);
         }
 
         {
@@ -6949,13 +6305,13 @@ mod tests {
         let db = open_test_db(dir.path());
 
         db.put(b"a", b"v1").unwrap();
-        let snap = db.snapshot_seq();
+        let snap = db.snapshot();
         db.put(b"a", b"v2").unwrap();
         db.put(b"b", b"new").unwrap();
 
         // Iterator at snapshot should see old value and no "b"
         let opts = ReadOptions {
-            snapshot: Some(snap),
+            snapshot: Some((&snap).into()),
             ..Default::default()
         };
         let entries: Vec<_> = db.iter_with_options(&opts).unwrap().collect();

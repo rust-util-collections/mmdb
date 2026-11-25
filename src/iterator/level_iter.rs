@@ -6,9 +6,10 @@
 
 use std::{cmp::Ordering, ops::Deref, sync::Arc};
 
+use crate::Error;
 use crate::iterator::merge::SeekableIterator;
 use crate::manifest::version::{TableFile, Version};
-use crate::options::BlockPropertyFilter;
+use crate::options::IterConfig;
 use crate::sst::table_reader::TableIterator;
 use crate::types::{LazyValue, compare_internal_key, user_key as user_key_from_internal};
 
@@ -64,20 +65,11 @@ pub struct LevelIterator {
     file_index: usize,
     /// Lazily opened iterator for the file at file_index.
     current_iter: Option<TableIterator>,
-    /// Optional prefix for bloom filter pruning.
-    prefix_filter: Option<Vec<u8>>,
-    /// Range pruning: user key lower bound (inclusive).
-    start_hint: Option<Vec<u8>>,
-    /// Range pruning: user key upper bound (exclusive).
-    end_hint: Option<Vec<u8>>,
-    /// Upper bound for iteration (set via set_bounds).
-    upper_bound: Option<Vec<u8>>,
-    /// Block property filters to pass to each TableIterator.
-    block_property_filters: Vec<Arc<dyn BlockPropertyFilter>>,
+    config: Arc<IterConfig>,
     /// First I/O error encountered while iterating or repositioning. Once
     /// set, iteration and subsequent seeks stay halted instead of silently
     /// clearing the failure or advancing past the errored file.
-    error: Option<String>,
+    error: Option<Error>,
     /// Whether cache misses populate the block cache (default: true).
     fill_cache: bool,
 }
@@ -99,11 +91,7 @@ impl LevelIterator {
             files,
             file_index: 0,
             current_iter: None,
-            prefix_filter: None,
-            start_hint: None,
-            end_hint: None,
-            upper_bound: None,
-            block_property_filters: Vec::new(),
+            config: IterConfig::empty(),
             error: None,
             fill_cache: true,
         }
@@ -117,34 +105,29 @@ impl LevelIterator {
     }
 
     /// Enable prefix bloom filter pruning.
+    #[cfg(test)]
     pub fn with_prefix(mut self, prefix: Vec<u8>) -> Self {
-        self.prefix_filter = Some(prefix);
+        Arc::make_mut(&mut self.config).prefix = Some(prefix.into());
         self
     }
 
     /// Enable range-based file skipping.
+    #[cfg(test)]
     pub fn with_range_hints(mut self, start: Option<Vec<u8>>, end: Option<Vec<u8>>) -> Self {
-        self.start_hint = start;
-        self.end_hint = end;
-        self
-    }
-
-    /// Attach block property filters that will be passed to each TableIterator.
-    pub fn with_block_filters(mut self, filters: Vec<Arc<dyn BlockPropertyFilter>>) -> Self {
-        self.block_property_filters = filters;
+        self.config = Arc::new(IterConfig {
+            lower: start,
+            upper: end,
+            ..Default::default()
+        });
         self
     }
 
     fn has_empty_bounds(&self) -> bool {
-        self.start_hint
-            .as_deref()
-            .zip(self.end_hint.as_deref())
-            .is_some_and(|(s, e)| s >= e)
-            || self
-                .start_hint
-                .as_deref()
-                .zip(self.upper_bound.as_deref())
-                .is_some_and(|(s, u)| s >= u)
+        self.config
+            .lower
+            .as_ref()
+            .zip(self.config.upper.as_ref())
+            .is_some_and(|(a, b)| a >= b)
     }
 
     /// Check a file against all configured filters. Files in a level are
@@ -157,7 +140,7 @@ impl LevelIterator {
             return FileFilter::AfterRange;
         }
         // Range filter: file's largest user key must be >= start_hint
-        if let Some(ref start) = self.start_hint {
+        if let Some(ref start) = self.config.lower {
             let largest_uk = user_key_from_internal(&tf.meta.largest_key);
             if largest_uk < start.as_slice() {
                 return FileFilter::BeforeRange;
@@ -166,18 +149,15 @@ impl LevelIterator {
         // Range filter: file's smallest user key must be < end_hint and < upper_bound
         let smallest_uk = user_key_from_internal(&tf.meta.smallest_key);
         if self
-            .end_hint
+            .config
+            .upper
             .as_deref()
-            .is_some_and(|end| smallest_uk >= end)
-            || self
-                .upper_bound
-                .as_deref()
-                .is_some_and(|ub| smallest_uk >= ub)
+            .is_some_and(|ub| smallest_uk >= ub)
         {
             return FileFilter::AfterRange;
         }
         // Prefix bloom filter
-        if let Some(ref prefix) = self.prefix_filter
+        if let Some(ref prefix) = self.config.prefix
             && !tf.reader.prefix_may_match(prefix)
         {
             return FileFilter::Skip;
@@ -189,7 +169,7 @@ impl LevelIterator {
         if self.error.is_none()
             && let Some(e) = self.current_iter.as_ref().and_then(|it| it.iter_error())
         {
-            self.error = Some(e);
+            self.error = Some(e.clone());
         }
         if self.error.is_some() {
             self.current_iter = None;
@@ -233,18 +213,13 @@ impl LevelIterator {
             }
             let mut table_iter =
                 TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
-            if !self.block_property_filters.is_empty() {
-                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
-            }
-            if let Some(ref ub) = self.upper_bound {
-                table_iter.set_bounds(None, Some(ub));
-            }
+            table_iter.set_config(self.config.clone());
             if let Some(t) = target {
                 table_iter.seek(t);
                 if let Some(e) = table_iter.iter_error() {
                     // Repositioning failed with I/O error — stop instead of
                     // silently skipping this file's keys.
-                    self.error = Some(e);
+                    self.error = Some(e.clone());
                     self.file_index = self.files.len();
                     self.current_iter = None;
                     return;
@@ -278,7 +253,7 @@ impl Iterator for LevelIterator {
                 // to the next file would silently truncate this file's
                 // contribution — stop and surface the error instead.
                 if let Some(e) = iter.iter_error() {
-                    self.error = Some(e);
+                    self.error = Some(e.clone());
                     self.current_iter = None;
                     return None;
                 }
@@ -315,7 +290,7 @@ impl super::merge::SeekableIterator for LevelIterator {
                 return Some((entry.0, LazyValue::Inline(entry.1)));
             }
             if let Some(e) = iter.iter_error() {
-                self.error = Some(e);
+                self.error = Some(e.clone());
                 self.current_iter = None;
                 return None;
             }
@@ -339,15 +314,10 @@ impl super::merge::SeekableIterator for LevelIterator {
             }
             let mut table_iter =
                 TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
-            if !self.block_property_filters.is_empty() {
-                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
-            }
-            if let Some(ref ub) = self.upper_bound {
-                table_iter.set_bounds(None, Some(ub));
-            }
+            table_iter.set_config(self.config.clone());
             table_iter.seek_to_last();
             if let Some(e) = table_iter.iter_error() {
-                self.error = Some(e);
+                self.error = Some(e.clone());
                 self.current_iter = None;
                 return None;
             }
@@ -394,18 +364,13 @@ impl super::merge::SeekableIterator for LevelIterator {
             }
             let mut table_iter =
                 TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
-            if !self.block_property_filters.is_empty() {
-                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
-            }
-            if let Some(ref ub) = self.upper_bound {
-                table_iter.set_bounds(None, Some(ub));
-            }
+            table_iter.set_config(self.config.clone());
             table_iter.seek_for_prev(target);
             if let Some(e) = table_iter.iter_error() {
                 // A repositioning I/O error is indistinguishable from "no
                 // entry" via current(); skipping the file would silently
                 // drop its keys from the scan. Stop and surface the error.
-                self.error = Some(e);
+                self.error = Some(e.clone());
                 self.file_index = 0;
                 self.current_iter = None;
                 return;
@@ -450,15 +415,10 @@ impl super::merge::SeekableIterator for LevelIterator {
             }
             let mut table_iter =
                 TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
-            if !self.block_property_filters.is_empty() {
-                table_iter = table_iter.with_block_filters(self.block_property_filters.clone());
-            }
-            if let Some(ref ub) = self.upper_bound {
-                table_iter.set_bounds(None, Some(ub));
-            }
+            table_iter.set_config(self.config.clone());
             table_iter.seek_to_last();
             if let Some(e) = table_iter.iter_error() {
-                self.error = Some(e);
+                self.error = Some(e.clone());
                 self.current_iter = None;
                 return;
             }
@@ -490,7 +450,7 @@ impl super::merge::SeekableIterator for LevelIterator {
                     return true;
                 }
                 if let Some(e) = iter.iter_error() {
-                    self.error = Some(e);
+                    self.error = Some(e.clone());
                     self.current_iter = None;
                     return false;
                 }
@@ -518,17 +478,16 @@ impl super::merge::SeekableIterator for LevelIterator {
         }
     }
 
-    fn set_bounds(&mut self, _lower: Option<&[u8]>, upper: Option<&[u8]>) {
-        self.upper_bound = upper.map(|b| b.to_vec());
-        // Propagate to the currently open table iterator, if any
+    fn set_config(&mut self, config: Arc<IterConfig>) {
+        self.config = config;
         if let Some(ref mut iter) = self.current_iter {
-            iter.set_bounds(None, upper);
+            iter.set_config(self.config.clone());
         }
     }
 
-    fn iter_error(&self) -> Option<String> {
+    fn iter_error(&self) -> Option<&Error> {
         self.error
-            .clone()
+            .as_ref()
             .or_else(|| self.current_iter.as_ref().and_then(|it| it.iter_error()))
     }
 
@@ -546,7 +505,7 @@ impl super::merge::SeekableIterator for LevelIterator {
                     return Some(lv);
                 }
                 if let Some(e) = iter.iter_error() {
-                    self.error = Some(e);
+                    self.error = Some(e.clone());
                     self.current_iter = None;
                     return None;
                 }
@@ -660,7 +619,6 @@ mod tests {
             &path,
             TableBuildOptions {
                 bloom_bits_per_key: 10,
-                internal_keys: true,
                 prefix_len,
                 ..Default::default()
             },
@@ -934,7 +892,7 @@ mod tests {
         iter.set_bounds(None, Some(b"key_000010"));
 
         iter.seek_to_last();
-        assert_eq!(iter.iter_error(), None);
+        assert!(iter.iter_error().is_none());
         assert_eq!(
             iter.current()
                 .map(|(k, _)| user_key_from_internal(&k).to_vec()),
@@ -943,7 +901,7 @@ mod tests {
 
         let target = InternalKey::new(b"key_000019", 100, ValueType::Value);
         iter.seek_for_prev(target.as_bytes());
-        assert_eq!(iter.iter_error(), None);
+        assert!(iter.iter_error().is_none());
         assert_eq!(
             iter.current()
                 .map(|(k, _)| user_key_from_internal(&k).to_vec()),

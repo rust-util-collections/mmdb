@@ -61,11 +61,9 @@ impl VersionEdit {
     ///   1 = log_number(u64 LE)
     ///   2 = next_file_number(u64 LE)
     ///   3 = last_sequence(u64 LE)
-    ///   4 = new_file (legacy): level(u32 LE) + number(u64 LE) + file_size(u64 LE)
-    ///       + smallest_key_len(u32 LE) + smallest_key
-    ///       + largest_key_len(u32 LE) + largest_key
-    ///   5 = deleted_file: level(u32 LE) + number(u64 LE)
-    ///   6 = new_file_v2: same as 4 + has_range_deletions(u8)
+    ///   5 = deleted_file: level(u32 LE), number(u64 LE)
+    ///   6 = new_file: level(u32 LE), number and file_size(u64 LE),
+    ///       two length-prefixed keys (u32 LE), has_range_deletions (0 or 1)
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
 
@@ -82,7 +80,7 @@ impl VersionEdit {
             buf.extend_from_slice(&s.to_le_bytes());
         }
         for (level, meta) in &self.new_files {
-            buf.push(6); // v2 format with has_range_deletions
+            buf.push(6);
             buf.extend_from_slice(&level.to_le_bytes());
             buf.extend_from_slice(&meta.number.to_le_bytes());
             buf.extend_from_slice(&meta.file_size.to_le_bytes());
@@ -102,119 +100,51 @@ impl VersionEdit {
     }
 
     /// Decode from bytes.
-    pub fn decode(data: &[u8]) -> Result<Self> {
-        let mut edit = Self::new();
-        let mut pos = 0;
-
-        while pos < data.len() {
-            let tag = data[pos];
-            pos += 1;
-
-            match tag {
-                1 => {
-                    if pos + 8 > data.len() {
-                        return Err(Error::corruption("truncated log_number"));
-                    }
-                    edit.log_number =
-                        Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
-                    pos += 8;
-                }
-                2 => {
-                    if pos + 8 > data.len() {
-                        return Err(Error::corruption("truncated next_file_number"));
-                    }
-                    edit.next_file_number =
-                        Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
-                    pos += 8;
-                }
-                3 => {
-                    if pos + 8 > data.len() {
-                        return Err(Error::corruption("truncated last_sequence"));
-                    }
-                    edit.last_sequence =
-                        Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
-                    pos += 8;
-                }
-                4 | 6 => {
-                    // new_file (tag 4 = legacy, tag 6 = v2 with has_range_deletions)
-                    if pos + 4 + 8 + 8 > data.len() {
-                        return Err(Error::corruption("truncated new_file header"));
-                    }
-                    let level = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-                    pos += 4;
-                    let number = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                    pos += 8;
-                    let file_size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                    pos += 8;
-
-                    if pos + 4 > data.len() {
-                        return Err(Error::corruption("truncated smallest_key_len"));
-                    }
-                    let sk_len =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                    pos += 4;
-                    if pos + sk_len > data.len() {
-                        return Err(Error::corruption("truncated smallest_key"));
-                    }
-                    let smallest_key = data[pos..pos + sk_len].to_vec();
-                    pos += sk_len;
-
-                    if pos + 4 > data.len() {
-                        return Err(Error::corruption("truncated largest_key_len"));
-                    }
-                    let lk_len =
-                        u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                    pos += 4;
-                    if pos + lk_len > data.len() {
-                        return Err(Error::corruption("truncated largest_key"));
-                    }
-                    let largest_key = data[pos..pos + lk_len].to_vec();
-                    pos += lk_len;
-
-                    let has_range_deletions = if tag == 6 {
-                        if pos >= data.len() {
-                            return Err(Error::corruption("truncated has_range_deletions"));
-                        }
-                        let v = data[pos] != 0;
-                        pos += 1;
-                        v
-                    } else {
-                        // Tag 4 predates the flag. Those writers stored range
-                        // tombstones inline in data blocks, so the record does
-                        // not say whether this file has any. Mark it as a
-                        // candidate; recovery resolves the real flag by reading
-                        // the file (see `VersionSet::recover_with_cache_mode`).
-                        true
-                    };
-
-                    edit.new_files.push((
-                        level,
-                        FileMetaData {
-                            number,
-                            file_size,
-                            smallest_key,
-                            largest_key,
-                            has_range_deletions,
-                        },
-                    ));
-                }
-                5 => {
-                    // deleted_file
-                    if pos + 4 + 8 > data.len() {
-                        return Err(Error::corruption("truncated deleted_file"));
-                    }
-                    let level = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-                    pos += 4;
-                    let number = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
-                    pos += 8;
-                    edit.deleted_files.push((level, number));
-                }
-                _ => {
-                    return Err(Error::corruption(format!("unknown tag: {}", tag)));
-                }
-            }
+    pub fn decode(mut data: &[u8]) -> Result<Self> {
+        fn take<'a>(data: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+            data.split_off(..n)
+                .ok_or_else(|| Error::corruption("truncated MANIFEST edit"))
+        }
+        fn u32_le(data: &mut &[u8]) -> Result<u32> {
+            Ok(u32::from_le_bytes(take(data, 4)?.try_into().unwrap()))
+        }
+        fn u64_le(data: &mut &[u8]) -> Result<u64> {
+            Ok(u64::from_le_bytes(take(data, 8)?.try_into().unwrap()))
+        }
+        fn key(data: &mut &[u8]) -> Result<Vec<u8>> {
+            let len = u32_le(data)? as usize;
+            Ok(take(data, len)?.to_vec())
         }
 
+        let mut edit = Self::new();
+        while let Some(&tag) = data.split_off_first() {
+            match tag {
+                1 => edit.log_number = Some(u64_le(&mut data)?),
+                2 => edit.next_file_number = Some(u64_le(&mut data)?),
+                3 => edit.last_sequence = Some(u64_le(&mut data)?),
+                5 => edit.delete_file(u32_le(&mut data)?, u64_le(&mut data)?),
+                6 => {
+                    let level = u32_le(&mut data)?;
+                    let meta = FileMetaData {
+                        number: u64_le(&mut data)?,
+                        file_size: u64_le(&mut data)?,
+                        smallest_key: key(&mut data)?,
+                        largest_key: key(&mut data)?,
+                        has_range_deletions: match take(&mut data, 1)?[0] {
+                            0 => false,
+                            1 => true,
+                            _ => {
+                                return Err(Error::corruption(
+                                    "invalid MANIFEST range-deletion flag",
+                                ));
+                            }
+                        },
+                    };
+                    edit.add_file(level, meta);
+                }
+                _ => return Err(Error::corruption(format!("unknown MANIFEST tag {tag}"))),
+            }
+        }
         Ok(edit)
     }
 }
@@ -305,29 +235,10 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_legacy_new_file_marks_range_deletion_candidate() {
-        let mut data = Vec::new();
-        data.push(4u8); // legacy new_file without has_range_deletions
-        data.extend_from_slice(&0u32.to_le_bytes());
-        data.extend_from_slice(&7u64.to_le_bytes());
-        data.extend_from_slice(&4096u64.to_le_bytes());
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(b"aaa");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(b"zzz");
-
-        let edit = VersionEdit::decode(&data).unwrap();
-        assert_eq!(edit.new_files.len(), 1);
-        let (level, meta) = &edit.new_files[0];
-        assert_eq!(*level, 0);
-        assert_eq!(meta.number, 7);
-        assert_eq!(meta.file_size, 4096);
-        assert_eq!(meta.smallest_key, b"aaa");
-        assert_eq!(meta.largest_key, b"zzz");
-        assert!(
-            meta.has_range_deletions,
-            "a tag-4 record must be treated as a range-deletion candidate"
-        );
+    fn rejects_unknown_edit_tags() {
+        for tag in [0, 4, 7, 255] {
+            assert!(VersionEdit::decode(&[tag]).is_err());
+        }
     }
 
     #[test]

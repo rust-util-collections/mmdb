@@ -37,12 +37,10 @@ fn make_value(size: usize) -> Vec<u8> {
 /// Open DB with warm cache (256MB) — data stays in memory.
 fn open_warm(path: &Path) -> mmdb::DB {
     mmdb::DB::open(
-        mmdb::DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 64 * 1024 * 1024,
-            block_cache_capacity: 256 * 1024 * 1024,
-            ..Default::default()
-        },
+        mmdb::DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(64 * 1024 * 1024)
+            .with_block_cache_capacity(256 * 1024 * 1024),
         path,
     )
     .unwrap()
@@ -51,13 +49,13 @@ fn open_warm(path: &Path) -> mmdb::DB {
 /// Open DB with a small block cache (256KB).
 fn open_small_cache(path: &Path) -> mmdb::DB {
     mmdb::DB::open(
-        mmdb::DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 4 * 1024 * 1024, // 4MB — frequent flushes
-            block_cache_capacity: 256 * 1024,   // 256KB — almost nothing cached
-            l0_compaction_trigger: 4,
-            ..Default::default()
-        },
+        mmdb::DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(4 * 1024 * 1024)
+            // 4MB — frequent flushes
+            .with_block_cache_capacity(256 * 1024)
+            // 256KB — almost nothing cached
+            .with_l0_compaction_trigger(4),
         path,
     )
     .unwrap()
@@ -365,13 +363,11 @@ fn bench_prefix_scan(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let opts = mmdb::DbOptions {
-                    create_if_missing: true,
-                    write_buffer_size: 64 * 1024 * 1024,
-                    block_cache_capacity: 256 * 1024 * 1024,
-                    prefix_len: 8,
-                    ..Default::default()
-                };
+                let opts = mmdb::DbOptions::default()
+                    .with_create_if_missing(true)
+                    .with_write_buffer_size(64 * 1024 * 1024)
+                    .with_block_cache_capacity(256 * 1024 * 1024)
+                    .with_prefix_len(8);
                 let db = open_with(dir.path(), opts);
                 for i in 0..10_000u64 {
                     let pfx = i % num_prefixes;
@@ -400,14 +396,12 @@ fn bench_prefix_scan(c: &mut Criterion) {
         b.iter_with_setup(
             || {
                 let dir = tempfile::tempdir().unwrap();
-                let opts = mmdb::DbOptions {
-                    create_if_missing: true,
-                    write_buffer_size: 4 * 1024 * 1024,
-                    block_cache_capacity: 256 * 1024,
-                    prefix_len: 8,
-                    l0_compaction_trigger: 4,
-                    ..Default::default()
-                };
+                let opts = mmdb::DbOptions::default()
+                    .with_create_if_missing(true)
+                    .with_write_buffer_size(4 * 1024 * 1024)
+                    .with_block_cache_capacity(256 * 1024)
+                    .with_prefix_len(8)
+                    .with_l0_compaction_trigger(4);
                 let db = open_with(dir.path(), opts);
                 for i in 0..3_000u64 {
                     let pfx = i % num_prefixes;
@@ -577,12 +571,10 @@ fn bench_compression(c: &mut Criterion) {
                         let dir = tempfile::tempdir().unwrap();
                         let db = open_with(
                             dir.path(),
-                            mmdb::DbOptions {
-                                create_if_missing: true,
-                                write_buffer_size: 64 * 1024 * 1024,
-                                compression,
-                                ..Default::default()
-                            },
+                            mmdb::DbOptions::default()
+                                .with_create_if_missing(true)
+                                .with_write_buffer_size(64 * 1024 * 1024)
+                                .with_compression(compression),
                         );
                         (dir, db)
                     },

@@ -59,28 +59,6 @@ impl RangeTombstoneTracker {
         self.sorted = false;
     }
 
-    /// Add a tombstone met while scanning in key order. When its begin key is
-    /// not below any earlier one the list stays sorted and the sweep keeps
-    /// its position: keys only grow, so pruned tombstones stay pruned and the
-    /// new one activates once the scan reaches its begin. Only an
-    /// out-of-order begin re-sorts and restarts the sweep, as `add` + `reset`.
-    pub fn push_in_order(&mut self, begin: Vec<u8>, end: Vec<u8>, seq: SequenceNumber) {
-        if seq > self.snapshot {
-            return;
-        }
-        let in_order = self
-            .tombstones
-            .last()
-            .is_none_or(|last| last.begin.as_slice() <= begin.as_slice());
-        self.tombstones.push(RangeTombstone { begin, end, seq });
-        if !in_order {
-            self.sorted = false;
-            self.reset();
-        } else if self.tombstones.len() == 1 {
-            self.sorted = true;
-        }
-    }
-
     /// Reset the sweep state (e.g., after seek or after adding new tombstones).
     pub fn reset(&mut self) {
         if !self.sorted {
@@ -283,11 +261,6 @@ fn tree_query(
 /// Constructed once at iterator creation time from all sources' cached
 /// tombstones; never mutated afterwards.
 pub(crate) struct FragmentedRangeTombstoneList {
-    /// Original `(begin, end, seq, level)` tuples exactly as supplied to the
-    /// constructor. Source of truth for `tombstones()`; also lets `is_empty`
-    /// answer without touching the query index.
-    raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>,
-    /// Query index (empty when `raw` is empty).
     bounds: Bounds,
     tree: Tree,
 }
@@ -296,7 +269,6 @@ impl FragmentedRangeTombstoneList {
     /// Create an empty list (no tombstones).
     pub fn empty() -> Self {
         Self {
-            raw: Vec::new(),
             bounds: Vec::new(),
             tree: Vec::new(),
         }
@@ -350,7 +322,7 @@ impl FragmentedRangeTombstoneList {
             }
         }
 
-        Self { raw, bounds, tree }
+        Self { bounds, tree }
     }
 
     /// Find the highest-seq tombstone covering `user_key` visible at `snapshot`.
@@ -404,25 +376,7 @@ impl FragmentedRangeTombstoneList {
 
     /// Whether the list contains any tombstones.
     pub fn is_empty(&self) -> bool {
-        self.raw.is_empty()
-    }
-
-    /// Export tombstones as `(begin, end, seq)` triples — exactly the raw
-    /// input, one triple per original tombstone (never re-expanded through
-    /// the fragmented query index, which could otherwise multiply out an
-    /// aggregate re-fragmentation downstream).
-    pub fn tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
-        self.iter_tombstones()
-            .map(|(b, e, s)| (b.to_vec(), e.to_vec(), s))
-            .collect()
-    }
-
-    /// Borrow raw endpoints for filtering and overlap checks. The immutable
-    /// index owns them; only retained output needs endpoint copies.
-    pub fn iter_tombstones(&self) -> impl Iterator<Item = (&[u8], &[u8], SequenceNumber)> {
-        self.raw
-            .iter()
-            .map(|(b, e, s, _)| (b.as_slice(), e.as_slice(), *s))
+        self.bounds.is_empty()
     }
 }
 

@@ -62,6 +62,7 @@ jobs:
       - run: cargo test --test lazy_delete
       - run: cargo test --test shared_cache
       - run: cargo test --test read_only
+      - run: cargo test --manifest-path tools/v4-export/Cargo.toml
       # scale_profile is profiling-only and intentionally excluded.
 
   bench-compile:

@@ -55,6 +55,10 @@ impl<'a> PendingSsts<'a> {
         Ok(number)
     }
 
+    pub fn track(&self, numbers: impl Iterator<Item = u64>) {
+        self.allocated.lock().extend(numbers);
+    }
+
     pub fn keep(mut self) {
         self.allocated.get_mut().clear();
     }

@@ -1,986 +1,362 @@
-//! A write-serialized, read-concurrent skip list with arena allocation.
-//!
-//! The DB's group commit model guarantees a single leader writes to the memtable
-//! at any time: the leader releases `write_queue` before applying its group and
-//! inserts while holding `DB::inner`, which `leader_active` makes exclusive to
-//! it. Recovery inserts only into a local memtable that is not yet published.
-//! Reads happen concurrently via shared references. This means:
-//! - **Single-writer**: `&self` insert, serialized externally by `DB::inner`
-//! - **Concurrent readers**: `&self` iter/get/range, lock-free via atomic pointers
-//!
-//! Nodes are arena-allocated in contiguous blocks for cache-friendly level-0
-//! traversal. Each node carries an inline `[AtomicPtr; MAX_HEIGHT]` array,
-//! eliminating a separate heap allocation for next-pointers.
-//!
-//! Max height 12, probability p = 0.25.
+//! Append-only, variable-height skip list with inline key/value bytes.
+//! Readers follow acquire-loaded links. One insertion guard protects both
+//! the bump allocator and predecessor updates; readers never take the guard.
 
 use std::{
-    cell::UnsafeCell,
-    marker::PhantomData,
-    ptr,
+    alloc::{Layout, alloc, dealloc, handle_alloc_error},
+    cmp::Ordering as Cmp,
+    ptr::{self, NonNull},
+    slice,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
-#[cfg(test)]
-use std::{cmp::Ordering as CmpOrdering, ops::RangeBounds};
 
-/// Maximum height of the skip list.
+use crate::types::compare_internal_key;
+use parking_lot::Mutex;
+
 const MAX_HEIGHT: usize = 12;
-
-/// Initial arena block size.
 const ARENA_INITIAL_BLOCK: usize = 4096;
+const ARENA_MAX_BLOCK: usize = 1 << 20;
 
-/// Maximum arena block size (blocks double up to this cap).
-const ARENA_MAX_BLOCK: usize = 1 << 20; // 1MB
+#[cfg(test)]
+thread_local! {
+    // Schedule a concurrent splice just after the final comparison in search.
+    static AFTER_SEARCH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
-// ---------------------------------------------------------------------------
-// Arena
-// ---------------------------------------------------------------------------
+struct Slab {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
 
-/// Bump-pointer arena that allocates from doubling blocks (4KB → 1MB cap).
-///
-/// Only mutated during `insert()` (single-writer); readers follow published
-/// pointers. No per-allocation free — memory is released when the Arena drops.
+impl Slab {
+    fn new(layout: Layout) -> Self {
+        // SAFETY: every caller supplies a nonempty Layout.
+        let ptr =
+            NonNull::new(unsafe { alloc(layout) }).unwrap_or_else(|| handle_alloc_error(layout));
+        Self { ptr, layout }
+    }
+}
+
+impl Drop for Slab {
+    fn drop(&mut self) {
+        // SAFETY: this slab uniquely owns the allocation and its exact Layout.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+// SAFETY: ownership of a slab can move between threads. Its allocation
+// remains at a fixed address until the owning list is exclusively dropped.
+unsafe impl Send for Slab {}
+
+#[derive(Default)]
 struct Arena {
-    blocks: UnsafeCell<Vec<Vec<u8>>>,
-    current_offset: UnsafeCell<usize>,
+    slabs: Vec<Slab>,
+    active: Option<usize>,
+    offset: usize,
+    random: u64,
 }
 
 impl Arena {
-    fn new() -> Self {
-        Self {
-            blocks: UnsafeCell::new(Vec::new()),
-            current_offset: UnsafeCell::new(0),
-        }
+    fn random_height(&mut self) -> usize {
+        // SplitMix64 produces independent low bits. Count pairs of zeroes
+        // for a geometric tower with p=1/4.
+        self.random = self.random.wrapping_add(0x9e3779b97f4a7c15);
+        let mut bits = self.random;
+        bits = (bits ^ (bits >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        bits = (bits ^ (bits >> 27)).wrapping_mul(0x94d049bb133111eb);
+        (1 + ((bits ^ (bits >> 31)).trailing_zeros() as usize / 2)).min(MAX_HEIGHT)
     }
 
-    /// Allocate `size` bytes with given alignment from the arena.
-    ///
-    /// # Safety
-    /// Must be called under external write serialization (single-writer).
-    unsafe fn alloc(&self, size: usize, align: usize) -> *mut u8 {
-        // SAFETY: the caller provides single-writer access, so mutating the
-        // UnsafeCell-backed arena metadata cannot race with another mutation.
-        unsafe {
-            let blocks = &mut *self.blocks.get();
-            let offset = &mut *self.current_offset.get();
-
-            // Try current block.
-            if let Some(block) = blocks.last_mut() {
-                let base = block.as_mut_ptr();
-                let tail = base.add(*offset);
-                let start = *offset + tail.align_offset(align);
-                let new_offset = start + size;
-                if new_offset <= block.capacity() {
-                    *offset = new_offset;
-                    return base.add(start);
-                }
-            }
-
-            // New block with doubling growth.
-            let prev_cap = blocks.last().map_or(0, Vec::capacity);
-            let block_size = if prev_cap == 0 {
-                ARENA_INITIAL_BLOCK
-            } else {
-                (prev_cap * 2).min(ARENA_MAX_BLOCK)
-            }
-            .max(size + align);
-
-            let mut block = Vec::<u8>::with_capacity(block_size);
-            let base = block.as_mut_ptr();
-            let start = base.align_offset(align);
-            let aligned = base.add(start);
-            *offset = start + size;
-            blocks.push(block);
-            aligned
+    /// Returns a new node's address and the additional slab capacity reserved.
+    fn allocate(&mut self, node: Layout) -> (*mut NodeHeader, usize) {
+        if node.size() > ARENA_MAX_BLOCK / 4 {
+            let slab = Slab::new(node);
+            let ptr = slab.ptr.as_ptr();
+            self.slabs.push(slab);
+            return (ptr.cast(), node.size());
         }
-    }
-
-    /// Allocate space for one `Node<K, V>`.
-    ///
-    /// # Safety
-    /// Same single-writer requirement as `alloc`.
-    unsafe fn alloc_node<K, V>(&self) -> *mut Node<K, V> {
-        // SAFETY: forwarded to `alloc` under the same single-writer precondition.
-        unsafe {
-            self.alloc(
-                std::mem::size_of::<Node<K, V>>(),
-                std::mem::align_of::<Node<K, V>>(),
-            ) as *mut Node<K, V>
+        let old_capacity = self.active.map_or(0, |idx| self.slabs[idx].layout.size());
+        let mut reserved = 0;
+        if old_capacity - self.offset < node.size() {
+            reserved = (old_capacity * 2)
+                .clamp(ARENA_INITIAL_BLOCK, ARENA_MAX_BLOCK)
+                .max(node.size());
+            let slab = Slab::new(Layout::from_size_align(reserved, node.align()).unwrap());
+            self.active = Some(self.slabs.len());
+            self.slabs.push(slab);
+            self.offset = 0;
         }
+        let base = self.slabs[self.active.unwrap()].ptr;
+        // SAFETY: every node layout is padded to the same alignment and the
+        // bounds check above reserves its complete extent in this slab.
+        let ptr = unsafe { base.as_ptr().add(self.offset) };
+        self.offset += node.size();
+        (ptr.cast(), reserved)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Node
-// ---------------------------------------------------------------------------
-
-/// A node in the skip list.
-///
-/// `#[repr(C)]` ensures key+value are laid out first (cache-hot during
-/// level-0 traversal), followed by the fixed-size pointer tower.
-#[repr(C)]
-struct Node<K, V> {
-    key: K,
-    value: V,
+#[repr(C, align(8))]
+struct NodeHeader {
+    key_len: u32,
+    val_len: u32,
     height: u8,
-    /// next[i] is the pointer to the next node at level i.
-    /// Levels `height..MAX_HEIGHT` are unused (always null).
-    next: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
+    _pad: [u8; 7],
 }
 
-// ---------------------------------------------------------------------------
-// ConcurrentSkipList
-// ---------------------------------------------------------------------------
+type Link = AtomicPtr<NodeHeader>;
 
-/// A concurrent skip list with single-writer / multi-reader semantics.
-///
-/// Insert is `&self` (externally serialized by the caller).
-/// Get / iter / range are `&self` (lock-free).
-pub struct ConcurrentSkipList<K: Ord + Clone, V: Clone> {
-    /// Head pointers for each level.
-    head: [AtomicPtr<Node<K, V>>; MAX_HEIGHT],
-    /// Pointer to the last node at level 0. Enables O(1) `tail_ptr()`.
-    tail: AtomicPtr<Node<K, V>>,
-    /// Number of entries.
-    len: AtomicUsize,
-    /// Current maximum height in the list.
-    max_height: AtomicUsize,
-    /// All allocated node pointers — needed to run destructors (K, V may own
-    /// heap data). Only mutated under writer serialization.
-    all_nodes: UnsafeCell<Vec<*mut Node<K, V>>>,
-    /// Arena backing store for all nodes.
-    arena: Arena,
+fn node_layout(height: usize, key_len: usize, value_len: usize) -> Layout {
+    let (layout, _) = Layout::new::<NodeHeader>()
+        .extend(Layout::array::<Link>(height).unwrap())
+        .unwrap();
+    let (layout, _) = layout
+        .extend(Layout::array::<u8>(key_len).unwrap())
+        .unwrap();
+    let (layout, _) = layout
+        .extend(Layout::array::<u8>(value_len).unwrap())
+        .unwrap();
+    layout.pad_to_align()
 }
 
-// SAFETY: Node pointers are stable (arena-allocated, never moved).
-// Single-writer guarantee ensures no concurrent mutations. Readers only follow
-// AtomicPtr chains that are fully initialized before publication (Release/Acquire).
-unsafe impl<K: Ord + Clone + Send, V: Clone + Send> Send for ConcurrentSkipList<K, V> {}
-unsafe impl<K: Ord + Clone + Send + Sync, V: Clone + Send + Sync> Sync
-    for ConcurrentSkipList<K, V>
-{
+// The trailing Link array starts immediately after NodeHeader. Both fields
+// are naturally aligned on supported targets.
+const _: () = assert!(align_of::<Link>() <= align_of::<NodeHeader>());
+
+unsafe fn tower(node: *mut NodeHeader) -> *mut Link {
+    // SAFETY: caller supplies a live raw allocation with a trailing tower.
+    unsafe { node.add(1).cast() }
 }
 
-impl<K: Ord + Clone, V: Clone> ConcurrentSkipList<K, V> {
+pub struct ConcurrentSkipList {
+    head: [Link; MAX_HEIGHT],
+    tail: Link,
+    height: AtomicUsize,
+    arena: Mutex<Arena>,
+}
+
+impl ConcurrentSkipList {
     pub fn new() -> Self {
         Self {
-            head: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-            tail: AtomicPtr::new(ptr::null_mut()),
-            len: AtomicUsize::new(0),
-            max_height: AtomicUsize::new(1),
-            all_nodes: UnsafeCell::new(Vec::new()),
-            arena: Arena::new(),
+            head: std::array::from_fn(|_| Link::new(ptr::null_mut())),
+            tail: Link::new(ptr::null_mut()),
+            height: AtomicUsize::new(1),
+            arena: Mutex::new(Arena::default()),
         }
     }
 
-    /// Insert a key-value pair. Must be called under external serialization.
-    pub fn insert(&self, key: K, value: V) {
-        let height = random_height();
-        let cur_max = self.max_height.load(Ordering::Relaxed);
-        if height > cur_max {
-            self.max_height.store(height, Ordering::Relaxed);
-        }
-
-        // Build predecessor array: prev[i] = pointer to the node that should
-        // precede the new node at level i (null means head).
-        let mut prev: [*mut Node<K, V>; MAX_HEIGHT] = [ptr::null_mut(); MAX_HEIGHT];
-
-        let max_h = height.max(cur_max);
-        for level in (0..max_h).rev() {
-            // Start walking from the predecessor at the level above (or head).
-            let mut current: *mut Node<K, V> = if level + 1 < max_h && !prev[level + 1].is_null() {
-                prev[level + 1]
-            } else {
-                ptr::null_mut()
-            };
-
-            if current.is_null() {
-                // Walk from head at this level.
-                let mut next = self.head[level].load(Ordering::Acquire);
-                while !next.is_null() {
-                    // SAFETY: next is a valid node published via Release.
-                    let node = unsafe { &*next };
-                    if node.key >= key {
-                        break;
-                    }
-                    current = next;
-                    next = node.next[level].load(Ordering::Acquire);
-                }
-                prev[level] = current;
-            } else {
-                // Continue from predecessor of upper level.
-                // SAFETY: current is a valid node (was set above or from upper level).
-                let mut next = unsafe { &*current }.next[level].load(Ordering::Acquire);
-                while !next.is_null() {
-                    // SAFETY: next is a valid node published via Release.
-                    let node = unsafe { &*next };
-                    if node.key >= key {
-                        break;
-                    }
-                    current = next;
-                    next = node.next[level].load(Ordering::Acquire);
-                }
-                prev[level] = current;
-            }
-        }
-
-        // Arena-allocate and initialize the new node.
-        // SAFETY: insert is externally serialized, satisfying the arena allocator contract.
-        let new_node: *mut Node<K, V> = unsafe { self.arena.alloc_node() };
-        // SAFETY: new_node points to uninitialized arena storage sized/aligned for Node.
-        unsafe {
-            ptr::write(
-                new_node,
-                Node {
-                    key,
-                    value,
-                    height: height as u8,
-                    next: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
-                },
-            );
-        }
-
-        // Track for destructor.
-        // SAFETY: single-writer — no concurrent mutation of all_nodes.
-        unsafe {
-            (*self.all_nodes.get()).push(new_node);
-        }
-
-        // Link the new node into each level.
-        // SAFETY: new_node was initialized above and remains arena-owned until drop.
-        let new_ref = unsafe { &*new_node };
-        for (level, &prev_node) in prev[..height].iter().enumerate() {
-            if prev_node.is_null() {
-                // New node becomes the first at this level.
-                let old_head = self.head[level].load(Ordering::Relaxed);
-                new_ref.next[level].store(old_head, Ordering::Relaxed);
-                self.head[level].store(new_node, Ordering::Release);
-            } else {
-                // SAFETY: prev_node is a valid node.
-                let p = unsafe { &*prev_node };
-                let old_next = p.next[level].load(Ordering::Relaxed);
-                new_ref.next[level].store(old_next, Ordering::Relaxed);
-                p.next[level].store(new_node, Ordering::Release);
-            }
-        }
-
-        // Update tail pointer: if new node has no level-0 successor, it is the
-        // new tail.
-        if new_ref.next[0].load(Ordering::Relaxed).is_null() {
-            self.tail.store(new_node, Ordering::Release);
-        }
-
-        self.len.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Look up a key. Lock-free.
-    #[cfg(test)]
-    pub fn get<Q>(&self, key: &Q) -> Option<V>
-    where
-        K: std::borrow::Borrow<Q>,
-        Q: Ord + ?Sized,
-    {
-        let max_h = self.max_height.load(Ordering::Acquire);
-        let mut current: *const Node<K, V> = ptr::null();
-
-        for level in (0..max_h).rev() {
-            let mut next = if current.is_null() {
-                self.head[level].load(Ordering::Acquire)
-            } else {
-                // SAFETY: current is a valid published predecessor.
-                unsafe { &*current }.next[level].load(Ordering::Acquire)
-            };
-
-            while !next.is_null() {
-                // SAFETY: next is a valid node published via Release.
-                let n = unsafe { &*next };
-                match n.key.borrow().cmp(key) {
-                    CmpOrdering::Less => {
-                        current = next;
-                        next = n.next[level].load(Ordering::Acquire);
-                    }
-                    CmpOrdering::Equal => return Some(n.value.clone()),
-                    CmpOrdering::Greater => break,
-                }
-            }
-        }
-        None
-    }
-
-    /// Find the first entry with key >= `target` using O(log N) skiplist
-    /// traversal and apply `f` to it by reference, so a caller that rejects
-    /// the entry copies nothing. Returns None if no such entry exists.
-    pub fn lower_bound_with<R>(&self, target: &K, f: impl FnOnce(&K, &V) -> R) -> Option<R> {
-        let max_h = self.max_height.load(Ordering::Acquire);
-        let mut current: *const Node<K, V> = ptr::null();
-
-        for level in (0..max_h).rev() {
-            let mut next = if current.is_null() {
-                self.head[level].load(Ordering::Acquire)
-            } else {
-                // SAFETY: current is a valid published predecessor.
-                unsafe { &*current }.next[level].load(Ordering::Acquire)
-            };
-
-            while !next.is_null() {
-                // SAFETY: next is a valid node published via Release.
-                let n = unsafe { &*next };
-                if n.key < *target {
-                    current = next;
-                    next = n.next[level].load(Ordering::Acquire);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // After the level traversal, walk level 0 from `current` to find
-        // the exact first node >= target. The level-0 linked list is complete
-        // (every node is reachable via level-0 links), so no fallback is needed.
-        let start = if current.is_null() {
-            self.head[0].load(Ordering::Acquire)
+    fn link(&self, node: *mut NodeHeader, level: usize) -> &Link {
+        if node.is_null() {
+            &self.head[level]
         } else {
-            // SAFETY: current is a valid published predecessor.
-            unsafe { &*current }.next[0].load(Ordering::Acquire)
+            // SAFETY: internal traversal reaches node only at this or a higher
+            // level. Its initialized tower has at least level + 1 slots.
+            unsafe { &*tower(node).add(level) }
+        }
+    }
+
+    /// `ptr` must be a non-null published node of this list.
+    pub unsafe fn node_kv(&self, ptr: *const ()) -> (&[u8], &[u8]) {
+        let node = ptr.cast_mut().cast::<NodeHeader>();
+        // SAFETY: the release splice published the header, the entire tower
+        // and the immutable payload. The list owns storage for both slices.
+        unsafe {
+            let header = &*node;
+            let key = tower(node).add(header.height as usize).cast::<u8>();
+            let value = key.add(header.key_len as usize);
+            (
+                slice::from_raw_parts(key, header.key_len as usize),
+                slice::from_raw_parts(value, header.val_len as usize),
+            )
+        }
+    }
+
+    // Walk forward while the predicate holds, descending one level at a time.
+    // The predecessor callback is inlined out of lookups.
+    fn search(
+        &self,
+        mut before: impl FnMut(&[u8]) -> bool,
+        mut predecessor: impl FnMut(usize, *mut NodeHeader),
+    ) -> (*mut NodeHeader, *mut NodeHeader) {
+        let mut current = ptr::null_mut();
+        let mut successor = ptr::null_mut();
+        for level in (0..self.height.load(Ordering::Acquire)).rev() {
+            successor = loop {
+                let next = self.link(current, level).load(Ordering::Acquire);
+                // SAFETY: a non-null acquire-loaded link points to a live node.
+                if next.is_null() || !before(unsafe { self.node_kv(next.cast()) }.0) {
+                    break next;
+                }
+                current = next;
+            };
+            predecessor(level, current);
+        }
+        #[cfg(test)]
+        if let Some(hook) = AFTER_SEARCH.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
+        // Re-reading current.next[0] could pick up a newly inserted node
+        // preceding the target, including a value newer than the read sequence.
+        (current, successor)
+    }
+
+    pub fn insert(&self, key: &[u8], trailer: &[u8; 8], value: &[u8]) -> usize {
+        let mut arena = self.arena.lock();
+        let height = arena.random_height();
+        let key_len = key.len().checked_add(8).unwrap();
+        let header = NodeHeader {
+            key_len: u32::try_from(key_len).unwrap(),
+            val_len: u32::try_from(value.len()).unwrap(),
+            height: height as u8,
+            _pad: [0; 7],
         };
-
-        let mut ptr = start;
-        while !ptr.is_null() {
-            // SAFETY: ptr is reached through acquired level-0 links.
-            let n = unsafe { &*ptr };
-            if n.key >= *target {
-                return Some(f(&n.key, &n.value));
-            }
-            ptr = n.next[0].load(Ordering::Acquire);
-        }
-
-        None
-    }
-
-    /// Borrowing iterator over all entries in key order, following the
-    /// level-0 links without copying. Entries inserted while it runs may or
-    /// may not be yielded; flush iterates frozen or unpublished tables, which
-    /// do not change.
-    pub fn iter_ref(&self) -> RefIter<'_, K, V> {
-        RefIter {
-            next: self.head[0].load(Ordering::Acquire),
-            _list: PhantomData,
-        }
-    }
-
-    /// Return a snapshot iterator over all entries, sorted by key.
-    /// Entries are collected at creation time (safe for concurrent modification).
-    #[cfg(test)]
-    pub fn iter(&self) -> SkipListIter<K, V> {
-        let entries = self.collect_all();
-        let len = entries.len();
-        SkipListIter {
-            entries,
-            front: 0,
-            back_exclusive: len,
-        }
-    }
-
-    /// Return a snapshot iterator over the given range, sorted by key.
-    #[cfg(test)]
-    pub fn range<R: RangeBounds<K>>(&self, bounds: R) -> SkipListIter<K, V> {
-        let all = self.collect_all();
-        let entries: Vec<(K, V)> = all
-            .into_iter()
-            .filter(|(k, _)| bounds.contains(k))
-            .collect();
-        let len = entries.len();
-        SkipListIter {
-            entries,
-            front: 0,
-            back_exclusive: len,
-        }
-    }
-
-    /// Access key and value of a node by opaque pointer. Zero-copy.
-    ///
-    /// # Safety
-    /// `ptr` must be a valid non-null node pointer from this skiplist.
-    pub unsafe fn node_kv(&self, ptr: *const ()) -> (&K, &V) {
-        // SAFETY: caller guarantees ptr is a valid node pointer from this skiplist.
-        unsafe {
-            let node = &*(ptr as *const Node<K, V>);
-            (&node.key, &node.value)
-        }
-    }
-
-    /// Get the next level-0 pointer from a node. Returns null if end.
-    ///
-    /// # Safety
-    /// `ptr` must be a valid non-null node pointer from this skiplist.
-    pub unsafe fn node_next0(&self, ptr: *const ()) -> *const () {
-        // SAFETY: caller guarantees ptr is a valid node pointer from this skiplist.
-        unsafe {
-            let node = &*(ptr as *const Node<K, V>);
-            node.next[0].load(Ordering::Acquire) as *const ()
-        }
-    }
-
-    /// Return a raw pointer to the first level-0 node (for cursor iteration).
-    pub fn head_ptr(&self) -> *const () {
-        self.head[0].load(Ordering::Acquire) as *const ()
-    }
-
-    /// Seek to first entry >= target, returning raw node pointer. O(log N).
-    pub fn seek_ge_raw(&self, target: &K) -> *const () {
-        let max_h = self.max_height.load(Ordering::Acquire);
-        let mut current: *const Node<K, V> = ptr::null();
-
-        for level in (0..max_h).rev() {
-            let mut next = if current.is_null() {
-                self.head[level].load(Ordering::Acquire)
-            } else {
-                // SAFETY: current is a valid published predecessor.
-                unsafe { &*current }.next[level].load(Ordering::Acquire)
-            };
-
-            while !next.is_null() {
-                // SAFETY: next is a valid node published via Release.
-                let n = unsafe { &*next };
-                if n.key < *target {
-                    current = next;
-                    next = n.next[level].load(Ordering::Acquire);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        let start = if current.is_null() {
-            self.head[0].load(Ordering::Acquire)
-        } else {
-            // SAFETY: current is a valid published predecessor.
-            unsafe { &*current }.next[0].load(Ordering::Acquire)
-        };
-
-        // Walk level-0 to find exact first >= target
-        let mut ptr = start;
-        while !ptr.is_null() {
-            // SAFETY: ptr is reached through acquired level-0 links.
-            let n = unsafe { &*ptr };
-            if n.key >= *target {
-                return ptr as *const ();
-            }
-            ptr = n.next[0].load(Ordering::Acquire);
-        }
-        ptr::null()
-    }
-
-    /// Seek to last entry < target, returning raw node pointer. O(log N).
-    ///
-    /// Returns null if no entry < target exists (i.e. target <= first key).
-    pub fn seek_lt_raw(&self, target: &K) -> *const () {
-        let max_h = self.max_height.load(Ordering::Acquire);
-        if max_h == 0 {
-            return ptr::null();
-        }
-
-        // `current` tracks the last node at each level with key < target.
-        // After descending all levels, `current` is the answer.
-        let mut current: *const Node<K, V> = ptr::null();
-
-        for level in (0..max_h).rev() {
-            let mut next = if current.is_null() {
-                self.head[level].load(Ordering::Acquire)
-            } else {
-                // SAFETY: current is a valid published predecessor.
-                unsafe { &*current }.next[level].load(Ordering::Acquire)
-            };
-
-            while !next.is_null() {
-                // SAFETY: next is a valid node published via Release.
-                let n = unsafe { &*next };
-                if n.key < *target {
-                    current = next;
-                    next = n.next[level].load(Ordering::Acquire);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        if current.is_null() {
-            ptr::null()
-        } else {
-            current as *const ()
-        }
-    }
-
-    /// Seek to last entry <= target, returning raw node pointer. O(log N).
-    ///
-    /// Returns null if no entry <= target exists (i.e. target < first key).
-    pub fn seek_le_raw(&self, target: &K) -> *const () {
-        // First try exact seek_ge
-        let ge_ptr = self.seek_ge_raw(target);
-        if !ge_ptr.is_null() {
-            // SAFETY: ge_ptr was returned by this skiplist's seek_ge_raw.
-            let (k, _) = unsafe { self.node_kv(ge_ptr) };
-            if k == target {
-                return ge_ptr;
-            }
-        }
-        // No exact match; fall back to largest key < target
-        self.seek_lt_raw(target)
-    }
-
-    /// Return a raw pointer to the last level-0 node. O(1) via cached tail.
-    ///
-    /// Returns null if the skip list is empty.
-    pub fn tail_ptr(&self) -> *const () {
-        self.tail.load(Ordering::Acquire) as *const ()
-    }
-
-    /// Number of entries.
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
-    }
-
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    // -- Internal helpers --
-
-    /// Collect all entries at level 0 (the bottom level has all entries).
-    #[cfg(test)]
-    fn collect_all(&self) -> Vec<(K, V)> {
-        let mut result = Vec::new();
-        let mut ptr = self.head[0].load(Ordering::Acquire);
-        while !ptr.is_null() {
-            // SAFETY: ptr is a valid published node.
-            let node = unsafe { &*ptr };
-            result.push((node.key.clone(), node.value.clone()));
-            ptr = node.next[0].load(Ordering::Acquire);
-        }
-        result
-    }
-}
-
-impl<K: Ord + Clone, V: Clone> Default for ConcurrentSkipList<K, V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<K: Ord + Clone, V: Clone> Drop for ConcurrentSkipList<K, V> {
-    fn drop(&mut self) {
-        // Run destructors for K and V (they may own heap data, e.g. Vec<u8>).
-        // Arena frees the node memory itself when it drops.
-        let nodes = self.all_nodes.get_mut();
-        for &node_ptr in nodes.iter() {
-            // SAFETY: all_nodes contains each initialized Node exactly once; drop has
-            // exclusive &mut self access and the arena storage outlives this loop.
-            unsafe {
-                ptr::drop_in_place(node_ptr);
-            }
-        }
-    }
-}
-
-/// Random height using geometric distribution with p = 0.25.
-fn random_height() -> usize {
-    let mut h = 1;
-    while h < MAX_HEIGHT && cheap_random_bool() {
-        h += 1;
-    }
-    h
-}
-
-/// Returns true ~25% of the time using a fast thread-local RNG.
-fn cheap_random_bool() -> bool {
-    thread_local! {
-        static STATE: std::cell::Cell<u64> = std::cell::Cell::new(
-            {
-                let x = 0u8;
-                let addr = &x as *const u8 as u64;
-                addr ^ 0x517cc1b727220a95
-            }
+        let (node, reserved) = arena.allocate(node_layout(height, key_len, value.len()));
+        let mut prev = [ptr::null_mut(); MAX_HEIGHT];
+        self.search(
+            |bytes| cmp_target(bytes, key, trailer).is_lt(),
+            |level, p| prev[level] = p,
         );
-    }
-    STATE.with(|s| {
-        let mut x = s.get();
-        // xorshift64
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        s.set(x);
-        (x & 3) == 0 // 25% probability
-    })
-}
 
-/// Borrowing iterator over skip list entries in key order.
-pub struct RefIter<'a, K, V> {
-    next: *const Node<K, V>,
-    _list: PhantomData<&'a Node<K, V>>,
-}
-
-impl<'a, K, V> Iterator for RefIter<'a, K, V> {
-    type Item = (&'a K, &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next.is_null() {
-            return None;
+        // SAFETY: this aligned node is fresh, the layout contains header,
+        // tower, key, trailer, and value. Nothing can reach it before splice.
+        unsafe {
+            node.write(header);
+            let links = tower(node);
+            for (i, &p) in prev[..height].iter().enumerate() {
+                links
+                    .add(i)
+                    .write(Link::new(self.link(p, i).load(Ordering::Relaxed)));
+            }
+            let data = links.add(height).cast::<u8>();
+            ptr::copy_nonoverlapping(key.as_ptr(), data, key.len());
+            ptr::copy_nonoverlapping(trailer.as_ptr(), data.add(key.len()), 8);
+            ptr::copy_nonoverlapping(value.as_ptr(), data.add(key_len), value.len());
         }
-        // SAFETY: `next` came from an Acquire load of a published level-0
-        // link, so the node is fully initialized. Nodes live in the list's
-        // arena and are freed only when the list drops, which the `'a`
-        // borrow taken by `iter_ref` rules out while this iterator lives.
-        let node = unsafe { &*self.next };
-        self.next = node.next[0].load(Ordering::Acquire);
-        Some((&node.key, &node.value))
-    }
-}
-
-/// Snapshot iterator over skip list entries. Supports `DoubleEndedIterator`.
-#[cfg(test)]
-pub struct SkipListIter<K, V> {
-    entries: Vec<(K, V)>,
-    front: usize,
-    /// Exclusive upper bound.
-    back_exclusive: usize,
-}
-
-#[cfg(test)]
-impl<K: Clone, V: Clone> Iterator for SkipListIter<K, V> {
-    type Item = (K, V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.front < self.back_exclusive {
-            let item = self.entries[self.front].clone();
-            self.front += 1;
-            Some(item)
-        } else {
-            None
+        let at_end = self.link(prev[0], 0).load(Ordering::Relaxed).is_null();
+        for (i, &p) in prev[..height].iter().enumerate() {
+            self.link(p, i).store(node, Ordering::Release);
         }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.back_exclusive.saturating_sub(self.front);
-        (remaining, Some(remaining))
-    }
-}
-
-#[cfg(test)]
-impl<K: Clone, V: Clone> DoubleEndedIterator for SkipListIter<K, V> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.back_exclusive > self.front {
-            self.back_exclusive -= 1;
-            Some(self.entries[self.back_exclusive].clone())
-        } else {
-            None
+        self.height.fetch_max(height, Ordering::Release);
+        if at_end {
+            self.tail.store(node, Ordering::Release);
         }
+        reserved
+    }
+
+    pub fn versions_of<'a>(&'a self, user: &'a [u8]) -> impl Iterator<Item = (&'a [u8], &'a [u8])> {
+        let (_, mut node) = self.search(|bytes| bytes[..bytes.len() - 8] < *user, |_, _| {});
+        std::iter::from_fn(move || {
+            if node.is_null() {
+                return None;
+            }
+            // SAFETY: node came from the acquired predecessor/successor link.
+            let (key, value) = unsafe { self.node_kv(node.cast()) };
+            if &key[..key.len() - 8] != user {
+                return None;
+            }
+            node = self.link(node, 0).load(Ordering::Acquire);
+            Some((key, value))
+        })
+    }
+
+    pub fn lower_bound(&self, key: &[u8], trailer: &[u8; 8]) -> Option<(&[u8], &[u8])> {
+        let (_, node) = self.search(|bytes| cmp_target(bytes, key, trailer).is_lt(), |_, _| {});
+        // SAFETY: the node belongs to this list and was acquired from level zero.
+        (!node.is_null()).then(|| unsafe { self.node_kv(node.cast()) })
+    }
+
+    pub fn seek_lt_raw(&self, target: &[u8]) -> *const () {
+        self.search(|k| compare_internal_key(k, target).is_lt(), |_, _| {})
+            .0
+            .cast()
+    }
+
+    pub fn seek_le_raw(&self, target: &[u8]) -> *const () {
+        self.search(|k| compare_internal_key(k, target).is_le(), |_, _| {})
+            .0
+            .cast()
+    }
+
+    pub fn seek_ge_raw(&self, target: &[u8]) -> *const () {
+        self.search(|k| compare_internal_key(k, target).is_lt(), |_, _| {})
+            .1
+            .cast()
+    }
+
+    pub fn head_ptr(&self) -> *const () {
+        self.head[0].load(Ordering::Acquire).cast()
+    }
+
+    pub fn tail_ptr(&self) -> *const () {
+        self.tail.load(Ordering::Acquire).cast()
+    }
+
+    /// `ptr` must be a non-null node obtained from this list.
+    pub unsafe fn node_next0(&self, ptr: *const ()) -> *const () {
+        self.link(ptr.cast_mut().cast(), 0)
+            .load(Ordering::Acquire)
+            .cast()
+    }
+
+    pub fn iter_ref(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let mut node = self.head_ptr();
+        std::iter::from_fn(move || {
+            if node.is_null() {
+                return None;
+            }
+            // SAFETY: node was obtained from the head or an acquire-loaded link.
+            unsafe {
+                let entry = self.node_kv(node);
+                node = self.node_next0(node);
+                Some(entry)
+            }
+        })
     }
 }
 
-#[cfg(test)]
-impl<K: Clone, V: Clone> ExactSizeIterator for SkipListIter<K, V> {}
+fn cmp_target(encoded: &[u8], key: &[u8], trailer: &[u8; 8]) -> Cmp {
+    let (user, tag) = encoded.split_at(encoded.len() - 8);
+    user.cmp(key).then_with(|| tag.cmp(trailer))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{InternalKey, ValueType, pack_sequence_and_type};
+    use std::sync::Arc;
 
     #[test]
-    fn aligned_nodes_remain_readable_across_arena_blocks() {
-        #[repr(align(256))]
-        #[derive(Clone)]
-        struct Aligned(u32);
+    fn forward_search_returns_the_node_that_passed_its_last_comparison() {
+        let tag = |seq| (!pack_sequence_and_type(seq, ValueType::Value)).to_be_bytes();
+        let prepare = || {
+            let list = Arc::new(ConcurrentSkipList::new());
+            list.insert(b"k", &tag(1), b"old");
+            let writer = list.clone();
+            AFTER_SEARCH.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    writer.insert(b"k", &tag(2), b"future");
+                }))
+            });
+            list
+        };
 
-        let list = ConcurrentSkipList::new();
-        for key in 0..128 {
-            list.insert(key, Aligned(key));
-        }
-        for (key, value) in list.iter_ref() {
-            assert_eq!(value.0, *key);
-            assert!(ptr::from_ref(value).is_aligned());
-        }
-    }
+        let list = prepare();
+        assert_eq!(list.lower_bound(b"k", &tag(1)).unwrap().1, b"old");
 
-    #[test]
-    fn test_insert_and_get() {
-        let sl = ConcurrentSkipList::new();
-        sl.insert(10, "ten");
-        sl.insert(5, "five");
-        sl.insert(20, "twenty");
-
-        assert_eq!(sl.get(&10), Some("ten"));
-        assert_eq!(sl.get(&5), Some("five"));
-        assert_eq!(sl.get(&20), Some("twenty"));
-        assert_eq!(sl.get(&1), None);
-        assert_eq!(sl.len(), 3);
-    }
-
-    #[test]
-    fn test_forward_iter() {
-        let sl = ConcurrentSkipList::new();
-        for i in (0..10).rev() {
-            sl.insert(i, i * 10);
-        }
-        let items: Vec<_> = sl.iter().collect();
-        assert_eq!(items.len(), 10);
-        for (i, (k, v)) in items.iter().enumerate() {
-            assert_eq!(*k, i as i32);
-            assert_eq!(*v, (i as i32) * 10);
-        }
-    }
-
-    #[test]
-    fn test_reverse_iter() {
-        let sl = ConcurrentSkipList::new();
-        for i in 0..5 {
-            sl.insert(i, i);
-        }
-        let items: Vec<_> = sl.iter().rev().collect();
-        assert_eq!(items, vec![(4, 4), (3, 3), (2, 2), (1, 1), (0, 0)]);
-    }
-
-    #[test]
-    fn test_bidirectional_iter() {
-        let sl = ConcurrentSkipList::new();
-        for i in 0..6 {
-            sl.insert(i, i);
-        }
-        let mut it = sl.iter();
-        assert_eq!(it.next(), Some((0, 0)));
-        assert_eq!(it.next_back(), Some((5, 5)));
-        assert_eq!(it.next(), Some((1, 1)));
-        assert_eq!(it.next_back(), Some((4, 4)));
-        assert_eq!(it.next(), Some((2, 2)));
-        assert_eq!(it.next_back(), Some((3, 3)));
-        assert_eq!(it.next(), None);
-        assert_eq!(it.next_back(), None);
-    }
-
-    #[test]
-    fn test_range() {
-        let sl = ConcurrentSkipList::new();
-        for i in 0..10 {
-            sl.insert(i, i);
-        }
-        let items: Vec<_> = sl.range(3..7).collect();
-        assert_eq!(items, vec![(3, 3), (4, 4), (5, 5), (6, 6)]);
-
-        let items: Vec<_> = sl.range(3..=7).collect();
-        assert_eq!(items, vec![(3, 3), (4, 4), (5, 5), (6, 6), (7, 7)]);
-
-        let items: Vec<_> = sl.range(..3).collect();
-        assert_eq!(items, vec![(0, 0), (1, 1), (2, 2)]);
-    }
-
-    #[test]
-    fn test_empty() {
-        let sl: ConcurrentSkipList<i32, i32> = ConcurrentSkipList::new();
-        assert_eq!(sl.len(), 0);
-        assert!(sl.is_empty());
-        assert_eq!(sl.get(&0), None);
-        assert_eq!(sl.iter().next(), None);
-        assert_eq!(sl.iter().next_back(), None);
-    }
-
-    #[test]
-    fn test_single_entry() {
-        let sl = ConcurrentSkipList::new();
-        sl.insert(42, "answer");
-        assert_eq!(sl.len(), 1);
-        assert_eq!(sl.get(&42), Some("answer"));
-
-        let mut it = sl.iter();
-        assert_eq!(it.next(), Some((42, "answer")));
-        assert_eq!(it.next(), None);
-
-        let mut it = sl.iter();
-        assert_eq!(it.next_back(), Some((42, "answer")));
-        assert_eq!(it.next_back(), None);
-    }
-
-    #[test]
-    fn test_large_dataset() {
-        let sl = ConcurrentSkipList::new();
-        for i in (0..10_000).rev() {
-            sl.insert(i, i);
-        }
-        assert_eq!(sl.len(), 10_000);
-
-        let items: Vec<_> = sl.iter().collect();
-        assert_eq!(items.len(), 10_000);
-        for (i, item) in items.iter().enumerate() {
-            assert_eq!(*item, (i as i32, i as i32));
-        }
-
-        let rev: Vec<_> = sl.iter().rev().collect();
-        assert_eq!(rev.len(), 10_000);
-        assert_eq!(rev[0], (9999, 9999));
-        assert_eq!(rev[9999], (0, 0));
-    }
-
-    #[test]
-    fn test_concurrent_reads() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let sl = Arc::new(ConcurrentSkipList::new());
-        // Single writer inserts all entries first.
-        for i in 0..1000 {
-            sl.insert(i, i * 2);
-        }
-
-        // Multiple concurrent readers.
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let sl = Arc::clone(&sl);
-            handles.push(thread::spawn(move || {
-                for i in 0..1000 {
-                    assert_eq!(sl.get(&i), Some(i * 2));
-                }
-                let items: Vec<_> = sl.iter().collect();
-                assert_eq!(items.len(), 1000);
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_vec_u8_keys() {
-        let sl = ConcurrentSkipList::new();
-        sl.insert(b"banana".to_vec(), b"yellow".to_vec());
-        sl.insert(b"apple".to_vec(), b"red".to_vec());
-        sl.insert(b"cherry".to_vec(), b"dark_red".to_vec());
-
-        let items: Vec<_> = sl.iter().collect();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].0, b"apple");
-        assert_eq!(items[1].0, b"banana");
-        assert_eq!(items[2].0, b"cherry");
-
-        assert_eq!(sl.get(b"banana".as_slice()), Some(b"yellow".to_vec()));
-    }
-
-    #[test]
-    fn test_seek_lt_raw() {
-        let sl = ConcurrentSkipList::new();
-        for i in [10, 20, 30, 40, 50] {
-            sl.insert(i, i * 10);
-        }
-
-        // seek_lt(30) should return 20
-        let ptr = sl.seek_lt_raw(&30);
+        let list = prepare();
+        let seek = InternalKey::new(b"k", 1, ValueType::Value);
+        let ptr = list.seek_ge_raw(seek.as_bytes());
         assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, v) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 20);
-        assert_eq!(*v, 200);
+        // SAFETY: ptr is a non-null cursor obtained from this list.
+        assert_eq!(unsafe { list.node_kv(ptr) }.1, b"old");
 
-        // seek_lt(10) should return null (nothing less than first entry)
-        let ptr = sl.seek_lt_raw(&10);
-        assert!(ptr.is_null());
-
-        // seek_lt(11) should return 10
-        let ptr = sl.seek_lt_raw(&11);
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, _) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 10);
-
-        // seek_lt(51) should return 50
-        let ptr = sl.seek_lt_raw(&51);
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, _) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 50);
-
-        // seek_lt(0) should return null
-        let ptr = sl.seek_lt_raw(&0);
-        assert!(ptr.is_null());
-    }
-
-    #[test]
-    fn test_seek_le_raw() {
-        let sl = ConcurrentSkipList::new();
-        for i in [10, 20, 30, 40, 50] {
-            sl.insert(i, i);
-        }
-
-        // seek_le(30) should return 30 (exact match)
-        let ptr = sl.seek_le_raw(&30);
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, _) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 30);
-
-        // seek_le(25) should return 20 (no exact, falls back to lt)
-        let ptr = sl.seek_le_raw(&25);
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, _) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 20);
-
-        // seek_le(9) should return null (nothing <= 9)
-        let ptr = sl.seek_le_raw(&9);
-        assert!(ptr.is_null());
-    }
-
-    #[test]
-    fn test_tail_ptr() {
-        let sl = ConcurrentSkipList::new();
-
-        // Empty skiplist
-        assert!(sl.tail_ptr().is_null());
-
-        sl.insert(10, 100);
-        sl.insert(5, 50);
-        sl.insert(20, 200);
-
-        let ptr = sl.tail_ptr();
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, v) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 20);
-        assert_eq!(*v, 200);
-    }
-
-    #[test]
-    fn test_seek_lt_raw_large() {
-        let sl = ConcurrentSkipList::new();
-        for i in (0..1000).rev() {
-            sl.insert(i * 2, i); // even numbers 0,2,4,...,1998
-        }
-
-        // seek_lt(500) should return 498
-        let ptr = sl.seek_lt_raw(&500);
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, _) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 498);
-
-        // seek_lt(1) should return 0
-        let ptr = sl.seek_lt_raw(&1);
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, _) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 0);
-
-        // seek_lt(1999) should return 1998
-        let ptr = sl.seek_lt_raw(&1999);
-        assert!(!ptr.is_null());
-        // SAFETY: `ptr` was returned by a seek/tail method on `sl` and asserted
-        // non-null above, so it points to a live node owned by this skiplist.
-        let (k, _) = unsafe { sl.node_kv(ptr) };
-        assert_eq!(*k, 1998);
+        // A newly spliced predecessor with a different key must not turn a
+        // same-key admission scan into an empty one.
+        let list_for_splice = list.clone();
+        AFTER_SEARCH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                list_for_splice.insert(b"j", &tag(4), b"other");
+            }))
+        });
+        assert_eq!(list.versions_of(b"k").count(), 2);
     }
 }

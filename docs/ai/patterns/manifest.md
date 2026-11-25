@@ -25,7 +25,7 @@ Validate before append; after install, rotation is deferred or latches fail-stop
 Uncertain post-publish durability ⇒ keep old MANIFEST. Pre-publish fail discard/defer;
 post dir-sync fail sets fail-stop `poisoned` (no switch-back / divergence).
 
-**MAN7 Encoding** — tags append-only; never reinterpret old tags. Bounds-check lengths.
+**MAN7 Encoding** — require the v5 DBHeader before replay or repair. Validate 2 through 16 levels, persisted prefix length, edit tags and field lengths.
 
 ## Checklist
 
@@ -37,4 +37,4 @@ post dir-sync fail sets fail-stop `poisoned` (no switch-back / divergence).
 - [ ] Allocators/last-seq never regress
 - [ ] CURRENT tmp/sync/rename/install/dir order
 - [ ] Old MANIFEST delete only after durable CURRENT
-- [ ] Tags backward compatible
+- [ ] Writable reopen matches stored geometry, read-only adopts it, and a format mismatch preserves the files

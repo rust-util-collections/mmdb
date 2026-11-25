@@ -41,6 +41,8 @@ pub enum ErrorKind {
     Corruption,
     /// A caller-supplied argument or configuration value is invalid.
     InvalidArgument,
+    /// A no-slowdown write encountered a full immutable-memtable queue.
+    Busy,
     /// The database has been closed; no further operations are possible.
     DbClosed,
     /// The database was opened without write capability.
@@ -59,6 +61,7 @@ impl ErrorKind {
             Self::Corruption => "Corruption",
             Self::InvalidArgument => "Invalid argument",
             Self::DbClosed => "DB is closed",
+            Self::Busy => "Busy",
             Self::ReadOnly => "DB is read-only",
             Self::Background => "Background error",
         }
@@ -124,6 +127,12 @@ impl Error {
     #[track_caller]
     pub fn invalid_argument(msg: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidArgument, msg.into())
+    }
+
+    /// A no-slowdown write encountered backpressure.
+    #[track_caller]
+    pub fn busy(msg: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Busy, msg.into())
     }
 
     /// Create an [`ErrorKind::Background`] error.

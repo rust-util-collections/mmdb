@@ -12,12 +12,10 @@ use mmdb::{DB, DbOptions, WriteBatch, WriteOptions};
 /// Helper: open a DB with small memtable for aggressive flushing.
 fn open_small(path: &std::path::Path) -> DB {
     DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 1024,
-            l0_compaction_trigger: 3,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(1024)
+            .with_l0_compaction_trigger(3),
         path,
     )
     .unwrap()
@@ -26,12 +24,10 @@ fn open_small(path: &std::path::Path) -> DB {
 /// Helper: open a DB with custom write_buffer_size.
 fn open_with_buffer(path: &std::path::Path, wbs: usize) -> DB {
     DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: wbs,
-            l0_compaction_trigger: 3,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(wbs)
+            .with_l0_compaction_trigger(3),
         path,
     )
     .unwrap()
@@ -170,13 +166,11 @@ fn test_kv_cache_scenario() {
 #[test]
 fn test_log_system_scenario() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 3,
-        num_levels: 2,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(3)
+        .with_num_levels(2);
     let db = DB::open(opts, dir.path()).unwrap();
 
     let total_logs = 100;
@@ -437,7 +431,7 @@ fn test_mixed_workload() {
                         let _ = iter.value();
                         iter.advance();
                     }
-                    assert_eq!(iter.error(), None);
+                    assert!(iter.error().is_none());
                 }
             }
         }));
@@ -475,14 +469,12 @@ fn test_mixed_workload() {
 #[test]
 fn test_long_running_compaction() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 2,
-        target_file_size_base: 2048,
-        max_bytes_for_level_base: 4096,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(2)
+        .with_target_file_size_base(2048)
+        .with_max_bytes_for_level_base(4096);
     let db = DB::open(opts, dir.path()).unwrap();
 
     let total = 300;
@@ -538,12 +530,11 @@ fn test_long_running_compaction() {
 fn test_large_dataset() {
     let dir = tempfile::tempdir().unwrap();
     // Use a moderately sized buffer so we flush many times but do not OOM.
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 64 * 1024, // 64 KB
-        l0_compaction_trigger: 4,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(64 * 1024)
+        // 64 KB
+        .with_l0_compaction_trigger(4);
     let db = DB::open(opts, dir.path()).unwrap();
 
     let total: usize = 5_000;
@@ -606,12 +597,10 @@ fn test_restart_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
 
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 1024,
-        l0_compaction_trigger: 3,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(1024)
+        .with_l0_compaction_trigger(3);
 
     // Phase 1: write + flush (data lands in SSTs).
     {
@@ -639,10 +628,7 @@ fn test_restart_recovery() {
 
         // Sync WAL to ensure durability, then simulate crash (no close).
         db.put_with_options(
-            &WriteOptions {
-                sync: true,
-                ..Default::default()
-            },
+            &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
             b"rec:sync_marker",
             b"synced",
         )
@@ -710,13 +696,11 @@ fn test_space_reclamation() {
     let dir = tempfile::tempdir().unwrap();
     // Use num_levels: 2 so a single compact() can merge L0 tombstones with L1
     // data, fully removing deleted keys (matching the pattern in integration tests).
-    let opts = DbOptions {
-        create_if_missing: true,
-        write_buffer_size: 512,
-        l0_compaction_trigger: 2,
-        num_levels: 2,
-        ..Default::default()
-    };
+    let opts = DbOptions::default()
+        .with_create_if_missing(true)
+        .with_write_buffer_size(512)
+        .with_l0_compaction_trigger(2)
+        .with_num_levels(2);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write data with largish values so SST size is meaningful.

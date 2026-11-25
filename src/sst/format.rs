@@ -13,7 +13,7 @@
 use crate::error::{Error, Result, ResultExt};
 
 /// Magic number identifying MMDB SST files.
-pub const TABLE_MAGIC: u64 = 0x4D4D_4442_5353_5400; // "MMDBSST\0"
+pub const TABLE_MAGIC_V2: u64 = 0x4D4D_4442_5353_5402; // "MMDBSST" v2
 
 /// Fixed footer size.
 pub const FOOTER_SIZE: usize = 48;
@@ -22,12 +22,10 @@ pub const FOOTER_SIZE: usize = 48;
 pub const RANGE_DEL_BLOCK_NAME: &str = "rangedelblock";
 /// Metaindex key storing the fixed prefix length used by the prefix bloom.
 pub const PREFIX_FILTER_LEN_NAME: &str = "filter.prefix_len";
-/// Metaindex key recording the hash used by the bloom and prefix filters.
-/// Files written before this key existed may use a different hash and must
-/// not be probed with the current one.
-pub const FILTER_HASH_NAME: &str = "filter.hash";
-/// Bloom hash version: MurmurHash2 (`filter::bloom_hash`).
-pub const FILTER_HASH_MURMUR2: u8 = 1;
+/// Required layout marker shared by whole-key and prefix Bloom payloads.
+pub const FILTER_FORMAT_NAME: &str = "filter.format";
+/// Cache-line-blocked XXH3-64 Bloom payload, eight probes per line.
+pub const FILTER_FORMAT_BLOCKED_64B: u8 = 2;
 
 /// A handle pointing to a block within an SST file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -104,14 +102,14 @@ pub fn encode_footer(
     footer[0..16].copy_from_slice(&meta_enc);
     footer[16..32].copy_from_slice(&idx_enc);
     // bytes 32..40 are padding (zeros)
-    footer[40..48].copy_from_slice(&TABLE_MAGIC.to_le_bytes());
+    footer[40..48].copy_from_slice(&TABLE_MAGIC_V2.to_le_bytes());
     footer
 }
 
 /// Decode an SST footer. Returns (metaindex_handle, index_handle).
 pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> Result<(BlockHandle, BlockHandle)> {
     let magic = u64::from_le_bytes(data[40..48].try_into().unwrap());
-    if magic != TABLE_MAGIC {
+    if magic != TABLE_MAGIC_V2 {
         return Err(Error::corruption(format!(
             "invalid SST magic: {:#x}",
             magic
@@ -123,7 +121,7 @@ pub fn decode_footer(data: &[u8; FOOTER_SIZE]) -> Result<(BlockHandle, BlockHand
 }
 
 /// Encode an extended index value: BlockHandle + first_key.
-pub fn encode_index_value(handle: &BlockHandle, first_key: &[u8]) -> Vec<u8> {
+fn encode_index_value(handle: &BlockHandle, first_key: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(20 + first_key.len());
     buf.extend_from_slice(&handle.encode());
     buf.extend_from_slice(&(first_key.len() as u32).to_le_bytes());
@@ -161,75 +159,53 @@ pub fn encode_index_value_with_props(
 /// Decoded extended index value with optional block properties.
 pub struct DecodedIndexValue<'a> {
     pub handle: BlockHandle,
-    pub first_key: Option<&'a [u8]>,
+    pub first_key: &'a [u8],
     pub properties: Vec<(&'a [u8], &'a [u8])>,
 }
 
 /// Decode an extended index value that may contain block properties.
-/// Compatible with old format (no properties appended).
+/// The first-key length and property count are mandatory, even when zero.
 pub fn decode_index_value_with_props(data: &[u8]) -> Result<DecodedIndexValue<'_>> {
     let handle = BlockHandle::decode(data).ctx()?;
-    let mut first_key: Option<&[u8]> = None;
+    let first_key_len = data
+        .get(16..20)
+        .ok_or_else(|| Error::corruption("missing index first key"))?;
+    let len = u32::from_le_bytes(first_key_len.try_into().unwrap()) as usize;
+    let (first_key, rest) = data[20..]
+        .split_at_checked(len)
+        .ok_or_else(|| Error::corruption("truncated index first key"))?;
+    if rest.len() < 2 {
+        return Err(Error::corruption("truncated property count"));
+    }
     let mut props = Vec::new();
-
-    if data.len() <= 16 {
-        return Ok(DecodedIndexValue {
-            handle,
-            first_key: None,
-            properties: props,
-        });
-    }
-
-    // Parse first_key
-    let mut offset = 16;
-    if data.len() >= offset + 4 {
-        let fk_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        if data.len() < offset + fk_len {
-            return Err(Error::corruption("truncated index first_key"));
+    let mut offset = 20 + len;
+    let num_props = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    offset += 2;
+    for _ in 0..num_props {
+        if data.len() < offset + 2 {
+            return Err(Error::corruption("truncated block property name length"));
         }
-        if fk_len > 0 {
-            first_key = Some(&data[offset..offset + fk_len]);
-        }
-        offset += fk_len;
-    } else if data.len() > 16 {
-        return Err(Error::corruption("truncated index first_key length"));
-    }
-
-    // Parse properties (if present)
-    if data.len() >= offset + 2 {
-        let num_props = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
-        for _ in 0..num_props {
-            if data.len() < offset + 2 {
-                return Err(Error::corruption("truncated block property name length"));
-            }
-            let name_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
-            if data.len() < offset + name_len {
-                return Err(Error::corruption("truncated block property name"));
-            }
-            let name = &data[offset..offset + name_len];
-            offset += name_len;
-            if data.len() < offset + 2 {
-                return Err(Error::corruption("truncated block property data length"));
-            }
-            let data_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
-            if data.len() < offset + data_len {
-                return Err(Error::corruption("truncated block property data"));
-            }
-            let prop_data = &data[offset..offset + data_len];
-            offset += data_len;
-            props.push((name, prop_data));
+        if data.len() < offset + name_len {
+            return Err(Error::corruption("truncated block property name"));
         }
-        if offset != data.len() {
-            return Err(Error::corruption("trailing bytes after block properties"));
+        let name = &data[offset..offset + name_len];
+        offset += name_len;
+        if data.len() < offset + 2 {
+            return Err(Error::corruption("truncated block property data length"));
         }
-    } else if data.len() > offset {
-        return Err(Error::corruption("truncated block property count"));
+        let data_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        if data.len() < offset + data_len {
+            return Err(Error::corruption("truncated block property data"));
+        }
+        let prop_data = &data[offset..offset + data_len];
+        offset += data_len;
+        props.push((name, prop_data));
+    }
+    if offset != data.len() {
+        return Err(Error::corruption("trailing bytes after block properties"));
     }
 
     Ok(DecodedIndexValue {

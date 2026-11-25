@@ -112,7 +112,7 @@ mod tests {
         // Create an SST file
         let path = dir.path().join("000001.sst");
         let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
-        builder.add(b"key", b"value").unwrap();
+        builder.add_point(b"key", b"value").unwrap();
         builder.finish().unwrap();
 
         let cache = TableCache::new(dir.path(), 100, None);

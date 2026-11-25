@@ -2,11 +2,11 @@
 
 use std::{
     borrow::Cow,
-    cmp::Ordering,
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::File,
     io::{BufWriter, Write},
     path::Path,
+    sync::Arc,
 };
 
 use crate::error::{Error, Result, ResultExt};
@@ -15,17 +15,24 @@ use crate::sst::{
     block_builder::BlockBuilder,
     filter::{BloomFilter, bloom_hash},
     format::*,
+    range::RangeFragment,
     table_reader::MAX_DECOMPRESSED_BLOCK_SIZE,
 };
 use crate::types::{
-    MAX_RANGE_DELETE_SIZE, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, ValueType,
-    compare_internal_key, decode_internal_key, user_key,
+    InternalKey, MAX_RANGE_DELETE_SIZE, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE,
+    MAX_WRITE_ENTRY_SIZE, ValueType, compare_internal_key, decode_internal_key, user_key,
 };
 
 /// Soft threshold at which callers that can split their output across
 /// multiple SST files (flush, compaction) should cut the current file, so
 /// the hard metadata-block limit is never approached in normal operation.
 pub(crate) const META_BLOCK_SPLIT_THRESHOLD: usize = 32 * 1024 * 1024;
+
+/// One range-deletion interval cannot split its sequence array across leaves.
+/// Reserve both maximum-sized endpoints and 128 bytes for field lengths,
+/// block framing and the restart array. The newest state consumes one stripe.
+pub(crate) const MAX_RANGE_STRIPES: usize =
+    (META_BLOCK_HARD_LIMIT - 2 * MAX_USER_KEY_SIZE - 128) / size_of::<u64>();
 
 /// Conservative per-entry overhead estimate for meta block accounting:
 /// covers the 16-byte block handle, varint length headers, and the restart
@@ -49,8 +56,6 @@ pub struct TableBuildOptions {
     pub block_size: usize,
     pub block_restart_interval: usize,
     pub bloom_bits_per_key: u32,
-    /// If true, keys are internal keys (user_key + 8-byte trailer).
-    pub internal_keys: bool,
     /// Compression type for data blocks.
     pub compression: CompressionType,
     /// Fixed prefix length for prefix bloom filter. 0 = disabled.
@@ -65,7 +70,6 @@ impl Clone for TableBuildOptions {
             block_size: self.block_size,
             block_restart_interval: self.block_restart_interval,
             bloom_bits_per_key: self.bloom_bits_per_key,
-            internal_keys: self.internal_keys,
             compression: self.compression,
             prefix_len: self.prefix_len,
             // Collectors are per-build; a clone starts with empty collectors
@@ -79,13 +83,38 @@ impl Default for TableBuildOptions {
         Self {
             block_size: 4096,
             block_restart_interval: 16,
-            bloom_bits_per_key: 10,
-            internal_keys: false,
+            bloom_bits_per_key: 12,
             compression: CompressionType::None,
             prefix_len: 0,
             block_property_collectors: Vec::new(),
         }
     }
+}
+
+type RangeExtents = Vec<(Vec<u8>, Vec<u8>)>;
+
+const PARTITION_BYTES: usize = 64 * 1024;
+fn range_partition_value(handle: BlockHandle, begin: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(16 + begin.len());
+    value.extend_from_slice(&handle.encode());
+    value.extend_from_slice(begin);
+    value
+}
+
+/// Pick a strict interior user-key prefix when it shortens the separator.
+/// The earliest valid trailer makes the result a seekable internal key.
+fn shorten_separator(last: &mut Vec<u8>, next: &[u8]) {
+    let lo = user_key(last);
+    let hi = user_key(next);
+    let Some(i) = lo.iter().zip(hi).position(|(a, b)| a != b) else {
+        return;
+    };
+    if i + 1 >= lo.len() || lo[i] >= hi[i] || (lo[i] + 1 == hi[i] && i + 1 == hi.len()) {
+        return;
+    }
+    let mut prefix = lo[..=i].to_vec();
+    prefix[i] += 1;
+    *last = InternalKey::new(&prefix, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion).into_bytes();
 }
 
 /// A pending index entry produced when a data block is flushed.
@@ -96,6 +125,122 @@ struct PendingIndexEntry {
     properties: Vec<(String, Vec<u8>)>,
 }
 
+/// Serialize one logical resident directory in bounded, CRC-protected pages.
+/// A page's trailing handle points strictly backwards. Opening a table walks
+/// these pages once; point lookup uses only the resulting in-memory directory.
+struct DirectoryWriter {
+    page: BlockBuilder,
+    previous: BlockHandle,
+    target: usize,
+}
+
+impl DirectoryWriter {
+    fn new() -> Self {
+        Self {
+            page: BlockBuilder::new(usize::MAX),
+            previous: BlockHandle::default(),
+            target: META_BLOCK_SPLIT_THRESHOLD,
+        }
+    }
+
+    fn append(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        write: &mut impl FnMut(&[u8]) -> Result<BlockHandle>,
+    ) -> Result<()> {
+        if !self.page.is_empty() && self.page.estimated_size() >= self.target {
+            self.flush(write)?;
+        }
+        self.page.add(key, value);
+        Ok(())
+    }
+
+    fn flush(&mut self, write: &mut impl FnMut(&[u8]) -> Result<BlockHandle>) -> Result<()> {
+        let mut data = std::mem::replace(&mut self.page, BlockBuilder::new(usize::MAX)).finish();
+        data.extend_from_slice(&self.previous.encode());
+        self.previous = write(&data)?;
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        write: &mut impl FnMut(&[u8]) -> Result<BlockHandle>,
+    ) -> Result<BlockHandle> {
+        self.flush(write)?;
+        Ok(self.previous)
+    }
+}
+
+/// Only the pending separator, the open index leaf and one root page are
+/// retained while compaction streams arbitrarily many versions of a key.
+struct IndexWriter {
+    pending: Option<PendingIndexEntry>,
+    leaf: BlockBuilder,
+    last_separator: Vec<u8>,
+    directory: DirectoryWriter,
+}
+
+impl IndexWriter {
+    fn new() -> Self {
+        Self {
+            pending: None,
+            leaf: BlockBuilder::new(1),
+            last_separator: Vec::new(),
+            directory: DirectoryWriter::new(),
+        }
+    }
+
+    fn emit_pending(
+        &mut self,
+        next: Option<&[u8]>,
+        write: &mut impl FnMut(&[u8]) -> Result<BlockHandle>,
+    ) -> Result<()> {
+        let Some(mut entry) = self.pending.take() else {
+            return Ok(());
+        };
+        if let Some(next) = next {
+            shorten_separator(&mut entry.last_key, next);
+        }
+        let props: Vec<_> = entry
+            .properties
+            .iter()
+            .map(|(n, d)| (n.as_str(), d.as_slice()))
+            .collect();
+        let value = encode_index_value_with_props(&entry.handle, &entry.first_key, &props)?;
+        if !self.leaf.is_empty()
+            && self
+                .leaf
+                .estimated_size()
+                .saturating_add(entry.last_key.len() + value.len() + 32)
+                > PARTITION_BYTES
+        {
+            self.flush_leaf(write)?;
+        }
+        self.leaf.add(&entry.last_key, &value);
+        self.last_separator = entry.last_key;
+        Ok(())
+    }
+
+    fn flush_leaf(&mut self, write: &mut impl FnMut(&[u8]) -> Result<BlockHandle>) -> Result<()> {
+        let data = std::mem::replace(&mut self.leaf, BlockBuilder::new(1)).finish();
+        let h = write(&data)?;
+        self.directory
+            .append(&self.last_separator, &h.encode(), write)
+    }
+
+    fn finish(
+        mut self,
+        write: &mut impl FnMut(&[u8]) -> Result<BlockHandle>,
+    ) -> Result<BlockHandle> {
+        self.emit_pending(None, write)?;
+        if !self.leaf.is_empty() {
+            self.flush_leaf(write)?;
+        }
+        self.directory.finish(write)
+    }
+}
+
 /// Builds an SST file.
 pub struct TableBuilder {
     writer: BufWriter<File>,
@@ -104,12 +249,12 @@ pub struct TableBuilder {
     // Current data block being built
     data_block: BlockBuilder,
     // Index entries produced by flushed data blocks
-    index_entries: Vec<PendingIndexEntry>,
+    index: Option<IndexWriter>,
     // First key of the current (not-yet-flushed) data block
     pending_first_key: Option<Vec<u8>>,
     // One bloom hash per distinct user key. Point lookup probes the user
     // key once, so extra versions must not grow the filter.
-    filter_key_hashes: Vec<u32>,
+    filter_key_hashes: Vec<u64>,
     /// User key of the last hash in `filter_key_hashes`. `None` until the
     /// first point key is hashed. Empty is a real user key, so this is not
     /// a bare `Vec`.
@@ -129,25 +274,16 @@ pub struct TableBuilder {
     // Whether any RangeDeletion entry was added
     has_range_deletions: bool,
 
-    /// Test-only: write `RangeDeletion` entries inline in data blocks, matching
-    /// the pre-flag SST layout written by mmdb 2.0.0. Always false in
-    /// production.
-    legacy_inline_range_deletions: bool,
-
-    /// Test-only: build bloom filters with the pre-MurmurHash2 function and
-    /// omit the `filter.hash` marker, matching filters written by published
-    /// mmdb <= 2.1.1. Always false in production.
-    legacy_bloom_hash: bool,
-
     /// Buffered range deletion entries (key, value) to write as a separate block.
-    range_del_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    range_del_entries: Vec<RangeFragment>,
+    range_versions: usize,
+    snapshot_stripes: Option<Vec<u64>>,
 
-    /// Projected encoded size of the index block from already-flushed data
-    /// blocks (each entry stores the block's last key, first key, handle and
-    /// properties). Used to keep the index block under the reader's cap.
+    /// Cumulative index bytes used to choose output-file cut points.
     index_block_projected: usize,
-    /// Projected encoded size of the range-del block.
+    /// Encoded endpoint estimate for buffered range deletions.
     range_del_projected: usize,
+    carried_projection: usize,
 
     /// Block property collectors for per-block metadata.
     block_property_collectors: Vec<Box<dyn crate::options::BlockPropertyCollector>>,
@@ -164,7 +300,7 @@ impl TableBuilder {
             writer: BufWriter::new(file),
             data_block: BlockBuilder::new(options.block_restart_interval),
             options,
-            index_entries: Vec::new(),
+            index: Some(IndexWriter::new()),
             pending_first_key: None,
             filter_key_hashes: Vec::new(),
             bloom_user_key: None,
@@ -173,28 +309,16 @@ impl TableBuilder {
             smallest_key: None,
             prefix_set: HashSet::new(),
             has_range_deletions: false,
-            legacy_inline_range_deletions: false,
-            legacy_bloom_hash: false,
+
             range_del_entries: Vec::new(),
+            range_versions: 0,
+            snapshot_stripes: None,
             index_block_projected: 0,
             range_del_projected: 0,
+            carried_projection: 0,
             block_property_collectors: collectors,
             finished: false,
         })
-    }
-
-    /// Test-only: emulate the pre-flag SST layout, where range deletions were
-    /// ordinary data-block entries instead of a dedicated range-del block.
-    #[cfg(test)]
-    pub(crate) fn use_legacy_inline_range_deletions(&mut self) {
-        self.legacy_inline_range_deletions = true;
-    }
-
-    /// Test-only: emulate filters written before the hash-version marker,
-    /// which used the pre-MurmurHash2 hash.
-    #[cfg(test)]
-    pub(crate) fn use_legacy_bloom_hash(&mut self) {
-        self.legacy_bloom_hash = true;
     }
 
     /// Projected encoded size of the index block, including the entry the
@@ -234,33 +358,49 @@ impl TableBuilder {
     /// reaches `META_BLOCK_SPLIT_THRESHOLD`.
     pub(crate) fn projected_meta_size(&self) -> usize {
         self.projected_index_size()
-            .max(self.range_del_projected)
+            .max(
+                self.range_projection()
+                    .saturating_sub(self.carried_projection),
+            )
             .max(self.projected_filter_size())
             .max(self.projected_prefix_filter_size())
+    }
+
+    fn range_projection(&self) -> usize {
+        self.range_del_projected.saturating_mul(2).saturating_add(
+            self.range_del_entries
+                .len()
+                .saturating_mul(16)
+                .saturating_mul(
+                    self.snapshot_stripes
+                        .as_ref()
+                        .map_or(self.range_versions, |s| s.len().saturating_add(1))
+                        .min(self.range_versions),
+                ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn add_point(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.add(InternalKey::new(key, 1, ValueType::Value).as_bytes(), value)
     }
 
     /// Add a key-value pair. Must be called in sorted key order.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         assert!(!self.finished);
-        let internal_vt = if self.options.internal_keys {
-            // Reject short keys / unknown type bytes before committing them
-            // to a CRC-valid SST that would later misread as deletions/absence.
-            let (_, _, vt) = decode_internal_key(key).ctx()?;
-            assert!(
-                self.last_key.is_empty()
-                    || compare_internal_key(key, &self.last_key) == Ordering::Greater,
-                "keys must be added in order"
-            );
-            Some(vt)
-        } else {
-            assert!(
-                self.last_key.is_empty() || key > self.last_key.as_slice(),
-                "keys must be added in order"
-            );
-            None
-        };
+        let (user_key_for_bloom, _, vt) = decode_internal_key(key).ctx()?;
+        assert!(
+            self.last_key.is_empty() || compare_internal_key(key, &self.last_key).is_gt(),
+            "keys must be added in order"
+        );
 
-        if self.smallest_key.is_none() {
+        if self.smallest_key.is_none()
+            || (self.last_key.is_empty()
+                && self
+                    .smallest_key
+                    .as_deref()
+                    .is_some_and(|s| compare_internal_key(key, s).is_lt()))
+        {
             self.smallest_key = Some(key.to_vec());
         }
 
@@ -279,51 +419,17 @@ impl TableBuilder {
             )));
         }
 
-        // Buffer range deletions into a separate block. The test-only legacy
-        // mode falls through to the data block, matching pre-flag files.
-        if internal_vt == Some(ValueType::RangeDeletion) && !self.legacy_inline_range_deletions {
-            // All range tombstones share one block; it must stay readable.
-            let projected = self
-                .range_del_projected
-                .saturating_add(entry_size)
-                .saturating_add(META_ENTRY_OVERHEAD);
-            if projected > META_BLOCK_HARD_LIMIT {
-                return Err(Error::invalid_argument(format!(
-                    "range-del block size {} would exceed maximum readable block size {}",
-                    projected, META_BLOCK_HARD_LIMIT
-                )));
+        if vt == ValueType::RangeDeletion {
+            if user_key(key) >= value {
+                return Err(Error::invalid_argument("empty range tombstone"));
             }
-            self.range_del_projected = projected;
-            self.has_range_deletions = true;
-            self.range_del_entries.push((key.to_vec(), value.to_vec()));
+            let (begin, seq, _) = decode_internal_key(key)?;
+            self.add_range_fragment(RangeFragment::new(begin, value, Arc::from([seq])));
             self.last_key.clear();
             self.last_key.extend_from_slice(key);
             return Ok(());
         }
 
-        // The index block stores each data block's last key AND first key, in
-        // a single block the reader caps at MAX_DECOMPRESSED_BLOCK_SIZE.
-        // Reject an entry that could push the index past the readable limit —
-        // pessimistically count this key as both extending the open block and
-        // starting a new one.
-        let projected_index = self
-            .projected_index_size()
-            .saturating_add(2 * key.len())
-            .saturating_add(META_ENTRY_OVERHEAD);
-        if projected_index > META_BLOCK_HARD_LIMIT {
-            return Err(Error::invalid_argument(format!(
-                "index block size {} would exceed maximum readable block size {} \
-                 (consider a larger block_size for very large keys)",
-                projected_index, META_BLOCK_HARD_LIMIT
-            )));
-        }
-
-        // Collect key for bloom filter (use user key if internal_keys mode)
-        let user_key_for_bloom = if self.options.internal_keys {
-            user_key(key)
-        } else {
-            key
-        };
         // Versions of one user key are adjacent. Lookup hashes that user key
         // once, so only the first version contributes a filter entry.
         if self.options.bloom_bits_per_key > 0
@@ -347,13 +453,6 @@ impl TableBuilder {
                     self.options.bloom_bits_per_key,
                 )?;
             }
-            #[cfg(test)]
-            let hash = if self.legacy_bloom_hash {
-                crate::sst::filter::legacy_bloom_hash(user_key_for_bloom)
-            } else {
-                bloom_hash(user_key_for_bloom)
-            };
-            #[cfg(not(test))]
             let hash = bloom_hash(user_key_for_bloom);
             self.filter_key_hashes.push(hash);
             let bloom_key = self.bloom_user_key.get_or_insert_with(Vec::new);
@@ -390,7 +489,7 @@ impl TableBuilder {
         self.last_key.extend_from_slice(key);
 
         for collector in &mut self.block_property_collectors {
-            collector.add(key, value);
+            collector.add(user_key_for_bloom);
         }
 
         Ok(())
@@ -409,8 +508,41 @@ impl TableBuilder {
         // Write prefix filter block
         let prefix_filter_handle = self.write_prefix_filter_block().ctx()?;
 
-        // Write range-del block if any
-        let range_del_handle = self.write_range_del_block().ctx()?;
+        // Compaction buffers packed ranges separately from point rows. Fold in
+        // their extreme keys once, irrespective of how many stripes they carry.
+        let by_first = |a: &&RangeFragment, b: &&RangeFragment| {
+            a.begin
+                .cmp(&b.begin)
+                .then_with(|| b.sequences().last().cmp(&a.sequences().last()))
+        };
+        let by_last = |a: &&RangeFragment, b: &&RangeFragment| {
+            a.begin
+                .cmp(&b.begin)
+                .then_with(|| b.sequences()[0].cmp(&a.sequences()[0]))
+        };
+        if let Some(first) = self.range_del_entries.iter().min_by(by_first) {
+            let key = InternalKey::new(
+                &first.begin,
+                *first.sequences().last().unwrap(),
+                ValueType::RangeDeletion,
+            );
+            if self
+                .smallest_key
+                .as_deref()
+                .is_none_or(|k| compare_internal_key(key.as_bytes(), k).is_lt())
+            {
+                self.smallest_key = Some(key.into_bytes());
+            }
+        }
+        if let Some(last) = self.range_del_entries.iter().max_by(by_last) {
+            let key = InternalKey::new(&last.begin, last.sequences()[0], ValueType::RangeDeletion);
+            if self.last_key.is_empty()
+                || compare_internal_key(key.as_bytes(), &self.last_key).is_gt()
+            {
+                self.last_key = key.into_bytes();
+            }
+        }
+        let (range_del_handle, range_tombstones) = self.write_range_del_block().ctx()?;
 
         // Write meta index block
         let metaindex_handle = self
@@ -429,14 +561,6 @@ impl TableBuilder {
         self.writer.get_ref().sync_all().ctx()?;
         self.finished = true;
 
-        // Surface the written range tombstones as user-key extents so callers
-        // (e.g. compaction install prechecks) never need to re-open the file.
-        let range_tombstones = self
-            .range_del_entries
-            .iter()
-            .map(|(key, end)| (user_key(key).to_vec(), end.clone()))
-            .collect();
-
         let largest_key = self.smallest_key.as_ref().map(|_| self.last_key);
         Ok(TableBuildResult {
             file_size: self.offset,
@@ -448,7 +572,7 @@ impl TableBuilder {
     }
 
     fn flush_data_block(&mut self) -> Result<()> {
-        let last_key = self.last_key.clone();
+        let last_key = self.data_block.last_key().to_vec();
         let first_key = self.pending_first_key.take().unwrap_or_default();
 
         // Take out the current block builder and replace with a new one
@@ -479,7 +603,7 @@ impl TableBuilder {
             .saturating_add(first_key.len())
             .saturating_add(props_size)
             .saturating_add(META_ENTRY_OVERHEAD);
-        if projected_index > META_BLOCK_HARD_LIMIT {
+        if projected_index - self.index_block_projected > META_BLOCK_HARD_LIMIT {
             return Err(Error::invalid_argument(format!(
                 "index block size {} including block properties exceeds maximum {}",
                 projected_index, META_BLOCK_HARD_LIMIT
@@ -487,12 +611,17 @@ impl TableBuilder {
         }
         let handle = self.write_raw_block(&block_data).ctx()?;
         self.index_block_projected = projected_index;
-        self.index_entries.push(PendingIndexEntry {
+        let mut index = self.index.take().expect("active index");
+        index.emit_pending(Some(first_key.as_slice()), &mut |data| {
+            self.write_raw_block(data)
+        })?;
+        index.pending = Some(PendingIndexEntry {
             last_key,
             handle,
             first_key,
             properties: props,
         });
+        self.index = Some(index);
 
         Ok(())
     }
@@ -581,17 +710,130 @@ impl TableBuilder {
         self.write_raw_block(&filter_data).ctx()
     }
 
-    fn write_range_del_block(&mut self) -> Result<BlockHandle> {
-        if self.range_del_entries.is_empty() {
-            return Ok(BlockHandle::default());
+    /// Clip all crossing tombstones at an output split. Right fragments are
+    /// carried into the next output, even when no point survives at the split.
+    pub(crate) fn clip_at(&mut self, split: &[u8]) -> Vec<RangeFragment> {
+        let mut carry = Vec::new();
+        let mut boundary = None;
+        for left in &mut self.range_del_entries {
+            if left.end.as_ref() > split {
+                let split = boundary.get_or_insert_with(|| Arc::<[u8]>::from(split));
+                let mut right = left.clone();
+                right.begin = split.clone();
+                left.end = split.clone();
+                carry.push(right);
+            }
         }
+        carry
+    }
 
-        let mut builder = BlockBuilder::new(self.options.block_restart_interval);
-        for (key, value) in &self.range_del_entries {
-            builder.add(key, value);
+    pub(crate) fn start_output(&mut self, snapshots: &[u64], carry: Vec<RangeFragment>) {
+        self.snapshot_stripes = Some(snapshots.to_vec());
+        for range in carry {
+            self.add_range_fragment(range);
         }
-        let data = builder.finish();
-        self.write_raw_block(&data).ctx()
+        self.carried_projection = self.range_projection();
+    }
+
+    pub(crate) fn add_range_fragment(&mut self, range: RangeFragment) {
+        let seqs = range.sequences();
+        self.has_range_deletions = true;
+        self.range_versions = self.range_versions.saturating_add(seqs.len());
+        self.range_del_projected = self
+            .range_del_projected
+            .saturating_add(range.begin.len() + range.end.len() + META_ENTRY_OVERHEAD);
+        self.range_del_entries.push(range);
+    }
+
+    fn write_range_del_block(&mut self) -> Result<(BlockHandle, RangeExtents)> {
+        let mut extents = Vec::new();
+        if self.range_del_entries.is_empty() {
+            return Ok((BlockHandle::default(), extents));
+        }
+        let ranges = std::mem::take(&mut self.range_del_entries);
+        let mut events = Vec::with_capacity(ranges.len() * 2);
+        for range in &ranges {
+            events.push((range.begin.as_ref(), range.sequences(), true));
+            events.push((range.end.as_ref(), range.sequences(), false));
+        }
+        events.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut live = BTreeMap::<u64, usize>::new();
+        let mut root = DirectoryWriter::new();
+        let mut leaf = BlockBuilder::new(16);
+        let mut first_begin = None;
+        let mut prev = events[0].0;
+        let mut leaf_end = prev;
+        let mut payload = Vec::new();
+        let mut idx = 0;
+        while idx < events.len() {
+            let boundary = events[idx].0;
+            if prev < boundary && !live.is_empty() {
+                payload.clear();
+                payload.extend_from_slice(&(prev.len() as u32).to_le_bytes());
+                payload.extend_from_slice(prev);
+                if let Some(snapshots) = &self.snapshot_stripes {
+                    let mut last = None;
+                    for upper in snapshots
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(MAX_SEQUENCE_NUMBER))
+                    {
+                        if let Some((&seq, _)) = live.range(..=upper).next_back()
+                            && last != Some(seq)
+                        {
+                            payload.extend_from_slice(&seq.to_le_bytes());
+                            last = Some(seq);
+                        }
+                    }
+                } else {
+                    for seq in live.keys() {
+                        payload.extend_from_slice(&seq.to_le_bytes());
+                    }
+                }
+                if !leaf.is_empty()
+                    && leaf
+                        .estimated_size()
+                        .saturating_add(payload.len() + boundary.len() + 32)
+                        > PARTITION_BYTES
+                {
+                    let handle = self.write_raw_block(
+                        &std::mem::replace(&mut leaf, BlockBuilder::new(16)).finish(),
+                    )?;
+                    let begin: &[u8] = first_begin.take().unwrap();
+                    extents.push((begin.to_vec(), leaf_end.to_vec()));
+                    root.append(leaf_end, &range_partition_value(handle, begin), &mut |d| {
+                        self.write_raw_block(d)
+                    })?;
+                }
+                first_begin.get_or_insert(prev);
+                leaf.add(boundary, &payload);
+                leaf_end = boundary;
+            }
+            while idx < events.len() && events[idx].0 == boundary {
+                let (_, stripes, add) = events[idx];
+                for seq in stripes {
+                    if add {
+                        *live.entry(*seq).or_default() += 1;
+                    } else {
+                        let count = live.get_mut(seq).expect("end event follows its start");
+                        *count -= 1;
+                        if *count == 0 {
+                            live.remove(seq);
+                        }
+                    }
+                }
+                idx += 1;
+            }
+            prev = boundary;
+        }
+        if let Some(begin) = first_begin {
+            extents.push((begin.to_vec(), leaf_end.to_vec()));
+            let handle = self.write_raw_block(&leaf.finish())?;
+            root.append(leaf_end, &range_partition_value(handle, begin), &mut |d| {
+                self.write_raw_block(d)
+            })?;
+        }
+        Ok((root.finish(&mut |d| self.write_raw_block(d))?, extents))
     }
 
     fn write_metaindex_block(
@@ -607,11 +849,8 @@ impl TableBuilder {
             builder.add(b"filter.bloom", &handle_bytes);
         }
 
-        // Record the hash shared by the bloom and prefix filters. Files
-        // without this marker may use the pre-MurmurHash2 hash and are not
-        // safe to probe with the current one.
-        if (filter_handle.size > 0 || prefix_filter_handle.size > 0) && !self.legacy_bloom_hash {
-            builder.add(FILTER_HASH_NAME.as_bytes(), &[FILTER_HASH_MURMUR2]);
+        if filter_handle.size > 0 || prefix_filter_handle.size > 0 {
+            builder.add(FILTER_FORMAT_NAME.as_bytes(), &[FILTER_FORMAT_BLOCKED_64B]);
         }
 
         if prefix_filter_handle.size > 0 {
@@ -633,24 +872,10 @@ impl TableBuilder {
     }
 
     fn write_index_block(&mut self) -> Result<BlockHandle> {
-        let mut builder = BlockBuilder::new(1);
-
-        for entry in &self.index_entries {
-            let value = if entry.properties.is_empty() {
-                encode_index_value(&entry.handle, &entry.first_key)
-            } else {
-                let prop_refs: Vec<(&str, &[u8])> = entry
-                    .properties
-                    .iter()
-                    .map(|(n, d)| (n.as_str(), d.as_slice()))
-                    .collect();
-                encode_index_value_with_props(&entry.handle, &entry.first_key, &prop_refs).ctx()?
-            };
-            builder.add(&entry.last_key, &value);
-        }
-
-        let data = builder.finish();
-        self.write_raw_block(&data).ctx()
+        self.index
+            .take()
+            .expect("active index")
+            .finish(&mut |d| self.write_raw_block(d))
     }
 }
 
@@ -677,7 +902,7 @@ mod tests {
     struct LargePropertyCollector(String);
 
     impl BlockPropertyCollector for LargePropertyCollector {
-        fn add(&mut self, _key: &[u8], _value: &[u8]) {}
+        fn add(&mut self, _key: &[u8]) {}
 
         fn finish_block(&mut self) -> Vec<u8> {
             vec![7; u16::MAX as usize]
@@ -685,6 +910,183 @@ mod tests {
 
         fn name(&self) -> &str {
             &self.0
+        }
+    }
+
+    #[test]
+    fn chained_directory_pages_preserve_index_order() {
+        use crate::types::InternalKey;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chain.sst");
+        let mut b = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Each separator of a 64 KiB user key owns one leaf. A tiny root
+        // page target exercises page rollover with a small fixture.
+        b.index.as_mut().unwrap().directory.target = 1;
+        let mut key = vec![7; 64 * 1024];
+        for i in 1..=6_u8 {
+            key[0] = i;
+            b.add(
+                InternalKey::new(&key, i.into(), ValueType::Value).as_bytes(),
+                &[i],
+            )
+            .unwrap();
+        }
+        b.finish().unwrap();
+        let r = TableReader::open(&path).unwrap();
+        for i in 1..=6_u8 {
+            key[0] = i;
+            assert_eq!(r.get_internal(&key, i.into()).unwrap(), Some(Some(vec![i])));
+        }
+        // The footer is unchecksummed. Even a valid earlier directory page
+        // cannot replace the head and silently truncate the key space.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let footer_at = bytes.len() - FOOTER_SIZE;
+        let (meta, head) = decode_footer(bytes[footer_at..].try_into().unwrap()).unwrap();
+        let end = (head.offset + head.size) as usize;
+        let previous = BlockHandle::decode(&bytes[end - 16..end]).unwrap();
+        assert_ne!(previous, BlockHandle::default());
+        bytes[footer_at..].copy_from_slice(&encode_footer(&meta, &previous));
+        std::fs::write(&path, bytes).unwrap();
+        let error = TableReader::open(&path)
+            .err()
+            .expect("truncated directory chain");
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        assert!(error.to_string().contains("index directory head"));
+    }
+
+    #[test]
+    fn recovery_rejects_invalid_internal_keys_and_unordered_index_roots() {
+        use crate::{DB, DbOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"key", b"value").unwrap();
+        db.close().unwrap();
+        let path = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|p| p.unwrap().path())
+            .find(|p| p.extension().is_some_and(|e| e == "sst"))
+            .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let (meta, head) =
+            decode_footer(original[original.len() - FOOTER_SIZE..].try_into().unwrap()).unwrap();
+        let valid = InternalKey::new(b"v", 1, ValueType::Value).into_bytes();
+        let invalid_type = vec![0; 8];
+        let earlier = InternalKey::new(b"a", 1, ValueType::Value).into_bytes();
+        for (keys, reason) in [
+            (vec![vec![0; 7]], "internal key too short"),
+            (vec![invalid_type], "invalid value_type"),
+            (
+                vec![valid.clone(), valid.clone()],
+                "unordered SST index partitions",
+            ),
+            (vec![valid, earlier], "unordered SST index partitions"),
+        ] {
+            let mut image = original[..head.offset as usize].to_vec();
+            let mut root = BlockBuilder::new(1);
+            for k in keys {
+                root.add(&k, &BlockHandle::new(0, 1).encode());
+            }
+            let mut payload = root.finish();
+            payload.extend_from_slice(&BlockHandle::default().encode());
+            let bad = BlockHandle::new(head.offset, payload.len() as u64);
+            payload.push(CompressionType::None as u8);
+            let crc = crc32fast::hash(&payload);
+            image.extend_from_slice(&payload);
+            image.extend_from_slice(&crc.to_le_bytes());
+            image.extend_from_slice(&encode_footer(&meta, &bad));
+            std::fs::write(&path, image).unwrap();
+            for result in [
+                DB::open_read_only(dir.path()),
+                DB::open(DbOptions::default(), dir.path()),
+            ] {
+                let error = result.err().expect("invalid root accepted during recovery");
+                assert_eq!(error.kind(), ErrorKind::Corruption);
+                assert!(error.to_string().contains(reason), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn compact_same_maximum_key_across_generations_with_live_snapshots() {
+        use crate::{DB, DbOptions};
+        let directory = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_num_levels(2)
+            .with_l0_compaction_trigger(12)
+            .with_l0_slowdown_trigger(16)
+            .with_l0_stop_trigger(20)
+            .with_pin_l0_first_block_and_warm_index(false)
+            .with_block_cache_capacity(0);
+        let db = DB::open(opts, directory.path()).unwrap();
+        let key = vec![b'm'; MAX_USER_KEY_SIZE];
+        let mut snapshots = Vec::new();
+        for i in 0..5 {
+            db.put(&key, &[i]).unwrap();
+            snapshots.push(db.snapshot());
+            db.flush().unwrap();
+        }
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("5"));
+        db.compact().unwrap();
+        assert_eq!(db.get_property("num-files-at-level1").as_deref(), Some("1"));
+        for (i, snapshot) in snapshots.iter().enumerate() {
+            assert_eq!(snapshot.get(&key).unwrap(), Some(vec![i as u8]));
+        }
+    }
+
+    #[test]
+    fn flush_clips_a_crossing_range_with_many_live_snapshot_stripes() {
+        use crate::{DB, DbOptions};
+        let directory = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), directory.path()).unwrap();
+        let mut snapshots = Vec::new();
+        for n in 0..1_500_u32 {
+            db.put(b"m", &n.to_be_bytes()).unwrap();
+            snapshots.push(db.snapshot());
+            db.delete_range(b"a", b"z").unwrap();
+            snapshots.push(db.snapshot());
+        }
+        db.flush().unwrap();
+        let mut bounds = Vec::new();
+        for e in std::fs::read_dir(directory.path()).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().is_some_and(|ext| ext == "sst") {
+                let reader = TableReader::open(&p).unwrap();
+                bounds.extend(
+                    reader
+                        .range_partition_extents()
+                        .map(|(a, b)| (a.to_vec(), b.to_vec())),
+                );
+            }
+        }
+        bounds.sort();
+        assert_eq!(
+            bounds,
+            vec![
+                (b"a".to_vec(), b"m".to_vec()),
+                (b"m".to_vec(), b"z".to_vec())
+            ]
+        );
+        for (n, pair) in snapshots.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(
+                pair[0].get(b"m").unwrap().unwrap(),
+                (n as u32).to_be_bytes()
+            );
+            assert!(pair[1].get(b"m").unwrap().is_none());
+        }
+        db.compact().unwrap();
+        for (n, pair) in snapshots.as_chunks::<2>().0.iter().enumerate().step_by(17) {
+            assert_eq!(
+                pair[0].get(b"m").unwrap().unwrap(),
+                (n as u32).to_be_bytes()
+            );
+            assert!(pair[1].get(b"m").unwrap().is_none());
         }
     }
 
@@ -720,10 +1122,10 @@ mod tests {
                 },
             )
             .unwrap();
-            let mut key = vec![b'a'; 1024];
+            let mut key = InternalKey::new(&[b'a'; 1024], 1, ValueType::Value).into_bytes();
             let (_, allocated) = crate::test_alloc::count_allocated(|| {
                 for i in 0..1000u64 {
-                    key[1016..].copy_from_slice(&i.to_be_bytes());
+                    key[1016..1024].copy_from_slice(&i.to_be_bytes());
                     builder.add(&key, b"v").unwrap();
                 }
             });
@@ -737,7 +1139,10 @@ mod tests {
             let result = builder.finish().unwrap();
             assert_eq!(result.largest_key.as_deref(), Some(key.as_slice()));
             assert_eq!(
-                TableReader::open(&path).unwrap().get(&key).unwrap(),
+                TableReader::open(&path)
+                    .unwrap()
+                    .get(user_key(&key))
+                    .unwrap(),
                 Some(b"v".to_vec())
             );
         }
@@ -748,10 +1153,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty-key.sst");
         let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
-        builder.add(b"", b"value").unwrap();
+        builder.add_point(b"", b"value").unwrap();
         let result = builder.finish().unwrap();
-        assert_eq!(result.smallest_key, Some(Vec::new()));
-        assert_eq!(result.largest_key, Some(Vec::new()));
+        assert_eq!(result.smallest_key.as_deref().map(user_key), Some(&[][..]));
+        assert_eq!(result.largest_key.as_deref().map(user_key), Some(&[][..]));
         assert_eq!(
             TableReader::open(&path).unwrap().get(b"").unwrap(),
             Some(b"value".to_vec())
@@ -774,7 +1179,7 @@ mod tests {
                 ..Default::default()
             };
             let mut builder = TableBuilder::new(&path, options).unwrap();
-            builder.add(b"key", b"value").unwrap();
+            builder.add_point(b"key", b"value").unwrap();
             // Every property fits its u16 fields, but 1024 together exceed
             // the reader's decompressed index limit, even when compressed.
             if count == 1024 {
@@ -800,18 +1205,18 @@ mod tests {
         for i in 0..100 {
             let key = format!("key_{:06}", i);
             let val = format!("value_{}", i);
-            builder.add(key.as_bytes(), val.as_bytes()).unwrap();
+            builder.add_point(key.as_bytes(), val.as_bytes()).unwrap();
         }
         let result = builder.finish().unwrap();
 
         assert_eq!(TableReader::open(&path).unwrap().iter().unwrap().len(), 100);
         assert!(result.file_size > 0);
         assert_eq!(
-            result.smallest_key.as_deref(),
+            result.smallest_key.as_deref().map(user_key),
             Some(b"key_000000".as_slice())
         );
         assert_eq!(
-            result.largest_key.as_deref(),
+            result.largest_key.as_deref().map(user_key),
             Some(b"key_000099".as_slice())
         );
     }
@@ -847,17 +1252,23 @@ mod tests {
         let path = dir.path().join("single.sst");
 
         let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
-        builder.add(b"only_key", b"only_value").unwrap();
+        builder.add_point(b"only_key", b"only_value").unwrap();
         let result = builder.finish().unwrap();
 
         assert_eq!(TableReader::open(&path).unwrap().iter().unwrap().len(), 1);
-        assert_eq!(result.smallest_key.as_deref(), Some(b"only_key".as_slice()));
-        assert_eq!(result.largest_key.as_deref(), Some(b"only_key".as_slice()));
+        assert_eq!(
+            result.smallest_key.as_deref().map(user_key),
+            Some(b"only_key".as_slice())
+        );
+        assert_eq!(
+            result.largest_key.as_deref().map(user_key),
+            Some(b"only_key".as_slice())
+        );
 
         let reader = TableReader::open(&path).unwrap();
         let entries = reader.iter().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, b"only_key");
+        assert_eq!(user_key(&entries[0].0), b"only_key");
         assert_eq!(entries[0].1, b"only_value");
 
         assert_eq!(
@@ -889,7 +1300,7 @@ mod tests {
                 i,
                 "x".repeat(100)
             );
-            builder.add(key.as_bytes(), val.as_bytes()).unwrap();
+            builder.add_point(key.as_bytes(), val.as_bytes()).unwrap();
         }
         builder.finish().unwrap();
         assert_eq!(TableReader::open(&path).unwrap().iter().unwrap().len(), 500);
@@ -906,7 +1317,7 @@ mod tests {
                 i,
                 "x".repeat(100)
             );
-            assert_eq!(entry.0, key.as_bytes());
+            assert_eq!(user_key(&entry.0), key.as_bytes());
             assert_eq!(entry.1, val.as_bytes());
         }
 
@@ -932,10 +1343,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("range_del.sst");
 
-        let opts = TableBuildOptions {
-            internal_keys: true,
-            ..Default::default()
-        };
+        let opts = TableBuildOptions::default();
         let mut builder = TableBuilder::new(&path, opts).unwrap();
 
         // Add a mix of point entries and range deletions in sorted order.
@@ -1019,7 +1427,7 @@ mod tests {
         )
         .unwrap();
 
-        builder.add(b"k", b"v").unwrap();
+        builder.add_point(b"k", b"v").unwrap();
 
         assert_eq!(builder.projected_filter_size(), META_BLOCK_SPLIT_THRESHOLD);
         assert!(builder.projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD);
@@ -1029,14 +1437,7 @@ mod tests {
     fn test_internal_keys_reject_malformed_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad_ikey.sst");
-        let mut builder = TableBuilder::new(
-            &path,
-            TableBuildOptions {
-                internal_keys: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
 
         let err = builder.add(b"short", b"v").unwrap_err();
         assert!(err.to_string().contains("too short"));
@@ -1069,7 +1470,6 @@ mod tests {
             &path,
             TableBuildOptions {
                 bloom_bits_per_key: bits_per_key,
-                internal_keys: true,
                 ..Default::default()
             },
         )
@@ -1101,7 +1501,6 @@ mod tests {
             &path,
             TableBuildOptions {
                 bloom_bits_per_key: bits_per_key,
-                internal_keys: true,
                 ..Default::default()
             },
         )
@@ -1125,7 +1524,7 @@ mod tests {
     fn test_bloom_filter_hard_limit_is_checked_before_allocation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized_filter.sst");
-        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8) as u32;
+        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8 + 1) as u32;
         let mut builder = TableBuilder::new(
             &path,
             TableBuildOptions {
@@ -1135,7 +1534,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = builder.add(b"k", b"v").unwrap_err();
+        let err = builder.add_point(b"k", b"v").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidArgument);
         assert!(err.message().contains("bloom filter block size"));
         assert!(builder.filter_key_hashes.is_empty());
@@ -1145,7 +1544,7 @@ mod tests {
     fn test_prefix_filter_hard_limit_is_checked_before_allocation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oversized_prefix_filter.sst");
-        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8) as u32;
+        let bits_per_key = (META_BLOCK_HARD_LIMIT * 8 + 1) as u32;
         let mut builder = TableBuilder::new(
             &path,
             TableBuildOptions {
@@ -1175,8 +1574,8 @@ mod tests {
             },
         )
         .unwrap();
-        builder.add(b"aakey", b"v1").unwrap();
-        builder.add(b"bbkey", b"v2").unwrap();
+        builder.add_point(b"aakey", b"v1").unwrap();
+        builder.add_point(b"bbkey", b"v2").unwrap();
         assert!(
             builder.prefix_set.is_empty(),
             "prefix_set must stay empty when bloom is disabled"

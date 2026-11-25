@@ -45,11 +45,7 @@ proptest! {
     #[test]
     fn test_random_operations(ops in vec(arb_op(), 1..100)) {
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open(DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 2048, // small to trigger flushes
-            ..Default::default()
-        }, dir.path()).unwrap();
+        let db = DB::open(DbOptions::default().with_create_if_missing(true).with_write_buffer_size(2048), dir.path()).unwrap();
 
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         let mut all_keys = BTreeSet::new();
@@ -95,11 +91,7 @@ proptest! {
         1..10
     )) {
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open(DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 2048,
-            ..Default::default()
-        }, dir.path()).unwrap();
+        let db = DB::open(DbOptions::default().with_create_if_missing(true).with_write_buffer_size(2048), dir.path()).unwrap();
 
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
@@ -126,11 +118,7 @@ proptest! {
         (arb_key(), arb_value()), 1..50
     )) {
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open(DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 1024,
-            ..Default::default()
-        }, dir.path()).unwrap();
+        let db = DB::open(DbOptions::default().with_create_if_missing(true).with_write_buffer_size(1024), dir.path()).unwrap();
 
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 

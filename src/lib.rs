@@ -31,8 +31,8 @@
 //! ```
 //!
 //! For a store created with custom read/cache settings, use
-//! [`DB::open_read_only_with_options`]. [`DbOptions::num_levels`] is not
-//! persisted, so pass the writer's value when it differs from the default.
+//! [`DB::open_read_only_with_options`]. Read-only recovery adopts the level count
+//! and prefix length recorded in the MANIFEST.
 //!
 //! On Unix, an existing `LOCK` file provides cooperative shared locking. A
 //! missing `LOCK` (and every platform without Unix `flock`) must be treated as
@@ -46,7 +46,11 @@ mod error;
 mod iterator;
 mod manifest;
 mod memtable;
+#[cfg(all(miri, feature = "test-utils"))]
+#[doc(hidden)]
+pub use memtable::arena_tests::concurrent_arena_pins;
 mod options;
+mod pinned;
 mod rate_limiter;
 mod sst;
 mod stats;
@@ -57,13 +61,14 @@ mod wal;
 
 // ---- Primary API ----
 pub use cache::block_cache::{BlockCache, BlockCachePool};
-pub use db::{DB, Snapshot};
+pub use db::{ArcSnapshot, DB, Snapshot, SnapshotRef};
 pub use error::{Error, ErrorKind, Result, ResultExt};
 pub use iterator::{BidiIterator, DBIterator};
 pub use options::{
     BlockPropertyCollector, BlockPropertyFilter, CompactionFilter, CompactionFilterDecision,
-    DbOptions, ReadOptions, SkipPointFn, WriteOptions,
+    DbOptions, DurabilityMode, ReadOptions, SkipPointFn, WriteOptions,
 };
+pub use pinned::PinnedSlice;
 pub use sst::format::CompressionType;
 pub use types::{
     MAX_RANGE_DELETE_SIZE, MAX_USER_KEY_SIZE, MAX_WRITE_ENTRY_SIZE, SequenceNumber, WriteBatch,

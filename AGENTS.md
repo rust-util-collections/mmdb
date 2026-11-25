@@ -99,6 +99,6 @@ Audit registry: `docs/audit.md` — maintained by `$x-review`, `$x-fix`, and `$x
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
-- Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
+- Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock and advisory WAL writeback paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes
 - **No Co-Authored-By in commits** — never add `Co-Authored-By:` or similar trailers to commit messages; project commits are authored only by the human contributor

@@ -20,11 +20,9 @@ pub const MAX_SEQUENCE_NUMBER: SequenceNumber = (1 << 56) - 1;
 
 /// Maximum allowed user key length for writes (8 MiB).
 ///
-/// Derived from the SST format: every data block contributes an index entry
-/// that stores the block's boundary keys *twice* (separator key + first key),
-/// and the whole index lives in a single block that the reader caps at 64 MiB.
-/// Bounding keys keeps any single index entry far below that cap; the table
-/// builder splits output files when the aggregate index grows large.
+/// Applies to both endpoints of a range deletion. A partitioned SST index
+/// leaf stores a data block's first key and separator within the 64 MiB
+/// decompressed-block limit.
 pub const MAX_USER_KEY_SIZE: usize = 8 * 1024 * 1024;
 
 /// Maximum allowed user key + value payload for a single point-write entry.
@@ -34,11 +32,11 @@ pub const MAX_USER_KEY_SIZE: usize = 8 * 1024 * 1024;
 /// fit in a readable 64 MiB block), minus the 8-byte internal-key trailer.
 pub const MAX_WRITE_ENTRY_SIZE: usize = 64 * 1024 * 1024 - 64 - 8;
 
-/// Maximum combined begin + end length for a range deletion (33,550,264 bytes).
+/// Maximum combined begin + end length for a range deletion.
 ///
 /// Reserves room for metadata already below the 32 MiB SST split threshold,
 /// the internal-key trailer, and entry framing in the range-deletion block.
-/// Writes above this limit return `InvalidArgument` before WAL/sequence changes.
+/// Each endpoint also obeys [`MAX_USER_KEY_SIZE`].
 pub const MAX_RANGE_DELETE_SIZE: usize = 32 * 1024 * 1024 - 4096 - 64 - 8;
 
 /// Operation type stored in the low 8 bits of the packed trailer.
@@ -146,6 +144,7 @@ impl InternalKey {
     }
 
     /// Length of the encoded form.
+    #[cfg(test)]
     #[inline]
     pub fn encoded_len(&self) -> usize {
         self.encoded.len()
@@ -262,6 +261,14 @@ pub fn user_key(internal_key: &[u8]) -> &[u8] {
     }
 }
 
+/// Exclusive upper bound of the keys beginning with `prefix`.
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|&byte| byte < u8::MAX)?;
+    let mut upper = prefix[..=last].to_vec();
+    upper[last] += 1;
+    Some(upper)
+}
+
 /// Whether the half-open range tombstone `[begin, end)` can cover any user
 /// key inside the half-open window `[lower, upper)` (`None` = unbounded).
 ///
@@ -285,90 +292,207 @@ pub fn tombstone_overlaps_bounds(
     lower.is_none_or(|lo| end > lo) && upper.is_none_or(|hi| begin < hi)
 }
 
-/// A write batch groups multiple mutations to be applied atomically.
+/// A reusable contiguous batch of mutations, applied atomically by `DB::write`.
+/// Size errors are retained until the batch is submitted or cleared.
+#[derive(Default)]
 pub struct WriteBatch {
-    pub(crate) entries: Vec<WriteBatchEntry>,
+    pub(crate) payload: Vec<u8>,
+    count: u32,
+    invalid: Option<Error>,
+    last_entry_offset: usize,
+    same_key_run_bytes: usize,
 }
 
-/// A single entry in a WriteBatch.
-pub(crate) struct WriteBatchEntry {
+#[derive(Clone, Copy)]
+pub(crate) struct BatchEntry<'a> {
     pub value_type: ValueType,
-    pub key: Vec<u8>,
-    pub value: Option<Vec<u8>>,
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+}
+
+impl BatchEntry<'_> {
+    pub(crate) fn metadata_charge(self) -> usize {
+        metadata_charge(self.value_type, self.key.len(), self.value.len())
+    }
+}
+
+fn metadata_charge(kind: ValueType, key_len: usize, value_len: usize) -> usize {
+    // A partition separator stores the key, internal trailer and framing.
+    // Range roots can use the end key.
+    let separator = if kind == ValueType::RangeDeletion {
+        key_len.max(value_len)
+    } else {
+        key_len
+    };
+    separator + 40
+}
+
+// This decoder is for private, validated, in-memory batches. Recovery uses
+// a fallible decoder for bytes read from disk.
+fn take_batch_field<'a>(input: &mut &'a [u8]) -> &'a [u8] {
+    let (len, rest) = input.split_at(4);
+    let (field, tail) = rest.split_at(u32::from_le_bytes(len.try_into().unwrap()) as usize);
+    *input = tail;
+    field
+}
+
+fn take_batch_entry<'a>(input: &mut &'a [u8]) -> BatchEntry<'a> {
+    let (tag, rest) = input.split_first().unwrap();
+    *input = rest;
+    let value_type = ValueType::from_u8(*tag).unwrap();
+    let key = take_batch_field(input);
+    let value = match value_type {
+        ValueType::Deletion => &[][..],
+        _ => take_batch_field(input),
+    };
+    BatchEntry {
+        value_type,
+        key,
+        value,
+    }
 }
 
 impl WriteBatch {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserve space for the encoded body, measured in bytes.
+    pub fn with_capacity(bytes: usize) -> Self {
         Self {
-            entries: Vec::new(),
+            payload: Vec::with_capacity(bytes),
+            ..Self::default()
         }
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        self.entries.push(WriteBatchEntry {
-            value_type: ValueType::Value,
-            key: key.to_vec(),
-            value: Some(value.to_vec()),
-        });
+        self.put_prefixed(&[], key, value);
+    }
+
+    /// Put `prefix || key` without allocating a concatenated key.
+    pub fn put_prefixed(&mut self, prefix: &[u8], key: &[u8], value: &[u8]) {
+        self.append(ValueType::Value, prefix, key, value);
     }
 
     pub fn delete(&mut self, key: &[u8]) {
-        self.entries.push(WriteBatchEntry {
-            value_type: ValueType::Deletion,
-            key: key.to_vec(),
-            value: None,
-        });
+        self.delete_prefixed(&[], key);
     }
 
-    /// Add a range deletion. Deletes all keys in [begin, end).
-    /// Stored as: InternalKey(begin, seq, RangeDeletion) → end.
-    ///
-    /// Empty or inverted ranges (`begin >= end`) are no-ops and are not
-    /// appended, so they do not consume WAL space or sequences.
+    /// Delete the point key `prefix || key`.
+    pub fn delete_prefixed(&mut self, prefix: &[u8], key: &[u8]) {
+        self.append(ValueType::Deletion, prefix, key, &[]);
+    }
+
+    /// Delete all keys in the half-open range. Empty ranges consume no sequence.
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
-        if begin >= end {
+        self.delete_range_prefixed(&[], begin, end);
+    }
+
+    /// Delete the half-open range between the two prefixed endpoints.
+    pub fn delete_range_prefixed(&mut self, prefix: &[u8], begin: &[u8], end: &[u8]) {
+        if begin < end {
+            self.append(ValueType::RangeDeletion, prefix, begin, end);
+        }
+    }
+
+    fn append(&mut self, kind: ValueType, prefix: &[u8], key: &[u8], value: &[u8]) {
+        if self.invalid.is_some() {
             return;
         }
-        self.entries.push(WriteBatchEntry {
-            value_type: ValueType::RangeDeletion,
-            key: begin.to_vec(),
-            value: Some(end.to_vec()),
-        });
+        let range = kind == ValueType::RangeDeletion;
+        let value_prefix = if range { prefix } else { &[] };
+        // A saturated length exceeds every format limit.
+        let key_len = prefix.len().saturating_add(key.len());
+        let value_len = value_prefix.len().saturating_add(value.len());
+        let entry_limit = if range {
+            MAX_RANGE_DELETE_SIZE
+        } else {
+            MAX_WRITE_ENTRY_SIZE
+        };
+        if key_len > MAX_USER_KEY_SIZE || (range && value_len > MAX_USER_KEY_SIZE) {
+            self.invalid = Some(Error::invalid_argument(format!(
+                "key size exceeds maximum {MAX_USER_KEY_SIZE}"
+            )));
+            return;
+        }
+        if key_len.saturating_add(value_len) > entry_limit || self.count == u32::MAX {
+            self.invalid = Some(Error::invalid_argument(
+                "write batch exceeds entry size or operation count limit",
+            ));
+            return;
+        }
+        // Bound a stream of repeated keys during construction. The commit
+        // path also checks interleaved keys and versions in the active table.
+        let mut run_bytes = metadata_charge(kind, key_len, value_len);
+        if self.count != 0 {
+            let previous = take_batch_entry(&mut &self.payload[self.last_entry_offset..]);
+            if previous.key.len() == key_len && previous.key.strip_prefix(prefix) == Some(key) {
+                run_bytes += self.same_key_run_bytes;
+            }
+        }
+        if run_bytes > crate::sst::table_builder::META_BLOCK_SPLIT_THRESHOLD {
+            self.invalid = Some(Error::invalid_argument(
+                "same-key metadata exceeds SST partition index budget",
+            ));
+            return;
+        }
+        self.same_key_run_bytes = run_bytes;
+        self.last_entry_offset = self.payload.len();
+        let has_value = kind != ValueType::Deletion;
+        self.payload
+            .reserve(5 + key_len + if has_value { 4 + value_len } else { 0 });
+        self.payload.push(kind as u8);
+        self.payload
+            .extend_from_slice(&(key_len as u32).to_le_bytes());
+        self.payload.extend_from_slice(prefix);
+        self.payload.extend_from_slice(key);
+        if has_value {
+            self.payload
+                .extend_from_slice(&(value_len as u32).to_le_bytes());
+            self.payload.extend_from_slice(value_prefix);
+            self.payload.extend_from_slice(value);
+        }
+        self.count += 1;
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.count == 0
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.count as usize
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.payload.clear();
+        self.count = 0;
+        self.invalid = None;
+        self.same_key_run_bytes = 0;
+        self.last_entry_offset = 0;
+    }
+
+    pub(crate) fn check_valid(&self) -> Result<()> {
+        self.invalid.clone().map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = BatchEntry<'_>> {
+        let mut body = self.payload.as_slice();
+        (0..self.count).map(move |_| take_batch_entry(&mut body))
+    }
+
+    pub(crate) fn wal_header(&self, sequence: SequenceNumber) -> [u8; 12] {
+        let mut header = [0; 12];
+        header[..8].copy_from_slice(&sequence.to_le_bytes());
+        header[8..].copy_from_slice(&self.count.to_le_bytes());
+        header
     }
 }
 
-impl Default for WriteBatch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WriteBatchWithIndex — indexed batch for iteration over uncommitted writes
-// ---------------------------------------------------------------------------
-
-/// A WriteBatch with a secondary sorted index for efficient iteration.
-/// Allows iterating over batch contents merged with a DB snapshot.
+/// A batch with a sorted point-key index for iteration over uncommitted writes.
 pub struct WriteBatchWithIndex {
     batch: WriteBatch,
-    /// Maps user_key -> (index of the latest entry in batch.entries, write position).
-    index: BTreeMap<Vec<u8>, (usize, u64)>,
-    /// Range tombstones: (begin, end, write_position) from delete_range calls.
-    range_del_entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
-    /// Monotonic counter: each put/delete/delete_range increments this.
-    next_pos: u64,
+    index: BTreeMap<Box<[u8]>, (usize, u64)>,
+    range_del_entries: Vec<(usize, u64)>,
 }
 
 impl WriteBatchWithIndex {
@@ -377,35 +501,40 @@ impl WriteBatchWithIndex {
             batch: WriteBatch::new(),
             index: BTreeMap::new(),
             range_del_entries: Vec::new(),
-            next_pos: 0,
+        }
+    }
+
+    fn index_point(&mut self, key: &[u8], offset: usize) {
+        if self.batch.invalid.is_some() {
+            return;
+        }
+        let location = (offset, self.operation_count() - 1);
+        if let Some(old) = self.index.get_mut(key) {
+            *old = location;
+        } else {
+            self.index.insert(key.into(), location);
         }
     }
 
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        let idx = self.batch.entries.len();
-        let pos = self.next_pos;
-        self.next_pos += 1;
+        let offset = self.batch.payload.len();
         self.batch.put(key, value);
-        self.index.insert(key.to_vec(), (idx, pos));
+        self.index_point(key, offset);
     }
 
     pub fn delete(&mut self, key: &[u8]) {
-        let idx = self.batch.entries.len();
-        let pos = self.next_pos;
-        self.next_pos += 1;
+        let offset = self.batch.payload.len();
         self.batch.delete(key);
-        self.index.insert(key.to_vec(), (idx, pos));
+        self.index_point(key, offset);
     }
 
     pub fn delete_range(&mut self, begin: &[u8], end: &[u8]) {
-        if begin >= end {
-            return;
-        }
-        let pos = self.next_pos;
-        self.next_pos += 1;
+        let offset = self.batch.payload.len();
+        let pos = self.operation_count();
         self.batch.delete_range(begin, end);
-        self.range_del_entries
-            .push((begin.to_vec(), end.to_vec(), pos));
+        if self.batch.payload.len() > offset {
+            self.range_del_entries.push((offset, pos));
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -416,48 +545,45 @@ impl WriteBatchWithIndex {
         self.batch.is_empty()
     }
 
-    pub fn into_batch(self) -> WriteBatch {
-        self.batch
+    /// Consume the index, returning any size error latched while building the batch.
+    pub fn into_batch(self) -> Result<WriteBatch> {
+        self.check_valid()?;
+        Ok(self.batch)
     }
 
-    /// Total number of operations (point + range-del).
-    /// Used for sequence number range allocation.
+    pub(crate) fn check_valid(&self) -> Result<()> {
+        self.batch.check_valid()
+    }
+
+    /// Total number of mutations including range deletions.
     pub fn operation_count(&self) -> u64 {
-        self.next_pos
+        u64::from(self.batch.count)
     }
 
-    /// Return the range tombstones with their write positions.
-    pub fn range_tombstones(&self) -> &[(Vec<u8>, Vec<u8>, u64)] {
-        &self.range_del_entries
+    /// Borrow the endpoints and original write position of each range deletion.
+    pub fn range_tombstones(&self) -> impl Iterator<Item = (&[u8], &[u8], u64)> {
+        self.range_del_entries.iter().map(|&(offset, pos)| {
+            let entry = take_batch_entry(&mut &self.batch.payload[offset..]);
+            (entry.key, entry.value, pos)
+        })
     }
 
-    /// Iterate the BTreeMap in order, producing (InternalKey, value) pairs
-    /// for point operations only. Range tombstones are handled separately
-    /// by `range_tombstones()` and injected into `DBIterator` via
-    /// `set_range_tombstones_with_levels()`.
-    ///
-    /// Sequence numbers are assigned as `base_seq + write_position`,
-    /// preserving temporal ordering regardless of key sort order.
     pub(crate) fn sorted_entries(
         &self,
         base_seq: SequenceNumber,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut result = Vec::with_capacity(self.index.len());
-        for (user_key, &(entry_idx, pos)) in &self.index {
-            let entry = &self.batch.entries[entry_idx];
-            let seq = base_seq.checked_add(pos).ok_or_else(|| {
-                Error::invalid_argument("sequence number space exhausted".to_string())
-            })?;
-            if seq > MAX_SEQUENCE_NUMBER {
-                return Err(Error::invalid_argument(
-                    "sequence number space exhausted".to_string(),
-                ));
-            }
-            let ikey = InternalKey::new(user_key, seq, entry.value_type);
-            let value = entry.value.clone().unwrap_or_default();
-            result.push((ikey.into_bytes(), value));
-        }
-        Ok(result)
+        self.index
+            .values()
+            .map(|&(offset, pos)| {
+                let entry = take_batch_entry(&mut &self.batch.payload[offset..]);
+                let seq = base_seq
+                    .checked_add(pos)
+                    .filter(|&n| n <= MAX_SEQUENCE_NUMBER)
+                    .ok_or_else(|| Error::invalid_argument("sequence number space exhausted"))?;
+                let key = InternalKey::new(entry.key, seq, entry.value_type);
+                Ok((key.into_bytes(), entry.value.to_vec()))
+            })
+            .collect()
     }
 }
 
@@ -478,7 +604,9 @@ impl Default for WriteBatchWithIndex {
 /// without ever allocating, while the final `Iterator::next()` boundary
 /// calls `into_vec()` to produce the owned bytes the public API promises.
 #[derive(Clone)]
-pub enum LazyValue {
+pub(crate) enum LazyValue {
+    /// Immutable arena bytes kept alive by the owning memtable.
+    MemTable(crate::memtable::MemTablePin),
     /// Owned bytes (from memtable sources or materialized backward iteration).
     Inline(Vec<u8>),
     /// Zero-copy slice into a cached/pinned SST block.
@@ -496,6 +624,7 @@ impl LazyValue {
     pub fn as_slice(&self) -> &[u8] {
         match self {
             LazyValue::Inline(v) => v,
+            LazyValue::MemTable(pin) => pin.as_ref(),
             LazyValue::BlockRef { data, offset, len } => {
                 &data[*offset as usize..(*offset as usize) + (*len as usize)]
             }
@@ -506,19 +635,14 @@ impl LazyValue {
     #[inline]
     pub fn into_vec(self) -> Vec<u8> {
         match self {
-            LazyValue::Inline(v) => v,
-            LazyValue::BlockRef { data, offset, len } => {
-                data[offset as usize..(offset as usize) + (len as usize)].to_vec()
-            }
+            Self::Inline(v) => v,
+            other => other.as_slice().to_vec(),
         }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        match self {
-            LazyValue::Inline(v) => v.len(),
-            LazyValue::BlockRef { len, .. } => *len as usize,
-        }
+        self.as_slice().len()
     }
 
     /// Create an empty inline value.
@@ -531,6 +655,7 @@ impl LazyValue {
 impl fmt::Debug for LazyValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            LazyValue::MemTable(pin) => write!(f, "MemTable({}B)", pin.as_ref().len()),
             LazyValue::Inline(v) => write!(f, "Inline({}B)", v.len()),
             LazyValue::BlockRef { len, .. } => write!(f, "BlockRef({}B)", len),
         }
@@ -717,6 +842,59 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_batch_matches_v4_record_body_and_reuses_allocation() {
+        let mut b = WriteBatch::with_capacity(128);
+        let (_, allocated) = crate::test_alloc::count_allocated(|| {
+            b.put_prefixed(b"p", b"a", b"v");
+            b.delete_prefixed(b"p", b"b");
+            b.delete_range_prefixed(b"p", b"c", b"d");
+            b.delete_range_prefixed(b"p", b"z", b"a");
+        });
+        assert_eq!(allocated, 0);
+        assert_eq!(b.len(), 3);
+        assert_eq!(
+            b.payload,
+            b"\x01\x02\0\0\0pa\x01\0\0\0v\x00\x02\0\0\0pb\x02\x02\0\0\0pc\x02\0\0\0pd"
+        );
+        let capacity = b.payload.capacity();
+        b.clear();
+        assert_eq!(b.payload.capacity(), capacity);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn building_a_giant_same_key_run_stops_growing_before_submission() {
+        let key = vec![1; MAX_USER_KEY_SIZE];
+        let mut b = WriteBatch::new();
+        for split in 0..12 {
+            b.delete_prefixed(&key[..split], &key[split..]);
+        }
+        assert_eq!(b.len(), 3);
+        assert_eq!(b.payload.len(), 3 * (5 + key.len()));
+        assert!(b.check_valid().is_err());
+        b.clear();
+        b.delete(&key);
+        assert!(b.check_valid().is_ok());
+    }
+
+    #[test]
+    fn rejected_index_entry_keeps_original_payload_offsets() {
+        let mut indexed = WriteBatchWithIndex::new();
+        indexed.put(b"k", b"v1");
+        indexed.put(b"k", b"v2");
+        indexed.delete_range(b"k", b"n");
+        indexed.delete_range(b"p", &vec![b'z'; MAX_USER_KEY_SIZE + 1]);
+        indexed.put(b"other", b"v");
+        assert_eq!(indexed.operation_count(), 3);
+        assert_eq!(indexed.index.len(), 1);
+        assert_eq!(
+            indexed.range_tombstones().collect::<Vec<_>>(),
+            vec![(b"k".as_slice(), b"n".as_slice(), 2)]
+        );
+        assert!(indexed.into_batch().is_err());
+    }
+
+    #[test]
     fn test_write_batch_large() {
         let mut wb = WriteBatch::new();
         let count = 10_001;
@@ -729,11 +907,11 @@ mod tests {
         assert!(!wb.is_empty());
 
         // Verify entries are stored correctly
-        assert_eq!(wb.entries.len(), count);
-        assert_eq!(wb.entries[0].key, b"key_00000000");
-        assert_eq!(wb.entries[0].value, Some(b"val_00000000".to_vec()));
+        assert_eq!(wb.entries().count(), count);
+        assert_eq!(wb.entries().next().unwrap().key, b"key_00000000");
+        assert_eq!(wb.entries().next().unwrap().value, b"val_00000000");
         assert_eq!(
-            wb.entries[count - 1].key,
+            wb.entries().last().unwrap().key,
             format!("key_{:08}", count - 1).into_bytes()
         );
 
@@ -741,7 +919,7 @@ mod tests {
         wb.clear();
         assert!(wb.is_empty());
         assert_eq!(wb.len(), 0);
-        assert!(wb.entries.is_empty());
+        assert!(wb.payload.is_empty());
     }
 
     #[test]
@@ -750,10 +928,10 @@ mod tests {
         wb.delete_range(b"begin", b"end");
         assert_eq!(wb.len(), 1);
 
-        let entry = &wb.entries[0];
+        let entry = &wb.entries().next().unwrap();
         assert_eq!(entry.value_type, ValueType::RangeDeletion);
         assert_eq!(entry.key, b"begin");
-        assert_eq!(entry.value, Some(b"end".to_vec()));
+        assert_eq!(entry.value, b"end");
 
         // Mix put, delete, delete_range in one batch
         wb.put(b"k1", b"v1");
@@ -761,12 +939,15 @@ mod tests {
         wb.delete_range(b"a", b"z");
         assert_eq!(wb.len(), 4);
 
-        assert_eq!(wb.entries[1].value_type, ValueType::Value);
-        assert_eq!(wb.entries[2].value_type, ValueType::Deletion);
-        assert_eq!(wb.entries[2].value, None);
-        assert_eq!(wb.entries[3].value_type, ValueType::RangeDeletion);
-        assert_eq!(wb.entries[3].key, b"a");
-        assert_eq!(wb.entries[3].value, Some(b"z".to_vec()));
+        assert_eq!(wb.entries().nth(1).unwrap().value_type, ValueType::Value);
+        assert_eq!(wb.entries().nth(2).unwrap().value_type, ValueType::Deletion);
+        assert!(wb.entries().nth(2).unwrap().value.is_empty());
+        assert_eq!(
+            wb.entries().nth(3).unwrap().value_type,
+            ValueType::RangeDeletion
+        );
+        assert_eq!(wb.entries().nth(3).unwrap().key, b"a");
+        assert_eq!(wb.entries().nth(3).unwrap().value, b"z");
     }
 
     #[test]

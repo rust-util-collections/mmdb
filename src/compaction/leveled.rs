@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::remove_file;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::thread::scope;
 
 #[cfg(test)]
@@ -22,10 +22,11 @@ use crate::iterator::range_del::RangeTombstoneTracker;
 use crate::manifest::file_numbers::{FileNumbers, PendingSsts};
 use crate::manifest::version::{TableFile, Version};
 use crate::manifest::version_edit::{FileMetaData, VersionEdit};
-use crate::manifest::version_set::VersionSet;
+use crate::manifest::version_set::{DirSynced, VersionSet, sync_new_sst_parent_dir};
 use crate::options::{CompactionFilterDecision, DbOptions};
 use crate::rate_limiter::RateLimiter;
 use crate::sst::SstBuilds;
+use crate::sst::range::RangeFragment;
 use crate::sst::table_builder::{META_BLOCK_SPLIT_THRESHOLD, TableBuildOptions, TableBuilder};
 use crate::sst::table_reader::TableIterator;
 use crate::stats::DbStats;
@@ -52,6 +53,7 @@ pub struct CompactionHint {
 /// Shared context for compaction operations, reducing argument count.
 pub(crate) struct CompactionContext<'a> {
     pub db_path: &'a Path,
+    pub manifest_poisoned: &'a AtomicBool,
     pub options: &'a DbOptions,
     pub builds: &'a SstBuilds,
     pub rate_limiter: Option<&'a Arc<RateLimiter>>,
@@ -80,6 +82,7 @@ type OutputTombstones = HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>>;
 
 /// Result of the I/O phase of compaction (no lock needed to produce this).
 pub struct CompactionOutput {
+    dir_synced: DirSynced,
     /// The version edit with new files added and old files deleted.
     pub edit: VersionEdit,
     /// Exact input files and levels the output was built from.
@@ -106,25 +109,6 @@ pub struct PostCompactionCleanup {
 impl CompactionTask {}
 
 pub struct LeveledCompaction;
-
-/// Collect range tombstones from input files and return them as sorted
-/// internal-key entries suitable for injection into the merge iterator.
-/// This ensures tombstones from new-format SSTs (which store range
-/// deletions in a separate block) participate in the merge.
-fn collect_range_del_entries(files: &[TableFile]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut entries = Vec::new();
-    for tf in files {
-        if tf.meta.has_range_deletions {
-            let tombstones = tf.reader.get_range_tombstones().ctx()?;
-            for (begin, end, seq) in tombstones {
-                let ikey = InternalKey::new(&begin, seq, ValueType::RangeDeletion);
-                entries.push((ikey.as_bytes().to_vec(), end));
-            }
-        }
-    }
-    entries.sort_by(|a, b| compare_internal_key(&a.0, &b.0));
-    Ok(entries)
-}
 
 enum UserKeyRange {
     /// Inclusive file metadata range.
@@ -159,22 +143,12 @@ fn file_overlaps_compact_bounds(
     if !tf.meta.has_range_deletions {
         return false;
     }
-    match tf.reader.cached_range_tombstones() {
-        Ok(tombstones) => tombstones
-            .iter_tombstones()
-            .any(|(begin, end, _)| tombstone_overlaps_bounds(begin, end, lower, upper)),
-        Err(e) => {
-            tracing::warn!(
-                "failed to read range tombstones from SST {} while picking compact_range: {}",
-                tf.meta.number,
-                e
-            );
-            true
-        }
-    }
+    tf.reader
+        .range_partition_extents()
+        .any(|(begin, end)| tombstone_overlaps_bounds(begin, end, lower, upper))
 }
 
-fn add_file_extents(tf: &TableFile, extents: &mut Vec<UserKeyRange>) -> bool {
+fn add_file_extents(tf: &TableFile, extents: &mut Vec<UserKeyRange>) {
     if !tf.meta.smallest_key.is_empty() && !tf.meta.largest_key.is_empty() {
         extents.push(UserKeyRange::File {
             smallest: user_key(&tf.meta.smallest_key).to_vec(),
@@ -182,25 +156,13 @@ fn add_file_extents(tf: &TableFile, extents: &mut Vec<UserKeyRange>) -> bool {
         });
     }
     if tf.meta.has_range_deletions {
-        match tf.reader.get_range_tombstones() {
-            Ok(tombstones) => {
-                extents.extend(
-                    tombstones
-                        .into_iter()
-                        .map(|(begin, end, _)| UserKeyRange::Tombstone { begin, end }),
-                );
+        extents.extend(tf.reader.range_partition_extents().map(|(begin, end)| {
+            UserKeyRange::Tombstone {
+                begin: begin.to_vec(),
+                end: end.to_vec(),
             }
-            Err(e) => {
-                tracing::warn!(
-                    "failed to read range tombstones from SST {} while expanding compaction range: {}",
-                    tf.meta.number,
-                    e
-                );
-                return false;
-            }
-        }
+        }));
     }
-    true
 }
 
 fn file_metadata_overlaps_extent(tf: &TableFile, extent: &UserKeyRange) -> bool {
@@ -235,27 +197,15 @@ fn file_overlaps_extent(tf: &TableFile, extent: &UserKeyRange) -> bool {
     if !tf.meta.has_range_deletions {
         return false;
     }
-    match tf.reader.cached_range_tombstones() {
-        Ok(tombstones) => tombstones
-            .iter_tombstones()
-            .any(|(begin, end, _)| tombstone_overlaps_extent(begin, end, extent)),
-        Err(e) => {
-            tracing::warn!(
-                "failed to read range tombstones from SST {} while checking overlap: {}",
-                tf.meta.number,
-                e
-            );
-            true
-        }
-    }
+    tf.reader
+        .range_partition_extents()
+        .any(|(begin, end)| tombstone_overlaps_extent(begin, end, extent))
 }
 
 fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Vec<TableFile> {
     let mut extents = Vec::new();
     for tf in inputs {
-        if !add_file_extents(tf, &mut extents) {
-            return files.to_vec();
-        }
+        add_file_extents(tf, &mut extents);
     }
 
     // Seed with the aggregate [min smallest, max largest] range across ALL
@@ -301,9 +251,7 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
                 .any(|extent| file_overlaps_extent(tf, extent))
             {
                 selected_numbers.insert(tf.meta.number);
-                if !add_file_extents(tf, &mut extents) {
-                    return files.to_vec();
-                }
+                add_file_extents(tf, &mut extents);
                 changed = true;
             }
         }
@@ -340,8 +288,7 @@ struct SubCompactionParams<'a> {
     build_opts: &'a TableBuildOptions,
     oldest_snapshot_seq: SequenceNumber,
     pending: &'a PendingSsts<'a>,
-    all_range_del_entries: &'a [(Vec<u8>, Vec<u8>)],
-    all_raw_tombstones: &'a [(Vec<u8>, Vec<u8>, SequenceNumber)],
+    range_fragments: &'a [RangeFragment],
 }
 
 /// Output of a single sub-compaction (new files only; deletions handled by orchestrator).
@@ -465,7 +412,19 @@ fn build_sub_tasks(task: &CompactionTask, split_points: &[Vec<u8>]) -> Vec<SubCo
 }
 
 /// Collect raw tombstone triples from input files.
-type RawTombstone = (Vec<u8>, Vec<u8>, SequenceNumber);
+enum OutputEntry {
+    Point(Vec<u8>, LazyValue),
+    Range(RangeFragment),
+}
+
+impl OutputEntry {
+    fn user_key(&self) -> &[u8] {
+        match self {
+            Self::Point(key, _) => user_key(key),
+            Self::Range(range) => &range.begin,
+        }
+    }
+}
 
 fn cleanup_output_files(db_path: &Path, new_files: &[(u32, FileMetaData)]) {
     for (_, meta) in new_files {
@@ -482,12 +441,11 @@ fn evict_table_cache_files(table_cache: Option<&Arc<TableCache>>, files: &[(u32,
     }
 }
 
-fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<RawTombstone>> {
+fn collect_range_fragments(files: &[TableFile]) -> Result<Vec<RangeFragment>> {
     let mut tombstones = Vec::new();
     for tf in files {
         if tf.meta.has_range_deletions {
-            let ts = tf.reader.get_range_tombstones().ctx()?;
-            tombstones.extend(ts);
+            tf.reader.collect_range_fragments(&mut tombstones).ctx()?;
         }
     }
     Ok(tombstones)
@@ -495,12 +453,8 @@ fn collect_raw_tombstones(files: &[TableFile]) -> Result<Vec<RawTombstone>> {
 
 /// Execute a single sub-compaction covering [lower_bound, upper_bound).
 /// File numbers are allocated from a shared atomic counter to avoid collisions.
-/// `all_range_del_entries` contains range tombstone merge entries from ALL
-/// input files; only those starting inside this sub-task's range are injected
-/// into its merge stream. `all_raw_tombstones` contains raw (begin, end, seq)
-/// triples to pre-populate the RangeTombstoneTracker; every tombstone
-/// overlapping the sub-task's range is applied, so tombstones whose start key
-/// is before `lower_bound` still take effect.
+/// Range deletions are shared across sub-tasks, clipped to the owned interval
+/// for output and applied to all covered point versions during GC.
 fn execute_sub_compaction_io(
     ctx: &CompactionContext<'_>,
     sub: &SubCompactionTask,
@@ -523,32 +477,44 @@ fn execute_sub_compaction_io(
         sources.push(IterSource::from_table_iter(iter));
     }
 
-    // Inject the range tombstones relevant to this sub-task into the merge
-    // stream. A tombstone entry is keyed at its start key, and the merge
-    // loop only consumes entries whose start lies in [lower_bound,
-    // upper_bound) — the seek skips earlier starts and the upper-bound
-    // check breaks before later ones — so entries outside that window are
-    // dead weight in this sub-task and need not be cloned.
-    if !params.all_range_del_entries.is_empty() {
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = params
-            .all_range_del_entries
-            .iter()
-            .filter(|(ikey, _)| {
-                let start = user_key(ikey);
-                sub.lower_bound
-                    .as_ref()
-                    .is_none_or(|lo| start >= lo.as_slice())
-                    && sub
-                        .upper_bound
-                        .as_ref()
-                        .is_none_or(|hi| start < hi.as_slice())
-            })
-            .cloned()
-            .collect();
-        if !entries.is_empty() {
-            sources.push(IterSource::new(entries));
+    // Clip each interval once. The newest stripe visible at the oldest
+    // snapshot suffices for the point-GC tracker; newer stripes stay packed.
+    let mut clipped = Vec::new();
+    let mut range_tombstones = RangeTombstoneTracker::new(params.oldest_snapshot_seq);
+    let lo = sub.lower_bound.as_deref().map(Arc::<[u8]>::from);
+    let hi = sub.upper_bound.as_deref().map(Arc::<[u8]>::from);
+    for input in params.range_fragments {
+        if !tombstone_overlaps_bounds(&input.begin, &input.end, lo.as_deref(), hi.as_deref()) {
+            continue;
+        }
+        let mut range = input.clone();
+        if let Some(lo) = &lo
+            && range.begin < *lo
+        {
+            range.begin = lo.clone();
+        }
+        if let Some(hi) = &hi
+            && range.end > *hi
+        {
+            range.end = hi.clone();
+        }
+        let visible = range
+            .sequences()
+            .partition_point(|s| *s <= params.oldest_snapshot_seq);
+        if visible > 0 {
+            range_tombstones.add(
+                range.begin.to_vec(),
+                range.end.to_vec(),
+                range.sequences()[visible - 1],
+            );
+        }
+        if !params.is_bottommost || range.keep_from(params.oldest_snapshot_seq) {
+            clipped.push(range);
         }
     }
+    range_tombstones.reset();
+    clipped.sort_unstable_by(|a, b| a.begin.cmp(&b.begin));
+    let mut ranges = clipped.into_iter().peekable();
 
     let mut merger = MergingIterator::new(sources, compare_internal_key);
 
@@ -569,48 +535,122 @@ fn execute_sub_compaction_io(
     let mut current_file_number = 0u64;
     let mut current_size = 0usize;
     let mut current_file_user_key: Vec<u8> = Vec::new();
+    let mut carry = Vec::new();
     let mut pending_cut = false;
     let mut last_point_key: Option<Vec<u8>> = None;
-    let mut last_range_del_key: Option<Vec<u8>> = None;
     let mut last_written_seq: SequenceNumber = 0;
     let mut snapshot_idx: usize = ctx.active_snapshots.len();
     let mut filter_mutated = false;
-    let mut range_tombstones = RangeTombstoneTracker::new(params.oldest_snapshot_seq);
-    // Pre-populate the tracker with every tombstone that can cover a key in
-    // this sub-task's range — in particular straddlers whose start key is
-    // before lower_bound must still take effect. Tombstones entirely outside
-    // [lower_bound, upper_bound) can never cover a processed key (the merge
-    // loop only queries the tracker for keys inside that window), so they
-    // are skipped instead of cloned.
-    for (begin, end, seq) in params.all_raw_tombstones {
-        if tombstone_overlaps_bounds(
-            begin,
-            end,
-            sub.lower_bound.as_deref(),
-            sub.upper_bound.as_deref(),
-        ) {
-            range_tombstones.add(begin.clone(), end.clone(), *seq);
-        }
-    }
-    range_tombstones.reset();
-
-    while let Some((ikey, value)) = merger.next_entry() {
-        let (user_key, entry_seq, vt) = decode_internal_key(&ikey).ctx()?;
-
-        // Check upper bound: stop if user_key >= upper_bound
-        if let Some(ref hi) = sub.upper_bound
-            && user_key >= hi.as_slice()
-        {
+    let mut next_point = merger.next_entry();
+    loop {
+        let mut row = if ranges.peek().is_some_and(|r| {
+            next_point
+                .as_ref()
+                .is_none_or(|(key, _)| r.begin.as_ref() <= user_key(key))
+        }) {
+            OutputEntry::Range(ranges.next().unwrap())
+        } else if let Some((key, value)) = next_point.take() {
+            if hi
+                .as_ref()
+                .is_some_and(|bound| user_key(&key) >= bound.as_ref())
+            {
+                break;
+            }
+            next_point = merger.next_entry();
+            OutputEntry::Point(key, value)
+        } else {
             break;
+        };
+        if let OutputEntry::Point(ikey, final_value) = &mut row {
+            let (user_key, entry_seq, vt) = decode_internal_key(ikey).ctx()?;
+            if vt == ValueType::RangeDeletion {
+                return Err(Error::corruption("range deletion in point data block"));
+            }
+            if let Some(ref last) = last_point_key
+                && last.as_slice() == user_key
+            {
+                while snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= last_written_seq
+                {
+                    snapshot_idx -= 1;
+                }
+                if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= entry_seq {
+                    last_written_seq = entry_seq;
+                    // A retained older version that is shadowed by a range tombstone
+                    // below the oldest snapshot must still be dropped. Otherwise, if
+                    // that tombstone is itself dropped at the bottommost level, the
+                    // value would resurrect for the snapshot that retained it. (The
+                    // newest-version branch below already applies this check; retained
+                    // versions need it too.)
+                    if vt == ValueType::Value
+                        && !range_tombstones.is_empty()
+                        && range_tombstones.is_deleted(user_key, entry_seq)
+                    {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                last_point_key = Some(user_key.to_vec());
+                last_written_seq = entry_seq;
+                snapshot_idx = ctx.active_snapshots.len();
+
+                // Only a genuine Deletion may be dropped here, and only at the
+                // bottommost level below the oldest snapshot. Type was validated
+                // by `decode_internal_key` above.
+                if params.is_bottommost
+                    && entry_seq < params.oldest_snapshot_seq
+                    && vt == ValueType::Deletion
+                {
+                    continue;
+                }
+
+                if vt == ValueType::Value
+                    && !range_tombstones.is_empty()
+                    && range_tombstones.is_deleted(user_key, entry_seq)
+                {
+                    continue;
+                }
+            }
+
+            // Apply compaction filter
+            if params.is_bottommost
+                && ctx.active_snapshots.is_empty()
+                && let Some(ref filter) = ctx.options.compaction_filter
+                && vt == ValueType::Value
+            {
+                match filter.filter(params.target_level, user_key, final_value.as_slice()) {
+                    CompactionFilterDecision::Keep => {}
+                    CompactionFilterDecision::Remove => {
+                        filter_mutated = true;
+                        continue;
+                    }
+                    CompactionFilterDecision::ChangeValue(new_val) => {
+                        filter_mutated = true;
+                        *final_value = LazyValue::Inline(new_val);
+                    }
+                }
+            }
+
+            if params.is_bottommost
+                && entry_seq > 0
+                && entry_seq < params.oldest_snapshot_seq
+                && vt == ValueType::Value
+            {
+                *ikey = InternalKey::new(user_key, 0, vt).into_bytes();
+            }
         }
 
+        let user_key = row.user_key();
         // Only cut output files at a user-key boundary: all versions of one user
         // key must stay in the same file, otherwise L1+ files would have
         // overlapping key ranges and a point read could pick the wrong file and
         // miss a visible version. A size-triggered cut is deferred until the user
         // key changes here.
         if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
-            let result = builder.take().unwrap().finish().ctx()?;
+            let mut previous = builder.take().unwrap();
+            carry = previous.clip_at(user_key);
+            let result = previous.finish().ctx()?;
             if let Some(s) = ctx.stats {
                 s.record_compaction_bytes(result.file_size);
             }
@@ -631,87 +671,6 @@ fn execute_sub_compaction_io(
             pending_cut = false;
         }
 
-        if vt == ValueType::RangeDeletion {
-            // Not re-added to `range_tombstones` here: `all_raw_tombstones`
-            // already pre-populated the tracker with every tombstone in the
-            // input set (including this one) before the loop started, so
-            // re-adding it on every native occurrence would just duplicate
-            // entries and force a full re-sort per tombstone for no benefit.
-            if let Some(ref last) = last_range_del_key
-                && last.as_slice() == ikey.as_slice()
-            {
-                continue;
-            }
-            last_range_del_key = Some(ikey.clone());
-            if params.is_bottommost && entry_seq < params.oldest_snapshot_seq {
-                continue;
-            }
-        } else if let Some(ref last) = last_point_key
-            && last.as_slice() == user_key
-        {
-            while snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= last_written_seq {
-                snapshot_idx -= 1;
-            }
-            if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= entry_seq {
-                last_written_seq = entry_seq;
-                // A retained older version that is shadowed by a range tombstone
-                // below the oldest snapshot must still be dropped. Otherwise, if
-                // that tombstone is itself dropped at the bottommost level, the
-                // value would resurrect for the snapshot that retained it. (The
-                // newest-version branch below already applies this check; retained
-                // versions need it too.)
-                if vt == ValueType::Value
-                    && !range_tombstones.is_empty()
-                    && range_tombstones.is_deleted(user_key, entry_seq)
-                {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-        } else {
-            last_point_key = Some(user_key.to_vec());
-            last_written_seq = entry_seq;
-            snapshot_idx = ctx.active_snapshots.len();
-
-            // Only a genuine Deletion may be dropped here, and only at the
-            // bottommost level below the oldest snapshot. Type was validated
-            // by `decode_internal_key` above.
-            if params.is_bottommost
-                && entry_seq < params.oldest_snapshot_seq
-                && vt == ValueType::Deletion
-            {
-                continue;
-            }
-
-            if vt == ValueType::Value
-                && !range_tombstones.is_empty()
-                && range_tombstones.is_deleted(user_key, entry_seq)
-            {
-                continue;
-            }
-        }
-
-        // Apply compaction filter
-        let mut final_value = value;
-        if params.is_bottommost
-            && ctx.active_snapshots.is_empty()
-            && let Some(ref filter) = ctx.options.compaction_filter
-            && vt == ValueType::Value
-        {
-            match filter.filter(params.target_level, user_key, final_value.as_slice()) {
-                CompactionFilterDecision::Keep => {}
-                CompactionFilterDecision::Remove => {
-                    filter_mutated = true;
-                    continue;
-                }
-                CompactionFilterDecision::ChangeValue(new_val) => {
-                    filter_mutated = true;
-                    final_value = LazyValue::Inline(new_val);
-                }
-            }
-        }
-
         // Create new output file if needed
         if builder.is_none() {
             current_file_number = params.pending.allocate().ctx()?;
@@ -723,33 +682,29 @@ fn execute_sub_compaction_io(
                 .iter()
                 .map(|f| f())
                 .collect();
-            builder = Some(TableBuilder::new(&sst_path, opts).ctx()?);
+            let mut output = TableBuilder::new(&sst_path, opts).ctx()?;
+            output.start_output(ctx.active_snapshots, std::mem::take(&mut carry));
+            builder = Some(output);
             current_size = 0;
         }
 
-        let final_ikey;
-        let ikey_ref = if params.is_bottommost
-            && entry_seq > 0
-            && entry_seq < params.oldest_snapshot_seq
-            && vt == ValueType::Value
-        {
-            final_ikey = InternalKey::new(user_key, 0, vt).as_bytes().to_vec();
-            &final_ikey
-        } else {
-            &ikey
-        };
-
-        let entry_bytes = ikey_ref.len() + final_value.len();
-        builder
-            .as_mut()
-            .unwrap()
-            .add(ikey_ref, final_value.as_slice())
-            .ctx()?;
-        current_size += entry_bytes;
         if current_file_user_key != user_key {
             current_file_user_key.clear();
             current_file_user_key.extend_from_slice(user_key);
         }
+        let output = builder.as_mut().unwrap();
+        let entry_bytes = match row {
+            OutputEntry::Point(key, value) => {
+                output.add(&key, value.as_slice()).ctx()?;
+                key.len() + value.len()
+            }
+            OutputEntry::Range(range) => {
+                let bytes = range.begin.len() + range.end.len() + size_of_val(range.sequences());
+                output.add_range_fragment(range);
+                bytes
+            }
+        };
+        current_size = current_size.saturating_add(entry_bytes);
 
         if let Some(rl) = ctx.rate_limiter {
             rl.request(entry_bytes);
@@ -1097,6 +1052,7 @@ impl LeveledCompaction {
             edit.delete_file(task.level as u32, tf.meta.number);
             edit.add_file(target_level as u32, tf.meta.clone());
             return Ok(CompactionOutput {
+                dir_synced: sync_new_sst_parent_dir(ctx.db_path, ctx.manifest_poisoned)?,
                 edit,
                 input_files: vec![(task.level as u32, tf.meta.clone())],
                 // Empty, NOT `{tf.meta.number}`: a trivial move relabels the
@@ -1130,7 +1086,6 @@ impl LeveledCompaction {
             block_size: ctx.options.block_size,
             block_restart_interval: ctx.options.block_restart_interval,
             bloom_bits_per_key: ctx.options.bloom_bits_per_key,
-            internal_keys: true,
             compression: target_compression,
             prefix_len: ctx.options.prefix_len,
             block_property_collectors: Vec::new(),
@@ -1142,7 +1097,7 @@ impl LeveledCompaction {
         // Sub-compaction is only useful for Ln→Ln+1 (level >= 1).
         //
         // Range deletions do NOT require serializing to a single sub-task:
-        // `all_range_del_entries`/`all_raw_tombstones` below are collected
+        // Range tombstones below are collected
         // once from ALL input files and shared (by reference) with every
         // sub-task's `SubCompactionParams`; each sub-compaction then applies
         // exactly the subset overlapping its own key range (straddlers
@@ -1169,8 +1124,7 @@ impl LeveledCompaction {
             .chain(task.input_files_next.iter())
             .cloned()
             .collect();
-        let all_range_del_entries = collect_range_del_entries(&all_input_files).ctx()?;
-        let all_raw_tombstones = collect_raw_tombstones(&all_input_files).ctx()?;
+        let range_fragments = collect_range_fragments(&all_input_files).ctx()?;
 
         let pending = PendingSsts::new(ctx.db_path, file_numbers);
         let sub_params = SubCompactionParams {
@@ -1179,8 +1133,7 @@ impl LeveledCompaction {
             build_opts: &build_opts,
             oldest_snapshot_seq,
             pending: &pending,
-            all_range_del_entries: &all_range_del_entries,
-            all_raw_tombstones: &all_raw_tombstones,
+            range_fragments: &range_fragments,
         };
 
         let sub_outputs = if actual_subs <= 1 {
@@ -1246,8 +1199,10 @@ impl LeveledCompaction {
             edit.delete_file(target_level as u32, tf.meta.number);
         }
 
+        let dir_synced = sync_new_sst_parent_dir(ctx.db_path, ctx.manifest_poisoned)?;
         pending.keep();
         Ok(CompactionOutput {
+            dir_synced,
             edit,
             input_files,
             input_file_numbers,
@@ -1328,7 +1283,7 @@ impl LeveledCompaction {
         output
             .edit
             .set_next_file_number(versions.next_file_number());
-        if let Err(e) = versions.log_and_apply(output.edit) {
+        if let Err(e) = versions.log_and_apply_synced(output.edit, output.dir_synced) {
             // Delete only the freshly-written SSTs (otherwise they would be
             // orphaned on disk) — `created_files` excludes a trivial move's
             // still-live input file.
@@ -1431,314 +1386,16 @@ impl LeveledCompaction {
         }
     }
 
-    /// Force-merge all files at a given level into one output at the same level.
-    /// Drops tombstones if this is the bottommost level.
-    pub(crate) fn force_merge_level(
-        ctx: &CompactionContext<'_>,
-        level: usize,
-        versions: &mut VersionSet,
-        table_cache: Option<&Arc<TableCache>>,
-        block_cache: Option<&Arc<BlockCache>>,
-    ) -> Result<()> {
-        let _build = ctx.builds.enter();
-        let oldest_snapshot_seq = ctx
-            .active_snapshots
-            .iter()
-            .min()
-            .copied()
-            .unwrap_or(SequenceNumber::MAX);
-        let version = versions.current();
+    /// Select a complete level for an in-place rewrite, using the same merge
+    /// and install checks as organic compaction.
+    pub(crate) fn full_level_task(version: &Version, level: usize) -> Option<CompactionTask> {
         let files = version.level_files(level);
-        if files.is_empty() {
-            return Ok(());
-        }
-        let is_bottommost =
-            Self::is_bottommost_level(&version, level, ctx.options.num_levels, files);
-        // A single file with a no-op filter is already in its final form —
-        // rewriting would waste I/O for no benefit. The same holds when a
-        // non-noop filter cannot fire anyway (the merge loop only applies
-        // filters at the bottommost level with no active snapshots): the
-        // rewrite would be byte-for-byte identical to its input. Skipping
-        // also forgoes snapshot-dedup/seq-zeroing for that file, but that
-        // only retains extra data — always read-safe, and picked up by the
-        // next compaction that touches the file. When the filter can
-        // actually remove or change entries (e.g. lazy-delete dead keys),
-        // even a single file must be reprocessed so every key-value pair
-        // passes through the filter.
-        let filter_can_apply = is_bottommost && ctx.active_snapshots.is_empty();
-        if files.len() == 1
-            && (!filter_can_apply
-                || ctx
-                    .options
-                    .compaction_filter
-                    .as_ref()
-                    .is_none_or(|f| f.is_noop()))
-        {
-            return Ok(());
-        }
-
-        let mut sources: Vec<IterSource> = Vec::new();
-        for tf in files {
-            // Compaction scans every input block exactly once; filling the
-            // block cache would evict hot point-read blocks for no benefit.
-            let iter = TableIterator::new(tf.reader.clone()).with_fill_cache(false);
-            // from_table_iter (not from_boxed): surfaces iter_error so a mid-block
-            // decode/CRC failure fails the job instead of looking like clean EOF.
-            sources.push(IterSource::from_table_iter(iter));
-        }
-
-        // Inject range tombstones from new-format SSTs into the merge stream
-        let range_del_entries = collect_range_del_entries(files).ctx()?;
-        if !range_del_entries.is_empty() {
-            sources.push(IterSource::new(range_del_entries));
-        }
-
-        let mut merger = MergingIterator::new(sources, compare_internal_key);
-
-        let compression = if !ctx.options.compression_per_level.is_empty()
-            && level < ctx.options.compression_per_level.len()
-        {
-            ctx.options.compression_per_level[level]
-        } else {
-            ctx.options.compression
-        };
-        // build_opts is a template; block_property_collectors are created fresh
-        // per output file (via factory functions) to avoid sharing mutable state.
-        let build_opts = TableBuildOptions {
-            block_size: ctx.options.block_size,
-            block_restart_interval: ctx.options.block_restart_interval,
-            bloom_bits_per_key: ctx.options.bloom_bits_per_key,
-            internal_keys: true,
-            compression,
-            prefix_len: ctx.options.prefix_len,
-            block_property_collectors: Vec::new(),
-        };
-
-        let mut edit = VersionEdit::new();
-        let mut builder: Option<TableBuilder> = None;
-        let mut current_file_number = 0u64;
-        let mut current_size = 0usize;
-        let mut current_file_user_key: Vec<u8> = Vec::new();
-        let mut pending_cut = false;
-        let mut last_point_key: Option<Vec<u8>> = None;
-        let mut last_range_del_key: Option<Vec<u8>> = None;
-        let mut last_written_seq: SequenceNumber = 0;
-        let mut snapshot_idx: usize = ctx.active_snapshots.len();
-        let file_numbers = versions.file_numbers.clone();
-        let pending = PendingSsts::new(ctx.db_path, &file_numbers);
-        let mut range_tombstones = RangeTombstoneTracker::new(oldest_snapshot_seq);
-
-        while let Some((ikey, value)) = merger.next_entry() {
-            let (user_key, entry_seq, vt) = decode_internal_key(&ikey).ctx()?;
-
-            // Defer size-triggered file cuts to user-key boundaries so a key's
-            // versions are never split across files (which would create overlapping
-            // same-level key ranges and possibly miss visible versions on reads).
-            if pending_cut && builder.is_some() && user_key != current_file_user_key.as_slice() {
-                let result = builder.take().unwrap().finish().ctx()?;
-                if let Some(s) = ctx.stats {
-                    s.record_compaction_bytes(result.file_size);
-                }
-                edit.add_file(
-                    level as u32,
-                    FileMetaData {
-                        number: current_file_number,
-                        file_size: result.file_size,
-                        smallest_key: result.smallest_key.unwrap_or_default(),
-                        largest_key: result.largest_key.unwrap_or_default(),
-                        has_range_deletions: result.has_range_deletions,
-                    },
-                );
-                current_size = 0;
-                pending_cut = false;
-            }
-
-            if vt == ValueType::RangeDeletion {
-                range_tombstones.push_in_order(
-                    user_key.to_vec(),
-                    value.as_slice().to_vec(),
-                    entry_seq,
-                );
-                if let Some(ref last) = last_range_del_key
-                    && last.as_slice() == ikey.as_slice()
-                {
-                    continue;
-                }
-                last_range_del_key = Some(ikey.clone());
-                if is_bottommost && entry_seq < oldest_snapshot_seq {
-                    continue;
-                }
-            } else if let Some(ref last) = last_point_key
-                && last.as_slice() == user_key
-            {
-                // Same key — check if a snapshot needs this version.
-                while snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= last_written_seq
-                {
-                    snapshot_idx -= 1;
-                }
-                if snapshot_idx > 0 && ctx.active_snapshots[snapshot_idx - 1] >= entry_seq {
-                    last_written_seq = entry_seq;
-                    // A retained older version shadowed by a range tombstone below
-                    // the oldest snapshot must still be dropped, or it would
-                    // resurrect if that tombstone is dropped at the bottommost level.
-                    if vt == ValueType::Value
-                        && !range_tombstones.is_empty()
-                        && range_tombstones.is_deleted(user_key, entry_seq)
-                    {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            } else {
-                last_point_key = Some(user_key.to_vec());
-                last_written_seq = entry_seq;
-                snapshot_idx = ctx.active_snapshots.len();
-
-                // Type was validated by `decode_internal_key` above.
-                if is_bottommost && entry_seq < oldest_snapshot_seq && vt == ValueType::Deletion {
-                    continue;
-                }
-
-                if vt == ValueType::Value
-                    && !range_tombstones.is_empty()
-                    && range_tombstones.is_deleted(user_key, entry_seq)
-                {
-                    continue;
-                }
-            }
-
-            // Apply compaction filter
-            let mut final_value = value;
-            if is_bottommost
-                && ctx.active_snapshots.is_empty()
-                && let Some(ref filter) = ctx.options.compaction_filter
-                && vt == ValueType::Value
-            {
-                match filter.filter(level, user_key, final_value.as_slice()) {
-                    CompactionFilterDecision::Keep => {}
-                    CompactionFilterDecision::Remove => continue,
-                    CompactionFilterDecision::ChangeValue(new_val) => {
-                        final_value = LazyValue::Inline(new_val);
-                    }
-                }
-            }
-
-            if builder.is_none() {
-                current_file_number = pending.allocate().ctx()?;
-                let sst_path = ctx.db_path.join(format!("{:06}.sst", current_file_number));
-                let mut opts = build_opts.clone();
-                opts.block_property_collectors = ctx
-                    .options
-                    .block_property_collectors
-                    .iter()
-                    .map(|f| f())
-                    .collect();
-                builder = Some(TableBuilder::new(&sst_path, opts).ctx()?);
-                current_size = 0;
-            }
-
-            // Sequence zeroing: at the bottommost level, if the entry's
-            // sequence falls below the minimum active snapshot, zero it out.
-            let final_ikey;
-            let ikey_ref = if is_bottommost
-                && entry_seq > 0
-                && entry_seq < oldest_snapshot_seq
-                && vt == ValueType::Value
-            {
-                final_ikey = InternalKey::new(user_key, 0, vt).as_bytes().to_vec();
-                &final_ikey
-            } else {
-                &ikey
-            };
-
-            builder
-                .as_mut()
-                .unwrap()
-                .add(ikey_ref, final_value.as_slice())
-                .ctx()?;
-            let entry_bytes = ikey_ref.len() + final_value.len();
-            current_size += entry_bytes;
-            if current_file_user_key != user_key {
-                current_file_user_key.clear();
-                current_file_user_key.extend_from_slice(user_key);
-            }
-
-            // Rate-limit compaction writes
-            if let Some(rl) = ctx.rate_limiter {
-                rl.request(entry_bytes);
-            }
-
-            if current_size >= ctx.options.target_file_size_base as usize
-                || builder.as_ref().unwrap().projected_meta_size() >= META_BLOCK_SPLIT_THRESHOLD
-            {
-                // Defer the actual cut to the next user-key boundary. The
-                // meta-size condition keeps each single-block metadata structure
-                // well below the reader's hard cap for key-heavy data.
-                pending_cut = true;
-            }
-        }
-
-        if let Some(b) = builder {
-            let result = b.finish().ctx()?;
-            if let Some(s) = ctx.stats {
-                s.record_compaction_bytes(result.file_size);
-            }
-            edit.add_file(
-                level as u32,
-                FileMetaData {
-                    number: current_file_number,
-                    file_size: result.file_size,
-                    smallest_key: result.smallest_key.unwrap_or_default(),
-                    largest_key: result.largest_key.unwrap_or_default(),
-                    has_range_deletions: result.has_range_deletions,
-                },
-            );
-        }
-
-        // Abort if the merge iterator encountered an I/O or corruption error.
-        if let Some(e) = merger.error() {
-            return Err(Error::background(format!(
-                "force_merge iterator error: {}",
-                e
-            )));
-        }
-
-        let input_file_numbers: HashSet<u64> = files.iter().map(|f| f.meta.number).collect();
-        for tf in files {
-            edit.delete_file(level as u32, tf.meta.number);
-        }
-
-        edit.set_next_file_number(versions.next_file_number());
-        versions.log_and_apply(edit).ctx()?;
-        pending.keep();
-        // force_merge_level holds &mut VersionSet for the duration, sync here.
-        versions.sync_manifest().ctx()?;
-
-        if let Some(cache) = table_cache {
-            for num in &input_file_numbers {
-                cache.evict(*num);
-            }
-        }
-        if let Some(bc) = block_cache {
-            for num in &input_file_numbers {
-                bc.invalidate_file(*num);
-            }
-        }
-
-        // Safe to delete old SSTs after manifest is synced
-        for num in &input_file_numbers {
-            let old_path = ctx.db_path.join(format!("{:06}.sst", num));
-            if let Err(e) = remove_file(&old_path) {
-                tracing::warn!("failed to remove old SST {}: {}", old_path.display(), e);
-            }
-        }
-
-        if let Some(s) = ctx.stats {
-            s.record_compaction_completed();
-        }
-
-        Ok(())
+        (!files.is_empty()).then(|| CompactionTask {
+            level,
+            target_level: level,
+            input_files_level: files.to_vec(),
+            input_files_next: Vec::new(),
+        })
     }
 
     /// Pick a compaction based on a read-triggered hint. If the hinted level
@@ -1792,9 +1449,7 @@ impl LeveledCompaction {
     ) -> bool {
         let mut extents = Vec::new();
         for tf in all_inputs {
-            if !add_file_extents(tf, &mut extents) {
-                return false;
-            }
+            add_file_extents(tf, &mut extents);
         }
         if extents.is_empty() {
             return true;
@@ -1820,6 +1475,51 @@ mod tests {
     use super::FileNumbers;
     use crate::db::DB;
     use crate::options::DbOptions;
+
+    #[test]
+    fn compact_keeps_range_endpoints_shared_across_snapshot_stripes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions::default()
+                .with_l0_compaction_trigger(usize::MAX)
+                .with_block_cache_capacity(0)
+                .with_pin_l0_first_block_and_warm_index(false),
+            dir.path(),
+        )
+        .unwrap();
+        db.put(b"m", b"initial").unwrap();
+        let first = db.snapshot();
+        let mut snapshots = Vec::new();
+        for _ in 0..256 {
+            db.delete_range(b"a", b"z").unwrap();
+            snapshots.push(db.snapshot());
+        }
+        // This single 64 KiB boundary now belongs to two elementary
+        // intervals containing all 256 historical deletion sequences.
+        db.delete_range(&vec![b'k'; 64 * 1024], b"z").unwrap();
+        db.flush().unwrap();
+        db.put(b"z", b"keep").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("2"));
+        let (result, allocation) = crate::test_alloc::measure(|| db.compact());
+        result.unwrap();
+        assert!(
+            allocation.peak_live < 8 * 1024 * 1024,
+            "compaction retained {} bytes while merging two packed intervals",
+            allocation.peak_live
+        );
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("0"));
+        assert_eq!(
+            first.get(b"m").unwrap().as_deref(),
+            Some(b"initial".as_slice())
+        );
+        assert!(
+            snapshots
+                .iter()
+                .all(|snap| snap.get(b"m").unwrap().is_none())
+        );
+        assert_eq!(db.get(b"z").unwrap().as_deref(), Some(b"keep".as_slice()));
+    }
 
     #[test]
     fn l0_compaction_includes_l1_range_tombstone_extent() {
@@ -1869,7 +1569,6 @@ mod tests {
             let mut builder = TableBuilder::new(
                 &path,
                 TableBuildOptions {
-                    internal_keys: true,
                     bloom_bits_per_key: 0,
                     ..Default::default()
                 },
@@ -1916,6 +1615,8 @@ mod tests {
         edit.delete_file(1, meta1.number);
         edit.add_file(2, meta1.clone());
         let output = CompactionOutput {
+            dir_synced: super::sync_new_sst_parent_dir(dir.path(), &versions.poison_flag())
+                .unwrap(),
             edit,
             input_files: vec![(1, meta1.clone())],
             input_file_numbers: HashSet::new(),
@@ -1984,7 +1685,6 @@ mod tests {
             let mut builder = TableBuilder::new(
                 &path,
                 TableBuildOptions {
-                    internal_keys: true,
                     bloom_bits_per_key: 0,
                     ..Default::default()
                 },
@@ -2059,7 +1759,6 @@ mod tests {
             let mut builder = TableBuilder::new(
                 &path,
                 TableBuildOptions {
-                    internal_keys: true,
                     bloom_bits_per_key: 0,
                     ..Default::default()
                 },
@@ -2466,10 +2165,7 @@ mod tests {
         use crate::types::{InternalKey, ValueType};
 
         let dir = tempfile::tempdir().unwrap();
-        let opts = TableBuildOptions {
-            internal_keys: true,
-            ..TableBuildOptions::default()
-        };
+        let opts = TableBuildOptions::default();
 
         let write = |number: u64, key: &[u8], seq: u64, vt: ValueType, value: &[u8]| {
             let path = dir.path().join(format!("{number:06}.sst"));
@@ -2515,6 +2211,7 @@ mod tests {
             ..DbOptions::default()
         };
         let ctx = super::CompactionContext {
+            manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
             options: &options,
             builds: &super::SstBuilds::default(),
@@ -2794,6 +2491,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = CompactionContext {
+            manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
             options: &options,
             builds: &super::SstBuilds::default(),
@@ -2884,7 +2582,6 @@ mod tests {
             let mut builder = TableBuilder::new(
                 &path,
                 TableBuildOptions {
-                    internal_keys: true,
                     bloom_bits_per_key: 0,
                     ..Default::default()
                 },
@@ -2982,6 +2679,7 @@ mod tests {
                 ..Default::default()
             };
             let ctx = CompactionContext {
+                manifest_poisoned: &super::AtomicBool::new(false),
                 db_path: dir.path(),
                 options: &options,
                 builds: &super::SstBuilds::default(),
@@ -3053,10 +2751,19 @@ mod tests {
             snapshot_parallel_count >= 1,
             "non-bottommost snapshot case should still take the parallel path"
         );
-        assert!(
-            snapshot_tombstones.contains(&(key(120).into_bytes(), key(220).into_bytes(), 50)),
-            "a snapshot below the tombstone sequence must retain the range tombstone"
-        );
+        let fragments: Vec<_> = snapshot_tombstones
+            .iter()
+            .filter(|(_, _, seq)| *seq == 50)
+            .collect();
+        assert!(fragments.len() > 1, "straddling tombstone must be clipped");
+        assert_eq!(fragments[0].0, key(120).as_bytes());
+        assert_eq!(fragments.last().unwrap().1, key(220).as_bytes());
+        for pair in fragments.windows(2) {
+            assert_eq!(
+                pair[0].1, pair[1].0,
+                "outputs must tile the original interval"
+            );
+        }
         assert!(
             snapshot_points.iter().any(|(k, seq, _, v)| {
                 k == &key(150) && *seq == 10 && v == &value("source", 150)
@@ -3089,7 +2796,6 @@ mod tests {
             let mut builder = TableBuilder::new(
                 &path,
                 TableBuildOptions {
-                    internal_keys: true,
                     bloom_bits_per_key: 0,
                     ..Default::default()
                 },
@@ -3186,14 +2892,7 @@ mod tests {
         for file in 0..2u64 {
             let number = versions.file_numbers.allocate().unwrap();
             let path = dir.path().join(format!("{number:06}.sst"));
-            let mut builder = TableBuilder::new(
-                &path,
-                TableBuildOptions {
-                    internal_keys: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+            let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
             for i in 0..PER_FILE {
                 let n = file as usize * PER_FILE + i;
                 let seq = 1 + n as u64;
@@ -3221,6 +2920,7 @@ mod tests {
         versions.log_and_apply(edit).unwrap();
 
         let ctx = CompactionContext {
+            manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
             options: &options,
             builds: &super::SstBuilds::default(),
@@ -3229,7 +2929,20 @@ mod tests {
             active_snapshots: &[],
         };
         TRACKER_ACTIVATIONS.with(|n| n.set(0));
-        LeveledCompaction::force_merge_level(&ctx, 1, &mut versions, None, None).unwrap();
+        let task = LeveledCompaction::full_level_task(&versions.current(), 1).unwrap();
+        let output =
+            LeveledCompaction::execute_compaction_io(&ctx, &task, &versions.file_numbers, true)
+                .unwrap();
+        LeveledCompaction::install_compaction(
+            output,
+            &mut versions,
+            None,
+            None,
+            dir.path(),
+            None,
+            false,
+        )
+        .unwrap();
         let activations = TRACKER_ACTIVATIONS.with(|n| n.get());
         assert!(
             activations <= 2 * 2 * PER_FILE,
@@ -3241,15 +2954,12 @@ mod tests {
     #[test]
     fn empty_and_deep_levels_keep_budget_checks_linear() {
         use super::{HashSet, LeveledCompaction};
-        use crate::manifest::version_set::VersionSet;
-
-        let dir = tempfile::tempdir().unwrap();
+        use crate::manifest::version::Version;
         let options = DbOptions {
             num_levels: 500,
             ..Default::default()
         };
-        let versions = VersionSet::create(dir.path(), options.num_levels).unwrap();
-        let version = versions.current();
+        let version = Version::new(options.num_levels);
 
         super::LEVEL_BUDGET_MULS.with(|n| n.set(0));
         assert!(!LeveledCompaction::is_pending(&version, &options));

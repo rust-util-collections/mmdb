@@ -2,8 +2,8 @@
 
 **Files:** `mod.rs`, `skiplist.rs`, `skiplist_impl.rs`.
 
-**Arch:** Lock-free skiplist, single-writer multi-reader; OrdInternalKey
-(user ASC, seq DESC); approx size; separate range-del collection; arena nodes;
+**Arch:** Lock-free skiplist, single-writer multi-reader, ordered by user key ascending
+and sequence descending, with slab accounting and a separate range-del collection.
 `MemTableCursorIter` = level-0 chain via raw ptr for O(1) scan.
 
 ## Invariants
@@ -15,8 +15,8 @@ on local unpublished tables only — never concurrent put.
 
 **M3 Ordering** — `(user_key ASC, seq DESC)` so latest first per user key.
 
-**M4 Size** — every stored shape updates atomic (key/value bytes, node overhead,
-duplicated range-del entry). Severe undercount → late flush/OOM. `approximate_size` = read only.
+**M4 Size** — count full allocated slab capacities, endpoint bytes and the
+range-deletion vector capacity, including unused tails.
 
 **M5 Range dels** — dedicated collection + independent iter for trackers.
 

@@ -1,18 +1,25 @@
 //! MemTable: in-memory sorted key-value store backed by a lock-free skiplist.
 
+#[cfg(any(test, all(miri, feature = "test-utils")))]
+pub(crate) mod arena_tests;
 pub mod skiplist;
 pub mod skiplist_impl;
 
 pub use skiplist::SkipListMemTable;
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::{
+    ptr::NonNull,
+    sync::{Arc, OnceLock},
+};
 
 use parking_lot::RwLock;
 
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
 
-use crate::types::{InternalKey, SequenceNumber, ValueType};
+#[cfg(test)]
+use crate::types::InternalKey;
+use crate::types::{SequenceNumber, ValueType};
 
 /// A cached range tombstone from a memtable.
 pub struct MemRangeTombstone {
@@ -27,6 +34,10 @@ pub struct MemRangeTombstone {
 /// The skiplist sorts by `compare_internal_key` ordering.
 pub struct MemTable {
     inner: SkipListMemTable,
+    // Upper bounds for groups of keys; a collision only triggers an exact
+    // skiplist run lookup. No per-key heap index is needed by the memtable.
+    metadata_buckets: [AtomicUsize; 64],
+    max_metadata_bucket: AtomicUsize,
     /// Approximate memory usage in bytes.
     approximate_size: AtomicUsize,
     /// Whether this memtable contains any RangeDeletion entries.
@@ -43,10 +54,32 @@ pub struct MemTable {
     frozen_tombstones: OnceLock<FragmentedRangeTombstoneList>,
 }
 
+/// An immutable slice in a slab retained by its owning memtable.
+#[derive(Clone)]
+pub(crate) struct MemTablePin {
+    _owner: Arc<MemTable>,
+    bytes: NonNull<[u8]>,
+}
+
+// SAFETY: the slice is initialized before release publication, never mutated
+// or reused, and its slab lives until the last owning Arc is dropped.
+unsafe impl Send for MemTablePin {}
+// SAFETY: shared readers can only observe the immutable bytes above.
+unsafe impl Sync for MemTablePin {}
+
+impl AsRef<[u8]> for MemTablePin {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: _owner retains this node, including zero-length values.
+        unsafe { self.bytes.as_ref() }
+    }
+}
+
 impl MemTable {
     pub fn new() -> Self {
         Self {
             inner: SkipListMemTable::new(),
+            metadata_buckets: std::array::from_fn(|_| AtomicUsize::new(0)),
+            max_metadata_bucket: AtomicUsize::new(0),
             approximate_size: AtomicUsize::new(0),
             has_range_deletions: AtomicBool::new(false),
             range_tombstones: RwLock::new(Vec::new()),
@@ -70,31 +103,80 @@ impl MemTable {
         if value_type == ValueType::RangeDeletion && key >= value {
             return;
         }
-        let ikey = InternalKey::new(key, sequence, value_type);
-        let val = match value_type {
-            ValueType::Value => value.to_vec(),
-            ValueType::Deletion => Vec::new(),
-            ValueType::RangeDeletion => {
-                // Add to dedicated range tombstone collection for O(T) lookup
-                self.range_tombstones.write().push(MemRangeTombstone {
-                    begin: key.to_vec(),
-                    end: value.to_vec(),
-                    seq: sequence,
-                });
-                // Release: ensures this flag is visible to any reader that
-                // subsequently Acquires skiplist entries via atomic pointers.
-                self.has_range_deletions.store(true, Ordering::Release);
-                value.to_vec()
-            }
-        };
-        let mut entry_size = ikey.encoded_len() + val.len() + 160; // Node struct overhead (inline [AtomicPtr; 12] + Vec headers)
+        let mut allocated = 0;
         if value_type == ValueType::RangeDeletion {
-            // Account for duplicated data in range_tombstones Vec
-            entry_size += key.len() + value.len() + std::mem::size_of::<MemRangeTombstone>();
+            let mut ranges = self.range_tombstones.write();
+            let old_cap = ranges.capacity();
+            ranges.push(MemRangeTombstone {
+                begin: key.to_vec(),
+                end: value.to_vec(),
+                seq: sequence,
+            });
+            allocated += (ranges.capacity() - old_cap) * size_of::<MemRangeTombstone>()
+                + key.len()
+                + value.len();
+            self.has_range_deletions.store(true, Ordering::Release);
         }
-        self.inner.insert(ikey.into_bytes(), val);
+        let value = if value_type == ValueType::Deletion {
+            &[]
+        } else {
+            value
+        };
+        let charge = crate::types::BatchEntry {
+            key,
+            value,
+            value_type,
+        }
+        .metadata_charge();
+        let bucket = &self.metadata_buckets[Self::metadata_bucket(key)];
+        let old = bucket.fetch_add(charge, Ordering::Relaxed);
+        self.max_metadata_bucket
+            .fetch_max(old + charge, Ordering::Relaxed);
+        allocated += self.inner.insert_entry(key, sequence, value_type, value);
         self.approximate_size
-            .fetch_add(entry_size, Ordering::Relaxed);
+            .fetch_add(allocated, Ordering::Relaxed);
+    }
+
+    fn metadata_bucket(key: &[u8]) -> usize {
+        // Hashing a bounded sample keeps metadata accounting independent of
+        // large key lengths. Exact verification below resolves collisions.
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        key.len().hash(&mut h);
+        h.write(&key[..key.len().min(8)]);
+        h.write(&key[key.len().saturating_sub(8)..]);
+        h.finish() as usize & 63
+    }
+
+    pub(crate) fn max_metadata_charge(&self) -> usize {
+        self.max_metadata_bucket.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn metadata_charge_bound(&self, key: &[u8]) -> usize {
+        self.metadata_buckets[Self::metadata_bucket(key)].load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn same_key_metadata(&self, key: &[u8]) -> usize {
+        self.inner.same_key_metadata(key)
+    }
+
+    pub(crate) fn point_value<V: crate::pinned::PointValue>(
+        self: &Arc<Self>,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<(Option<V>, SequenceNumber)> {
+        let (value, seq) = self.inner.get_ref_with_seq(key, sequence)?;
+        Some((
+            value.map(|value| {
+                V::project(value.len(), || {
+                    crate::PinnedSlice::from_memtable(MemTablePin {
+                        _owner: self.clone(),
+                        bytes: NonNull::from(value),
+                    })
+                })
+            }),
+            seq,
+        ))
     }
 
     /// Look up a user key at or below the given sequence number.
@@ -106,13 +188,15 @@ impl MemTable {
     }
 
     /// Like `get`, but also returns the sequence number of the found entry.
+    #[cfg(test)]
     pub fn get_with_seq(
         &self,
         key: &[u8],
         sequence: SequenceNumber,
     ) -> Option<(Option<Vec<u8>>, SequenceNumber)> {
-        let search_key = InternalKey::new(key, sequence, ValueType::RangeDeletion);
-        self.inner.get_with_seq(search_key.into_bytes(), key)
+        self.inner
+            .get_ref_with_seq(key, sequence)
+            .map(|(v, seq)| (v.map(<[u8]>::to_vec), seq))
     }
 
     /// Approximate memory usage in bytes.
@@ -131,14 +215,6 @@ impl MemTable {
     /// Each item is (encoded_internal_key, value).
     pub fn iter_ref(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.inner.iter_ref()
-    }
-
-    /// Get a raw pointer to the underlying skiplist for cursor-based iteration.
-    /// The pointer is valid as long as this MemTable is alive.
-    pub fn skiplist_ref(
-        &self,
-    ) -> *const skiplist_impl::ConcurrentSkipList<skiplist::OrdInternalKey, Vec<u8>> {
-        self.inner.skiplist_ptr()
     }
 
     /// Whether this memtable contains any range deletion entries.
@@ -207,6 +283,37 @@ impl Default for MemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedicated_node_preserves_room_in_active_slab() {
+        let mt = MemTable::new();
+        mt.put(b"a", b"", 1, ValueType::Value);
+        let initial = mt.approximate_size();
+        assert_eq!(initial, 4096);
+        let value = vec![0xab; (1 << 18) + 1];
+        mt.put(b"big", &value, 2, ValueType::Value);
+        let after_large = mt.approximate_size();
+        assert!((value.len()..value.len() + 256).contains(&(after_large - initial)));
+        mt.put(b"c", b"x", 3, ValueType::Value);
+        assert_eq!(mt.approximate_size(), after_large);
+        assert_eq!(mt.get(b"big", 2), Some(Some(value)));
+    }
+
+    #[test]
+    fn slab_density_for_small_keys_and_values() {
+        let mt = MemTable::new();
+        let count = 120_000u128;
+        for i in 0..count {
+            mt.put(&i.to_be_bytes(), &[0; 16], i as u64, ValueType::Value);
+        }
+        let bytes = mt.approximate_size();
+        // The accounting includes slab tail space and 8-byte alignment.
+        assert!(
+            bytes / count as usize <= 82,
+            "{bytes} allocated for {count} entries"
+        );
+        eprintln!("{bytes} slab bytes for {count} distinct 16B key/value pairs");
+    }
 
     /// Frozen memtables answer coverage checks from a fragmented index; it
     /// must agree with the linear scan used while the memtable is active.

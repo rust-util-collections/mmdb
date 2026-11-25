@@ -20,11 +20,9 @@ fn wait_until_removed(db: &DB, key: &[u8], message: &str) {
 /// optimisation that skips the compaction filter).
 fn make_db(dir: &std::path::Path) -> DB {
     DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 1024, // 1 KB — forces frequent flushes
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(1024),
         dir,
     )
     .unwrap()
@@ -119,15 +117,13 @@ fn clear_dead_keys_resets_count() {
 fn lazy_delete_batch_auto_triggers_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 1024,
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(1024)
             // Keep the threshold low enough to cross, but avoid also calling
             // compact_range() — the point of this test is verifying that the
             // auto-triggered background compaction removes the keys.
-            lazy_delete_compaction_threshold: 5,
-            ..Default::default()
-        },
+            .with_lazy_delete_compaction_threshold(5),
         dir.path(),
     )
     .unwrap();
@@ -186,10 +182,7 @@ fn lazy_delete_batch_auto_triggers_compaction() {
 fn lazy_delete_batch_default_threshold_zero_requires_manual_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            ..Default::default()
-        },
+        DbOptions::default().with_create_if_missing(true),
         dir.path(),
     )
     .unwrap();
@@ -310,11 +303,9 @@ fn lazy_delete_single_file_at_l1_removed_by_compact() {
 fn lazy_delete_sweeps_settled_store() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            lazy_delete_compaction_threshold: 5,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_lazy_delete_compaction_threshold(5),
         dir.path(),
     )
     .unwrap();
@@ -354,13 +345,11 @@ fn lazy_delete_sweeps_settled_store() {
 fn lazy_delete_sweeps_deepest_level_before_l0() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            l0_compaction_trigger: usize::MAX,
-            lazy_delete_compaction_threshold: 1,
-            num_levels: 3,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_l0_compaction_trigger(usize::MAX)
+            .with_lazy_delete_compaction_threshold(1)
+            .with_num_levels(3),
         dir.path(),
     )
     .unwrap();
@@ -386,13 +375,11 @@ fn lazy_delete_sweeps_deepest_level_before_l0() {
 fn lazy_delete_requeues_new_keys_above_threshold() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            l0_compaction_trigger: usize::MAX,
-            lazy_delete_compaction_threshold: 1,
-            max_background_compactions: 4,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_l0_compaction_trigger(usize::MAX)
+            .with_lazy_delete_compaction_threshold(1)
+            .with_max_background_compactions(4),
         dir.path(),
     )
     .unwrap();
@@ -416,12 +403,10 @@ fn lazy_delete_requeues_new_keys_above_threshold() {
 fn lazy_delete_retries_after_snapshot_release() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            l0_compaction_trigger: usize::MAX,
-            lazy_delete_compaction_threshold: 1,
-            ..Default::default()
-        },
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_l0_compaction_trigger(usize::MAX)
+            .with_lazy_delete_compaction_threshold(1),
         dir.path(),
     )
     .unwrap();
@@ -478,10 +463,7 @@ fn lazy_delete_registrations_pruned_after_full_compaction() {
 fn lazy_delete_registration_kept_while_key_visible() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            ..Default::default()
-        },
+        DbOptions::default().with_create_if_missing(true),
         dir.path(),
     )
     .unwrap();
@@ -501,10 +483,7 @@ fn lazy_delete_registration_kept_while_key_visible() {
 fn lazy_delete_unknown_key_pruned_on_flush() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            ..Default::default()
-        },
+        DbOptions::default().with_create_if_missing(true),
         dir.path(),
     )
     .unwrap();
@@ -527,10 +506,7 @@ fn lazy_delete_unknown_key_pruned_on_flush() {
 fn compact_range_prunes_only_in_range_registrations() {
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            ..Default::default()
-        },
+        DbOptions::default().with_create_if_missing(true),
         dir.path(),
     )
     .unwrap();
@@ -600,15 +576,13 @@ fn compact_waits_for_inflight_compaction_and_removes_dead_keys() {
     let (release_tx, release_rx) = mpsc::channel();
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
-        DbOptions {
-            create_if_missing: true,
-            write_buffer_size: 1024,
-            compaction_filter: Some(Arc::new(GateFilter {
+        DbOptions::default()
+            .with_create_if_missing(true)
+            .with_write_buffer_size(1024)
+            .with_compaction_filter(Some(Arc::new(GateFilter {
                 entered: Mutex::new(Some(entered_tx)),
                 release: Mutex::new(Some(release_rx)),
-            })),
-            ..Default::default()
-        },
+            }))),
         dir.path(),
     )
     .unwrap();
@@ -650,10 +624,7 @@ fn compact_waits_for_inflight_compaction_and_removes_dead_keys() {
 #[test]
 fn compact_range_rewrites_bottommost_level_for_lazy_delete_and_tombstone_gc() {
     let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions {
-        l0_compaction_trigger: 100,
-        ..Default::default()
-    };
+    let opts = DbOptions::default().with_l0_compaction_trigger(100);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Keep out-of-range key in its own L0 SST so [c, d) compaction only touches [c1, c2].

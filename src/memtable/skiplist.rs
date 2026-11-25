@@ -1,55 +1,13 @@
 //! SkipList-based MemTable implementation using a custom concurrent skiplist.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::sync::Arc;
 
-use super::skiplist_impl::ConcurrentSkipList;
+use super::{MemTable, skiplist_impl::ConcurrentSkipList};
 use crate::iterator::merge::SeekableIterator;
-use crate::types::{InternalKeyRef, LazyValue, ValueType, compare_internal_key};
+use crate::types::{InternalKeyRef, LazyValue, SequenceNumber, ValueType, pack_sequence_and_type};
 
-/// Newtype wrapper for internal keys that implements `Ord` using `compare_internal_key`.
-/// This ensures the skip list maintains logical internal key order directly,
-/// eliminating the need for O(N log N) re-sorting on iteration.
-#[derive(Clone, Debug)]
-pub struct OrdInternalKey(Vec<u8>);
-
-impl OrdInternalKey {
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl PartialEq for OrdInternalKey {
-    fn eq(&self, other: &Self) -> bool {
-        compare_internal_key(&self.0, &other.0) == Ordering::Equal
-    }
-}
-
-impl Eq for OrdInternalKey {}
-
-impl PartialOrd for OrdInternalKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrdInternalKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare_internal_key(&self.0, &other.0)
-    }
-}
-
-/// Lock-free concurrent skiplist MemTable.
-///
-/// Keys are encoded InternalKeys (user_key + 8-byte trailer).
-/// The skiplist is ordered by `compare_internal_key` via the `OrdInternalKey` newtype.
 pub struct SkipListMemTable {
-    map: ConcurrentSkipList<OrdInternalKey, Vec<u8>>,
-}
-
-impl Default for SkipListMemTable {
-    fn default() -> Self {
-        Self::new()
-    }
+    map: ConcurrentSkipList,
 }
 
 impl SkipListMemTable {
@@ -59,76 +17,80 @@ impl SkipListMemTable {
         }
     }
 
-    /// Get a raw pointer to the underlying skiplist for cursor-based iteration.
-    pub fn skiplist_ptr(&self) -> *const ConcurrentSkipList<OrdInternalKey, Vec<u8>> {
-        &self.map as *const _
-    }
-
-    /// Insert an encoded internal key and value.
-    pub fn insert(&self, encoded_key: Vec<u8>, value: Vec<u8>) {
-        self.map.insert(OrdInternalKey(encoded_key), value);
-    }
-
-    /// Look up a user key. `search_key` is an encoded InternalKey used to seek.
-    /// `user_key` is the raw user key for matching.
-    ///
-    /// Returns:
-    /// - `Some(Some(value))` if a Value entry is found
-    /// - `Some(None)` if a Deletion entry is found
-    /// - `None` if no entry for this user key exists at or below the search sequence
-    #[cfg(test)]
-    pub fn get(&self, search_key: &[u8], user_key: &[u8]) -> Option<Option<Vec<u8>>> {
-        self.get_with_seq(search_key.to_vec(), user_key)
-            .map(|(result, _seq)| result)
-    }
-
-    /// Like `get`, but also returns the sequence number of the found entry.
-    /// Needed for range tombstone vs point entry sequence comparison.
-    /// Inspects the candidate by reference and copies only a matching value.
-    pub fn get_with_seq(
+    pub fn insert_entry(
         &self,
-        search_key: Vec<u8>,
-        user_key: &[u8],
-    ) -> Option<(Option<Vec<u8>>, crate::types::SequenceNumber)> {
-        let search = OrdInternalKey(search_key);
-        self.map
-            .lower_bound_with(&search, |k, v| {
-                let kb = k.as_bytes();
-                if kb.len() < 8 || &kb[..kb.len() - 8] != user_key {
-                    return None;
-                }
-                let entry_ref = InternalKeyRef::new(kb);
-                let seq = entry_ref.sequence();
-                Some((
-                    match entry_ref.value_type() {
-                        ValueType::Value => Some(v.clone()),
-                        ValueType::Deletion | ValueType::RangeDeletion => None,
-                    },
-                    seq,
-                ))
-            })
-            .flatten()
+        user: &[u8],
+        sequence: SequenceNumber,
+        kind: ValueType,
+        value: &[u8],
+    ) -> usize {
+        let tag = (!pack_sequence_and_type(sequence, kind)).to_be_bytes();
+        self.map.insert(user, &tag, value)
     }
 
-    /// Iterate over all entries in internal key order (user_key ASC, seq DESC).
-    /// With `OrdInternalKey`, the skip list is already in the correct order —
-    /// no sorting needed.
+    pub(super) fn same_key_metadata(&self, key: &[u8]) -> usize {
+        self.map
+            .versions_of(key)
+            .map(|(encoded, value)| {
+                crate::types::BatchEntry {
+                    key,
+                    value,
+                    value_type: InternalKeyRef::new(encoded).value_type(),
+                }
+                .metadata_charge()
+            })
+            .sum()
+    }
+
+    pub fn get_ref_with_seq(
+        &self,
+        user: &[u8],
+        sequence: SequenceNumber,
+    ) -> Option<(Option<&[u8]>, SequenceNumber)> {
+        let tag = (!pack_sequence_and_type(sequence, ValueType::RangeDeletion)).to_be_bytes();
+        let (key, value) = self.map.lower_bound(user, &tag)?;
+        let key = InternalKeyRef::new(key);
+        (key.user_key() == user).then(|| {
+            (
+                (key.value_type() == ValueType::Value).then_some(value),
+                key.sequence(),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    fn insert(&self, encoded: Vec<u8>, value: Vec<u8>) {
+        let k = InternalKeyRef::new(&encoded);
+        self.insert_entry(k.user_key(), k.sequence(), k.value_type(), &value);
+    }
+
+    #[cfg(test)]
+    fn get(&self, target: &[u8], user: &[u8]) -> Option<Option<Vec<u8>>> {
+        self.get_ref_with_seq(user, InternalKeyRef::new(target).sequence())
+            .map(|(v, _)| v.map(<[u8]>::to_vec))
+    }
+
     #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
-        self.map.iter().map(|(k, v)| (k.0, v))
+        self.iter_ref().map(|(k, v)| (k.to_vec(), v.to_vec()))
     }
 
-    /// Borrowing iteration in internal key order, without copying entries.
-    pub fn iter_ref(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.map
-            .iter_ref()
-            .map(|(k, v)| (k.as_bytes(), v.as_slice()))
-    }
-
-    /// Iterate over all entries in reverse internal key order.
     #[cfg(test)]
-    pub fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
-        self.map.iter().rev().map(|(k, v)| (k.0, v))
+    fn iter_rev(&self) -> impl Iterator<Item = (Vec<u8>, Vec<u8>)> {
+        let mut node = self.map.tail_ptr();
+        std::iter::from_fn(move || {
+            if node.is_null() {
+                return None;
+            }
+            // SAFETY: node is either the tail or a result of seek_lt_raw.
+            let (k, v) = unsafe { self.map.node_kv(node) };
+            node = self.map.seek_lt_raw(k);
+            Some((k.to_vec(), v.to_vec()))
+        })
+    }
+
+    pub fn iter_ref(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.map.iter_ref()
     }
 }
 
@@ -140,13 +102,11 @@ impl SkipListMemTable {
 /// in `MergingIterator`, eliminating the O(N) iterator creation cost.
 pub struct MemTableCursorIter {
     /// Arc to keep the underlying memtable (and its skiplist) alive.
-    _memtable: Arc<crate::memtable::MemTable>,
+    memtable: Arc<MemTable>,
     /// Current node pointer in the level-0 chain. null = exhausted (either
     /// freshly past-the-end, or before-the-start — see `exhausted_backward`
     /// to distinguish the two).
     cursor: *const (),
-    /// Reference to the skiplist for node_kv/node_next0 access.
-    skiplist: *const ConcurrentSkipList<OrdInternalKey, Vec<u8>>,
     /// Set by `prev()` when it finds no predecessor, i.e. the cursor has
     /// moved before the first entry. A null `cursor` alone is ambiguous
     /// between "freshly past-the-end" (prev() should jump to the last
@@ -165,28 +125,22 @@ pub struct MemTableCursorIter {
 unsafe impl Send for MemTableCursorIter {}
 
 impl MemTableCursorIter {
-    pub fn new(memtable: Arc<crate::memtable::MemTable>) -> Self {
-        let skiplist = memtable.skiplist_ref();
-        // SAFETY: skiplist_ref points into `memtable`; the Arc stored in the
-        // iterator keeps that MemTable alive for at least this iterator's lifetime.
-        let head = unsafe { &*skiplist }.head_ptr();
+    pub fn new(memtable: Arc<MemTable>) -> Self {
+        let head = memtable.inner.map.head_ptr();
         Self {
-            _memtable: memtable,
+            memtable,
             cursor: head,
-            skiplist,
             exhausted_backward: false,
         }
     }
 
     #[inline]
-    fn sl(&self) -> &ConcurrentSkipList<OrdInternalKey, Vec<u8>> {
-        // SAFETY: `self._memtable` owns the skiplist and keeps this raw pointer valid.
-        unsafe { &*self.skiplist }
+    fn sl(&self) -> &ConcurrentSkipList {
+        &self.memtable.inner.map
     }
 
     fn seek_internal(&mut self, target: &[u8]) {
-        let search = OrdInternalKey(target.to_vec());
-        self.cursor = self.sl().seek_ge_raw(&search);
+        self.cursor = self.sl().seek_ge_raw(target);
         // Repositioned by an explicit seek — no longer in the "exhausted
         // backward" state (if we were even in it).
         self.exhausted_backward = false;
@@ -216,7 +170,7 @@ impl Iterator for MemTableCursorIter {
         // is a node pointer returned by this skiplist (either the
         // pre-existing cursor or `head_ptr()`).
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
-        let result = (k.as_bytes().to_vec(), v.clone());
+        let result = (k.to_vec(), v.to_vec());
         // SAFETY: same cursor validity as above; node_next0 only reads an atomic link.
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
         Some(result)
@@ -234,7 +188,7 @@ impl SeekableIterator for MemTableCursorIter {
         }
         // SAFETY: cursor is non-null and comes from this skiplist.
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
-        Some((k.as_bytes().to_vec(), LazyValue::Inline(v.clone())))
+        Some((k.to_vec(), LazyValue::Inline(v.to_vec())))
     }
 
     /// Copy directly into caller buffers, reusing their capacity.
@@ -257,7 +211,7 @@ impl SeekableIterator for MemTableCursorIter {
         // pre-existing cursor or `head_ptr()`).
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
-        key_buf.extend_from_slice(k.as_bytes());
+        key_buf.extend_from_slice(k);
         value_buf.clear();
         value_buf.extend_from_slice(v);
         // SAFETY: cursor is still the same valid node pointer.
@@ -285,8 +239,8 @@ impl SeekableIterator for MemTableCursorIter {
         // pre-existing cursor or `head_ptr()`).
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
-        key_buf.extend_from_slice(k.as_bytes());
-        let lv = LazyValue::Inline(v.clone());
+        key_buf.extend_from_slice(k);
+        let lv = LazyValue::Inline(v.to_vec());
         // SAFETY: cursor is still the same valid node pointer.
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
         Some(lv)
@@ -315,15 +269,14 @@ impl SeekableIterator for MemTableCursorIter {
         }
         // SAFETY: ptr is non-null and either the previous node or skiplist tail.
         let (k, v) = unsafe { self.sl().node_kv(ptr) };
-        let result = (k.as_bytes().to_vec(), LazyValue::Inline(v.clone()));
+        let result = (k.to_vec(), LazyValue::Inline(v.to_vec()));
         self.cursor = ptr;
         Some(result)
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
-        let search = OrdInternalKey(target.to_vec());
         // seek_le_raw: find last entry <= target
-        let ptr = self.sl().seek_le_raw(&search);
+        let ptr = self.sl().seek_le_raw(target);
         if ptr.is_null() {
             // Nothing is <= target, so this is the before-first state, same
             // as `prev()` walking off the front. A null cursor with the flag

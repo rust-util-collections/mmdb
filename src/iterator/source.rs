@@ -2,12 +2,12 @@
 //! iterators behind a uniform `IterSource` interface. Also defines the `SeekableIterator`
 //! trait that concrete iterators implement.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc};
 
-use crate::iterator::level_iter::LevelIterator;
-use crate::memtable::skiplist::MemTableCursorIter;
-use crate::sst::table_reader::TableIterator;
-use crate::types::LazyValue;
+use crate::{
+    Error, iterator::level_iter::LevelIterator, memtable::skiplist::MemTableCursorIter,
+    options::IterConfig, sst::table_reader::TableIterator, types::LazyValue,
+};
 
 /// A source of sorted (key, value) pairs — can be backed by a Vec or a streaming iterator.
 pub struct IterSource {
@@ -103,12 +103,16 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
 
     /// Return the last error encountered during iteration, if any.
     /// This distinguishes normal exhaustion (None) from I/O failures.
-    fn iter_error(&self) -> Option<String> {
+    fn iter_error(&self) -> Option<&Error> {
         None
     }
 
     /// Set lower/upper bounds for iteration. Default: no-op.
-    fn set_bounds(&mut self, _lower: Option<&[u8]>, _upper: Option<&[u8]>) {}
+    fn set_config(&mut self, _config: Arc<IterConfig>) {}
+    #[cfg(test)]
+    fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
+        self.set_config(Arc::new(IterConfig::new(lower, upper, &[])));
+    }
 
     /// Decode next entry with lazy value — key written into caller buffer,
     /// value returned as LazyValue (zero-copy for SST sources).
@@ -314,17 +318,17 @@ impl IterSource {
     }
 
     /// Propagate iteration bounds to the underlying seekable iterator (if any).
-    pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
+    pub fn set_config(&mut self, config: Arc<IterConfig>) {
         match &mut self.inner {
-            IterSourceInner::Memtable { iter } => iter.set_bounds(lower, upper),
-            IterSourceInner::Sst { iter } => iter.set_bounds(lower, upper),
-            IterSourceInner::Level { iter } => iter.set_bounds(lower, upper),
+            IterSourceInner::Memtable { iter } => iter.set_config(config),
+            IterSourceInner::Sst { iter } => iter.set_config(config),
+            IterSourceInner::Level { iter } => iter.set_config(config),
             _ => {}
         }
     }
 
     /// Return the first error from the underlying iterator, if any.
-    pub fn iter_error(&self) -> Option<String> {
+    pub fn iter_error(&self) -> Option<&Error> {
         match &self.inner {
             IterSourceInner::Sst { iter } => iter.iter_error(),
             IterSourceInner::Level { iter } => iter.iter_error(),

@@ -24,10 +24,28 @@ use parking_lot::Mutex;
 // Thread-local fault scheduling stays out of production and test-utils builds.
 #[cfg(test)]
 thread_local! {
+    pub(crate) static FAIL_NEXT_SST_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static BEFORE_MANIFEST_APPEND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static BEFORE_SYNC_POISON: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Evidence that all new SST directory entries precede the referencing edit.
+pub(crate) struct DirSynced(());
+
+pub(crate) fn sync_new_sst_parent_dir(path: &Path, poisoned: &AtomicBool) -> Result<DirSynced> {
+    check_manifest_poison(poisoned)?;
+    #[cfg(test)]
+    if FAIL_NEXT_SST_DIR_SYNC.with(|fault| fault.replace(false)) {
+        poisoned.store(true, Ordering::Release);
+        return Err(std::io::Error::other("injected SST directory sync failure")).ctx();
+    }
+    if let Err(e) = VersionSet::fsync_directory(path) {
+        poisoned.store(true, Ordering::Release);
+        return Err(e).ctx();
+    }
+    Ok(DirSynced(()))
 }
 
 fn check_manifest_poison(poisoned: &AtomicBool) -> Result<()> {
@@ -62,8 +80,55 @@ pub(crate) fn confirm_manifest_durable(
     check_manifest_poison(poisoned)
 }
 
+/// First WAL-framed record in every v5 MANIFEST. Fixed-width integers are LE.
+#[derive(Clone, Copy)]
+struct DBHeader {
+    levels: u32,
+    prefix_len: u32,
+}
+
+impl DBHeader {
+    fn new(levels: usize, prefix_len: usize) -> Result<Self> {
+        if !(2..=16).contains(&levels) {
+            return Err(Error::invalid_argument("num_levels must be in 2..=16"));
+        }
+        Ok(Self {
+            levels: levels as u32,
+            prefix_len: u32::try_from(prefix_len)
+                .map_err(|_| Error::invalid_argument("prefix_len exceeds u32"))?,
+        })
+    }
+
+    fn encode(self) -> [u8; 16] {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(b"MMDB");
+        bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.levels.to_le_bytes());
+        bytes[12..].copy_from_slice(&self.prefix_len.to_le_bytes());
+        bytes
+    }
+
+    fn read(reader: &mut WalReader) -> Result<Self> {
+        let data = reader.read_record().ctx()?.unwrap_or_default();
+        if data.len() != 16 || &data[..4] != b"MMDB" || data[4..8] != 5u32.to_le_bytes() {
+            return Err(Error::corruption(
+                "missing or unsupported MMDB v5 MANIFEST header",
+            ));
+        }
+        let levels = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        if !(2..=16).contains(&levels) {
+            return Err(Error::corruption("invalid MANIFEST num_levels"));
+        }
+        Ok(Self {
+            levels,
+            prefix_len: u32::from_le_bytes(data[12..].try_into().unwrap()),
+        })
+    }
+}
+
 /// Manages the MANIFEST file and the current Version.
 pub struct VersionSet {
+    header: DBHeader,
     db_path: PathBuf,
     num_levels: usize,
 
@@ -124,6 +189,38 @@ impl VersionSet {
         Ok(manifest_number)
     }
 
+    fn open_table(
+        db_path: &Path,
+        cache: Option<&TableCache>,
+        meta: &FileMetaData,
+    ) -> Result<TableFile> {
+        let reader = if let Some(cache) = cache {
+            cache.get_reader(meta.number)
+        } else {
+            TableReader::open(&db_path.join(format!("{:06}.sst", meta.number))).map(Arc::new)
+        }
+        .map_err(|e| {
+            let path = db_path.join(format!("{:06}.sst", meta.number));
+            Error::corruption(format!(
+                "failed to open new SST {} (path {}, exists_now={}): {e}",
+                meta.number,
+                path.display(),
+                path.exists()
+            ))
+            .with_source(e)
+        })?;
+        if reader.has_range_deletions() != meta.has_range_deletions {
+            return Err(Error::corruption(format!(
+                "MANIFEST range-deletion flag disagrees with SST {}",
+                meta.number
+            )));
+        }
+        Ok(TableFile {
+            meta: meta.clone(),
+            reader,
+        })
+    }
+
     /// Validate the L1+ invariant that point-lookup binary search relies on:
     /// within each level >= 1, files sorted by `smallest_key` must have
     /// pairwise-disjoint user-key ranges. Compaction cuts output files at
@@ -153,24 +250,25 @@ impl VersionSet {
     /// Create a new VersionSet (for a fresh database). Test-only wrapper.
     #[cfg(test)]
     pub(crate) fn create(db_path: &Path, num_levels: usize) -> Result<Self> {
-        Self::create_with_cache(db_path, num_levels, None)
+        Self::create_with_cache(db_path, num_levels, 0, None)
     }
 
     /// Create a new VersionSet with an optional table cache.
     pub fn create_with_cache(
         db_path: &Path,
         num_levels: usize,
+        prefix_len: usize,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
+        let header = DBHeader::new(num_levels, prefix_len)?;
         let current = Arc::new(Version::new(num_levels));
         let manifest_number = 1;
         let manifest_path = db_path.join(format!("MANIFEST-{:06}", manifest_number));
-        let manifest_writer = WalWriter::new(&manifest_path).ctx()?;
-
-        // Write CURRENT file
-        Self::set_current_file(db_path, manifest_number).ctx()?;
+        let mut manifest_writer = WalWriter::new(&manifest_path).ctx()?;
+        manifest_writer.add_record(&header.encode()).ctx()?;
 
         let mut vs = Self {
+            header,
             db_path: db_path.to_path_buf(),
             num_levels,
             current,
@@ -188,8 +286,9 @@ impl VersionSet {
         let mut edit = VersionEdit::new();
         edit.set_next_file_number(vs.next_file_number());
         edit.set_last_sequence(vs.last_sequence);
-        vs.log_and_apply(edit).ctx()?;
+        vs.apply_metadata(edit).ctx()?;
         vs.sync_manifest().ctx()?;
+        Self::set_current_file(db_path, manifest_number).ctx()?;
 
         Ok(vs)
     }
@@ -197,33 +296,36 @@ impl VersionSet {
     /// Test-only wrapper for [`Self::recover_with_cache`].
     #[cfg(test)]
     pub(crate) fn recover(db_path: &Path, num_levels: usize) -> Result<Self> {
-        Self::recover_with_cache(db_path, num_levels, None)
+        Self::recover_with_cache(db_path, num_levels, 0, None)
     }
 
     /// Recover with an optional table cache.
     pub fn recover_with_cache(
         db_path: &Path,
         num_levels: usize,
+        prefix_len: usize,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
-        Self::recover_with_cache_mode(db_path, num_levels, table_cache, false)
+        Self::recover_with_cache_mode(
+            db_path,
+            Some(DBHeader::new(num_levels, prefix_len)?),
+            table_cache,
+        )
     }
 
     /// Recover an existing VersionSet without opening or repairing its
     /// MANIFEST for append.
     pub fn recover_read_only_with_cache(
         db_path: &Path,
-        num_levels: usize,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
-        Self::recover_with_cache_mode(db_path, num_levels, table_cache, true)
+        Self::recover_with_cache_mode(db_path, None, table_cache)
     }
 
     fn recover_with_cache_mode(
         db_path: &Path,
-        num_levels: usize,
+        requested: Option<DBHeader>,
         table_cache: Option<Arc<TableCache>>,
-        read_only: bool,
     ) -> Result<Self> {
         // Read CURRENT to find manifest file
         let current_path = db_path.join("CURRENT");
@@ -240,6 +342,16 @@ impl VersionSet {
         // This handles the case where compaction adds + deletes files in
         // separate edits, and the deleted SST no longer exists on disk.
         let mut reader = WalReader::new(&manifest_path).ctx()?;
+        let header = DBHeader::read(&mut reader).ctx()?;
+        if requested.is_some_and(|expected| {
+            header.levels != expected.levels || header.prefix_len != expected.prefix_len
+        }) {
+            return Err(Error::invalid_argument(format!(
+                "MANIFEST geometry requires num_levels={} and prefix_len={}",
+                header.levels, header.prefix_len
+            )));
+        }
+        let num_levels = header.levels as usize;
         let mut next_file_number = 2u64;
         let mut log_number = 0u64;
         let mut last_sequence = 0u64;
@@ -335,12 +447,8 @@ impl VersionSet {
                     // and the next MANIFEST snapshot would persist the loss
                     // permanently. Fail loudly instead.
                     return Err(Error::corruption(format!(
-                        "MANIFEST references SST {} at level {} but the database \
-                         is configured with num_levels {}; reopen with num_levels >= {}",
-                        meta.number,
-                        level,
-                        num_levels,
-                        level + 1
+                        "MANIFEST references SST {} at level {level} outside its {num_levels} levels",
+                        meta.number
                     )));
                 }
                 if let Some((prev_level, _)) = live_files.insert(meta.number, (level, meta.clone()))
@@ -355,37 +463,9 @@ impl VersionSet {
 
         // Pass 2: Open only live files
         let mut version = Version::new(num_levels);
-        for (level, meta) in live_files.values_mut() {
-            let reader_result = if let Some(ref tc) = table_cache {
-                tc.get_reader(meta.number)
-            } else {
-                let sst_path = db_path.join(format!("{:06}.sst", meta.number));
-                TableReader::open(&sst_path).map(Arc::new)
-            };
-            match reader_result {
-                Ok(reader) => {
-                    // A tag-4 record is a range-deletion candidate: writers
-                    // before the flag stored tombstones inline in data blocks.
-                    // Resolve the flag from the file once, here. Every gated
-                    // read/compaction path then agrees on the tombstone set,
-                    // and the legacy data-block scan warms the reader cache
-                    // before the DB is live instead of running under a lock.
-                    if meta.has_range_deletions {
-                        let tombstones = reader.get_range_tombstones().ctx()?;
-                        meta.has_range_deletions = !tombstones.is_empty();
-                    }
-                    Arc::make_mut(&mut version.files[*level]).push(TableFile {
-                        meta: meta.clone(),
-                        reader,
-                    });
-                }
-                Err(e) => {
-                    return Err(Error::corruption(format!(
-                        "cannot open SST {} during recovery: {}",
-                        meta.number, e
-                    )));
-                }
-            }
+        for (level, meta) in live_files.values() {
+            let file = Self::open_table(db_path, table_cache.as_deref(), meta).ctx()?;
+            Arc::make_mut(&mut version.files[*level]).push(file);
         }
 
         // Sort L0 by file number descending (newest first)
@@ -402,7 +482,7 @@ impl VersionSet {
 
         // Writable recovery repairs a torn tail and reopens the MANIFEST for
         // append. Read-only recovery must leave the file byte-for-byte intact.
-        let manifest_writer = if read_only {
+        let manifest_writer = if requested.is_none() {
             None
         } else {
             let valid_offset = reader.last_valid_offset();
@@ -410,6 +490,7 @@ impl VersionSet {
         };
 
         Ok(Self {
+            header,
             db_path: db_path.to_path_buf(),
             num_levels,
             current: Arc::new(version),
@@ -424,12 +505,31 @@ impl VersionSet {
         })
     }
 
-    /// Apply a VersionEdit: write to MANIFEST and install a new Version.
-    ///
-    /// Error contract: `Err` means the edit was **not** applied — neither in
-    /// memory nor durably. Callers rely on this to safely delete output SSTs
-    /// referenced by a failed edit.
+    /// Append a metadata-only edit. New SST references require a directory sync token.
+    pub fn apply_metadata(&mut self, edit: VersionEdit) -> Result<()> {
+        if !edit.new_files.is_empty() {
+            return Err(Error::invalid_argument(
+                "metadata-only edit contains new SSTs",
+            ));
+        }
+        self.log_and_apply_synced(edit, DirSynced(()))
+    }
+
+    #[cfg(test)]
     pub fn log_and_apply(&mut self, edit: VersionEdit) -> Result<()> {
+        if self.manifest_writer.lock().is_none() {
+            return Err(Error::read_only());
+        }
+        if edit.new_files.is_empty() {
+            return self.apply_metadata(edit);
+        }
+        let synced = sync_new_sst_parent_dir(&self.db_path, &self.poisoned)?;
+        self.log_and_apply_synced(edit, synced)
+    }
+
+    /// Publish an edit after syncing its new SST directory entries. On error the
+    /// edit was rejected before publication, so its newly built SSTs can be removed.
+    pub fn log_and_apply_synced(&mut self, edit: VersionEdit, _synced: DirSynced) -> Result<()> {
         if self.manifest_writer.lock().is_none() {
             return Err(Error::read_only());
         }
@@ -494,56 +594,16 @@ impl VersionSet {
                     meta.number, level
                 )));
             }
-            let reader = if let Some(ref tc) = self.table_cache {
-                tc.get_reader(meta.number)
+            let file = Self::open_table(&self.db_path, self.table_cache.as_deref(), meta).ctx()?;
+            let files = Arc::make_mut(&mut new_version.files[level]);
+            let index = if level == 0 {
+                0
             } else {
-                let sst_path = self.db_path.join(format!("{:06}.sst", meta.number));
-                TableReader::open(&sst_path).map(Arc::new)
+                files.partition_point(|other| {
+                    compare_internal_key(&other.meta.smallest_key, &meta.smallest_key).is_lt()
+                })
             };
-            match reader {
-                Ok(reader) => {
-                    if level == 0 {
-                        // L0: insert at front (newest first)
-                        Arc::make_mut(&mut new_version.files[level]).insert(
-                            0,
-                            TableFile {
-                                meta: meta.clone(),
-                                reader,
-                            },
-                        );
-                    } else {
-                        // The existing level is already sorted. Insert at its
-                        // key boundary instead of sorting the whole level.
-                        let files = Arc::make_mut(&mut new_version.files[level]);
-                        let index = files.partition_point(|file| {
-                            compare_internal_key(&file.meta.smallest_key, &meta.smallest_key)
-                                == std::cmp::Ordering::Less
-                        });
-                        files.insert(
-                            index,
-                            TableFile {
-                                meta: meta.clone(),
-                                reader,
-                            },
-                        );
-                    }
-                }
-                Err(e) => {
-                    // Nothing has been persisted or applied at this point —
-                    // the edit is rejected wholesale. Include an existence
-                    // probe so a post-mortem can distinguish "file vanished"
-                    // (unlinked between build and install) from "file present
-                    // but unreadable" (open raced a transient failure).
-                    let sst_path = self.db_path.join(format!("{:06}.sst", meta.number));
-                    return Err(Error::corruption(format!(
-                        "failed to open new SST {} (path {}, exists_now={}): {}",
-                        meta.number,
-                        sst_path.display(),
-                        sst_path.exists(),
-                        e
-                    )));
-                }
-            }
+            files.insert(index, file);
         }
 
         // The fully-applied shape must keep L1+ binary search sound. Reject
@@ -551,28 +611,6 @@ impl VersionSet {
         // the level/deletion checks above); recovery enforces the identical
         // invariant, so a persisted violation would also fail the next open.
         Self::validate_level_disjointness(&new_version).ctx()?;
-
-        // Before any MANIFEST record referencing the new SST files can become
-        // durable — either via a later `sync_manifest()`/`manifest_sync_handle`
-        // sync, or via the `maybe_compact_manifest()` snapshot below — fsync the
-        // DB directory so the new files' directory entries survive a crash.
-        // (The file *contents* are already fsynced by `TableBuilder::finish`.)
-        // Otherwise a crash could leave the MANIFEST referencing an SST whose
-        // directory entry was lost.
-        if !edit.new_files.is_empty()
-            && let Err(e) = Self::fsync_directory(&self.db_path)
-        {
-            // A failed directory fsync means these files' directory entries
-            // are not confirmed durable (fsyncgate): a later "successful"
-            // fsync of the same directory (e.g. from a sibling background
-            // compaction thread, since this is the only durability guard for
-            // SST directory entries) could falsely report durability of the
-            // entries this one failed to persist. Poison the writer so no
-            // further edits are appended; reopen to recover.
-            let _writer = self.manifest_writer.lock();
-            self.poisoned.store(true, Ordering::Release);
-            return Err(e).ctx();
-        }
 
         // Version built successfully — now persist to MANIFEST (write only, no sync).
         // Callers on hot paths should release the main lock and call
@@ -632,9 +670,8 @@ impl VersionSet {
     /// Sync the MANIFEST writer. Only acquires the internal manifest lock,
     /// so callers can invoke this without holding the main DB mutex.
     ///
-    /// Directory entries for any newly created SST files are made durable in
-    /// `log_and_apply` (before the referencing MANIFEST record), so this only
-    /// needs to fsync the MANIFEST writer itself.
+    /// The SST builder or recovery path syncs the parent directory before
+    /// publication. This call syncs the MANIFEST containing those references.
     pub fn sync_manifest(&self) -> Result<()> {
         confirm_manifest_durable(&self.manifest_writer, &self.poisoned)
     }
@@ -654,6 +691,10 @@ impl VersionSet {
     /// Get the current version.
     pub fn current(&self) -> Arc<Version> {
         self.current.clone()
+    }
+
+    pub fn geometry(&self) -> (usize, usize) {
+        (self.num_levels, self.header.prefix_len as usize)
     }
 
     pub fn next_file_number(&self) -> u64 {
@@ -744,7 +785,11 @@ impl VersionSet {
 
         // Write the snapshot edit
         let encoded = snapshot_edit.encode();
-        if let Err(e) = new_writer.add_record(&encoded).ctx() {
+        if let Err(e) = new_writer
+            .add_record(&self.header.encode())
+            .and_then(|()| new_writer.add_record(&encoded))
+            .ctx()
+        {
             drop(new_writer);
             let _ = fs::remove_file(&new_manifest_path);
             tracing::warn!("MANIFEST compaction deferred writing snapshot: {}", e);
@@ -885,10 +930,7 @@ mod tests {
         let build = |number, user_key: &[u8]| {
             let mut builder = TableBuilder::new(
                 &dir.path().join(format!("{number:06}.sst")),
-                TableBuildOptions {
-                    internal_keys: true,
-                    ..Default::default()
-                },
+                TableBuildOptions::default(),
             )
             .unwrap();
             builder
@@ -1088,7 +1130,7 @@ mod tests {
                 bytes[offset + 4..offset + 6].copy_from_slice(&changed.to_le_bytes());
             }
             fs::write(&path, &bytes).unwrap();
-            assert!(VersionSet::recover_read_only_with_cache(dir.path(), 7, None).is_err());
+            assert!(VersionSet::recover_read_only_with_cache(dir.path(), None).is_err());
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert!(VersionSet::recover(dir.path(), 7).is_err());
             assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -1115,7 +1157,7 @@ mod tests {
                 .unwrap();
             bytes[middle + 4..middle + 6].copy_from_slice(&(enlarged as u16).to_le_bytes());
             fs::write(&path, &bytes).unwrap();
-            assert!(VersionSet::recover_read_only_with_cache(dir.path(), 7, None).is_err());
+            assert!(VersionSet::recover_read_only_with_cache(dir.path(), None).is_err());
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert!(VersionSet::recover(dir.path(), 7).is_err());
             assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -1140,7 +1182,7 @@ mod tests {
         drop(file);
         let before = fs::read(&manifest_path).unwrap();
 
-        let mut vs = VersionSet::recover_read_only_with_cache(path, 7, None).unwrap();
+        let mut vs = VersionSet::recover_read_only_with_cache(path, None).unwrap();
         assert_eq!(fs::read(&manifest_path).unwrap(), before);
         assert_eq!(vs.sync_manifest().unwrap_err().kind(), ErrorKind::ReadOnly);
         assert_eq!(
@@ -1148,6 +1190,58 @@ mod tests {
             ErrorKind::ReadOnly
         );
         assert_eq!(fs::read(&manifest_path).unwrap(), before);
+    }
+
+    #[test]
+    fn creation_and_rotation_publish_only_durable_geometry() {
+        use crate::wal::writer::FAIL_NEXT_SYNC;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        FAIL_NEXT_SYNC.with(|flag| flag.set(true));
+        assert!(VersionSet::create_with_cache(path, 3, 5, None).is_err());
+        assert!(!path.join("CURRENT").exists());
+        let mut vs = VersionSet::create_with_cache(path, 3, 5, None).unwrap();
+        let first = vs.manifest_number();
+        vs.edits_since_snapshot = 1000;
+        vs.maybe_compact_manifest();
+        assert_ne!(vs.manifest_number(), first);
+        drop(vs);
+        let recovered = VersionSet::recover_with_cache(path, 3, 5, None).unwrap();
+        assert_eq!(recovered.geometry(), (3, 5));
+        let manifest = path.join(format!("MANIFEST-{:06}", recovered.manifest_number()));
+        drop(recovered);
+        let mut reader = WalReader::new(&manifest).unwrap();
+        assert_eq!(
+            reader.read_record().unwrap().unwrap(),
+            DBHeader::new(3, 5).unwrap().encode()
+        );
+    }
+
+    #[test]
+    fn invalid_header_stops_recovery_before_tail_repair() {
+        for (version, levels) in [(4u32, 7u32), (6, 7), (5, 1), (5, 17), (5, u32::MAX)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            let manifest = path.join("MANIFEST-000001");
+            let mut bytes = DBHeader::new(2, 0).unwrap().encode();
+            bytes[4..8].copy_from_slice(&version.to_le_bytes());
+            bytes[8..12].copy_from_slice(&levels.to_le_bytes());
+            let mut writer = WalWriter::new(&manifest).unwrap();
+            writer.add_record(&bytes).unwrap();
+            writer.sync().unwrap();
+            drop(writer);
+            let mut original = fs::read(&manifest).unwrap();
+            original.extend([1, 2]);
+            fs::write(&manifest, &original).unwrap();
+            fs::write(path.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+            for result in [
+                VersionSet::recover(path, 2),
+                VersionSet::recover_read_only_with_cache(path, None),
+            ] {
+                assert_eq!(result.err().unwrap().kind(), crate::ErrorKind::Corruption);
+            }
+            assert_eq!(fs::read(manifest).unwrap(), original);
+        }
     }
 
     #[test]
@@ -1169,107 +1263,6 @@ mod tests {
         // Recovery should succeed for a clean (empty) DB
         let vs = VersionSet::recover(path, 7).unwrap();
         assert_eq!(vs.current().total_files(), 0);
-    }
-
-    /// Stores written before the `has_range_deletions` flag store range
-    /// tombstones inline in data blocks and encode tag-4 MANIFEST records.
-    /// Recovery must resolve the flag from the file so reads and compaction
-    /// apply those tombstones.
-    #[test]
-    fn test_recovery_resolves_legacy_inline_range_tombstones() {
-        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
-        use crate::types::{InternalKey, ValueType};
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path();
-
-        // File 1: legacy format with an inline tombstone covering "m".
-        let mut builder = TableBuilder::new(
-            &path.join("000001.sst"),
-            TableBuildOptions {
-                internal_keys: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        builder.use_legacy_inline_range_deletions();
-        builder
-            .add(
-                InternalKey::new(b"a", 1, ValueType::RangeDeletion).as_bytes(),
-                b"z",
-            )
-            .unwrap();
-        builder
-            .add(
-                InternalKey::new(b"m", 2, ValueType::Value).as_bytes(),
-                b"value",
-            )
-            .unwrap();
-        let with_tombstone = builder.finish().unwrap();
-
-        // File 2: legacy format without tombstones.
-        let mut builder = TableBuilder::new(
-            &path.join("000002.sst"),
-            TableBuildOptions {
-                internal_keys: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        builder.use_legacy_inline_range_deletions();
-        builder
-            .add(
-                InternalKey::new(b"x", 1, ValueType::Value).as_bytes(),
-                b"value",
-            )
-            .unwrap();
-        let without_tombstone = builder.finish().unwrap();
-
-        {
-            let vs = VersionSet::create(path, 7).unwrap();
-            let mut record = Vec::new();
-            record.push(2u8); // next_file_number
-            record.extend_from_slice(&10u64.to_le_bytes());
-            record.push(3u8); // last_sequence
-            record.extend_from_slice(&3u64.to_le_bytes());
-            for (number, result) in [(1u64, &with_tombstone), (2u64, &without_tombstone)] {
-                record.push(4u8); // legacy new_file
-                record.extend_from_slice(&0u32.to_le_bytes());
-                record.extend_from_slice(&number.to_le_bytes());
-                record.extend_from_slice(&result.file_size.to_le_bytes());
-                let smallest = result.smallest_key.as_deref().unwrap_or_default();
-                let largest = result.largest_key.as_deref().unwrap_or_default();
-                record.extend_from_slice(&(smallest.len() as u32).to_le_bytes());
-                record.extend_from_slice(smallest);
-                record.extend_from_slice(&(largest.len() as u32).to_le_bytes());
-                record.extend_from_slice(largest);
-            }
-            let mut guard = vs.manifest_writer.lock();
-            let writer = guard.as_mut().expect("writable MANIFEST");
-            writer.add_record(&record).unwrap();
-            writer.sync().unwrap();
-        }
-
-        let recovered = VersionSet::recover(path, 7).unwrap();
-        let current = recovered.current();
-        let files = current.level_files(0);
-        assert_eq!(files.len(), 2);
-
-        let with_tombstone = files.iter().find(|f| f.meta.number == 1).unwrap();
-        assert!(
-            with_tombstone.meta.has_range_deletions,
-            "an inline tombstone must be visible after recovery"
-        );
-        assert_eq!(
-            with_tombstone.reader.get_range_tombstones().unwrap(),
-            vec![(b"a".to_vec(), b"z".to_vec(), 1)]
-        );
-
-        let without_tombstone = files.iter().find(|f| f.meta.number == 2).unwrap();
-        assert!(
-            !without_tombstone.meta.has_range_deletions,
-            "a legacy file without tombstones must not stay flagged"
-        );
     }
 
     #[test]
@@ -1401,10 +1394,7 @@ mod tests {
         let build_sst = |number: u64, key: &[u8]| {
             let mut builder = TableBuilder::new(
                 &path.join(format!("{:06}.sst", number)),
-                TableBuildOptions {
-                    internal_keys: true,
-                    ..Default::default()
-                },
+                TableBuildOptions::default(),
             )
             .unwrap();
             builder
@@ -1582,7 +1572,6 @@ mod tests {
             let mut builder = TableBuilder::new(
                 &path,
                 TableBuildOptions {
-                    internal_keys: true,
                     bloom_bits_per_key: 0,
                     ..Default::default()
                 },
