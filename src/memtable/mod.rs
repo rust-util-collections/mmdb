@@ -67,6 +67,30 @@ unsafe impl Send for MemTablePin {}
 // SAFETY: shared readers can only observe the immutable bytes above.
 unsafe impl Sync for MemTablePin {}
 
+impl MemTablePin {
+    #[inline]
+    pub(crate) fn from_raw(owner: &Arc<MemTable>, bytes: NonNull<[u8]>) -> Self {
+        Self {
+            _owner: owner.clone(),
+            bytes,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn update_if_same_owner(
+        &mut self,
+        owner: &Arc<MemTable>,
+        bytes: NonNull<[u8]>,
+    ) -> bool {
+        if Arc::ptr_eq(&self._owner, owner) {
+            self.bytes = bytes;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl AsRef<[u8]> for MemTablePin {
     fn as_ref(&self) -> &[u8] {
         // SAFETY: _owner retains this node, including zero-length values.

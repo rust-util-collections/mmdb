@@ -14,10 +14,12 @@ pub struct IterSource {
     inner: IterSourceInner,
     /// Reusable key buffer for peeked entry.
     pub(crate) peeked_key: Vec<u8>,
-    /// Lazy value buffer for peeked entry (zero-copy for SST sources).
+    /// Lazy value buffer for peeked entry (zero-copy for SST and MemTable sources).
     pub(crate) peeked_value: LazyValue,
-    /// Whether a peeked entry is available.
+    /// Whether a peeked entry key is available.
     pub(crate) has_peeked: bool,
+    /// Whether `peeked_value` has been populated for the current `peeked_key`.
+    value_materialized: bool,
     /// LSM level this source belongs to. Memtable/L0 = 0, L1 = 1, etc.
     /// Defaults to usize::MAX (unknown/untagged).
     pub(crate) level: usize,
@@ -73,12 +75,13 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
         None
     }
 
-    /// Decode previous entry directly into caller-provided buffers.
-    fn prev_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
+    /// Decode previous entry into reusable `(key_buf, LazyValue)` without copying values.
+    fn prev_into_lazy(&mut self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
         match self.prev() {
             Some((k, v)) => {
-                *key_buf = k;
-                *value_buf = v.into_vec();
+                key_buf.clear();
+                key_buf.extend_from_slice(&k);
+                *val_out = v;
                 true
             }
             None => false,
@@ -90,6 +93,19 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
     /// without moving the cursor forward — critical for correct backward iteration.
     fn current(&self) -> Option<(Vec<u8>, LazyValue)> {
         None
+    }
+
+    /// Populate reusable `(key_buf, LazyValue)` from the current reverse cursor position.
+    fn current_into_lazy(&self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
+        match self.current() {
+            Some((k, v)) => {
+                key_buf.clear();
+                key_buf.extend_from_slice(&k);
+                *val_out = v;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Seek to the last entry <= target.
@@ -114,18 +130,12 @@ pub trait SeekableIterator: Iterator<Item = (Vec<u8>, Vec<u8>)> {
         self.set_config(Arc::new(IterConfig::new(lower, upper, &[])));
     }
 
-    /// Decode next entry with lazy value — key written into caller buffer,
-    /// value returned as LazyValue (zero-copy for SST sources).
-    /// Default impl delegates to next_into() and wraps as Inline.
-    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
-        // Default: allocate a temp value buffer and wrap as Inline.
-        let mut val_buf = Vec::new();
-        if self.next_into(key_buf, &mut val_buf) {
-            Some(LazyValue::Inline(val_buf))
-        } else {
-            None
-        }
-    }
+    /// Advance to the next entry and write ONLY its key into `key_buf` so skipped
+    /// MVCC versions pay zero value allocation or `Arc` cloning.
+    fn advance_key(&mut self, key_buf: &mut Vec<u8>) -> bool;
+
+    /// Materialize the `LazyValue` for the entry most recently loaded by `advance_key`.
+    fn materialize_value_into(&self, val_out: &mut LazyValue);
 }
 
 impl IterSource {
@@ -135,6 +145,7 @@ impl IterSource {
             peeked_key: Vec::new(),
             peeked_value: LazyValue::empty(),
             has_peeked: false,
+            value_materialized: false,
             level: usize::MAX,
         }
     }
@@ -146,6 +157,7 @@ impl IterSource {
             peeked_key: Vec::new(),
             peeked_value: LazyValue::empty(),
             has_peeked: false,
+            value_materialized: false,
             level: usize::MAX,
         }
     }
@@ -156,6 +168,7 @@ impl IterSource {
             peeked_key: Vec::new(),
             peeked_value: LazyValue::empty(),
             has_peeked: false,
+            value_materialized: false,
             level: usize::MAX,
         }
     }
@@ -166,6 +179,7 @@ impl IterSource {
             peeked_key: Vec::new(),
             peeked_value: LazyValue::empty(),
             has_peeked: false,
+            value_materialized: false,
             level: usize::MAX,
         }
     }
@@ -176,6 +190,7 @@ impl IterSource {
             peeked_key: Vec::new(),
             peeked_value: LazyValue::empty(),
             has_peeked: false,
+            value_materialized: false,
             level: usize::MAX,
         }
     }
@@ -192,36 +207,57 @@ impl IterSource {
         self
     }
 
-    pub fn peek(&mut self) -> Option<(&[u8], &[u8])> {
+    /// Peek only the key slice without materializing `LazyValue` (`0` value work on skips).
+    #[inline]
+    pub fn peek_key_only(&mut self) -> Option<&[u8]> {
         if !self.has_peeked {
-            self.has_peeked = self.advance_into_buffers();
+            self.has_peeked = self.advance_key_into_buffer();
         }
         if self.has_peeked {
-            Some((self.peeked_key.as_slice(), self.peeked_value.as_slice()))
+            Some(self.peeked_key.as_slice())
         } else {
             None
         }
+    }
+
+    /// Recycle caller buffers via `swap` (`0` heap allocations in steady state).
+    #[inline]
+    pub fn take_peeked_into(&mut self, key_out: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
+        if !self.has_peeked {
+            self.has_peeked = self.advance_key_into_buffer();
+        }
+        if !self.has_peeked {
+            return false;
+        }
+        std::mem::swap(key_out, &mut self.peeked_key);
+        if self.value_materialized {
+            std::mem::swap(val_out, &mut self.peeked_value);
+        } else {
+            match &self.inner {
+                IterSourceInner::Memtable { iter } => iter.materialize_value_into(val_out),
+                IterSourceInner::Sst { iter } => iter.materialize_value_into(val_out),
+                IterSourceInner::Level { iter } => iter.materialize_value_into(val_out),
+                IterSourceInner::Vec { .. } => unreachable!(),
+                #[cfg(test)]
+                IterSourceInner::Boxed(_) => unreachable!(),
+            }
+        }
+        self.has_peeked = false;
+        self.value_materialized = false;
+        true
     }
 
     /// Take the peeked key/lazy-value, transferring ownership.
     pub fn take_peeked(&mut self) -> Option<(Vec<u8>, LazyValue)> {
-        if !self.has_peeked {
-            self.has_peeked = self.advance_into_buffers();
-        }
-        if self.has_peeked {
-            self.has_peeked = false;
-            Some((
-                std::mem::take(&mut self.peeked_key),
-                std::mem::replace(&mut self.peeked_value, LazyValue::empty()),
-            ))
-        } else {
-            None
-        }
+        let mut key_out = Vec::new();
+        let mut val_out = LazyValue::empty();
+        self.take_peeked_into(&mut key_out, &mut val_out)
+            .then_some((key_out, val_out))
     }
 
-    /// Advance the inner iterator and store the result in reusable buffers.
-    /// Returns true if a new entry was loaded.
-    fn advance_into_buffers(&mut self) -> bool {
+    /// Advance the inner iterator and store its key in `peeked_key` (deferring value
+    /// materialization for `Memtable` / `Sst` / `Level` sources).
+    fn advance_key_into_buffer(&mut self) -> bool {
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 if *pos < entries.len() {
@@ -229,9 +265,11 @@ impl IterSource {
                     self.peeked_key.clear();
                     self.peeked_key.extend_from_slice(k);
                     self.peeked_value = LazyValue::Inline(v.clone());
+                    self.value_materialized = true;
                     *pos += 1;
                     true
                 } else {
+                    self.value_materialized = false;
                     false
                 }
             }
@@ -240,38 +278,34 @@ impl IterSource {
                 Some((k, v)) => {
                     self.peeked_key = k;
                     self.peeked_value = LazyValue::Inline(v);
+                    self.value_materialized = true;
                     true
                 }
-                None => false,
-            },
-            IterSourceInner::Memtable { iter } => match iter.next_lazy(&mut self.peeked_key) {
-                Some(lv) => {
-                    self.peeked_value = lv;
-                    true
+                None => {
+                    self.value_materialized = false;
+                    false
                 }
-                None => false,
             },
-            IterSourceInner::Sst { iter } => match iter.next_lazy(&mut self.peeked_key) {
-                Some(lv) => {
-                    self.peeked_value = lv;
-                    true
-                }
-                None => false,
-            },
-            IterSourceInner::Level { iter } => match iter.next_lazy(&mut self.peeked_key) {
-                Some(lv) => {
-                    self.peeked_value = lv;
-                    true
-                }
-                None => false,
-            },
+            IterSourceInner::Memtable { iter } => {
+                self.value_materialized = false;
+                iter.advance_key(&mut self.peeked_key)
+            }
+            IterSourceInner::Sst { iter } => {
+                self.value_materialized = false;
+                iter.advance_key(&mut self.peeked_key)
+            }
+            IterSourceInner::Level { iter } => {
+                self.value_materialized = false;
+                iter.advance_key(&mut self.peeked_key)
+            }
         }
     }
 
     /// Advance the inner iterator backward and store the result in reusable buffers.
     /// Returns true if a new entry was loaded.
     fn reverse_advance_into_buffers(&mut self) -> bool {
-        match &mut self.inner {
+        self.value_materialized = false;
+        let ok = match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 if *pos >= 2 {
                     *pos -= 2;
@@ -288,33 +322,17 @@ impl IterSource {
             #[cfg(test)]
             IterSourceInner::Boxed(_) => false,
             IterSourceInner::Memtable { iter } => {
-                let mut tmp_val = Vec::new();
-                if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = LazyValue::Inline(tmp_val);
-                    true
-                } else {
-                    false
-                }
+                iter.prev_into_lazy(&mut self.peeked_key, &mut self.peeked_value)
             }
             IterSourceInner::Sst { iter } => {
-                let mut tmp_val = Vec::new();
-                if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = LazyValue::Inline(tmp_val);
-                    true
-                } else {
-                    false
-                }
+                iter.prev_into_lazy(&mut self.peeked_key, &mut self.peeked_value)
             }
             IterSourceInner::Level { iter } => {
-                let mut tmp_val = Vec::new();
-                if iter.prev_into(&mut self.peeked_key, &mut tmp_val) {
-                    self.peeked_value = LazyValue::Inline(tmp_val);
-                    true
-                } else {
-                    false
-                }
+                iter.prev_into_lazy(&mut self.peeked_key, &mut self.peeked_value)
             }
-        }
+        };
+        self.value_materialized = ok;
+        ok
     }
 
     /// Propagate iteration bounds to the underlying seekable iterator (if any).
@@ -350,6 +368,7 @@ impl IterSource {
     /// For plain Boxed sources, can only seek forward (same as `seek`).
     pub fn seek_to<F: Fn(&[u8], &[u8]) -> Ordering>(&mut self, target: &[u8], compare: &F) {
         self.has_peeked = false;
+        self.value_materialized = false;
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 let idx = entries.partition_point(|(k, _)| compare(k, target) == Ordering::Less);
@@ -360,6 +379,7 @@ impl IterSource {
                     self.peeked_key.extend_from_slice(k);
                     self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
+                    self.value_materialized = true;
                     *pos += 1;
                 }
             }
@@ -367,26 +387,21 @@ impl IterSource {
             IterSourceInner::Boxed(_) => {
                 self.seek(target, compare);
             }
-            // Seekable variants: seek + peek next entry (lazily — key lands in
-            // the reused peeked_key buffer, value stays zero-copy for SST sources)
             IterSourceInner::Memtable { iter } => {
                 iter.seek_to(target);
-                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
-                    self.peeked_value = lv;
+                if iter.advance_key(&mut self.peeked_key) {
                     self.has_peeked = true;
                 }
             }
             IterSourceInner::Sst { iter } => {
                 iter.seek_to(target);
-                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
-                    self.peeked_value = lv;
+                if iter.advance_key(&mut self.peeked_key) {
                     self.has_peeked = true;
                 }
             }
             IterSourceInner::Level { iter } => {
                 iter.seek_to(target);
-                if let Some(lv) = iter.next_lazy(&mut self.peeked_key) {
-                    self.peeked_value = lv;
+                if iter.advance_key(&mut self.peeked_key) {
                     self.has_peeked = true;
                 }
             }
@@ -399,10 +414,11 @@ impl IterSource {
     pub fn seek<F: Fn(&[u8], &[u8]) -> Ordering>(&mut self, target: &[u8], compare: &F) {
         // Discard peeked if < target
         loop {
-            match self.peek() {
-                Some((k, _)) if compare(k, target) == Ordering::Less => {
+            match self.peek_key_only() {
+                Some(k) if compare(k, target) == Ordering::Less => {
                     self.has_peeked = false;
-                    self.has_peeked = self.advance_into_buffers();
+                    self.value_materialized = false;
+                    self.has_peeked = self.advance_key_into_buffer();
                     if !self.has_peeked {
                         break;
                     }
@@ -419,6 +435,7 @@ impl IterSource {
         compare: &F,
     ) {
         self.has_peeked = false;
+        self.value_materialized = false;
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 // partition_point returns first idx where key > target
@@ -430,31 +447,33 @@ impl IterSource {
                     self.peeked_key.extend_from_slice(k);
                     self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
+                    self.value_materialized = true;
                     *pos += 1;
                 }
             }
             IterSourceInner::Memtable { iter } => {
                 iter.seek_for_prev(target);
-                if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
+                if iter.current_into_lazy(&mut self.peeked_key, &mut self.peeked_value) {
                     self.has_peeked = true;
+                    self.value_materialized = true;
                 }
             }
             IterSourceInner::Sst { iter } => {
                 SeekableIterator::seek_for_prev(iter, target);
-                if let Some((k, v)) = SeekableIterator::current(iter) {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
+                if SeekableIterator::current_into_lazy(
+                    iter,
+                    &mut self.peeked_key,
+                    &mut self.peeked_value,
+                ) {
                     self.has_peeked = true;
+                    self.value_materialized = true;
                 }
             }
             IterSourceInner::Level { iter } => {
                 iter.seek_for_prev(target);
-                if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
+                if iter.current_into_lazy(&mut self.peeked_key, &mut self.peeked_value) {
                     self.has_peeked = true;
+                    self.value_materialized = true;
                 }
             }
             #[cfg(test)]
@@ -465,6 +484,7 @@ impl IterSource {
     /// Seek to the first entry (for forward iteration from beginning).
     pub fn seek_to_first_impl(&mut self) {
         self.has_peeked = false;
+        self.value_materialized = false;
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 *pos = 0;
@@ -474,30 +494,25 @@ impl IterSource {
                     self.peeked_key.extend_from_slice(k);
                     self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
+                    self.value_materialized = true;
                     *pos = 1;
                 }
             }
             IterSourceInner::Memtable { iter } => {
                 iter.seek_to_first();
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
+                if iter.advance_key(&mut self.peeked_key) {
                     self.has_peeked = true;
                 }
             }
             IterSourceInner::Sst { iter } => {
                 iter.seek_to_first();
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
+                if iter.advance_key(&mut self.peeked_key) {
                     self.has_peeked = true;
                 }
             }
             IterSourceInner::Level { iter } => {
                 iter.seek_to_first();
-                if let Some((k, v)) = iter.next() {
-                    self.peeked_key = k;
-                    self.peeked_value = LazyValue::Inline(v);
+                if iter.advance_key(&mut self.peeked_key) {
                     self.has_peeked = true;
                 }
             }
@@ -509,6 +524,7 @@ impl IterSource {
     /// Seek to the last entry (for backward iteration from end).
     pub fn seek_to_last_impl(&mut self) {
         self.has_peeked = false;
+        self.value_materialized = false;
         match &mut self.inner {
             IterSourceInner::Vec { entries, pos } => {
                 if !entries.is_empty() {
@@ -518,31 +534,33 @@ impl IterSource {
                     self.peeked_key.extend_from_slice(k);
                     self.peeked_value = LazyValue::Inline(v.clone());
                     self.has_peeked = true;
+                    self.value_materialized = true;
                     *pos += 1;
                 }
             }
             IterSourceInner::Memtable { iter } => {
                 iter.seek_to_last();
-                if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
+                if iter.current_into_lazy(&mut self.peeked_key, &mut self.peeked_value) {
                     self.has_peeked = true;
+                    self.value_materialized = true;
                 }
             }
             IterSourceInner::Sst { iter } => {
                 SeekableIterator::seek_to_last(iter);
-                if let Some((k, v)) = SeekableIterator::current(iter) {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
+                if SeekableIterator::current_into_lazy(
+                    iter,
+                    &mut self.peeked_key,
+                    &mut self.peeked_value,
+                ) {
                     self.has_peeked = true;
+                    self.value_materialized = true;
                 }
             }
             IterSourceInner::Level { iter } => {
                 iter.seek_to_last();
-                if let Some((k, v)) = iter.current() {
-                    self.peeked_key = k;
-                    self.peeked_value = v;
+                if iter.current_into_lazy(&mut self.peeked_key, &mut self.peeked_value) {
                     self.has_peeked = true;
+                    self.value_materialized = true;
                 }
             }
             #[cfg(test)]
@@ -563,5 +581,6 @@ impl IterSource {
     #[inline]
     pub fn skip_peeked(&mut self) {
         self.has_peeked = false;
+        self.value_materialized = false;
     }
 }

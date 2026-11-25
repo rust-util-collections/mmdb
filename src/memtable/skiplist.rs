@@ -1,8 +1,8 @@
 //! SkipList-based MemTable implementation using a custom concurrent skiplist.
 
-use std::sync::Arc;
+use std::{ptr::NonNull, sync::Arc};
 
-use super::{MemTable, skiplist_impl::ConcurrentSkipList};
+use super::{MemTable, MemTablePin, skiplist_impl::ConcurrentSkipList};
 use crate::iterator::merge::SeekableIterator;
 use crate::types::{InternalKeyRef, LazyValue, SequenceNumber, ValueType, pack_sequence_and_type};
 
@@ -107,6 +107,9 @@ pub struct MemTableCursorIter {
     /// freshly past-the-end, or before-the-start — see `exhausted_backward`
     /// to distinguish the two).
     cursor: *const (),
+    /// Value slice of the entry most recently loaded by `advance_key`.
+    /// Valid for the lifetime of `self.memtable`.
+    last_value: Option<NonNull<[u8]>>,
     /// Set by `prev()` when it finds no predecessor, i.e. the cursor has
     /// moved before the first entry. A null `cursor` alone is ambiguous
     /// between "freshly past-the-end" (prev() should jump to the last
@@ -130,6 +133,7 @@ impl MemTableCursorIter {
         Self {
             memtable,
             cursor: head,
+            last_value: None,
             exhausted_backward: false,
         }
     }
@@ -141,9 +145,19 @@ impl MemTableCursorIter {
 
     fn seek_internal(&mut self, target: &[u8]) {
         self.cursor = self.sl().seek_ge_raw(target);
+        self.last_value = None;
         // Repositioned by an explicit seek — no longer in the "exhausted
         // backward" state (if we were even in it).
         self.exhausted_backward = false;
+    }
+
+    #[inline]
+    fn pin_slice(&self, v: &[u8]) -> LazyValue {
+        if v.is_empty() {
+            LazyValue::empty()
+        } else {
+            LazyValue::MemTable(MemTablePin::from_raw(&self.memtable, NonNull::from(v)))
+        }
     }
 }
 
@@ -188,7 +202,19 @@ impl SeekableIterator for MemTableCursorIter {
         }
         // SAFETY: cursor is non-null and comes from this skiplist.
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
-        Some((k.to_vec(), LazyValue::Inline(v.to_vec())))
+        Some((k.to_vec(), self.pin_slice(v)))
+    }
+
+    fn current_into_lazy(&self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
+        if self.cursor.is_null() {
+            return false;
+        }
+        // SAFETY: cursor is non-null and comes from this skiplist.
+        let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
+        key_buf.clear();
+        key_buf.extend_from_slice(k);
+        val_out.set_memtable_raw(&self.memtable, NonNull::from(v));
+        true
     }
 
     /// Copy directly into caller buffers, reusing their capacity.
@@ -214,46 +240,53 @@ impl SeekableIterator for MemTableCursorIter {
         key_buf.extend_from_slice(k);
         value_buf.clear();
         value_buf.extend_from_slice(v);
+        self.last_value = Some(NonNull::from(v));
         // SAFETY: cursor is still the same valid node pointer.
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
         true
     }
 
-    /// Override default next_lazy to avoid temporary Vec::new() allocation.
-    /// Writes key into caller buffer, returns value as LazyValue directly.
-    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
+    fn advance_key(&mut self, key_buf: &mut Vec<u8>) -> bool {
         if self.cursor.is_null() {
             if !self.exhausted_backward {
-                return None;
+                self.last_value = None;
+                return false;
             }
-            // See `next()`: resume forward from before-the-start at the
-            // first entry instead of staying stuck.
             self.cursor = self.sl().head_ptr();
             if self.cursor.is_null() {
-                return None;
+                self.last_value = None;
+                return false;
             }
         }
         self.exhausted_backward = false;
-        // SAFETY: cursor is non-null here (the null case returned above) and
-        // is a node pointer returned by this skiplist (either the
-        // pre-existing cursor or `head_ptr()`).
+        // SAFETY: cursor is non-null and comes from this skiplist.
         let (k, v) = unsafe { self.sl().node_kv(self.cursor) };
         key_buf.clear();
         key_buf.extend_from_slice(k);
-        let lv = LazyValue::Inline(v.to_vec());
+        self.last_value = Some(NonNull::from(v));
         // SAFETY: cursor is still the same valid node pointer.
         self.cursor = unsafe { self.sl().node_next0(self.cursor) };
-        Some(lv)
+        true
+    }
+
+    fn materialize_value_into(&self, val_out: &mut LazyValue) {
+        if let Some(bytes) = self.last_value {
+            val_out.set_memtable_raw(&self.memtable, bytes);
+        } else {
+            val_out.set_empty();
+        }
     }
 
     fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        let mut key_buf = Vec::new();
+        let mut val_out = LazyValue::empty();
+        self.prev_into_lazy(&mut key_buf, &mut val_out)
+            .then_some((key_buf, val_out))
+    }
+
+    fn prev_into_lazy(&mut self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
         if self.exhausted_backward {
-            // Already moved before the first entry on a previous `prev()`
-            // call. A null `cursor` here does NOT mean "freshly past the
-            // end" (which would jump to the last entry below) — it means
-            // we're still stuck before the start, so keep returning `None`
-            // instead of re-entering that branch and wrapping around.
-            return None;
+            return false;
         }
         let ptr = if self.cursor.is_null() {
             self.sl().tail_ptr()
@@ -264,19 +297,24 @@ impl SeekableIterator for MemTableCursorIter {
         };
         if ptr.is_null() {
             self.cursor = std::ptr::null();
+            self.last_value = None;
             self.exhausted_backward = true;
-            return None;
+            return false;
         }
         // SAFETY: ptr is non-null and either the previous node or skiplist tail.
         let (k, v) = unsafe { self.sl().node_kv(ptr) };
-        let result = (k.to_vec(), LazyValue::Inline(v.to_vec()));
+        key_buf.clear();
+        key_buf.extend_from_slice(k);
+        val_out.set_memtable_raw(&self.memtable, NonNull::from(v));
         self.cursor = ptr;
-        Some(result)
+        self.last_value = None;
+        true
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
         // seek_le_raw: find last entry <= target
         let ptr = self.sl().seek_le_raw(target);
+        self.last_value = None;
         if ptr.is_null() {
             // Nothing is <= target, so this is the before-first state, same
             // as `prev()` walking off the front. A null cursor with the flag
@@ -293,12 +331,14 @@ impl SeekableIterator for MemTableCursorIter {
 
     fn seek_to_first(&mut self) {
         self.cursor = self.sl().head_ptr();
+        self.last_value = None;
         self.exhausted_backward = false;
     }
 
     fn seek_to_last(&mut self) {
         let ptr = self.sl().tail_ptr();
         self.cursor = ptr;
+        self.last_value = None;
         self.exhausted_backward = false;
     }
 }

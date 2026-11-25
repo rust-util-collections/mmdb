@@ -332,6 +332,10 @@ pub struct BlockCache {
     pin_updates: Mutex<()>,
 }
 
+/// Raw cached block payload paired with optional pre-validated `Block` metadata
+/// (`(block, index_validated)`).
+pub(crate) type CachedBlockLookup = (Arc<Vec<u8>>, Option<(Block, bool)>);
+
 impl BlockCache {
     pub(crate) fn is_enabled(&self) -> bool {
         !self.pool.disabled && !self.detached.load(Ordering::Relaxed)
@@ -372,7 +376,7 @@ impl BlockCache {
         &self,
         file_number: u64,
         block_offset: u64,
-    ) -> Option<(Arc<Vec<u8>>, Option<(Block, bool)>)> {
+    ) -> Option<CachedBlockLookup> {
         let entry = self.get_entry(file_number, block_offset)?;
         let raw = entry.data.clone();
         Some((raw, entry.into_block()))

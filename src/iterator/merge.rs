@@ -111,10 +111,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                     source.prefetch_hint();
                 }
             }
-            // Phase 2: peek all sources (I/O should hit page cache / block cache
-            // thanks to the prefetch hints issued above).
+            // Phase 2: peek keys of all sources (values stay unmaterialized until taken).
             for source in self.sources.iter_mut() {
-                let _ = source.peek();
+                let _ = source.peek_key_only();
             }
         }
 
@@ -197,14 +196,14 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if self.single_source {
             if !self.initialized {
                 self.initialized = true;
-                let _ = self.sources[0].peek();
+                let _ = self.sources[0].peek_key_only();
             }
             let entry = self.sources[0].take_peeked();
             if let Some(ref entry) = entry {
                 // Track current key for direction switching (same as multi-source path).
                 self.current_key.clear();
                 self.current_key.extend_from_slice(&entry.0);
-                let _ = self.sources[0].peek();
+                let _ = self.sources[0].peek_key_only();
             }
             if !self.sources[0].has_peeked {
                 self.latch_source_error(0);
@@ -225,8 +224,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         self.current_key.clear();
         self.current_key.extend_from_slice(&entry.0);
 
-        // Advance the source and peek its next entry
-        let _ = self.sources[min_idx].peek();
+        // Advance the source and peek its next key
+        let _ = self.sources[min_idx].peek_key_only();
 
         if self.sources[min_idx].has_peeked {
             // Source still has entries — sift down to maintain heap
@@ -389,8 +388,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 let mut stepped = 0;
                 let mut reached = false;
                 if self.sources[0]
-                    .peek()
-                    .is_some_and(|(k, _)| (self.compare)(k, target) != Ordering::Less)
+                    .peek_key_only()
+                    .is_some_and(|k| (self.compare)(k, target) != Ordering::Less)
                 {
                     reached = true;
                 } else if self.latch_source_error(0) {
@@ -400,9 +399,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                     reached = true;
                 }
                 while !reached {
-                    self.sources[0].has_peeked = false;
+                    self.sources[0].skip_peeked();
                     stepped += 1;
-                    if let Some((k, _)) = self.sources[0].peek() {
+                    if let Some(k) = self.sources[0].peek_key_only() {
                         if (self.compare)(k, target) != Ordering::Less {
                             reached = true;
                             break;
@@ -445,9 +444,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 let mut stepped = 0;
                 let mut reached = false;
                 loop {
-                    self.sources[i].has_peeked = false;
+                    self.sources[i].skip_peeked();
                     stepped += 1;
-                    if let Some((k, _)) = self.sources[i].peek() {
+                    if let Some(k) = self.sources[i].peek_key_only() {
                         if (self.compare)(k, target) != Ordering::Less {
                             reached = true;
                             break;
@@ -506,11 +505,11 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             if !self.initialized {
                 self.initialized = true;
             }
-            if self.sources[0].peek().is_none() {
+            if self.sources[0].peek_key_only().is_none() {
                 self.latch_source_error(0);
                 return None;
             }
-            return self.sources[0].peek().map(|(key, _)| (key, 0));
+            return self.sources[0].peek_key_only().map(|key| (key, 0));
         }
 
         self.init_heap();
@@ -518,7 +517,9 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             return None;
         }
         let min_idx = self.heap[0];
-        self.sources[min_idx].peek().map(|(key, _)| (key, min_idx))
+        self.sources[min_idx]
+            .peek_key_only()
+            .map(|key| (key, min_idx))
     }
 
     /// Advance past the current minimum entry (discard it).
@@ -535,7 +536,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
         if self.single_source {
             self.sources[0].skip_peeked();
-            if self.sources[0].peek().is_none() {
+            if self.sources[0].peek_key_only().is_none() {
                 self.latch_source_error(0);
             }
             return;
@@ -547,7 +548,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
 
         let min_idx = self.heap[0];
         self.sources[min_idx].skip_peeked();
-        let _ = self.sources[min_idx].peek();
+        let _ = self.sources[min_idx].peek_key_only();
 
         if self.sources[min_idx].has_peeked {
             self.sift_down(0);
@@ -556,34 +557,42 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
     }
 
-    /// Take ownership of the current minimum entry.
-    /// Uses take_peeked (which resets buffer capacity to 0 for the source).
-    /// Only call this for entries that will actually be returned to the caller.
-    pub fn take_entry(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+    /// Take the current minimum entry into caller-recycled buffers via `swap`
+    /// (`0` heap allocations in steady state).
+    #[inline]
+    pub(crate) fn take_entry_into(
+        &mut self,
+        key_out: &mut Vec<u8>,
+        val_out: &mut LazyValue,
+    ) -> bool {
         if self.error.is_some() {
-            return None;
+            return false;
         }
         if self.single_source {
-            let entry = self.sources[0].take_peeked()?;
+            if !self.sources[0].take_peeked_into(key_out, val_out) {
+                return false;
+            }
             self.current_key.clear();
-            self.current_key.extend_from_slice(&entry.0);
-            if self.sources[0].peek().is_none() {
+            self.current_key.extend_from_slice(key_out);
+            if self.sources[0].peek_key_only().is_none() {
                 self.latch_source_error(0);
             }
-            return Some(entry);
+            return true;
         }
 
         if self.heap_size == 0 {
-            return None;
+            return false;
         }
 
         let min_idx = self.heap[0];
-        let entry = self.sources[min_idx].take_peeked()?;
+        if !self.sources[min_idx].take_peeked_into(key_out, val_out) {
+            return false;
+        }
 
         self.current_key.clear();
-        self.current_key.extend_from_slice(&entry.0);
+        self.current_key.extend_from_slice(key_out);
 
-        let _ = self.sources[min_idx].peek();
+        let _ = self.sources[min_idx].peek_key_only();
 
         if self.sources[min_idx].has_peeked {
             self.sift_down(0);
@@ -591,7 +600,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             self.remove_exhausted_top(min_idx);
         }
 
-        Some(entry)
+        true
     }
 
     /// Seek all sources to first, rebuild the min-heap.

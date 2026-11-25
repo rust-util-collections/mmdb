@@ -32,6 +32,10 @@ pub struct DBIterator {
     has_last_key: bool,
     /// Buffered current entry for valid()/key()/value() API.
     current: Option<(Vec<u8>, LazyValue)>,
+    /// Recycled user-key buffer swapped with source `peeked_key` on each step.
+    scratch_key: Vec<u8>,
+    /// Recycled `LazyValue` wrapper updated in place across consecutive steps.
+    scratch_val: LazyValue,
     /// Whether we've already consumed current via advance().
     needs_advance: bool,
     /// Pre-fragmented, immutable range tombstone index for O(log T) coverage
@@ -88,6 +92,8 @@ impl DBIterator {
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
+            scratch_key: Vec::new(),
+            scratch_val: LazyValue::empty(),
             needs_advance: true,
             range_tombstones: FragmentedRangeTombstoneList::empty(),
             config: IterConfig::empty(),
@@ -194,10 +200,21 @@ impl DBIterator {
             self.halt_on_error();
             return;
         }
-        self.current = None;
+        self.recycle_current();
         self.needs_advance = true;
         self.prev_overshoot = None;
         self.prefix_exhausted = false;
+    }
+
+    #[inline]
+    fn recycle_current(&mut self) {
+        if let Some((mut k, v)) = self.current.take() {
+            k.clear();
+            if k.capacity() > self.scratch_key.capacity() {
+                self.scratch_key = k;
+            }
+            self.scratch_val = v;
+        }
     }
 
     #[inline]
@@ -207,7 +224,7 @@ impl DBIterator {
 
     #[inline]
     fn halt_on_error(&mut self) {
-        self.current = None;
+        self.recycle_current();
         self.needs_advance = false;
         self.prev_overshoot = None;
         self.backward_positioned = false;
@@ -269,7 +286,7 @@ impl DBIterator {
                 self.last_seek_key = Some(target);
                 self.has_last_key = false;
                 self.needs_advance = true;
-                self.current = None;
+                self.recycle_current();
                 self.prev_overshoot = None;
                 self.backward_positioned = false;
                 return;
@@ -278,20 +295,19 @@ impl DBIterator {
         // All `prefix_len` bytes were 0xFF (or `prefix_len == 0`) — no next
         // prefix exists, so exhaust forward iteration until an explicit seek.
         self.prefix_exhausted = true;
-        self.current = None;
+        self.recycle_current();
         self.needs_advance = false;
         self.prev_overshoot = None;
         self.backward_positioned = false;
     }
 
-    /// Advance the streaming iterator to the next visible (user_key, value) pair.
-    ///
-    /// Uses peek_entry/advance_entry/take_entry to avoid heap allocations for
-    /// skipped entries. Only the one returned entry pays the allocation cost.
-    fn next_visible(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+    /// Advance the streaming iterator to the next visible `(user_key, value)` pair,
+    /// populating `self.scratch_key` and `self.scratch_val` in place (`0` steady-state
+    /// heap allocations for both skipped and returned rows).
+    fn next_visible_into(&mut self) -> bool {
         if self.has_failed() {
             self.halt_on_error();
-            return None;
+            return false;
         }
         // After a backward operation (prev/seek_to_last), the merger is in backward mode.
         // Re-seek forward past the last user key so forward iteration resumes correctly.
@@ -324,12 +340,14 @@ impl DBIterator {
         let has_batch_overlay = self.has_batch_overlay;
         loop {
             let action = {
-                let (ikey_ref, source) = self.merger.peek_key()?;
+                let Some((ikey_ref, source)) = self.merger.peek_key() else {
+                    return false;
+                };
                 match decode_internal_key(ikey_ref) {
                     Err(e) => {
                         self.key_decode_error = Some(e);
                         self.halt_on_error();
-                        return None;
+                        return false;
                     }
                     Ok((_, seq, vt)) => {
                         if !(seq <= snapshot || (has_batch_overlay && source == 0)) {
@@ -347,7 +365,7 @@ impl DBIterator {
                             else if let Some(ref ub) = self.config.upper
                                 && ikey_ref[..uk_len] >= **ub
                             {
-                                return None;
+                                return false;
                             } else if vt == ValueType::RangeDeletion {
                                 // Skip RangeDeletion entries — tombstones are pre-loaded.
                                 // Do NOT update last_user_key: RangeDeletion is not a point
@@ -408,37 +426,53 @@ impl DBIterator {
                         self.merger.advance_entry();
                         continue;
                     }
-                    let (mut ikey, value) = self.merger.take_entry()?;
-                    ikey.truncate(uk_len);
-                    if self.skip_point.as_ref().is_some_and(|sp| sp(&ikey))
-                        || !self.config.matches(&ikey)
+                    if !self
+                        .merger
+                        .take_entry_into(&mut self.scratch_key, &mut self.scratch_val)
+                    {
+                        return false;
+                    }
+                    self.scratch_key.truncate(uk_len);
+                    if self
+                        .skip_point
+                        .as_ref()
+                        .is_some_and(|sp| sp(&self.scratch_key))
+                        || !self.config.matches(&self.scratch_key)
                     {
                         continue;
                     }
-                    return Some((ikey, value));
+                    return true;
                 }
                 Action::Take { uk_len } => {
-                    let (mut ikey, value) = self.merger.take_entry()?;
-                    ikey.truncate(uk_len);
-                    if self.skip_point.as_ref().is_some_and(|sp| sp(&ikey))
-                        || !self.config.matches(&ikey)
+                    if !self
+                        .merger
+                        .take_entry_into(&mut self.scratch_key, &mut self.scratch_val)
+                    {
+                        return false;
+                    }
+                    self.scratch_key.truncate(uk_len);
+                    if self
+                        .skip_point
+                        .as_ref()
+                        .is_some_and(|sp| sp(&self.scratch_key))
+                        || !self.config.matches(&self.scratch_key)
                     {
                         continue;
                     }
-                    return Some((ikey, value));
+                    return true;
                 }
             }
         }
     }
 
     /// Streamlined next_visible for the common case: no range tombstones,
-    /// no skip_point callback. Removes per-entry source_level tracking,
-    /// tombstone checks, and skip_point callback dispatch.
+    /// no skip_point callback. Populates `self.scratch_key` and `self.scratch_val`
+    /// with zero steady-state heap allocations.
     #[inline(always)]
-    fn next_visible_clean(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+    fn next_visible_clean_into(&mut self) -> bool {
         if self.has_failed() {
             self.halt_on_error();
-            return None;
+            return false;
         }
         if self.backward_positioned {
             self.backward_positioned = false;
@@ -454,12 +488,14 @@ impl DBIterator {
         let snapshot = self.sequence;
         let has_batch_overlay = self.has_batch_overlay;
         loop {
-            let (ikey_ref, source) = self.merger.peek_key()?;
+            let Some((ikey_ref, source)) = self.merger.peek_key() else {
+                return false;
+            };
             let (seq, vt) = match decode_internal_key(ikey_ref) {
                 Err(e) => {
                     self.key_decode_error = Some(e);
                     self.halt_on_error();
-                    return None;
+                    return false;
                 }
                 Ok((_, seq, vt)) => (seq, vt),
             };
@@ -482,7 +518,7 @@ impl DBIterator {
             if let Some(ref ub) = self.config.upper
                 && ikey_ref[..uk_len] >= **ub
             {
-                return None;
+                return false;
             }
 
             // Dedup + deletion check
@@ -503,16 +539,21 @@ impl DBIterator {
                 continue;
             }
 
-            let (mut ikey, value) = self.merger.take_entry()?;
-            ikey.truncate(uk_len);
-            return Some((ikey, value));
+            if !self
+                .merger
+                .take_entry_into(&mut self.scratch_key, &mut self.scratch_val)
+            {
+                return false;
+            }
+            self.scratch_key.truncate(uk_len);
+            return true;
         }
     }
 
     /// Ensure current is populated. Returns whether there's a valid entry.
     fn ensure_current(&mut self) -> bool {
         // Keep an already-resolved, unconsumed entry stable across repeated
-        // valid()/key()/value() calls even if take_entry()'s lookahead into the
+        // valid()/key()/value() calls even if take_entry_into()'s lookahead into the
         // next block latched a source read error; the failure halts the
         // iterator once the caller advances past this entry.
         if !self.needs_advance {
@@ -525,11 +566,17 @@ impl DBIterator {
         if self.prefix_exhausted {
             return false;
         }
-        self.current = if self.clean_read {
-            self.next_visible_clean()
+        self.recycle_current();
+        let found = if self.clean_read {
+            self.next_visible_clean_into()
         } else {
-            self.next_visible()
+            self.next_visible_into()
         };
+        if found {
+            let k = std::mem::take(&mut self.scratch_key);
+            let v = std::mem::replace(&mut self.scratch_val, LazyValue::empty());
+            self.current = Some((k, v));
+        }
         self.needs_advance = false;
         self.current.is_some()
     }
@@ -614,7 +661,7 @@ impl DBIterator {
         self.last_seek_key = Some(target);
         self.has_last_key = false;
         self.needs_advance = true;
-        self.current = None;
+        self.recycle_current();
         self.prev_overshoot = None;
         self.backward_positioned = false;
     }
@@ -641,7 +688,7 @@ impl DBIterator {
         self.merger.seek_to_first();
         self.has_last_key = false;
         self.needs_advance = true;
-        self.current = None;
+        self.recycle_current();
         self.prev_overshoot = None;
         self.last_seek_key = Some(Vec::new());
         self.backward_positioned = false;
@@ -721,16 +768,15 @@ impl DBIterator {
             let mut iter_entry = first_entry;
 
             while let Some((ikey, value, source)) = iter_entry.take() {
-                let (uk_owned, seq, vt) = match decode_internal_key(&ikey) {
+                let (uk_len, seq, vt) = match decode_internal_key(&ikey) {
                     Err(e) => {
                         self.key_decode_error = Some(e);
                         self.halt_on_error();
                         return;
                     }
-                    Ok((uk, seq, vt)) => (uk.to_vec(), seq, vt),
+                    Ok((uk, seq, vt)) => (uk.len(), seq, vt),
                 };
-                let uk = uk_owned.as_slice();
-                let uk_len = uk.len();
+                let uk = &ikey[..uk_len];
 
                 // Skip entries >= current_bound (same or later user key) before
                 // checking prefix/lower bounds so boundary keys at or above
@@ -2109,5 +2155,95 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn step_next_allocates_zero_heap_bytes_in_steady_state() {
+        use crate::{DB, DbOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions::default()
+                .with_block_cache_capacity(8 << 20)
+                .with_write_buffer_size(4 << 20),
+            dir.path(),
+        )
+        .unwrap();
+
+        // 1. MemTable scan with shadowed MVCC versions, point deletions, and
+        //    post-snapshot invisible entries: steady-state step_next() must
+        //    recycle key/value buffers with 0 heap allocations.
+        let val_a = vec![b'a'; 256];
+        let val_b = vec![b'b'; 256];
+        for i in 0..300u32 {
+            let k = format!("key_{i:06}");
+            db.put(k.as_bytes(), &val_a).unwrap();
+            if i % 2 == 0 {
+                db.put(k.as_bytes(), &val_b).unwrap();
+            }
+            if i % 5 == 0 {
+                db.delete(k.as_bytes()).unwrap();
+            }
+        }
+        let snap = db.snapshot();
+        for i in 0..100u32 {
+            let k = format!("key_{:06}", i * 3);
+            db.put(k.as_bytes(), &[b'z'; 512]).unwrap();
+        }
+
+        let mut mem_iter = snap.iter().unwrap();
+        for _ in 0..3 {
+            assert!(mem_iter.step_next().unwrap().is_some());
+        }
+        let (rows, mem_alloc) = crate::test_alloc::count_allocated(|| {
+            let mut n = 0usize;
+            while let Some((k, v)) = mem_iter.step_next().unwrap() {
+                assert_eq!(k.len(), 10);
+                assert_eq!(v.len(), 256);
+                n += 1;
+            }
+            n
+        });
+        assert_eq!(rows, 240 - 3);
+        assert_eq!(
+            mem_alloc, 0,
+            "steady-state MemTable step_next allocated {mem_alloc} heap bytes across {rows} rows"
+        );
+        drop(mem_iter);
+        drop(snap);
+
+        // 2. Multi-source merge (flushed multi-block SST + active MemTable):
+        //    warm the SST blocks in BlockCache, then verify steady-state
+        //    step_next() allocates 0 heap bytes across merged rows.
+        db.flush().unwrap();
+        for i in 0..300u32 {
+            if i % 3 == 1 {
+                let k = format!("key_{i:06}");
+                db.put(k.as_bytes(), &val_b).unwrap();
+            }
+        }
+        {
+            let mut warm = db.iter().unwrap();
+            while warm.step_next().unwrap().is_some() {}
+        }
+
+        let mut merged_iter = db.iter().unwrap();
+        for _ in 0..4 {
+            assert!(merged_iter.step_next().unwrap().is_some());
+        }
+        let (merged_rows, merged_alloc) = crate::test_alloc::count_allocated(|| {
+            let mut n = 0usize;
+            while let Some((k, v)) = merged_iter.step_next().unwrap() {
+                assert_eq!(k.len(), 10);
+                assert!(!v.is_empty());
+                n += 1;
+            }
+            n
+        });
+        assert!(merged_rows > 200);
+        assert_eq!(
+            merged_alloc, 0,
+            "steady-state merged SST+MemTable step_next allocated {merged_alloc} heap bytes"
+        );
     }
 }

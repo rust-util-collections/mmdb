@@ -274,32 +274,45 @@ impl super::merge::SeekableIterator for LevelIterator {
     }
 
     fn current(&self) -> Option<(Vec<u8>, LazyValue)> {
+        let mut key_buf = Vec::new();
+        let mut val_out = LazyValue::empty();
+        self.current_into_lazy(&mut key_buf, &mut val_out)
+            .then_some((key_buf, val_out))
+    }
+
+    fn current_into_lazy(&self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
         self.current_iter
             .as_ref()
-            .and_then(|iter| iter.current())
-            .map(|(k, v)| (k, LazyValue::Inline(v)))
+            .is_some_and(|iter| iter.current_into_lazy(key_buf, val_out))
     }
 
     fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
+        let mut key_buf = Vec::new();
+        let mut val_out = LazyValue::empty();
+        self.prev_into_lazy(&mut key_buf, &mut val_out)
+            .then_some((key_buf, val_out))
+    }
+
+    fn prev_into_lazy(&mut self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
         if self.error.is_some() {
-            return None;
+            return false;
         }
         // Try prev within current table iterator
         if let Some(ref mut iter) = self.current_iter {
-            if let Some(entry) = iter.prev() {
-                return Some((entry.0, LazyValue::Inline(entry.1)));
+            if iter.prev_into_lazy(key_buf, val_out) {
+                return true;
             }
             if let Some(e) = iter.iter_error() {
                 self.error = Some(e.clone());
                 self.current_iter = None;
-                return None;
+                return false;
             }
         }
         // Current table exhausted backward — move to previous file
         loop {
             if self.file_index == 0 {
                 self.current_iter = None;
-                return None;
+                return false;
             }
             self.file_index -= 1;
             let tf = &self.files[self.file_index];
@@ -308,7 +321,7 @@ impl super::merge::SeekableIterator for LevelIterator {
                 FileFilter::BeforeRange => {
                     self.file_index = 0;
                     self.current_iter = None;
-                    return None;
+                    return false;
                 }
                 FileFilter::Skip | FileFilter::AfterRange => continue,
             }
@@ -319,13 +332,11 @@ impl super::merge::SeekableIterator for LevelIterator {
             if let Some(e) = table_iter.iter_error() {
                 self.error = Some(e.clone());
                 self.current_iter = None;
-                return None;
+                return false;
             }
-            // Use current() to read without advancing the cursor, so
-            // subsequent prev() calls work correctly.
-            if let Some(entry) = table_iter.current() {
+            if table_iter.current_into_lazy(key_buf, val_out) {
                 self.current_iter = Some(table_iter);
-                return Some((entry.0, LazyValue::Inline(entry.1)));
+                return true;
             }
         }
     }
@@ -375,7 +386,7 @@ impl super::merge::SeekableIterator for LevelIterator {
                 self.current_iter = None;
                 return;
             }
-            if table_iter.current().is_some() {
+            if table_iter.has_current() {
                 self.file_index = try_idx;
                 self.current_iter = Some(table_iter);
                 return;
@@ -426,7 +437,7 @@ impl super::merge::SeekableIterator for LevelIterator {
             // the upper bound may leave the table iterator unpositioned. Only accept
             // it if it actually yielded an entry; otherwise an earlier file holding
             // matching keys would be skipped (mirrors seek_for_prev above).
-            if table_iter.current().is_some() {
+            if table_iter.has_current() {
                 self.file_index = idx;
                 self.current_iter = Some(table_iter);
                 return;
@@ -491,30 +502,40 @@ impl super::merge::SeekableIterator for LevelIterator {
             .or_else(|| self.current_iter.as_ref().and_then(|it| it.iter_error()))
     }
 
-    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
+    fn advance_key(&mut self, key_buf: &mut Vec<u8>) -> bool {
         if self.error.is_some() {
-            return None;
+            return false;
         }
         loop {
             if self.current_iter.is_none() && self.file_index < self.files.len() {
                 self.open_file_and_seek(None);
-                self.current_iter.as_ref()?;
+                if self.current_iter.is_none() {
+                    return false;
+                }
             }
             if let Some(ref mut iter) = self.current_iter {
-                if let Some(lv) = iter.next_lazy(key_buf) {
-                    return Some(lv);
+                if iter.advance_key(key_buf) {
+                    return true;
                 }
                 if let Some(e) = iter.iter_error() {
                     self.error = Some(e.clone());
                     self.current_iter = None;
-                    return None;
+                    return false;
                 }
             }
             self.current_iter = None;
             self.file_index += 1;
             if self.file_index >= self.files.len() {
-                return None;
+                return false;
             }
+        }
+    }
+
+    fn materialize_value_into(&self, val_out: &mut LazyValue) {
+        if let Some(ref iter) = self.current_iter {
+            iter.materialize_value_into(val_out);
+        } else {
+            val_out.set_empty();
         }
     }
 }

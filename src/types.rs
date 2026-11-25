@@ -650,6 +650,62 @@ impl LazyValue {
     pub fn empty() -> Self {
         LazyValue::Inline(Vec::new())
     }
+
+    /// Reset to empty while retaining any existing inline `Vec` capacity.
+    #[inline]
+    pub fn set_empty(&mut self) {
+        if let Self::Inline(v) = self {
+            v.clear();
+        } else {
+            *self = Self::Inline(Vec::new());
+        }
+    }
+
+    /// Populate from an immutable memtable arena slice, reusing the existing
+    /// `Arc<MemTable>` in place when `owner` matches (`0` allocs, `0` atomics).
+    #[inline]
+    pub(crate) fn set_memtable_raw(
+        &mut self,
+        owner: &Arc<crate::memtable::MemTable>,
+        bytes: std::ptr::NonNull<[u8]>,
+    ) {
+        if bytes.is_empty() {
+            self.set_empty();
+            return;
+        }
+        if let Self::MemTable(pin) = self
+            && pin.update_if_same_owner(owner, bytes)
+        {
+            return;
+        }
+        *self = Self::MemTable(crate::memtable::MemTablePin::from_raw(owner, bytes));
+    }
+
+    /// Populate from a cached/pinned SST block slice, reusing the existing
+    /// `Arc<Vec<u8>>` in place when `block_data` matches (`0` allocs, `0` atomics).
+    #[inline]
+    pub(crate) fn set_block_ref(&mut self, block_data: &Arc<Vec<u8>>, offset: u32, len: u32) {
+        if len == 0 {
+            self.set_empty();
+            return;
+        }
+        if let Self::BlockRef {
+            data,
+            offset: o,
+            len: l,
+        } = self
+            && Arc::ptr_eq(data, block_data)
+        {
+            *o = offset;
+            *l = len;
+            return;
+        }
+        *self = Self::BlockRef {
+            data: block_data.clone(),
+            offset,
+            len,
+        };
+    }
 }
 
 impl fmt::Debug for LazyValue {

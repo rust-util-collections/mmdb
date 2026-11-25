@@ -1,7 +1,7 @@
 use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::Result;
-use crate::sst::block::{Block, decode_entry_reuse};
+use crate::sst::block::{Block, RestartSegmentEntry, decode_entry_reuse};
 use crate::sst::format::{BlockHandle, DecodedIndexEntry, decode_index_entry};
 use crate::types::{LazyValue, compare_internal_key, user_key};
 use crate::{Error, options::IterConfig};
@@ -66,8 +66,13 @@ pub struct TableIterator {
     deferred_index_pos: usize,
 
     // --- Backward iteration (windowed segment decoding) ---
-    /// Materialized entries from a restart segment — only populated by seek_for_prev/prev.
-    current_block_entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Entry descriptors for the active backward restart segment (zero value copies).
+    backward_entries: Vec<RestartSegmentEntry>,
+    /// Contiguous decoded key arena referenced by `backward_entries`.
+    backward_keys: Vec<u8>,
+    /// Value slice `(from_backward_block, offset, len)` for the entry most recently
+    /// decoded by `advance_key`, materialized lazily via `materialize_value_into`.
+    last_value_loc: (bool, u32, u32),
     /// Position within materialized block segment.
     block_pos: usize,
     /// Current restart index within the backward-iteration block (for windowed segment loading).
@@ -105,7 +110,9 @@ impl TableIterator {
             prev_block_index: usize::MAX,
             at_first_key_from_index: false,
             deferred_index_pos: 0,
-            current_block_entries: Vec::new(),
+            backward_entries: Vec::new(),
+            backward_keys: Vec::new(),
+            last_value_loc: (false, 0, 0),
             block_pos: 0,
             current_restart_index: 0,
             backward_block: None,
@@ -184,7 +191,9 @@ impl TableIterator {
         self.backward_block = None;
         self.backward_block_index = usize::MAX;
         self.current_restart_index = 0;
-        self.current_block_entries.clear();
+        self.backward_entries.clear();
+        self.backward_keys.clear();
+        self.last_value_loc = (false, 0, 0);
         self.block_pos = 0;
     }
 
@@ -195,7 +204,9 @@ impl TableIterator {
         self.block_cursor_key.clear();
         self.at_first_key_from_index = false;
         self.deferred_index_pos = 0;
-        self.current_block_entries.clear();
+        self.backward_entries.clear();
+        self.backward_keys.clear();
+        self.last_value_loc = (false, 0, 0);
         self.block_pos = 0;
         self.current_restart_index = 0;
         self.backward_block = None;
@@ -242,47 +253,34 @@ impl TableIterator {
         }
     }
 
-    /// Decode the next entry from the current block using the cursor.
-    /// Decode the next entry from the current block, returning a lazy value
-    /// reference into the block's Arc data (zero-copy for the value).
-    fn cursor_next_lazy(&mut self) -> Option<(Vec<u8>, LazyValue)> {
-        let block = self.current_block.as_ref()?;
-        if self.block_cursor_offset >= self.block_data_end {
-            return None;
-        }
-        let data = block.data();
-        let entry_data = &data[..self.block_data_end];
-        let (value_start, value_len, next_offset) = match decode_entry_reuse(
-            entry_data,
-            self.block_cursor_offset,
-            &mut self.block_cursor_key,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                self.err = Some(e.context("block entry decode error"));
-                return None;
-            }
-        };
-        // Check upper bound before returning entry
-        if let Some(ref ub) = self.config.upper
-            && user_key(&self.block_cursor_key) >= ub.as_slice()
-        {
-            self.exhaust_at_upper_bound();
-            return None;
-        }
-        self.block_cursor_offset = next_offset;
-        let lazy_val = LazyValue::BlockRef {
-            data: block.data_arc().clone(),
-            offset: value_start as u32,
-            len: value_len as u32,
-        };
-        Some((self.block_cursor_key.clone(), lazy_val))
+    #[inline]
+    pub(crate) fn has_current(&self) -> bool {
+        self.err.is_none() && self.block_pos < self.backward_entries.len()
     }
 
-    /// Convenience wrapper that materializes the lazy value for backward compat.
-    fn cursor_next(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let (k, lv) = self.cursor_next_lazy()?;
-        Some((k, lv.into_vec()))
+    #[cfg(test)]
+    #[inline]
+    fn backward_entry_owned(&self, pos: usize) -> (Vec<u8>, Vec<u8>) {
+        let e = self.backward_entries[pos];
+        let key = self.backward_keys[e.key_start as usize..e.key_end as usize].to_vec();
+        let val = self
+            .backward_block
+            .as_ref()
+            .map(|b| b.data()[e.val_offset as usize..(e.val_offset + e.val_len) as usize].to_vec())
+            .unwrap_or_default();
+        (key, val)
+    }
+
+    #[inline]
+    fn copy_backward_into_lazy(&self, pos: usize, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) {
+        let e = self.backward_entries[pos];
+        key_buf.clear();
+        key_buf.extend_from_slice(&self.backward_keys[e.key_start as usize..e.key_end as usize]);
+        if let Some(ref block) = self.backward_block {
+            val_out.set_block_ref(block.data_arc(), e.val_offset, e.val_len);
+        } else {
+            val_out.set_empty();
+        }
     }
 
     /// Seek to the first entry >= target using the index block for O(log N) lookup.
@@ -476,10 +474,7 @@ impl TableIterator {
         if self.err.is_some() {
             return;
         }
-        loop {
-            let Some(index_block) = self.index_block.clone() else {
-                break;
-            };
+        while let Some(index_block) = self.index_block.clone() {
             let index_len = index_block.num_restarts() as usize;
             let mut left = 0usize;
             let mut right = index_len;
@@ -551,13 +546,22 @@ impl TableIterator {
         let Some(restart) = block.restart_for_prev(target, cmp_bounded)? else {
             return Ok(false);
         };
-        let entries = block.iter_restart_segment(restart)?;
-        let end = entries.partition_point(|(key, _)| cmp_bounded(key, target) != Ordering::Greater);
+        block.decode_restart_segment_into(
+            restart,
+            &mut self.backward_keys,
+            &mut self.backward_entries,
+        )?;
+        let keys = &self.backward_keys;
+        let end = self.backward_entries.partition_point(|e| {
+            cmp_bounded(&keys[e.key_start as usize..e.key_end as usize], target)
+                != Ordering::Greater
+        });
         let Some(position) = end.checked_sub(1) else {
+            self.backward_entries.clear();
+            self.backward_keys.clear();
             return Ok(false);
         };
         self.index_pos = block_index + 1;
-        self.current_block_entries = entries;
         self.block_pos = position;
         self.current_restart_index = restart;
         self.backward_block = Some(block);
@@ -565,19 +569,14 @@ impl TableIterator {
         Ok(true)
     }
 
-    /// Move to the previous entry. Returns the entry at the new position,
-    /// or None if we've moved before the first entry.
-    ///
-    /// Uses windowed segment decoding: when crossing restart segment boundaries,
-    /// only loads the previous segment (not the entire block).
-    pub fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn prev_step(&mut self) -> bool {
         if self.err.is_some() {
-            return None;
+            return false;
         }
         // If we have a previous entry in the current segment, just decrement
         if self.block_pos > 0 {
             self.block_pos -= 1;
-            return Some(self.current_block_entries[self.block_pos].clone());
+            return true;
         }
 
         // Try loading the previous restart segment within the same block
@@ -585,48 +584,64 @@ impl TableIterator {
             && let Some(ref block) = self.backward_block
         {
             self.current_restart_index -= 1;
-            match block.iter_restart_segment(self.current_restart_index) {
-                Ok(entries) => {
-                    self.current_block_entries = entries;
-                    if !self.current_block_entries.is_empty() {
-                        self.block_pos = self.current_block_entries.len() - 1;
-                        return Some(self.current_block_entries[self.block_pos].clone());
+            match block.decode_restart_segment_into(
+                self.current_restart_index,
+                &mut self.backward_keys,
+                &mut self.backward_entries,
+            ) {
+                Ok(()) => {
+                    if !self.backward_entries.is_empty() {
+                        self.block_pos = self.backward_entries.len() - 1;
+                        return true;
                     }
                 }
                 Err(e) => {
                     self.reset_positioning_state();
                     self.err = Some(e.context("block entry decode error in prev"));
-                    return None;
+                    return false;
                 }
             }
         }
 
         // Need to load the previous block's last segment.
         if self.backward_block_index == usize::MAX {
-            return None;
+            return false;
         }
-        self.previous_block_end(self.backward_block_index)
+        self.previous_block_end_step(self.backward_block_index)
+    }
+
+    /// Move to the previous entry. Returns the entry at the new position,
+    /// or None if we've moved before the first entry.
+    ///
+    /// Uses windowed segment decoding: when crossing restart segment boundaries,
+    /// only loads the previous segment (not the entire block).
+    #[cfg(test)]
+    pub fn prev(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.prev_step()
+            .then(|| self.backward_entry_owned(self.block_pos))
     }
 
     /// Walk backwards from an exclusive leaf-local block position, crossing
     /// index partitions only when all earlier blocks in this leaf are spent.
-    fn previous_block_end(&mut self, mut before: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn previous_block_end_step(&mut self, mut before: usize) -> bool {
         loop {
             while before == 0 {
                 if self.partition == 0 {
                     self.reset_positioning_state();
                     self.index_pos = 0;
-                    return None;
+                    return false;
                 }
                 self.select_partition(self.partition - 1);
                 if self.err.is_some() {
-                    return None;
+                    return false;
                 }
                 before = self.index_len();
             }
             before -= 1;
             let prev_block_index = before;
-            let index_block = self.index_block.as_ref()?;
+            let Some(index_block) = self.index_block.as_ref() else {
+                return false;
+            };
             let (_, entry) = index_entry_at(index_block, prev_block_index);
             if self.block_properties_should_skip(&entry) {
                 continue;
@@ -638,25 +653,24 @@ impl TableIterator {
             {
                 Ok(block) => {
                     let last_restart = block.num_restarts().saturating_sub(1);
-                    match block.iter_restart_segment(last_restart) {
-                        Ok(entries) => {
-                            self.current_block_entries = entries;
-                        }
-                        Err(e) => {
-                            self.reset_positioning_state();
-                            self.err = Some(e.context("block entry decode error in prev"));
-                            return None;
-                        }
+                    if let Err(e) = block.decode_restart_segment_into(
+                        last_restart,
+                        &mut self.backward_keys,
+                        &mut self.backward_entries,
+                    ) {
+                        self.reset_positioning_state();
+                        self.err = Some(e.context("block entry decode error in prev"));
+                        return false;
                     }
-                    if self.current_block_entries.is_empty() {
+                    if self.backward_entries.is_empty() {
                         continue;
                     }
-                    self.block_pos = self.current_block_entries.len() - 1;
+                    self.block_pos = self.backward_entries.len() - 1;
                     self.index_pos = prev_block_index + 1;
                     self.current_restart_index = last_restart;
                     self.backward_block = Some(block);
                     self.backward_block_index = prev_block_index;
-                    return Some(self.current_block_entries[self.block_pos].clone());
+                    return true;
                 }
                 Err(e) => {
                     self.reset_positioning_state();
@@ -664,20 +678,15 @@ impl TableIterator {
                 }
             }
 
-            return None;
+            return false;
         }
     }
 
     /// Return the current entry without advancing, or None if not positioned.
+    #[cfg(test)]
     pub fn current(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        if self.err.is_some() {
-            return None;
-        }
-        if self.block_pos < self.current_block_entries.len() {
-            Some(self.current_block_entries[self.block_pos].clone())
-        } else {
-            None
-        }
+        self.has_current()
+            .then(|| self.backward_entry_owned(self.block_pos))
     }
 
     fn load_next_block(&mut self) -> bool {
@@ -685,9 +694,12 @@ impl TableIterator {
             && self.current_restart_index + 1 < block.num_restarts()
         {
             self.current_restart_index += 1;
-            match block.iter_restart_segment(self.current_restart_index) {
-                Ok(entries) => {
-                    self.current_block_entries = entries;
+            match block.decode_restart_segment_into(
+                self.current_restart_index,
+                &mut self.backward_keys,
+                &mut self.backward_entries,
+            ) {
+                Ok(()) => {
                     self.block_pos = 0;
                     return true;
                 }
@@ -797,51 +809,10 @@ impl Iterator for TableIterator {
     type Item = (Vec<u8>, Vec<u8>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // F7: bail immediately if a prior I/O error was recorded
-        if self.err.is_some() {
-            return None;
-        }
-        loop {
-            // Handle deferred block read: materialize now that we need the value
-            if self.at_first_key_from_index {
-                self.at_first_key_from_index = false;
-                self.materialize_deferred_block();
-                if self.err.is_some() {
-                    return None;
-                }
-                if let Some(entry) = self.cursor_next() {
-                    return Some(entry);
-                }
-                // cursor_next sets err on mid-block decode failure and returns
-                // None; must not fall through to load_next_block (silent key loss).
-                if self.err.is_some() {
-                    return None;
-                }
-            }
-            // Try cursor-based path first (forward iteration)
-            if let Some(entry) = self.cursor_next() {
-                return Some(entry);
-            }
-            if self.err.is_some() {
-                return None;
-            }
-            // Try materialized entries (backward iteration positioned us here)
-            if self.block_pos < self.current_block_entries.len() {
-                if let Some(ref ub) = self.config.upper
-                    && user_key(&self.current_block_entries[self.block_pos].0) >= ub.as_slice()
-                {
-                    self.exhaust_at_upper_bound();
-                    return None;
-                }
-                let entry = self.current_block_entries[self.block_pos].clone();
-                self.block_pos += 1;
-                return Some(entry);
-            }
-            // Load next block via cursor path
-            if !self.load_next_block() {
-                return None;
-            }
-        }
+        let mut key_buf = Vec::new();
+        let mut val_buf = Vec::new();
+        crate::iterator::merge::SeekableIterator::next_into(self, &mut key_buf, &mut val_buf)
+            .then_some((key_buf, val_buf))
     }
 }
 
@@ -851,11 +822,33 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
     }
 
     fn current(&self) -> Option<(Vec<u8>, LazyValue)> {
-        TableIterator::current(self).map(|(k, v)| (k, LazyValue::Inline(v)))
+        let mut key_buf = Vec::new();
+        let mut val_out = LazyValue::empty();
+        self.current_into_lazy(&mut key_buf, &mut val_out)
+            .then_some((key_buf, val_out))
+    }
+
+    fn current_into_lazy(&self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
+        if !self.has_current() {
+            return false;
+        }
+        self.copy_backward_into_lazy(self.block_pos, key_buf, val_out);
+        true
     }
 
     fn prev(&mut self) -> Option<(Vec<u8>, LazyValue)> {
-        TableIterator::prev(self).map(|(k, v)| (k, LazyValue::Inline(v)))
+        let mut key_buf = Vec::new();
+        let mut val_out = LazyValue::empty();
+        self.prev_into_lazy(&mut key_buf, &mut val_out)
+            .then_some((key_buf, val_out))
+    }
+
+    fn prev_into_lazy(&mut self, key_buf: &mut Vec<u8>, val_out: &mut LazyValue) -> bool {
+        if !self.prev_step() {
+            return false;
+        }
+        self.copy_backward_into_lazy(self.block_pos, key_buf, val_out);
+        true
     }
 
     fn seek_for_prev(&mut self, target: &[u8]) {
@@ -891,16 +884,16 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.reset_positioning_state();
         if self.err.is_none() {
             let before = self.index_len();
-            self.previous_block_end(before);
+            self.previous_block_end_step(before);
         }
     }
 
-    fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
-        // Bail immediately if a prior I/O error was recorded
+    fn advance_key(&mut self, key_buf: &mut Vec<u8>) -> bool {
+        // F7: bail immediately if a prior I/O error was recorded
         if self.err.is_some() {
             return false;
         }
-        // Handle deferred block read
+        // F6: materialize deferred block if positioned at first_key from index
         if self.at_first_key_from_index {
             self.at_first_key_from_index = false;
             self.materialize_deferred_block();
@@ -913,15 +906,13 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             if let Some(ref block) = self.current_block
                 && self.block_cursor_offset < self.block_data_end
             {
-                let data = block.data();
-                let entry_data = &data[..self.block_data_end];
+                let entry_data = &block.data()[..self.block_data_end];
                 match decode_entry_reuse(
                     entry_data,
                     self.block_cursor_offset,
                     &mut self.block_cursor_key,
                 ) {
                     Ok((vs, vl, next)) => {
-                        // Check upper bound before returning entry
                         if let Some(ref ub) = self.config.upper
                             && user_key(&self.block_cursor_key) >= ub.as_slice()
                         {
@@ -931,8 +922,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                         self.block_cursor_offset = next;
                         key_buf.clear();
                         key_buf.extend_from_slice(&self.block_cursor_key);
-                        value_buf.clear();
-                        value_buf.extend_from_slice(&data[vs..vs + vl]);
+                        self.last_value_loc = (false, vs as u32, vl as u32);
                         return true;
                     }
                     Err(e) => {
@@ -942,9 +932,9 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 }
             }
             // Try materialized entries (backward iteration)
-            if self.block_pos < self.current_block_entries.len() {
-                let (ref k, ref v) = self.current_block_entries[self.block_pos];
-                // Check upper bound before returning entry
+            if self.block_pos < self.backward_entries.len() {
+                let e = self.backward_entries[self.block_pos];
+                let k = &self.backward_keys[e.key_start as usize..e.key_end as usize];
                 if let Some(ref ub) = self.config.upper
                     && user_key(k) >= ub.as_slice()
                 {
@@ -953,8 +943,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 }
                 key_buf.clear();
                 key_buf.extend_from_slice(k);
-                value_buf.clear();
-                value_buf.extend_from_slice(v);
+                self.last_value_loc = (true, e.val_offset, e.val_len);
                 self.block_pos += 1;
                 return true;
             }
@@ -962,6 +951,37 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
                 return false;
             }
         }
+    }
+
+    fn materialize_value_into(&self, val_out: &mut LazyValue) {
+        let (from_backward, offset, len) = self.last_value_loc;
+        let block = if from_backward {
+            self.backward_block.as_ref()
+        } else {
+            self.current_block.as_ref()
+        };
+        if let Some(b) = block {
+            val_out.set_block_ref(b.data_arc(), offset, len);
+        } else {
+            val_out.set_empty();
+        }
+    }
+
+    fn next_into(&mut self, key_buf: &mut Vec<u8>, value_buf: &mut Vec<u8>) -> bool {
+        if !self.advance_key(key_buf) {
+            return false;
+        }
+        let (from_backward, offset, len) = self.last_value_loc;
+        let block = if from_backward {
+            self.backward_block.as_ref()
+        } else {
+            self.current_block.as_ref()
+        };
+        value_buf.clear();
+        if let Some(b) = block {
+            value_buf.extend_from_slice(&b.data()[offset as usize..(offset + len) as usize]);
+        }
+        true
     }
 
     fn prefetch_first_block(&mut self) {
@@ -982,77 +1002,6 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
 
     fn iter_error(&self) -> Option<&Error> {
         self.err.as_ref()
-    }
-
-    fn next_lazy(&mut self, key_buf: &mut Vec<u8>) -> Option<LazyValue> {
-        // F7: bail immediately if a prior I/O error was recorded
-        if self.err.is_some() {
-            return None;
-        }
-        // F6: materialize deferred block if positioned at first_key from index
-        if self.at_first_key_from_index {
-            self.at_first_key_from_index = false;
-            self.materialize_deferred_block();
-            if self.err.is_some() {
-                return None;
-            }
-        }
-        loop {
-            // Forward cursor path (hot path)
-            if let Some(ref block) = self.current_block
-                && self.block_cursor_offset < self.block_data_end
-            {
-                let data = block.data();
-                let entry_data = &data[..self.block_data_end];
-                let result = decode_entry_reuse(
-                    entry_data,
-                    self.block_cursor_offset,
-                    &mut self.block_cursor_key,
-                );
-                match result {
-                    Ok((value_start, value_len, next_offset)) => {
-                        // Check upper bound
-                        if let Some(ref ub) = self.config.upper
-                            && user_key(&self.block_cursor_key) >= ub.as_slice()
-                        {
-                            self.exhaust_at_upper_bound();
-                            return None;
-                        }
-                        self.block_cursor_offset = next_offset;
-                        key_buf.clear();
-                        key_buf.extend_from_slice(&self.block_cursor_key);
-                        return Some(LazyValue::BlockRef {
-                            data: block.data_arc().clone(),
-                            offset: value_start as u32,
-                            len: value_len as u32,
-                        });
-                    }
-                    Err(e) => {
-                        self.err = Some(e.context("block entry decode error"));
-                        return None;
-                    }
-                }
-            }
-            // Materialized entries path (backward iteration)
-            if self.block_pos < self.current_block_entries.len() {
-                let (ref k, ref v) = self.current_block_entries[self.block_pos];
-                if let Some(ref ub) = self.config.upper
-                    && user_key(k) >= ub.as_slice()
-                {
-                    self.exhaust_at_upper_bound();
-                    return None;
-                }
-                key_buf.clear();
-                key_buf.extend_from_slice(k);
-                let lv = LazyValue::Inline(v.clone());
-                self.block_pos += 1;
-                return Some(lv);
-            }
-            // Try loading next block
-            if !self.load_next_block() {
-                return None;
-            }
-        }
     }
 }
 
@@ -1316,10 +1265,14 @@ mod tests {
         let cache = Arc::new(BlockCache::new(1 << 20));
         let reader = TableReader::open_with_all(&path, 1, Some(cache), None).unwrap();
         let mut iter = TableIterator::new(Arc::new(reader));
-        iter.seek_for_prev(&key(0)); // warm the index and data block
-        let (_, allocated) = crate::test_alloc::count_allocated(|| iter.seek_for_prev(&key(0)));
-        assert!(allocated < 4096, "reverse seek allocated {allocated} bytes");
-        assert_eq!(iter.current_block_entries.len(), 1);
+        let k0 = key(0);
+        iter.seek_for_prev(&k0); // warm the index and data block
+        let (_, allocated) = crate::test_alloc::count_allocated(|| iter.seek_for_prev(&k0));
+        assert_eq!(
+            allocated, 0,
+            "warm reverse seek allocated {allocated} bytes"
+        );
+        assert_eq!(iter.backward_entries.len(), 1);
         for i in 0..16 {
             assert_eq!(iter.next().unwrap().0, key(i));
         }

@@ -71,6 +71,15 @@ pub struct Block {
     num_restarts: u32,
 }
 
+/// Packed index/offset descriptor for a single entry inside a restart segment.
+#[derive(Clone, Copy)]
+pub(crate) struct RestartSegmentEntry {
+    pub key_start: u32,
+    pub key_end: u32,
+    pub val_offset: u32,
+    pub val_len: u32,
+}
+
 impl Block {
     /// Construct a `Block` whose restart table was already validated on cache admission.
     #[inline]
@@ -283,9 +292,50 @@ impl Block {
         Ok(left.checked_sub(1))
     }
 
+    /// Decode all entries of `restart_index` into caller-reused arena buffers,
+    /// avoiding per-entry `Vec` allocations and value copies during reverse scans.
+    pub(crate) fn decode_restart_segment_into(
+        &self,
+        restart_index: u32,
+        keys_arena: &mut Vec<u8>,
+        entries: &mut Vec<RestartSegmentEntry>,
+    ) -> Result<()> {
+        keys_arena.clear();
+        entries.clear();
+        if restart_index >= self.num_restarts {
+            return Ok(());
+        }
+
+        let start = self.restart_point(restart_index) as usize;
+        let end = if restart_index + 1 < self.num_restarts {
+            self.restart_point(restart_index + 1) as usize
+        } else {
+            self.restart_offset
+        };
+
+        let mut offset = start;
+        let mut current_key = smallvec::SmallVec::<[u8; 128]>::new();
+        while offset < end {
+            let (val_start, val_len, next_off) =
+                decode_entry_reuse(&self.entry_data()[..end], offset, &mut current_key)?;
+            let key_start = keys_arena.len() as u32;
+            keys_arena.extend_from_slice(&current_key);
+            let key_end = keys_arena.len() as u32;
+            entries.push(RestartSegmentEntry {
+                key_start,
+                key_end,
+                val_offset: val_start as u32,
+                val_len: val_len as u32,
+            });
+            offset = next_off;
+        }
+        Ok(())
+    }
+
     /// Decode entries from the given restart point index to the next restart point.
     /// Returns only entries within this single segment (not the rest of the block).
     /// Returns `Err` if a block entry is malformed (corrupted data).
+    #[cfg(test)]
     pub fn iter_restart_segment(&self, restart_index: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         if restart_index >= self.num_restarts {
             return Ok(Vec::new());
