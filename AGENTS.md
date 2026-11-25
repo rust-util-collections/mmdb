@@ -71,7 +71,7 @@ identifiers and finding severities.
 Supporting docs (`docs/ai/`):
 
 - [workflow-policy.md](docs/ai/workflow-policy.md) — scope resolution, embedded-storage specification, scoped handoffs, worktree ownership, atomic commits
-- [pragmatic-engineering.md](docs/ai/pragmatic-engineering.md) — root goal, low variance
+- [pragmatic-engineering.md](docs/ai/pragmatic-engineering.md) — engineering and [performance priorities](docs/ai/pragmatic-engineering.md#performance-priorities) for core operations, cleanup, and migration
 - [technical-patterns.md](docs/ai/technical-patterns.md) / [design-patterns.md](docs/ai/design-patterns.md) — LSM bugs + D-\* design lens
 - [review-core.md](docs/ai/review-core.md) — evidence/report templates + Subsystem Map
 - [false-positive-guide.md](docs/ai/false-positive-guide.md) — check existing guarantees before recording findings

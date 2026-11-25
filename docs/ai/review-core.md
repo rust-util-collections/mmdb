@@ -106,7 +106,8 @@ append, `confirm_manifest_durable`, `CURRENT` rename, WAL rotation, and
 obsolete-file unlink (`patterns/manifest.md`, `patterns/wal.md`).
 
 **Performance:** report hot/warm-path regressions only with path class and
-concrete allocation, lock, or I/O cost; skip cold-path micro-optimizations.
+concrete allocation, lock, or I/O cost. Assess maintenance overhead by its
+effect on normal reads and writes. [Performance priorities](pragmatic-engineering.md#performance-priorities)
 
 **Design:** walk applicable `D-*` checks in `design-patterns.md` for locks,
 resource lifecycles, bounded queues/memory, multi-step state transitions, error

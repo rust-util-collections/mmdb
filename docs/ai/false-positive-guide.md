@@ -54,10 +54,12 @@ assumptions, or missing/vague comment.
 
 ## FP-9: Perf off hot path
 
-**Hot:** `get`/`get_pinned`/`contains_key`, `step_next`/`step_prev`/`next`/`prev`,
-block decode, blocked Bloom. **Warm:** `FlushQueue`, compaction merge, index/rangedel leaf load.
-**Cold:** open/close, options, error format, WAL recovery, `tools/v4-export` CLI setup.
-Report perf only on hot/warm with path evidence.
+Point reads, iteration, group commit, block decoding and Bloom probes run on
+core paths. Flush and compaction affect them when writers wait for capacity
+or readers contend for resources. Quantify allocations, lock time, I/O or
+throughput at the affected API. For occasional cleanup jobs or a one-time
+export, assess the cost within that task. A bounded local cost can be an
+acceptable trade for correctness or simplicity. [Performance priorities](pragmatic-engineering.md#performance-priorities)
 
 ## FP-10: Incomplete lock analysis
 
