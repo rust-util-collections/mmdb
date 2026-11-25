@@ -120,6 +120,9 @@ impl DB {
     ///   retains the referenced files and latches a background error.
     /// - All rows share one fresh sequence. Snapshots with an earlier
     ///   sequence retain their previous view.
+    /// - The input iterator and its items may read this DB. Calling a write,
+    ///   flush, WAL fence, explicit compaction, or close on the same DB from
+    ///   an input callback returns `InvalidArgument`.
     pub fn ingest_sorted<I, K, V>(&self, iter: I) -> Result<u64>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -136,16 +139,19 @@ impl DB {
             WriteLeaderGuard(self)
         };
 
+        // Input conversion, iteration, AsRef and destructors can run caller code
+        // while we own write leadership. Cover them all with the callback guard.
+        let _build = self.builds.enter();
         let mut iter = iter.into_iter();
         let Some(first_item) = iter.next() else {
             return Ok(0);
         };
 
-        validate_ingest_entry(first_item.0.as_ref(), first_item.1.as_ref())?;
+        let first_k = first_item.0.as_ref();
+        validate_ingest_entry(first_k, first_item.1.as_ref())?;
 
         let (ingest_seq, file_numbers) = {
             let inner = self.inner.lock();
-            let first_k = first_item.0.as_ref();
             if inner_overlaps_user_range(&inner, first_k, first_k) {
                 return Err(Error::invalid_argument(
                     "ingest_sorted key range overlaps existing database state",
@@ -158,7 +164,6 @@ impl DB {
             (seq, inner.versions.file_numbers.clone())
         };
 
-        let _build = self.builds.enter();
         let target_level = self.options.num_levels - 1;
         let target_file_size = self.options.target_file_size_base.max(1);
         let pending = PendingSsts::new(&self.storage_path, &file_numbers);
@@ -368,6 +373,57 @@ mod tests {
         assert_eq!(files.len(), 1);
         let number = files[0].meta.number;
         assert!(dir.path().join(format!("{number:06}.sst")).exists());
+    }
+
+    #[test]
+    fn ingest_sorted_guards_input_callbacks_and_permits_reads() {
+        struct Rows<'a>(&'a DB);
+        struct Key<'a>(&'a DB);
+
+        impl AsRef<[u8]> for Key<'_> {
+            fn as_ref(&self) -> &[u8] {
+                // A snapshot registers under inner. Detect an accidental
+                // lock held across AsRef without hanging this regression test.
+                assert!(
+                    self.0
+                        .inner
+                        .try_lock_for(std::time::Duration::from_secs(5))
+                        .is_some()
+                );
+                assert!(self.0.snapshot().get(b"source").unwrap().is_some());
+                b"target"
+            }
+        }
+
+        impl<'a> IntoIterator for Rows<'a> {
+            type Item = (Key<'a>, &'static [u8]);
+            type IntoIter = std::vec::IntoIter<Self::Item>;
+
+            fn into_iter(self) -> Self::IntoIter {
+                assert!(self.0.builds.contains_current_thread());
+                assert_eq!(
+                    self.0.close().unwrap_err().kind(),
+                    ErrorKind::InvalidArgument
+                );
+                vec![(Key(self.0), b"v".as_slice())].into_iter()
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"source", b"v").unwrap();
+        assert_eq!(db.ingest_sorted(Rows(&db)).unwrap(), 1);
+        let first = std::iter::once_with(|| {
+            assert!(db.builds.contains_current_thread());
+            assert_eq!(
+                db.put(b"nested", b"v").unwrap_err().kind(),
+                ErrorKind::InvalidArgument
+            );
+            (b"z", b"v")
+        });
+        assert_eq!(db.ingest_sorted(first).unwrap(), 1);
+        assert!(db.get(b"nested").unwrap().is_none());
+        db.put(b"after", b"ok").unwrap();
     }
 
     #[test]
