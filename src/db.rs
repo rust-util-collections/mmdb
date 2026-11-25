@@ -2940,6 +2940,11 @@ impl DB {
             // (the slowdown delay or the stop-trigger drain) can activate.
             let l0_count = self.l0_file_count.load(Ordering::Relaxed);
             if l0_count >= self.options.l0_slowdown_trigger {
+                // An earlier wake may have found an overlapping maintenance claim.
+                // Leave eligible L0 work queued even when all writers are no_slowdown.
+                if l0_count >= self.options.l0_compaction_trigger {
+                    self.read.signal_compaction();
+                }
                 return Err(Error::busy(
                     "L0 file count reached the write slowdown threshold",
                 ));
@@ -4578,6 +4583,30 @@ mod tests {
         for handle in db.compaction_handles.lock().drain(..) {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn busy_l0_retry_requeues_eligible_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions::default()
+            .with_l0_compaction_trigger(1)
+            .with_l0_slowdown_trigger(1)
+            .with_l0_stop_trigger(2);
+        let db = DB::open(options, dir.path()).unwrap();
+        stop_background_workers(&db);
+        db.put(b"seed", b"initial").unwrap();
+        db.flush_generation().unwrap();
+        // Model a picker that consumed the flush wake while its L1 input
+        // was claimed. The backlog is real and no other writer makes a wake.
+        *db.read.compaction_notify.0.lock() = false;
+        let no_wait = WriteOptions::default().with_no_slowdown(true);
+        let err = db
+            .put_with_options(&no_wait, b"retry", b"value")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Busy);
+        assert!(*db.read.compaction_notify.0.lock());
+        db.drain_l0(true).unwrap();
+        db.put_with_options(&no_wait, b"retry", b"value").unwrap();
     }
 
     #[test]

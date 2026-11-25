@@ -41,7 +41,7 @@ pub enum ErrorKind {
     Corruption,
     /// A caller-supplied argument or configuration value is invalid.
     InvalidArgument,
-    /// A no-slowdown write encountered a full immutable-memtable queue.
+    /// A no-slowdown write encountered immutable-queue or L0 file-count pressure.
     Busy,
     /// The database has been closed; no further operations are possible.
     DbClosed,
