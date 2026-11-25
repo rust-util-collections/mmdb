@@ -88,6 +88,11 @@ python3 docs/benchmarks/engine-profile/run.py handoff ./control handoff.jsonl.gz
 python3 docs/benchmarks/engine-profile/run.py reopen ./control reopen.jsonl.gz --cpus 4-7 --tmpdir /path/to/scratch
 ```
 
+In the original `memory` suite, `peak_kib` status describes the absolute
+RSS ceiling only. Check the completed load pairs and both the foreground
+p99 and saturation guards before selecting a profile. All paced pairs in
+the published original matrix sustained the offered work.
+
 The focused memory p99 repeat uses the original uninstrumented binary. It compares depth 2 at 10 MiB with depth 4 at 6 MiB. The hot and all-active placements retain their respective 251 and 1,381 requests/s per stream from the 30 MiB-envelope calibration. Each seed runs an independent control/control pair and control/candidate pair in separate processes. The ordinary summarizer computes its noise against the first A/A arm and its gain against the separate A/B control. RSS budget flags describe the observed peak in each arm. A matched pair that cannot sustain the offer receives `offered-load-unqualified` on its p99 and RSS guard rows, alongside the observed memory figures.
 
 ```sh
