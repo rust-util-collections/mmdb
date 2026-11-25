@@ -679,3 +679,19 @@ fn compact_range_rewrites_bottommost_level_for_lazy_delete_and_tombstone_gc() {
         "out-of-range key must remain intact"
     );
 }
+
+#[test]
+fn lazy_delete_batch_can_inspect_registrations_while_enumerating_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = make_db(dir.path());
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        db.lazy_delete(b"existing");
+        db.lazy_delete_batch([b"new", b"new"].into_iter().inspect(|_| {
+            assert_eq!(db.dead_key_count(), 1);
+        }));
+        tx.send(db.dead_key_count()).unwrap();
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
+    worker.join().unwrap();
+}

@@ -2441,9 +2441,13 @@ impl DB {
         if self.read.read_only {
             return;
         }
+        self.register_dead_key(key.to_vec());
+    }
+
+    fn register_dead_key(&self, key: Vec<u8>) {
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
-        let inserted = set.insert(key.to_vec());
+        let inserted = set.insert(key);
         let len = set.len();
         drop(set);
         if threshold > 0 && len >= threshold && inserted {
@@ -2451,7 +2455,8 @@ impl DB {
         }
     }
 
-    /// Batch version of [`lazy_delete`](Self::lazy_delete).
+    /// Batch version of [`lazy_delete`](Self::lazy_delete). The input iterator
+    /// is consumed before the batch is registered, so it can query this DB.
     ///
     /// Dead keys are **not** persisted — see [`lazy_delete`](Self::lazy_delete)
     /// for durability caveats.
@@ -2465,15 +2470,70 @@ impl DB {
         if self.read.read_only {
             return;
         }
+        let mut keys = keys.into_iter();
+        let Some(first) = keys.next().map(|key| key.as_ref().to_vec()) else {
+            return;
+        };
+        let Some(second) = keys.next() else {
+            drop(keys);
+            self.register_dead_key(first);
+            return;
+        };
+
+        // Reuse an empty registry's allocation. Otherwise stage short batches
+        // contiguously and deduplicate excess input to bound duplicate storage.
+        let mut budget = 32 * 1024usize;
+        let mut distinct = {
+            let mut set = self.dead_keys.write();
+            if set.is_empty() {
+                budget = 0;
+                mem::take(&mut *set)
+            } else {
+                HashSet::new()
+            }
+        };
+        let mut bytes = Vec::new();
+        let mut ends = Vec::new();
+        let mut stage = |key: &[u8]| {
+            let cost = key.len() + size_of::<usize>();
+            if cost <= budget {
+                budget -= cost;
+                bytes.extend_from_slice(key);
+                ends.push(bytes.len());
+            } else {
+                distinct.insert(key.to_vec());
+            }
+        };
+        stage(&first);
+        for item in std::iter::once(second).chain(keys) {
+            stage(item.as_ref());
+        }
+
+        // Publish once, after every caller-controlled callback and destructor.
         let threshold = self.options.lazy_delete_compaction_threshold;
         let mut set = self.dead_keys.write();
-        let mut any_new = false;
-        for k in keys {
-            any_new |= set.insert(k.as_ref().to_vec());
+        let before = set.len();
+        if distinct.len() > before {
+            mem::swap(&mut *set, &mut distinct);
+        }
+        for key in distinct {
+            set.insert(key);
+        }
+        let mut changed = set.len() > before;
+        let mut start = 0;
+        for end in ends {
+            let key = &bytes[start..end];
+            // Existing batches need no key copies. After the first addition,
+            // insert directly so new keys need only one hash probe each.
+            if changed || !set.contains(key) {
+                set.insert(key.to_vec());
+                changed = true;
+            }
+            start = end;
         }
         let len = set.len();
         drop(set);
-        if threshold > 0 && len >= threshold && any_new {
+        if threshold > 0 && len >= threshold && changed {
             self.request_dead_key_sweep();
         }
     }
@@ -3806,6 +3866,64 @@ impl Drop for DB {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+
+    #[test]
+    fn lazy_delete_batch_sizes_the_registry_by_distinct_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.lazy_delete_batch(std::iter::repeat_n(b"k", 4096));
+        db.lazy_delete_batch(std::iter::repeat_n(b"k", 32 * 1024));
+        let keys = db.dead_keys.read();
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys.capacity() < 128,
+            "duplicate input reserved {} slots",
+            keys.capacity()
+        );
+    }
+
+    #[test]
+    fn lazy_delete_singleton_registers_after_the_input_iterator_drops() {
+        struct ClearOnDrop<'a>(&'a DB);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.clear_dead_keys();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.lazy_delete(b"old");
+        let clear = ClearOnDrop(&db);
+        let mut one = Some(b"new");
+        db.lazy_delete_batch(std::iter::from_fn(move || {
+            let _keep_until_drop = &clear;
+            one.take()
+        }));
+        assert!(db.dead_keys.read().contains(b"new".as_slice()));
+        assert_eq!(db.dead_key_count(), 1);
+    }
+
+    #[test]
+    fn lazy_delete_batch_publishes_mixed_size_keys_after_reentrant_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_test_db(dir.path());
+        db.lazy_delete(b"prior");
+        let large = vec![7; 64 * 1024];
+        let keys = [b"".as_slice(), b"ab", &large, b"ab", b"tail"];
+        db.lazy_delete_batch(keys.into_iter().enumerate().map(|(i, key)| {
+            if i == 3 {
+                assert_eq!(db.dead_key_count(), 1);
+                db.clear_dead_keys();
+                db.lazy_delete(b"callback");
+            }
+            key
+        }));
+        let registered = db.dead_keys.read();
+        assert_eq!(registered.len(), 5);
+        for key in keys.into_iter().chain([b"callback".as_slice()]) {
+            assert!(registered.contains(key));
+        }
+    }
 
     #[test]
     fn batch_iterator_hides_future_commits_at_the_overlay_sequence() {
