@@ -1,41 +1,25 @@
 # WAL Review Patterns
 
-**Files:** `writer.rs`, `reader.rs`, `record.rs`.
+**Files:** `writer.rs`, `reader.rs`, `record.rs`, `src/db.rs` (`write_batch_group`, `freeze_memtable`, `open_impl`), `src/db/flush.rs`.
 
-**Arch:** Fixed blocks; Full/First/Middle/Last fragments; CRC per fragment;
-group commit = order batches → append → one flush/fsync; recovery rebuilds MemTable.
+**Arch:** 32 KiB (`BLOCK_SIZE`) blocks with 7-byte (`HEADER_SIZE`) `Full`/`First`/`Middle`/`Last` fragment headers (`crc32(type || payload)`); vectored `WalWriter::add_record_parts` (`PartsCursor`) streams `[wal_header(first_seq), batch.payload]` without intermediate concatenation; group commit supports `DurabilityMode::{WalAsync, WalSync, DisableWal}` plus `DB::sync_wal()` (`WalFence`); leader rotates WALs outside `DB::inner` while `mmdb-flush` unlinks `old_wal` only after durable MANIFEST install.
 
 ## Invariants
 
-**W1 Order** — WAL write order = seq assignment order (not bare arrival).
-**W2 CRC** — covers type **and** record bytes (`crc32(type || data)`). A changed type byte must produce `ErrorKind::Corruption`.
-**W3 Fragments** — oversize → First+Middle*+Last; each checksummed; header size in block boundary math.
-**W4 Recovery** — retain all complete records. An incomplete record returns a
-recovery error unless it belongs to the highest recoverable WAL and the
-remaining bytes establish an interrupted final append (possibly zero-padded).
-If the stored CRC verifies complete data under another valid record type or
-record length, the header is damaged (`ErrorKind::Corruption`); a zero suffix
-must not permit prefix truncation. An invalid earlier record, or non-zero bytes
-after the failed record, must stop recovery and leave the file intact
-(and `open_read_only` never truncates any file).
-**W5 Fsync** — any grouped `sync=true` ⇒ all prior WAL-enabled records durable before ack.
-No-sync group: flush buffer only (no power-loss durability claim).
-**W6 WAL↔MemTable** — for WAL-on requests, ack ⇒ earlier matching WAL record.
-`disable_wal` omits WAL durability by contract — never document otherwise.
+**W1 Sequence & group order** — WAL record order equals contiguous sequence assignment order. `DisableWal` batches still reserve sequences and apply to `active_memtable` in group order while omitting WAL records.
 
-## Bug patterns
+**W2 CRC & vectored framing** — `PartsCursor` skips empty interior slices, zero-pads `< 7B` block trailers, emits a 0-length `First` fragment when `remaining == 7` with non-empty data, and computes streaming `crc32([record_type as u8] || fragment_bytes)` identical to `WalReader`. Any partial `write_vectored` / `WriteZero` failure latches `bg_error` / `VersionSet::poisoned` so no later record appends after a torn fragment.
 
-**Partial write (tech 2.3)** — header without complete record data; reader checks length.
-**Notify race** — notify only after MemTable inserts + `committed_sequence` publish.
-**Stale WAL delete** — use flushed mem max seq; after MANIFEST acknowledges state.
+**W3 Durability modes, `WalFence`, & `wal_bytes_per_sync`** — `WalWriter::new` syncs the parent directory on creation, making `WalWriter::sync_data()` (`BufWriter::flush` + `fdatasync`) sufficient for append/rotation durability (`WalWriter::sync()` = `sync_all` is used after `open_append_truncated` and on MANIFEST). Any grouped `WalSync` or `WalFence { target_seq > synced_wal_seq }` runs `wal.sync_data()` (even when grouped only with `DisableWal` batches) and advances `synced_wal_seq` to `last_seq`; `WalAsync` runs `wal.flush()` without advancing `synced_wal_seq`. `wal_bytes_per_sync` (`sync_file_range`) is strictly an advisory writeback hint (`end_offset >= last_writeback`) and never substitutes for `sync_data()`.
+
+**W4 Post-commit acknowledgement & rotation** — once `wal.sync_data()`/`flush()`, `active_memtable` inserts, and `committed_sequence.store(Release)` complete, committed requests must receive `Ok(())` even if a later batch in the group hits `append_error` or post-commit `submit_active()` (`freeze_memtable` / `FlushQueue::check_capacity`) fails. Failed `freeze_memtable` restores `old_wal`, keeps `wal_number` and `active_memtable` intact, and fail-stops subsequent writes.
+
+**W5 Multi-WAL bounded recovery & torn-tail isolation** — replay all `*.wal >= log_number` in ascending order, spilling mid-WAL (`>= write_buffer_size`) and at WAL boundaries into `PendingSsts` *without* mutating MANIFEST until every WAL validates, then commit one atomic `VersionEdit` + `sync_manifest()` before `remove_orphan_files`. Tolerate an incomplete record (`last_error_is_truncation() && rest_is_zero_padding()`) **only** on `recoverable_tail_wal_num` (highest non-empty `*.wal >= log_number`); checksum mismatches, malformed batch payloads/trailing bytes, or earlier-WAL truncations fail closed with `ErrorKind::Corruption` and leave all files untouched (`open_read_only` never truncates or spills to disk).
 
 ## Checklist
 
-- [ ] Write order ≡ seq order
-- [ ] CRC covers `type + data` on both writer and reader
-- [ ] Fragment boundaries handle end-of-block
-- [ ] Recovery: only active zero-pad torn tail tolerated (and never truncated in read-only mode)
-- [ ] flush/fsync respects sync + disable_wal
-- [ ] WAL before MemTable for enabled requests
-- [ ] Old WAL deleted after flush + MANIFEST
-- [ ] Notify after assigned entries published
+- [ ] `PartsCursor` handles empty slices, 0-byte records, and 32 KiB block-tail boundaries identically to `WalReader`
+- [ ] `WalSync` and `WalFence` call `sync_data()` before acknowledging or advancing `synced_wal_seq`; `DisableWal` + `sync_wal()` fences prior `WalAsync` writes
+- [ ] Post-commit `append_error` / `submit_active` failures preserve `Ok(())` for already-committed requests while latching fail-stop
+- [ ] `old_wal` unlinked only after `FlushContext::flush` confirms MANIFEST durability; `mmdb-flush` exits on failure so newer WALs never leapfrog a failed generation
+- [ ] Multi-WAL recovery stages spills via `PendingSsts` and tolerates zero-padded torn tails solely on `recoverable_tail_wal_num` (never mutating files in `open_read_only`)

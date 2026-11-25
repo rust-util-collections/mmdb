@@ -26,8 +26,10 @@ by this invocation.
    regression test, matching docs, and any resolved `docs/audit.md` hunk.
 2. Formatting check:
    - Docs/config only: `git diff --check` (skip Rust checks).
-   - Rust edits: `cargo +stable fmt --all -- --check`. If an owned `.rs` file
-     needs formatting, run
+   - Rust edits in root crate: `cargo +stable fmt --all -- --check` (and when
+     `tools/v4-export/**` is owned, also
+     `cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check`).
+     If an owned `.rs` file needs formatting, run
      `rustfmt +stable --edition 2024 --config skip_children=true <owned-paths>`
      and inspect the diff (`cargo fmt -- <paths>` still walks discovered module
      children and can touch unowned files). If an unowned file fails fmt check,
@@ -37,9 +39,17 @@ by this invocation.
    never the full suite per unit):
    - docs-only → none;
    - single subsystem → targeted `--lib <filter>` plus the integration binary
-     covering any public behavior change;
-   - WAL / MANIFEST / interrupted-write recovery →
-     `cargo +stable test --test crash_recovery`.
+     covering any public behavior change (`integration`, `read_only`,
+     `shared_cache`, `lazy_delete`, `bidi_debug`, `e2e_scenarios`, or
+     `proptest_db`);
+   - WAL / MANIFEST / flush / interrupted-write recovery →
+     `cargo +stable test --test crash_recovery`;
+   - `src/memtable/` arena or skiplist `unsafe` → when `cargo +nightly miri` is
+     installed locally, also run `cargo +nightly miri test --test arena_miri`
+     (never install toolchains automatically; note if `miri` is absent);
+   - `tools/v4-export/**` →
+     `cargo +stable test --manifest-path tools/v4-export/Cargo.toml` (clean
+     `tools/v4-export/target` if `.gitignore` does not yet ignore nested `target/`).
 4. Fix failures caused by the unit before committing. Report pre-existing
    out-of-scope failures with the command and output rather than looping.
 5. Stage exact paths/hunks (`git add -- <paths>`); never use `git add -A` or
@@ -65,14 +75,17 @@ requested a toolchain update, and do not add MSRV pins or compatibility shims.
 After the last behavior commit, run these commands once (do not substitute a
 `make` target unless requested by the user). Including `clippy --lib` checks the
 production library configuration without `[dev-dependencies]` enabling
-`test-utils`, while `--all-targets` and the test binaries mirror
-`.github/workflows/ci.yml` and `make ci` (if CI and `Makefile` ever diverge, run
-the union and report the drift):
+`test-utils`, `--all-targets` and the test binaries mirror
+`.github/workflows/ci.yml` and `make ci`, and the explicit `--manifest-path`
+commands cover the workspace-excluded `tools/v4-export` crate (if CI and
+`Makefile` diverge, run the union and report the drift):
 
 ```bash
 cargo +stable fmt --all -- --check
+cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check
 cargo +stable clippy --lib -- -D warnings
 cargo +stable clippy --all-targets -- -D warnings
+cargo +stable clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
 cargo +stable test --lib
 cargo +stable test --doc
@@ -95,6 +108,9 @@ Notes on gate execution:
   `strace` is installed (enforced in CI via `CI=1`). If `strace` is absent on
   the local host, note in the report that the optional `strace` probe skipped
   while the read-only suite passed.
+- If `.gitignore` uses root-anchored `/target` rather than `target/`, run
+  `cargo +stable clean --manifest-path tools/v4-export/Cargo.toml` after the
+  exporter checks so `tools/v4-export/target/` is not left untracked.
 - Skip the Rust gate for docs-only runs unless the scope is `all` or an eligible
   version bump is being finalized. `all` runs the full gate even with zero code
   edits.
@@ -113,16 +129,17 @@ A bump is owed only when **shipped library inputs** changed since the latest
 commit that modified `package.version` in `Cargo.toml` — specifically production
 library Rust files (`src/**/*.rs` excluding `#[cfg(test)]`-only
 `src/test_alloc.rs`) or shipped `[dependencies]` / `[target.*.dependencies]` /
-`[features]` entries in `Cargo.toml`:
+`[features]` entries in root `Cargo.toml`:
 
 ```sh
 base=$(git log -1 --format=%H -G'^version = ' -- Cargo.toml)
 git diff --name-only "$base" HEAD -- 'src/*.rs' 'src/**/*.rs' ':(exclude)src/test_alloc.rs'
 ```
 
-Changes confined to `tests/`, `benches/`, `examples/`, `src/test_alloc.rs`,
-`docs/`, `README.md`, `COMPARISON.md`, `TODO.md`, or `.agents/` do **not** owe a
-version bump.
+Changes confined to `tools/v4-export/` (`publish = false`), `tests/`,
+`benches/`, `examples/`, `src/test_alloc.rs`, `docs/`, `README.md`,
+`COMPARISON.md`, `TODO.md`, `Makefile`, `.github/`, `.gitignore`, or `.agents/`
+do **not** owe a version bump.
 
 Scope eligibility:
 
@@ -133,8 +150,8 @@ Scope eligibility:
   `<rev1>..<rev2>`): finalize one owed patch bump **only if** this invocation
   itself committed a shipped library change, or the frozen reviewed commit range
   itself contains shipped library changes since `$base`. Do not bump
-  `Cargo.toml` during a docs/tests/benches-only narrow overhaul merely because
-  unrelated earlier commits sit after `$base`.
+  `Cargo.toml` during a docs/tests/benches/tools-only narrow overhaul merely
+  because unrelated earlier commits sit after `$base`.
 - **Dirty `Cargo.toml` baseline**: if `Cargo.toml` already had uncommitted
   baseline edits at preflight, leave `Cargo.toml` untouched and report the
   baseline conflict instead of staging unowned manifest lines.

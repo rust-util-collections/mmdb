@@ -34,8 +34,8 @@ Skip documented single-writer + intentional snapshot reads unless a multi-writer
 - **1** Unbounded queue/batch (write group, compact jobs) without backpressure.
 - **2** Unbounded concurrency when fan-out can grow with L0.
 - **3** Retry/compaction without budget that amplifies load.
-- **4** Hot-path full-file materialization when streaming/blocks suffice.
-- **5** Expensive work before checking stored fields, ranges, or options.
+- **4** Hot-path full-file materialization when streaming/partitioned leaves suffice.
+- **5** Expensive work or disk I/O before checking stored headers (`DBHeader`), `[lower, upper)` bounds (e.g. loading excluded SST index leaves), or options.
 
 ## D-STATE
 
@@ -48,9 +48,9 @@ Skip documented single-writer + intentional snapshot reads unless a multi-writer
 ## D-FAIL
 
 - **1** Durability side effect dropped after log/catch while reporting success.
-- **2** Partial success returned as full success.
-- **3** Incorrect success result (checksum not checked; unreadable table returned as empty).
-- **4** Distinct failures collapsed (recoverable vs fail-stop unclear).
+- **2** Partial success returned as full success, **or** post-commit side-effect failure (rotation/queueing) returning `Err` for writes already visible and durable.
+- **3** Incorrect success result (checksum or directory-to-leaf bounds not checked; unreadable/truncated leaf returned as empty).
+- **4** Distinct failures collapsed (`Corruption`/`Io` reclassified as `Background` when not fail-stopped) or fail-stop flag published *after* waking waiters.
 - **5** Interrupted multi-step write leaves inconsistent or unrecoverable on-disk state.
 
 ## D-API

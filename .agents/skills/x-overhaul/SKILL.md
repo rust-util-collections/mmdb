@@ -66,11 +66,14 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
    baseline worktree changes uncommitted and untouched; stop and report if an
    in-scope fix overlaps dirty baseline lines. List each frozen commit with its
    type (`fix`, `perf`, `refactor`, other) for the intent checks in Step 2.
-5. `all`: build a complete tracked-file ledger across `src/`, `tests/`,
-   `benches/`, `examples/`, `Cargo.toml`/`Makefile`/`.github/`, public docs
-   (`README.md`, `COMPARISON.md`), `.agents/`, and `docs/ai/`. Large files
-   (`src/db.rs`, `src/compaction/leveled.rs`) may be partitioned into disjoint
-   line-range sections so each section has a single review owner in the ledger.
+5. `all`: build a complete tracked-file ledger across `src/`,
+   `tools/v4-export/`, `tests/`, `benches/`, `examples/`,
+   `Cargo.toml`/`Makefile`/`.github/`/`.gitignore`, public docs (`README.md`,
+   `COMPARISON.md`), `.agents/`, and `docs/ai/`. Large files (`src/db.rs`,
+   `src/compaction/leveled.rs`, `src/sst/table_reader/{mod.rs,iterator.rs}`,
+   `src/sst/table_builder.rs`, `src/iterator/db_iter.rs`,
+   `src/manifest/version_set.rs`) may be partitioned into disjoint line-range
+   sections so each section has a single review owner in the ledger.
    Order review by risk: the Review priority classes in `review-core.md` first,
    and within them files with the most recent `fix(...)` commits
    (`git log -60 --format= --name-only --grep='^fix' -- src | sort | uniq -c |
@@ -115,13 +118,23 @@ hunk), skip the probe and trace coverage statically, saying so in the report.
 **Variant sweep** (each confirmed finding and each `fix(...)` commit in scope):
 
 1. State the defect pattern as one violated invariant (for example "an error
-   latched by an iterator stays latched on every later advance", "an SST number
-   is allocated only when its output file is built").
+   latched by an iterator stays latched on every later advance", "a partitioned
+   SST leaf agrees with its resident directory bounds", "already-committed
+   writes still return `Ok(())` when post-commit rotation fails").
 2. Search for every sibling that must hold the same invariant: forward/reverse
-   twins, `DBIterator` / `TableIterator` / merge and bidirectional iterators,
-   writable vs read-only open, flush vs compaction output, normal vs recovery
-   path, `close` / `Drop` / `DB::simulate_crash()` teardown, and every caller of
-   the guarded function or field (`rg` on the identifier, not only the diff).
+   twins (`seek` vs `seek_for_prev` / `seek_to_last`), lending `step_next` /
+   `step_prev` vs `Iterator::next` / `next_back`, `DBIterator` / `BidiIterator` /
+   `LevelIterator` / `TableIterator` / `MergingIterator`, point-index
+   (`partitions` / `index_leaf` / `find_data_block`) vs range-tombstone
+   (`range_partitions` / `visit_ranges` / `covering_sequence`) leaves, `get` /
+   `get_pinned` / `contains_key` and `Snapshot` / `ArcSnapshot`,
+   `WalAsync` / `WalSync` / `DisableWal` + `sync_wal()` (`WalFence`), explicit
+   `flush()` vs `write_batch_group` auto-freeze, `FlushQueue::run` vs
+   `set_bg_error` vs compaction `set_error`, `confirm_manifest_durable` vs
+   `sync_new_sst_parent_dir`, writable vs read-only open, normal vs multi-WAL
+   recovery path, `close` / `Drop` / `DB::simulate_crash()` teardown, and every
+   caller of the guarded function or field (`rg` on the identifier, not only the
+   diff).
 3. Classify each sibling: already holds it (cite the guard), same-root-cause
    gap, or independent variant. Same-root-cause gaps join the finding's unit. A
    gap in a sibling the reviewed `fix(...)` commit should have covered is an

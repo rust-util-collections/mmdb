@@ -1,59 +1,30 @@
 # Iterator Review Patterns
 
-**Files:** `db_iter`, `merge`, `source`, `level_iter`, `bidi_iter`, `range_del`, `mod`.
+**Files:** `db_iter.rs`, `bidi_iter.rs`, `level_iter.rs`, `merge.rs`, `range_del.rs`, `source.rs`, `mod.rs`.
 
-**Arch:** DBIterator = dedupe + snapshot + tombstone + prefix. MergingIterator =
-heap merge (+ single-source fast path). IterSource = peeked adapter. LevelIterator =
-lazy L1+. Bidi = direction + heap rebuild. FragmentedRangeTombstoneList =
-immutable segment tree with per-level sequence searches (compact still uses sweep tracker).
+**Arch:** `DBIterator` = MVCC cutoff + same-key dedupe + point/range tombstones + `BlockPropertyFilter` row filter + `[lower, upper)` / prefix bounds + lending `step_next`/`step_prev`. `MergingIterator` = binary heap (+ single-source fast path). `IterSource` = peeked `MemTableCursorIter` / `TableIterator` / `LevelIterator` (`Boxed` is `#[cfg(test)]`-only). `BidiIterator::lazy` = O(1)-memory bidirectional wrapper narrowing `IterConfig` bounds monotonically across direction switches. `FragmentedRangeTombstoneList` = pre-loaded interval list with per-level sequence checks.
 
 ## Invariants
 
-**I1 Forward mono** — `next` advances user key; one latest visible version per key.
-**I2 Completeness** — every snapshot-visible key in range once. Sources: active +
-imm mems + L0 + L1+.
-**I3 Range del** — tomb `[start,end)` seq S hides key with seq S'<S. Every yield
-checks fragmented list; correct seq compare.
-**I4 Direction switch** — no skip/dup; reposition children + rebuild; current key
-rules if unconsumed.
-**I5 Prefix** — stop at exact prefix: `key[..n]==prefix`, not loose end bound alone.
-**I6 Snapshot** — latest visible version with `seq <= snapshot_seq` (not first only).
+**I1 Forward & reverse monotonicity** — `step_next`/`next` yields strictly increasing user keys; `step_prev`/`prev`/`next_back` yields strictly decreasing user keys; each visible user key appears once at its highest sequence `<= read_seq`.
 
-## Bug patterns
+**I2 Typed error propagation & permanent latching** — every layer (`SeekableIterator`, `IterSource`, `LevelIterator`, `MergingIterator`, `DBIterator`, `BidiIterator`) exposes `Option<&Error>` and permanently fuses (`has_failed()` / `halt_on_error()`) on the first I/O, CRC, block-entry, or `InternalKey` decode failure. Subsequent `seek*`, `advance`, `prev`, `next_prefix`, or direction switches must never clear a latched error or expose a shadowed older version from a deeper source.
 
-**Heap after seek** — rebuild after child moves.
-**Double yield on reverse** — account for consumed current.
-**Seek skips tombstone check** — every post-seek yield still queries list.
-**Level file boundary skip** — first key of next file must yield.
+**I3 Lending `step_next`/`step_prev` vs `Iterator::next`** — `step_next` and `step_prev` (`lend_current(true)`) enforce strict `Err` precedence: if lookahead into the next block fails while taking the current entry, they halt and return `Err(error)` immediately. Infallible `Iterator::next` / `valid()` / `BidiIterator::next` (`front(false)`) may yield an already-decoded, MVCC-verified front entry and halt on the next advance with `error().is_some()`.
 
-## Optimizations to preserve
+**I4 Post-MVCC `BlockPropertyFilter` & `SkipPoint`** — `IterConfig::matches(user_key)` (`BlockPropertyFilter::key_matches`) and `skip_point` run strictly *after* MVCC sequence cutoff, same-key deduplication, point `Deletion`, and `FragmentedRangeTombstoneList` visibility resolution in both forward (`next_visible`) and reverse (`resolve_prev_user_key`) scans (`clean_read` disabled when filters are active). `TableBuilder` feeds both `Value` and `Deletion` user keys to `BlockPropertyCollector` so blocks containing point tombstones for matching keys are never skipped.
 
-- `next_into` buffer reuse — no alias live MemTable/SST bytes
-- `intersect_iter_bounds` merges `ReadOptions`, explicit range, and prefix bounds
-  **before** selecting SST point sources or issuing `init_heap` `posix_fadvise(WILLNEED)`
-  prefetch hints, while retaining covering cross-file range tombstones independently
-- L0 point lookups prune by `[smallest_key, largest_key]` only after folding
-  covering range tombstones from every L0 file
-- SetBounds → Level/Table iters; upper bound file skip
-- SkipPoint without skipping past matches
-- Cross-level tombstone: timestamp from L only covers L and deeper
-  (`level > source_level` ignored). Guards bottommost seq-zero vs stale deeper
-  tomb. Same/shallower levels still cover (mem DeleteRange must hit deeper + same mem Put)
-- Sequential fadvise hints; deferred block read via index first_key
-- L0 first-block pin for init_heap peek; unpin when leave L0 (incl. trivial move);
-  index/bloom/range-del live on TableReader, not block_cache
-- Atomic L0 counter for write throttle
+**I5 Bounds, prefix, & partitioned SST leaf isolation** — `intersect_iter_bounds` intersects `ReadOptions` (`Cow<'a, [u8]>`), range, and `[prefix, prefix_successor(prefix))` bounds into shared `Arc<IterConfig>` *before* SST pruning and `init_heap` `posix_fadvise`. Point SSTs may be skipped at scan setup only when `smallest_key >= upper` (never `largest_key < lower` when `has_range_deletions`, since `end` can exceed `largest_key`); `TableReader::read_tombstones` binary-searches overlapping `range_partitions` and picks at most one stripe `<= read_seq`. `TableIterator` must check `iterate_upper_bound` and `index_pos == usize::MAX` *before* `select_partition` / `ensure_index` so out-of-bounds seeks never read, cache, or fail on excluded ~64 KiB index leaves.
+
+**I6 Cross-level range tombstones & `iter_with_batch`** — a range tombstone at level `L` covers only sources at `>= L` (`level > source_level` ignored, protecting bottommost sequence-zeroed points). `DB::iter_with_batch` validates `batch.check_valid()` upfront, pins `SuperVersion` before `committed_sequence`, and assigns overlay sequences `[MAX_SEQUENCE_NUMBER - (op_count - 1) ..= MAX_SEQUENCE_NUMBER]` strictly above `read_seq`.
 
 ## Checklist
 
-- [ ] Heap OK after next/prev/seek
-- [ ] Same-user-key higher-seq skipped correctly
-- [ ] All sources present
-- [ ] Fragmented list on every yield
-- [ ] Direction switch rebuilds
-- [ ] Prefix byte-exact
-- [ ] Seek+tombstone checked
-- [ ] Arcs pin SV/Mem/SST for iter life
-- [ ] next_into alias-safe
-- [ ] Bounds/SkipPoint/fadvise correct
-- [ ] L0 pins unpinned on file drop
+- [ ] Errors latch permanently across `seek`, `seek_for_prev`, `seek_to_first`, `seek_to_last`, `next_prefix`, and `BidiIterator` switches
+- [ ] `step_next` / `step_prev` return `Err` immediately on lookahead failure; backward decode failure never exposes older versions
+- [ ] `BlockPropertyFilter::key_matches` runs post-MVCC in both forward and reverse; `LevelIterator` reverse walks past all-skipped SSTs
+- [ ] `TableIterator::seek`, `seek_for_prev`, and `load_next_block` check `upper` / exhaustion before loading index partition leaves
+- [ ] `BidiIterator::lazy` narrows `[lower, upper)` monotonically without materializing windows or double-yielding unconsumed `current`
+- [ ] Prefix scans enforce exact `key.starts_with(prefix)` (including all-`0xFF` prefix exhaustion)
+- [ ] `next_into` / `next_lazy` never alias or dangle across MemTable/SST cursors
+- [ ] SST v2 index and `rangedel` leaves respect `fill_cache`; partition directories and blocked Bloom filters stay resident on `TableReader`

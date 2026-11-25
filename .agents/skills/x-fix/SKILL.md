@@ -50,8 +50,10 @@ Verify each finding against current code and dedupe shared root causes:
 ### 2. One finding → one commit
 
 1. Implement the root-cause fix and a focused regression test in a temporary DB.
-2. Trace error propagation, interrupted-write recovery, concurrency, and
-   resource cleanup paths.
+2. Trace typed `ErrorKind` propagation, post-commit acknowledgement boundaries,
+   interrupted-write recovery, lock/claim/fail-stop publication order, and
+   resource cleanup paths; check sibling twins (`forward`/`reverse`,
+   `partitions`/`range_partitions`, `Snapshot`/`ArcSnapshot`, `WalAsync`/`WalSync`/`DisableWal`).
 3. Remove that finding's `Open` entry in the same commit.
 4. Run per-unit validation in `commit-protocol.md`.
 5. Stage only the unit's owned fix/test/doc/audit paths, inspect

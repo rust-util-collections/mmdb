@@ -1,59 +1,32 @@
 # Compaction Review Patterns
 
-**Files:** `leveled.rs`, `mod.rs`.
+**Files:** `leveled.rs`, `mod.rs`, `src/db.rs` (`LevelRewrite`, `drain_l0`, `DeadKeySweepScheduler`).
 
-**Arch:** L0 overlap → L1+ sorted disjoint; trigger L0 count ≥ `l0_compaction_trigger`;
-sub-compaction on L(n+1) bounds; trivial move = single file, no target overlap;
-point entries stream from input blocks; memory for the range-deletion tracker grows with the input tombstone count.
+**Arch:** L0 overlap → L1+ sorted disjoint; trigger L0 count ≥ `l0_compaction_trigger` or L1+ level budget overflow; sub-compaction splits on sorted L(n+1) file boundaries (`compute_split_points`); trivial move = single file, `target_level != level`, no target point/range overlap, no effective `CompactionFilter`; `PendingSsts` owns newly allocated SST numbers and unlinks abandoned outputs on error/drop without touching concurrent jobs' files.
 
 ## Invariants
 
-**C1 Output disjoint (L1+)** — non-overlapping ranges or binary search misses keys.
-Split points use exclusive boundaries.
+**C1 Output disjointness & user-key cuts (L1+)** — outputs are strictly monotonic and non-overlapping. Output file splits (`pending_cut`) defer until `user_key != current_file_user_key` so a cut never lands mid-user-key or between `OutputEntry::Range(begin=K)` and `OutputEntry::Point(K@seq)`.
 
-**C2 Tombstone retention** — keep at non-bottommost. Bottommost drop only if no
-live snapshot covers. `is_bottommost` must consider **all** lower levels, not only +1.
+**C2 Tombstone & snapshot-stripe retention** — keep point `Deletion`s and range tombstones at non-bottommost levels or when covered by an active snapshot. At `is_bottommost`, `RangeFragment::keep_from(oldest_snapshot_seq)` drops stripes strictly `< oldest_snapshot_seq`, matching the strict inequality `entry_seq < oldest_snapshot_seq` used for `Value` sequence zeroing (so surviving stripes always satisfy `t_seq > 0` and never invert `t_seq > entry_seq`). `is_bottommost_level` checks union extents across `first_checked_level..num_levels`.
 
-**C2a Range tomb across sub-jobs** — collect full `all_range_del_entries` /
-`all_raw_tombstones` once; share by ref; each sub-job builds local
-`RangeTombstoneTracker` before merge. Bounds must not truncate equality coverage.
+**C2a Range fragments & split clipping** — `collect_range_fragments` reads packed SST v2 intervals once (`fill_cache = false`), sharing `Arc<[u8]>` endpoints and `Arc<[u64]>` ascending stripe arrays across sub-jobs. Sub-jobs clip fragments to `[lo, hi)` (`lo < hi`) and seek points at `InternalKey::new(lo, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion)` so boundary keys and `MAX_SEQUENCE_NUMBER` tombstones at `lo` belong exclusively to the right sub-job. Across SST file cuts at `K_split`, `OutputSplit::clip_at(K_split)` tiles `[begin, K_split)` and `[K_split, end)` with identical retained stripes and zero gaps; `projected_meta_size()` subtracts `carried_projection` so carried fragments do not force 1-key file splits.
 
-**C3 Seq zero** — bottommost only, and only keys without snapshot dependency.
+**C3 Zero-I/O extent closure** — `overlapping_files_for_inputs` and `add_file_extents` close source and target files over resident `TableReader::range_partition_extents()` (no disk I/O under `DB::inner`) and return target files in level order so `compute_split_points` stays strictly increasing.
 
-**C4 Sub boundary** — boundary key to exactly one sub-job (exclusive start/end).
+**C4 Durable install & `PendingSsts`** — finish + `sync_all` all output SSTs → `sync_new_sst_parent_dir` (`DirSynced`) → `PendingSsts::keep()` inside `install_compaction` after `log_and_apply_synced` → `confirm_manifest_durable` before `run_post_compaction_cleanup` unlinks superseded inputs and unpins/evicts caches.
 
-**C5 Delete inputs after durable install** — inputs unlinked only after outputs
-written and replacing MANIFEST edit durably synced. `install_compaction` may
-return `PostCompactionCleanup` after `log_and_apply`; caller syncs MANIFEST
-before `run_post_compaction_cleanup`.
+**C5 Stale inputs, `l0_install_epoch`, & snapshot races** — under `DB::inner`, verify all inputs remain live, outputs do not overlap unexpected target files (using `output_tombstones` captured in I/O phase), and `!(output.filter_mutated && live_snapshots_present)`. Full-level `LevelRewrite` claims inputs via `CompactionClaim`; if an L0 in-place rewrite (`0 -> 0`) sees `l0_install_epoch` change, discard created outputs (never live trivial-move inputs) and switch to `L0 -> L1`.
 
-**C5a Stale install** — under lock, inputs still in current Version; no output
-overlap with a target file the edit neither deletes nor produces. Stale outputs
-deleted off MANIFEST. Prec check under DB lock must not read SSTs; tombstone
-extents come from `CompactionOutput::output_tombstones` captured in I/O phase.
-
-**C6 Filter** — when bottommost + no snapshots: each eligible surviving Value once
-after visibility; Keep/Remove/ChangeValue on that entry. Same eligibility for
-normal and forced.
-
-## Bug patterns
-
-**Deleted key reappears (tech 4.1):** tombstone removed above bottommost while an older value remains deeper.
-**Stall:** compact holds `db_mutex` waiting on work that needs it — release before I/O.
-**Rate limiter:** `rate_bytes_per_sec == 0` returns without locking; enabled limiter handles burst + concurrent debt without unbounded stall.
-**Output allocation** — flushes and compactions allocate a number for each new SST from the shared allocator. Failed jobs remove only their own output files.
-**Bottommost range:** union of **all** input extents (`add_file_extents`), not per-file only.
+**C6 Filter & typed errors** — `CompactionFilter` runs at most once per logical user key when `is_bottommost && active_snapshots.is_empty() && vt == ValueType::Value`. `SstBuilds` blocks re-entrant DB mutations/close from filter/collector callbacks (`ErrorKind::InvalidArgument`). Preserve typed `MergingIterator::error()` (`ErrorKind::Corruption` / `ErrorKind::Io` + `source()`) on synchronous `compact()` / `compact_range()` rather than reclassifying as `ErrorKind::Background` when the DB is not fail-stopped.
 
 ## Checklist
 
-- [ ] Outputs monotonic non-overlapping
-- [ ] Tombstones kept non-bottommost; range dels reach all sub-jobs
-- [ ] Seq zero only bottommost w/o snapshot dep
-- [ ] Sub boundaries no dup/skip
-- [ ] MANIFEST durable before input unlink
-- [ ] Filter once per logical KV when eligible
-- [ ] Trivial/no-op cannot skip effective filter
-- [ ] Partial fail leaves consistent DB
-- [ ] Rate limiter no unbounded stall
-- [ ] Stale-input check before VersionEdit apply
-- [ ] `is_bottommost` uses aggregate extents
+- [ ] Outputs strictly monotonic, non-overlapping, cut only at user-key boundaries
+- [ ] `RangeFragment` stripes clipped cleanly across sub-compaction `[lo, hi)` and SST `clip_at` splits
+- [ ] Bottommost `keep_from(oldest_snapshot_seq)` matches strict `< oldest_snapshot_seq` point seq zeroing
+- [ ] `overlapping_files_for_inputs` and `is_bottommost_level` include resident `range_partition_extents()` and preserve target level order
+- [ ] `DirSynced` + `confirm_manifest_durable` complete before unlinking inputs; `PendingSsts` cleans failed outputs
+- [ ] Discarded installs (`stale`, `snapshot_raced`, `l0_install_epoch`) never delete live trivial-move input SSTs
+- [ ] `CompactionFilter` runs once per logical key; `LazyDeleteFilter::is_noop` checks both user filter and `dead_keys`
+- [ ] `MergingIterator` `Corruption`/`Io` errors keep their `ErrorKind` and `source()`

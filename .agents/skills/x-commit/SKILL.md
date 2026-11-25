@@ -53,13 +53,14 @@ Preflight, then freeze owned paths before editing.
 
 ### 2. Review and fix (per unit)
 
-Read full functions, callers, error paths, and tests. Check data-structure
-invariants, interrupted-write recovery, concurrency, `unsafe` preconditions,
-quantified hot-path cost, design shape, unfinished placeholders, and the public
-API in `src/lib.rs`. Apply `false-positive-guide.md`. Fix confirmed defects in
-the owned unit completely, add a focused regression test, and re-check until
-clean. Stop and report on no progress or when a fix requires editing an unowned
-baseline file.
+Read full functions, callers, error paths, and tests. Check data-structure and
+SST v2 directory-leaf invariants, MVCC/snapshot cutoffs, post-commit and
+interrupted-write durability, concurrency/wake ordering, `unsafe` provenance
+preconditions, quantified hot-path cost, design shape, unfinished placeholders,
+standalone `tools/v4-export` parity, and the public API in `src/lib.rs`. Apply
+`false-positive-guide.md`. Fix confirmed defects in the owned unit completely,
+add a focused regression test, and re-check until clean. Stop and report on no
+progress or when a fix requires editing an unowned baseline file.
 
 Reads may run in parallel; edits and commits are strictly sequential.
 

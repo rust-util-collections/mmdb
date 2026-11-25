@@ -57,22 +57,33 @@ downloads and Git commands are separate developer-tooling operations.
 Describe every candidate, finding, test, progress update, and commit message in
 concrete storage-engineering terms:
 
-1. **Operation and input** — public API call sequence, `WriteBatch` contents,
-   iterator bounds/direction, `DB::simulate_crash()`, or deterministic file
-   truncation / header-byte edit in an isolated `tempfile::TempDir`.
-2. **State and invariant** — MVCC sequence cutoff, internal-key ordering,
-   prefix-block restart layout, WAL/MANIFEST record framing, or lock acquisition
-   order.
+1. **Operation and input** — public API call sequence, `WriteBatch` /
+   `DurabilityMode` (`WalAsync`, `WalSync`, `DisableWal`) / `sync_wal()` calls,
+   `Snapshot` / `ArcSnapshot` (`SnapshotRef`), `PinnedSlice`, iterator
+   `[lower, upper)` bounds/direction (`step_next`/`step_prev` vs `Iterator::next`),
+   `DB::simulate_crash()`, or deterministic file truncation / block-byte edit in
+   an isolated `tempfile::TempDir`.
+2. **State and invariant** — MVCC sequence cutoff, `SuperVersion`-before-sequence
+   read barrier, internal-key ordering, SST v2 partitioned index/`rangedel`
+   directory-to-leaf bounds, 64B blocked Bloom (`filter.format = 2`), WAL or
+   MANIFEST `DBHeader` framing, `DirSynced` / `PendingSsts`, or lock acquisition
+   and fail-stop publication order.
 3. **Expected vs observed behavior** — expected `Result` (`Ok(...)` or typed
-   `Err(ErrorKind::Corruption)` / `ErrorKind::ReadOnly` / `ErrorKind::Io`) and
+   `Err(ErrorKind::Corruption)` / `ErrorKind::Busy` / `ErrorKind::Background` /
+   `ErrorKind::ReadOnly` / `ErrorKind::DbClosed` / `ErrorKind::Io`) and
    persisted state versus the actual returned value, panic, retained allocation,
    or quantified hot-path cost.
 4. **Existing checks and regression test** — why current guards do or do not
    cover the path, and the smallest deterministic test that fails before the fix.
 
 Keep exact Rust and MMDB identifiers (`unsafe`, `ErrorKind::Corruption`,
-`VersionSet::poisoned`, `SequenceNumber`, `ArcSwap`) verbatim, while conversing
-in the user's language.
+`VersionSet::poisoned`, `ReadState::has_bg_error`, `DirSynced`, `PinnedSlice`,
+`SequenceNumber`, `ArcSwap`) verbatim, while conversing in the user's language.
+
+`tools/v4-export` is a standalone Cargo package (`exclude = ["tools/v4-export"]`
+in root `Cargo.toml`) because it links `mmdb = "=4.3.15"` alongside path `../..`;
+keep it excluded from `[workspace]` and run Cargo checks against it via
+`--manifest-path tools/v4-export/Cargo.toml`.
 
 ### Review-agent handoffs
 
@@ -83,11 +94,14 @@ large context materially helps (`all` or multi-subsystem ranges).
 Give each delegated subagent a fresh, narrow prompt using the template in
 `review-core.md`: include the embedded local-library context, repository path,
 frozen `HEAD`/baseline, disjoint assigned files (or disjoint line ranges for
-large files such as `src/db.rs` and `src/compaction/leveled.rs`), mapped pattern
+large files such as `src/db.rs`, `src/compaction/leveled.rs`,
+`src/sst/table_reader/{mod.rs,iterator.rs}`, `src/sst/table_builder.rs`,
+`src/iterator/db_iter.rs`, and `src/manifest/version_set.rs`), mapped pattern
 guides, and a concrete storage-invariant question (for example, key ordering,
-MVCC visibility, WAL/MANIFEST replay, or lock ordering) — never an open-ended
-request to hunt vulnerabilities. Retain the full coverage ledger in the
-coordinating session; smaller handoffs do not narrow the user's requested scope.
+MVCC visibility, SST v2 directory-leaf bounds, WAL/MANIFEST replay, or lock
+ordering) — never an open-ended request to hunt vulnerabilities. Retain the full
+coverage ledger in the coordinating session; smaller handoffs do not narrow the
+user's requested scope.
 
 Derive scope and status from the current checkout and `docs/audit.md`, not from
 prior session claims. If a subagent run stops early or returns incomplete

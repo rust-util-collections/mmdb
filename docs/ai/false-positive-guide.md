@@ -14,11 +14,15 @@ cover, or explain why the guarantee does not cover the described conditions.
 **Skip:** Check-then-act while the protecting guard spans the whole sequence.
 Trace `MutexGuard`/`RwLockGuard` to end of scope or `drop`.
 
-## FP-3: ArcSwap snapshot staleness
+## FP-3: ArcSwap snapshot staleness & view-before-sequence pinning
 
-**Skip:** `super_version.load()` lagging a concurrent flush/compact — by design.
-Pin/seq makes snapshot reads correct; non-snapshot may see any version current during the call.
-**Keep:** SuperVersion used for a latest-state decision (e.g. compact inputs).
+**Skip:** `super_version.load()` lagging a concurrent flush/compaction — by design.
+`ReadState::point_lookup` and `scan` pin `SuperVersion` *before* `Acquire`-loading
+`committed_sequence`, and `FlushContext::flush` keeps `oldest` in
+`immutable_memtables` until *after* `confirm_manifest_durable`, so memtable
+tombstone early-exit (`tomb_seq > 0`) never misses newly installed L0 SSTs.
+**Keep:** `SuperVersion` used for a latest-state mutation decision without
+revalidating under `DB::inner`.
 
 ## FP-4: unwrap/expect on proven state
 
@@ -28,13 +32,14 @@ caller guards, and tests (panics OK).
 ## FP-5: Clippy already enforces
 
 CI is `-D warnings`. Skip unused vars, needless clones, redundant closures, etc.
-Focus on semantics clippy cannot see.
+Focus on semantics clippy cannot see (note: check standalone crates outside root
+`[workspace]` such as `tools/v4-export` explicitly).
 
 ## FP-6: Advice without downside
 
 No unsupported “consider” advice. Name an observable result.
-Vague: “add bounds check”. Concrete: “stored SST prefix_len > key.len() causes
-a slice panic instead of returning a decoding error”.
+Vague: “add bounds check”. Concrete: “index leaf ending before its directory
+separator causes `find_data_block` to return `Ok(None)` instead of `Corruption`”.
 
 ## FP-7: Test code standards
 
@@ -43,25 +48,30 @@ Tests may unwrap, Drop cleanup, block, hardcode.
 
 ## FP-8: Documented unsafe
 
-Read `// SAFETY:`. Skip if prereqs hold.
-**Keep:** broken prereqs, invalidated assumptions, missing/vague comment.
+Read `// SAFETY:`. Skip if prereqs (including Stacked/Tree Borrows provenance) hold.
+**Keep:** broken prereqs, `Unique` retag invalidating shared pins, invalidated
+assumptions, or missing/vague comment.
 
 ## FP-9: Perf off hot path
 
-**Hot:** get, iter next/prev, block decode, bloom. **Warm:** flush, compact loop.
-**Cold:** open/close, options, error format, WAL recovery.
+**Hot:** `get`/`get_pinned`/`contains_key`, `step_next`/`step_prev`/`next`/`prev`,
+block decode, blocked Bloom. **Warm:** `FlushQueue`, compaction merge, index/rangedel leaf load.
+**Cold:** open/close, options, error format, WAL recovery, `tools/v4-export` CLI setup.
 Report perf only on hot/warm with path evidence.
 
 ## FP-10: Incomplete lock analysis
 
-Before races: all locks (`Mutex`/`RwLock`/`ArcSwap`), order, higher serializer
-locks, and that parking_lot is non-reentrant.
+Before races: trace all locks (`lock_file`, `maintenance`, `write_queue`, `inner`,
+`compacting_files`, `manifest_writer`, `pin_updates`, `SstBuilds`), lock order,
+leader/claim barriers, and that `parking_lot` is non-reentrant.
 
-## FP-11: Tombstone retention by design
+## FP-11: Tombstone & snapshot-stripe retention by design
 
-Non-bottommost / snapshot-covered / covering lower levels → must keep.
-Drop only when still needed → correctness. Bottommost conservative keep → only
-with material accumulation, not mere eligibility.
+Non-bottommost / snapshot-covered tombstones and `RangeFragment` stripes
+(`admit_range_stripes` ≤ `MAX_RANGE_STRIPES`), plus fragments carried across SST
+splits (`clip_at`), must be kept.
+**Keep:** premature drop (resurrection), `entry_seq -> 0` inversion against
+surviving stripes, or unbounded meta-block overflow.
 
 ## FP-12: Half-open ranges
 
@@ -77,7 +87,8 @@ Rejected (`workflow-policy.md` §5).
 
 ## FP-14: Legitimate no-ops
 
-`Ok(())` / `None` / empty vec often correct. Placeholder only if contract requires
+`Ok(())` / `None` / empty vec often correct (e.g., empty/inverted `delete_range`
+dropped before WAL/sequence assignment). Placeholder only if contract requires
 work and body is stub (`todo!`, unfinished TODO, temp dummy).
 
 ## FP-15: Design ID is not a finding
@@ -87,12 +98,40 @@ catalog the bug.
 
 ## FP-16: Cache invalidation window
 
-`insert`/reverse-index and detach vs unpinned insert are cutoff-not-barrier.
-IDs never reuse → wrong data cannot swap; cold unreachable until LRU.
-**Keep:** wrong-data visibility, ID reuse, unbounded retain, pin-path races.
+Unpinned `insert`/reverse-index and `detach` vs unpinned insert are cutoff-not-barrier.
+`member_id` and `file_number` never reuse → wrong data cannot alias; cold orphans
+stay LRU-bounded.
+**Keep:** wrong-data visibility, ID reuse, `u32` weight truncation, unbounded
+retain, or `pin_updates` races.
 
 ## FP-17: Not a defect
 
 A feature request, documented contract, or by-design limit is not a finding.
 Do not record it as Open or Won't Fix. A claim that the code disproves is
 Rejected. Delete an existing entry when a re-check shows it was never a defect.
+
+## FP-18: `DisableWal` & advisory `wal_bytes_per_sync`
+
+**Skip:** `DurabilityMode::DisableWal` omitting WAL records (losing un-flushed
+batches on crash is its contract), or `wal_bytes_per_sync` (`sync_file_range`)
+not guaranteeing crash durability (it is an advisory writeback hint).
+**Keep:** `WalSync` or `sync_wal()` (`WalFence`) returning `Ok(())` without
+`sync_data()` covering prior WAL-enabled batches, or `synced_wal_seq` advancing
+past unsynced `WalAsync` records.
+
+## FP-19: `Iterator::next` vs fallible `step_next` / `step_prev` lookahead
+
+**Skip:** `std::iter::Iterator::next` / `valid()` yielding an already-decoded,
+MVCC-resolved front entry when readahead into the *following* block fails, then
+halting on the next step with `error().is_some()` — documented contract.
+**Keep:** `step_next` / `step_prev` returning `Ok(Some(...))` instead of `Err`
+when an error is present, re-seeks/direction switches clearing a latched error,
+or backward decode failure exposing a shadowed older version.
+
+## FP-20: `ArcSnapshot` after `DB::close()` / `Drop`
+
+**Skip:** `ArcSnapshot` methods returning `Err(ErrorKind::DbClosed)` after the
+originating `DB` is closed or dropped — `SnapshotLease` holds `Weak<ReadState>`
+by design so surviving handles never pin `TableCache`, `MemTable`s, SST FDs, or
+`LOCK`. Cross-DB snapshot use returning `Err(ErrorKind::InvalidArgument)` via
+`db_id` is also by design.

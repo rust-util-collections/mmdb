@@ -44,8 +44,8 @@ anything else, including `--fix`.
 1. Worktree baseline: the recorded preflight above.
 2. Changed files, full diff, callers, tests. `worktree` includes intended
    untracked source/test files (`git status --short`). `all` → ledger of `src/`,
-   `tests/`, `benches/`, `examples/`, build/CI, public docs, `.agents/`, and
-   `docs/ai/`.
+   `tools/v4-export/`, `tests/`, `benches/`, `examples/`, build/CI/`.gitignore`,
+   public docs, `.agents/`, and `docs/ai/`.
 3. Map via the Subsystem Map. Load concurrency/`unsafe` guides when relevant.
 4. Mark generated, vendored, and out-of-scope rows explicitly in the ledger.
 
@@ -56,8 +56,10 @@ Delegate read-only subagents only when splitting large context helps (`all` or
 multi-subsystem diffs), using the
 [scoped handoff](../../../docs/ai/review-core.md#agent-handoff-and-response)
 with concrete storage-invariant questions. For `all`, assign disjoint subsystem
-batches; large files (`src/db.rs`, `src/compaction/leveled.rs`) may be split
-into disjoint line-range sections so every line has one owner in the ledger.
+batches; large files (`src/db.rs`, `src/compaction/leveled.rs`,
+`src/sst/table_reader/{mod.rs,iterator.rs}`, `src/sst/table_builder.rs`,
+`src/iterator/db_iter.rs`, `src/manifest/version_set.rs`) may be split into
+disjoint line-range sections so every line has one owner in the ledger.
 `fmt`, compile, and `clippy` are Cargo tools, not subagent tasks.
 
 Cover what the scope touches: key/value ordering, MVCC visibility,

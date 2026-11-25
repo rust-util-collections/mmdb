@@ -32,7 +32,7 @@ cargo test --test e2e_scenarios
 cargo test --test proptest_db
 ```
 
-Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
+Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks (including `--manifest-path tools/v4-export/Cargo.toml` for the standalone v4 exporter crate, which is excluded from the root workspace). Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
 
 Toolchain: official latest stable Rust (edition 2024) for development, CI, and
 releases, selected via `RUSTUP_TOOLCHAIN=stable` or `cargo +stable`. Do not run
@@ -45,15 +45,16 @@ jobs, or older-compiler compatibility shims.
 
 | Subsystem | Key files | Purpose |
 |-----------|-----------|---------|
-| Write path | `src/db.rs` | Group commit: WAL → MemTable |
-| Read path | `src/db.rs` | Lock-free via `ArcSwap<SuperVersion>` |
-| MemTable | `src/memtable/` | Lock-free skiplist (single-writer, multi-reader) |
-| WAL | `src/wal/` | Crash recovery, block-based records with CRC32 |
-| SST | `src/sst/` | Prefix-compressed blocks, dedicated range-del block, bloom filters, LZ4/Zstd |
-| Iterator | `src/iterator/` | Heap merge, range tombstones, bidirectional |
-| Compaction | `src/compaction/leveled.rs` | Leveled strategy, sub-compaction parallelism |
-| Manifest | `src/manifest/` | VersionSet, atomic version edits |
-| Cache | `src/cache/` | Block cache (moka SegmentedCache via BlockCachePool), table handle cache |
+| Write & flush | `src/db.rs`, `src/db/flush.rs` | Group commit (`WalAsync`/`WalSync`/`DisableWal` + `WalFence`), unlocked WAL rotation, FIFO `FlushQueue` worker |
+| Read & snapshots | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | Lock-free `ArcSwap<SuperVersion>`, zero-copy `PinnedSlice`, `Snapshot` / `ArcSnapshot` (`SnapshotRef`) |
+| MemTable | `src/memtable/` | Slab-arena `ConcurrentSkipList` (`MemTablePin`), range-del list, same-key metadata buckets |
+| WAL | `src/wal/` | Vectored `add_record_parts`, 32 KiB block-framed CRC32 records, multi-WAL bounded recovery |
+| SST v2 | `src/sst/` | `TABLE_MAGIC_V2`, paged two-level index & pre-fragmented `rangedel` directories, 64B XXH3-64 blocked Bloom (`filter.format = 2`), LZ4/Zstd |
+| Iterator | `src/iterator/` | Heap merge, `FragmentedRangeTombstoneList`, lending `step_next`/`step_prev` with typed `&Error`, lazy `BidiIterator` |
+| Compaction | `src/compaction/leveled.rs`, `src/db.rs` (`LevelRewrite`) | Unlocked leveled & full-level compaction, sub-compaction range/stripe clipping |
+| Manifest | `src/manifest/` | `VersionSet`, v5 `DBHeader` (`levels`, `prefix_len`), `DirSynced`, `FileNumbers` / `PendingSsts` |
+| Cache | `src/cache/` | `BlockCachePool` (`SegmentedCache`), lock-free `ArcSwap` L0 block-0 pins, `TableCache` |
+| Migration | `tools/v4-export/` | Standalone `mmdb-v4-export` (`=4.3.15` read-only → v5 staging + atomic rename) |
 
 ## Skills
 
@@ -98,7 +99,7 @@ Audit registry: `docs/audit.md` — maintained by `$x-review`, `$x-fix`, and `$x
 - Typed errors: `Error`/`ErrorKind` in `src/error.rs` (hand-rolled, no thiserror/ruc); propagate with `.ctx()` / `.with_ctx(|| ..)` — each hop records `file:line:column` via `#[track_caller]`
 - `tracing` for logging
 - Tests use `tempfile` for isolated DB directories
-- Feature `test-utils` exposes `DB::simulate_crash()` for durability tests
+- Feature `test-utils` exposes `DB::simulate_crash()` for durability tests and `concurrent_arena_pins()` for `cargo +nightly miri test --test arena_miri`
 - Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock and advisory WAL writeback paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
 - Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes
 - **No Co-Authored-By in commits** — never add `Co-Authored-By:` or similar trailers to commit messages; project commits are authored only by the human contributor
