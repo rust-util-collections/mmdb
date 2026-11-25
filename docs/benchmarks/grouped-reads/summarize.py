@@ -26,6 +26,7 @@ for filename in sys.argv[1:]:
     for cell, pairs in sorted(cells.items()):
         aa, ab, control_us, grouped_us, control_probes, grouped_probes = [], [], [], [], [], []
         device_a_us, device_b_us = [], []
+        qualified_fractions, storage_a, storage_b = [], [], []
         for kind in ["AA", "AB"]:
             for repeat in range(1, 6):
                 arms = pairs[kind, repeat]
@@ -46,10 +47,17 @@ for filename in sys.argv[1:]:
                     if cell[0] == "device":
                         device_a_us.append(int(a["device_p99_ns"]) / 1000)
                         device_b_us.append(int(b["device_p99_ns"]) / 1000)
+                        storage_a.append(int(a["storage_bytes"]) / int(a["samples"]))
+                        storage_b.append(int(b["storage_bytes"]) / int(b["samples"]))
+                if cell[0] == "device":
+                    qualified_fractions.extend(int(row["device_requests"]) / int(row["samples"])
+                                               for row in (a, b))
         device_details = ""
         if device_a_us:
             device_details = (f" io_positive_only_p99_us={median(device_a_us):.2f}/"
-                              f"{median(device_b_us):.2f}")
+                              f"{median(device_b_us):.2f} "
+                              f"min_io_qualified={min(qualified_fractions):.3f} "
+                              f"bytes_per_request={median(storage_a):.0f}/{median(storage_b):.0f}")
         print(f"{path.name} {cell} p99_us={median(control_us):.2f}/{median(grouped_us):.2f} "
               f"p99_ranges_us={min(control_us):.2f}..{max(control_us):.2f}/"
               f"{min(grouped_us):.2f}..{max(grouped_us):.2f} "

@@ -6,8 +6,7 @@ and **27.12 µs** with 32 pinned gets on one snapshot. The median within-pair
 gain was **33.30%** across five pairs (32.27–35.88%). Its largest A/A
 difference was 7.41%. The same trace reduced index/data block acquisitions
 from 64 to 3.07 per request on average. Both arms delivered the same 32
-values with the same ownership lifetime. These reads measure the MMDB API;
-the distribution of actual collection queries remains a separate VSDB
+values with the same ownership lifetime. These reads measure the MMDB API. The distribution of actual collection queries remains a separate VSDB
 integration decision. [Primary raw trials](results/final/primary.csv) · [Host and fixture](results/final/primary.metadata.json)
 
 A separate normal-dependency build compared the existing single-key API
@@ -19,11 +18,19 @@ paired median change of −0.63% and a maximum absolute A/A difference of
 [Initial guard](results/final/default-scalar.csv) · [Longer guard](results/final/default-scalar-extended.csv)
 
 The grouped singleton itself also passed its longer calibration at 1,000,000
-requests: paired median change 0.00%, range −1.29% to +1.56%, largest A/A
-difference 2.20%. In separate uninstrumented 32-key release builds, clustered
+requests per process. Its paired median change was 0.00% (−1.29% to +1.56%),
+with a largest A/A difference of 2.20%. In separate uninstrumented 32-key release builds, clustered
 single-SST p99 improved by 31.54% and the overlapping L0/bottom-SST fixture
 by 26.79%, both across five favorable pairs. The latter checks returned
 versions for known odd-key overwrites. [Grouped singleton](results/final/primary-singleton-extended.csv) · [Production single SST](results/final/release-fixture.csv) · [Production overlapping SSTs](results/final/release-overlap.csv)
+
+The production integration check repeated the 32-key single-SST workload
+with separate release builds of `277ef08` (scalar control) and `736b87e`
+(grouped after integration with the writer/metrics work). At 50,000 requests
+per process the five paired gains were 35.16–51.29%, with median **37.55%**.
+Median run p99 was 28.71 µs / 17.93 µs and the largest A/A difference was
+3.87%. MMDB used its default feature set in both binaries.
+[Integrated production trials](results/final/integration-release.csv)
 
 ## Mechanism and correctness
 
@@ -51,7 +58,7 @@ neighboring `.rows` file across trials.
 ```sh
 cargo +stable bench --features test-utils --bench grouped_reads --no-run
 "$probe" prepare "$fixture" 262144
-python3 docs/benchmarks/grouped-reads/trials.py "$probe" "$fixture" primary.csv \
+python3 -B docs/benchmarks/grouped-reads/trials.py "$probe" "$fixture" primary.csv \
     --matrix primary --samples 300000 --cpus "$cpus" --revision "$revision"
 ```
 
@@ -60,12 +67,14 @@ per run. To extend the scattered singleton control, select `--matrix warm
 --fanout 1 --locality scattered --samples 300000`. The runner places machine,
 binary, fixture and filesystem metadata beside the CSV and checks each
 run's cache evidence. Use `summarize.py FILE.csv ...` for the paired results
-and `python3 -m unittest discover -s docs/benchmarks/grouped-reads` for the
+and `python3 -B -m unittest discover -s docs/benchmarks/grouped-reads` for the
 cache-regime classification checks.
 
-Both read methods pin the same snapshot; a query starts after construction
-of the key list, and its timer stops when the complete result vector returns.
+Both read methods pin the same snapshot. Timing starts after construction
+of the key list and stops when the complete result vector returns.
 Every value is then checked against its key and all pins released together.
+A caller that releases a scalar pin immediately after decoding it has a
+different retention pattern from this all-results workload.
 `peak_pin_bytes` charges each distinct returned SST allocation once, using its
 buffer capacity. The fixture budget of 143,360 bytes covers the returned
 allocations for this 128-byte value, 4 KiB block workload. Reader scratch,
