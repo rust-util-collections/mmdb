@@ -112,7 +112,8 @@ fn rss_kib(field: &str) -> Option<u64> {
 fn main() {
     let mode = env::args()
         .nth(1)
-        .expect("expected mixed, memory, or reopen");
+        .filter(|arg| arg != "--bench")
+        .unwrap_or_else(|| "mixed".to_owned());
     let config = Config::load();
     if mode == "prepare-reopen" {
         let dir = env::args().nth(2).expect("expected fixture directory");

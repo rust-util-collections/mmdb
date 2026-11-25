@@ -27,6 +27,11 @@ rows, flush them and report the initial live set before timing. Scalar writes
 carry 128-byte values. Reported logical write bytes include the key and
 value. WAL and SST compression are separate from filesystem compression.
 The paired driver uses the engine's default uncompressed SST blocks.
+The fixed-buffer sweep brackets alternatives with depth 4 and 16 MiB.
+The equal-envelope sweep brackets alternatives with depth 4 and 6 MiB,
+and holds `(1 + depth) × buffer size` at 30 MiB per member. Each sweep
+calibrates its own offered load. Both use the same process RSS ceiling.
+Separate sampled runs cover every placement and geometry in both sweeps.
 The reopen child writes deterministic rows, syncs the WAL and exits without
 dropping its handle. The parent measures writable open and verifies all rows.
 
@@ -47,7 +52,10 @@ Each compressed JSON-lines record contains the per-run settings, revision-
 specific binary digest in the header, success/rejection counts, outstanding
 work at the halfway point and at the end of the offered schedule, latencies
 and memory/LSM measurements. Each trial drains its trace. Interpret p99 on
-a per-run basis and review each class's sample count. TLS counters belong
+a per-run basis. Classes below 10,000 successes are labeled
+`p99_qualified=false` and only their completion, throughput and stage
+measurements are used for decisions. Service time starts after preparing
+the key or batch. Arrival-to-ack also includes preparation and any backlog. TLS counters belong
 to the worker executing a stage. A follower's wait overlaps time spent in
 another worker's WAL and apply stages. RSS includes the benchmark driver,
 preload and temporary allocations. [Decision protocol](../../proposals/mmdb-v5-execution-plan.md#4-measure-the-limiting-engine-operation)

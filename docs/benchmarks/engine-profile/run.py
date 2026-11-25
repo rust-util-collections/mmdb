@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import random
 import re
+import shutil
 import subprocess
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -84,31 +85,38 @@ def rate(record):
 def memory(out):
     # First vary queue depth at fixed buffer size, then hold the nominal
     # (1+depth)*buffer envelope at 30 MiB per member with integer MiB buffers.
-    variants = [(4,16), (1,16), (2,16), (1,15), (2,10), (4,6)]
+    sweeps = {"buffer": [(4, 16), (1, 16), (2, 16)],
+              "envelope": [(4, 6), (1, 15), (2, 10)]}
     controls = {}
-    for placement in ["hot", "all"]:
-        fixed = {"PLACEMENT": placement, "POOL_MIB": 256, "BATCH_ENTRIES": 32}
-        base = {"BUFFER_MIB": 16, "IMMUTABLES": 4, **fixed}
-        controls[placement] = (fixed, rate(trial(out, "memory", "calibrate", "q4-b16", base)))
+    for sweep, variants in sweeps.items():
+        if sweep == "envelope":
+            assert {(q + 1) * b for q, b in variants} == {30}
+        q, b = variants[0]
+        for placement in ["hot", "all"]:
+            fixed = {"PLACEMENT": placement, "POOL_MIB": 256, "BATCH_ENTRIES": 32}
+            base = {"BUFFER_MIB": b, "IMMUTABLES": q, **fixed}
+            calibration = trial(out, "memory", "calibrate-" + sweep, placement, base)
+            controls[sweep, placement] = fixed, rate(calibration)
     for i in range(1, args.rounds + 1):
-        # One A/A pair per placement/load block. Reuse the bracketing control
-        # as the paired reference for all candidate sizes in that block.
-        blocks = list(itertools.product(controls, ["paced","saturation"]))
+        # Reuse bracketing controls only within the same sweep, layout and load.
+        blocks = list(itertools.product(controls, ["paced", "saturation"]))
         rng.shuffle(blocks)
-        for placement, load in blocks:
-            fixed, offered = controls[placement]
+        for (sweep, placement), load in blocks:
+            fixed, offered = controls[sweep, placement]
             fixed = {**fixed, "RATE": offered if load == "paced" else 0}
-            case = f"{placement}-{load}"
-            variants_in_order = variants[1:]
-            rng.shuffle(variants_in_order)
-            arms = [("A1",4,16)] + [(f"q{q}-b{b}",q,b) for q,b in variants_in_order] + [("A2",4,16)]
+            case = f"{sweep}-{placement}-{load}"
+            (cq, cb), *variants = sweeps[sweep]
+            rng.shuffle(variants)
+            arms = [("A1", cq, cb)] + [(f"q{q}-b{b}", q, b) for q, b in variants] + [("A2", cq, cb)]
             if i % 2 == 0:
                 arms.reverse()
-            for arm,q,b in arms:
-                trial(out, "memory", case, arm, {**fixed,"BUFFER_MIB":b,"IMMUTABLES":q}, i)
-        print("memory round",i,flush=True)
-    for placement,(fixed,offered) in controls.items():
-        trial(out,"memory","gauge-sample","q4-b16",{**fixed,"RATE":offered,"SAMPLE":"true"})
+            for arm, q, b in arms:
+                trial(out, "memory", case, arm, {**fixed, "BUFFER_MIB": b, "IMMUTABLES": q}, i)
+        print("memory round", i, flush=True)
+    for (sweep, placement), (fixed, offered) in controls.items():
+        for q, b in sweeps[sweep]:
+            trial(out, "memory", "gauge-" + sweep + "-" + placement, f"q{q}-b{b}",
+                  {**fixed, "RATE": offered, "SAMPLE": "true", "BUFFER_MIB": b, "IMMUTABLES": q})
 
 
 def mixed(out):
@@ -160,5 +168,8 @@ with gzip.open(args.output,"xt") as output:
     fs = subprocess.check_output(["findmnt","-T",str(args.tmpdir),"-no","SOURCE,FSTYPE,OPTIONS"],text=True).strip()
     meta = {"suite":args.suite,"cpus":args.cpus,"platform":platform.platform(),
             "fs":fs,"binary_sha256":{k:hashlib.sha256(p.read_bytes()).hexdigest() for k,p in binaries.items()}}
+    if shutil.which("btrfs") and "btrfs" in fs:
+        meta["directory_compression"] = subprocess.check_output(
+            ["btrfs", "property", "get", str(args.tmpdir), "compression"], text=True).strip()
     output.write(json.dumps({"metadata":meta})+"\n")
     {"memory":memory,"mixed":mixed,"handoff":handoff,"reopen":reopen}[args.suite](output)

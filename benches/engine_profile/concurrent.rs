@@ -142,12 +142,14 @@ fn run_stream(
         {
             thread::sleep(delay);
         }
-        let begin = Instant::now();
+        let dispatch = Instant::now();
+        let begin;
         let suffix = mix(i as u64 ^ config.seed) as usize % KEYS;
         let k = key(s.prefix, suffix);
         let result = match s.operation {
             Operation::SmallPut => {
                 let offset = suffix % slots * 256;
+                begin = Instant::now();
                 db.put_with_options(&opts, &k, &corpus[offset..offset + 128])
             }
             Operation::Batch => {
@@ -157,9 +159,11 @@ fn run_stream(
                     let offset = (j + suffix) % slots * 256;
                     batch.put(&k, &corpus[offset..offset + 256]);
                 }
+                begin = Instant::now();
                 db.write_with_options(&opts, batch)
             }
             Operation::Read | Operation::FreshSnapshot | Operation::HeldSnapshot => {
+                begin = Instant::now();
                 let v = match &held {
                     Some(view) => view.get_pinned(&k),
                     None if s.operation == Operation::FreshSnapshot => db.snapshot().get_pinned(&k),
@@ -178,7 +182,7 @@ fn run_stream(
         samples.rows.push(Sample {
             service_ns: service,
             latency_ns: if s.period.is_zero() {
-                service
+                nanos(end.duration_since(dispatch))
             } else {
                 nanos(end.duration_since(scheduled))
             },
@@ -361,13 +365,14 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         }
         let (_, svc) = print_percentiles(&mut times);
         println!(
-            "class op={op:?} offered={} completed={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} outstanding_half={} outstanding_end={}",
+            "class op={op:?} offered={} completed={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} p99_qualified={} outstanding_half={} outstanding_end={}",
             all.offered,
             all.rows.len(),
             all.rejected,
             all.bytes,
             all.bytes as f64 / wall,
             all.rows.len() as f64 / wall,
+            all.rows.len() >= 10_000,
             all.outstanding_half,
             all.outstanding_end
         );
