@@ -32,3 +32,5 @@ optimizations in the tool. Before adding state, locking, or branches to the
 engine for maintenance work, establish a measurable benefit to normal
 operations. If cleanup holds a writer lock or retains a growing queue,
 measure that foreground impact as part of the core path.
+
+For bounded point reads, keep the scalar and grouped controls on the same snapshot and charge the same lifetime for returned pins. Compare full-request p99 across the same input trace and qualify device traffic separately. [Grouped-read evidence](../benchmarks/grouped-reads/README.md)

@@ -27,7 +27,7 @@ to unsupported architectures under `Won't Fix`.
 | Public operations, errors, defaults | [Usage guide](../usage.md), public rustdoc on the items re-exported by `src/lib.rs`, and the corresponding API tests |
 | Read, write, recovery, format, or resource behavior | [Storage architecture](../architecture.md), the subsystem implementation and its tests |
 | Store and caller migration | [Migration guide](../migration.md), `tools/v4-export/src/main.rs` and its golden-store tests |
-| Engine performance and diagnostic changes | [Engine workloads](../benchmarks/engine-profile/), [L0 trial and disposition](../benchmarks/l0-profile/), and [performance priorities](pragmatic-engineering.md#performance-priorities). Match revision, feature flags, load and counter scope. |
+| Engine performance and diagnostic changes | [Engine workloads](../benchmarks/engine-profile/), [L0 trial and disposition](../benchmarks/l0-profile/), [grouped read trials](../benchmarks/grouped-reads/), and [performance priorities](pragmatic-engineering.md#performance-priorities). Match revision, feature flags, load and counter scope. |
 | Historical measurements or proposed designs | [Design records](../proposals/) and their cited revisions. Use the current implementation to establish what shipped |
 | Skill scope, outputs, and validation | [Project guide](../../AGENTS.md#skills), the four skill entry points and their `agents/openai.yaml`, [workflow policy](workflow-policy.md) and [commit protocol](commit-protocol.md) |
 

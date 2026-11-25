@@ -8,10 +8,12 @@ fmt:
 
 lint:
 	cargo clippy --lib -- -D warnings
+	cargo clippy --lib --features bench-metrics -- -D warnings
 	cargo clippy --all-targets -- -D warnings
 	cargo clippy --all-targets --features bench-metrics -- -D warnings
 	cargo clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features bench-metrics
 
 check:
 	cargo check --all-targets

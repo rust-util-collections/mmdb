@@ -93,10 +93,12 @@ cargo +stable check --all-targets
 cargo +stable check --benches --features bench-metrics
 cargo +stable check --manifest-path tools/v4-export/Cargo.toml --all-targets
 cargo +stable clippy --lib -- -D warnings
+cargo +stable clippy --lib --features bench-metrics -- -D warnings
 cargo +stable clippy --all-targets -- -D warnings
 cargo +stable clippy --all-targets --features bench-metrics -- -D warnings
 cargo +stable clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
+RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps --features bench-metrics
 cargo +stable test --lib
 cargo +stable test --lib --features bench-metrics
 cargo +stable test --doc
@@ -115,8 +117,9 @@ CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml
 Notes on gate execution:
 
 - The default-feature checks exercise the shipped hot paths. The additional
-  Clippy and lib-test runs compile the feature-gated benchmark and verify the
-  profiling counters. Timed trials belong to performance investigations.
+  library-only Clippy and rustdoc runs cover diagnostic exports without
+  dev-dependencies. All-target Clippy and library tests also cover the
+  benchmark targets and their counters. Timed trials belong to performance investigations.
 - CI runs correctness tests on x86_64 and AArch64 Linux. Distinguish a native
   execution, an emulated execution, and a cross-compile in the validation report.
 - Exclude `tests/scale_profile.rs` and `--release`.
