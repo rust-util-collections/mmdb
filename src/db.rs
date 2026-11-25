@@ -1257,9 +1257,9 @@ impl DB {
                     // Helper: set background error and log it.
                     let set_error = |msg: String| {
                         tracing::error!("{}", msg);
-                        bg_flush_queue.fail(Error::background(msg.clone()));
-                        *bg_error_msg.lock() = Some(msg);
+                        *bg_error_msg.lock() = Some(msg.clone());
                         bg_has_error.store(true, Ordering::Release);
+                        bg_flush_queue.fail(Error::background(msg));
                     };
 
                     let mut retry_l0 = false;
@@ -2756,9 +2756,9 @@ impl DB {
     /// Record a background error, setting the fast-path flag and the detailed message.
     /// All subsequent `check_usable()` calls will return this error.
     fn set_bg_error(&self, msg: String) {
-        self.flush_queue.fail(Error::background(msg.clone()));
-        *self.read.bg_error.lock() = Some(msg);
+        *self.read.bg_error.lock() = Some(msg.clone());
         self.read.has_bg_error.store(true, Ordering::Release);
+        self.flush_queue.fail(Error::background(msg));
     }
 
     fn check_writable(&self) -> Result<()> {

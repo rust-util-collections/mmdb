@@ -17,12 +17,19 @@ pub(super) struct FlushQueue {
     changed: Condvar,
     #[cfg(test)]
     before_build: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    on_fail: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl FlushQueue {
     #[cfg(test)]
     pub(super) fn on_next_build(&self, hook: impl FnOnce() + Send + 'static) {
         *self.before_build.lock() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn on_next_fail(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.on_fail.lock() = Some(Box::new(hook));
     }
 
     pub(super) fn submit(&self, frozen: FrozenMemtable) -> u64 {
@@ -40,6 +47,10 @@ impl FlushQueue {
     pub(super) fn fail(&self, error: Error) {
         self.progress.lock().error.get_or_insert(error);
         self.changed.notify_all();
+        #[cfg(test)]
+        if let Some(hook) = self.on_fail.lock().take() {
+            hook();
+        }
     }
 
     pub(super) fn check_capacity(&self, limit: usize, no_slowdown: bool) -> Result<()> {
@@ -656,6 +667,47 @@ mod tests {
         assert_eq!(
             reopened.get(b"committed").unwrap().as_deref(),
             Some(payload.as_slice())
+        );
+    }
+
+    #[test]
+    fn bg_error_is_published_before_waking_flush_queue_waiters() {
+        // 1. Foreground DB::set_bg_error path.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DB::open(options(), dir.path()).unwrap());
+        db.put(b"k", b"v").unwrap();
+        let db_check = db.clone();
+        let (tx, rx) = mpsc::channel();
+        db.flush_queue.on_next_fail(move || {
+            let _ = tx.send(db_check.get(b"k").map_err(|e| e.kind()));
+        });
+        db.set_bg_error("simulated foreground error".to_string());
+        assert_eq!(rx.recv().unwrap(), Err(ErrorKind::Background));
+
+        // 2. Background compaction worker set_error path.
+        let dir2 = tempfile::tempdir().unwrap();
+        let opts2 = DbOptions::default()
+            .with_write_buffer_size(8 << 10)
+            .with_l0_compaction_trigger(2)
+            .with_pin_l0_first_block_and_warm_index(false);
+        let db2 = Arc::new(DB::open(opts2, dir2.path()).unwrap());
+        db2.put(b"a", b"1").unwrap();
+        db2.flush().unwrap();
+        let sst_num = db2.inner.lock().versions.current().level_files(0)[0]
+            .meta
+            .number;
+        fs::write(dir2.path().join(format!("{sst_num:06}.sst")), b"corrupt").unwrap();
+        let db2_check = db2.clone();
+        let (tx2, rx2) = mpsc::channel();
+        db2.flush_queue.on_next_fail(move || {
+            let _ = tx2.send(db2_check.get(b"a").map_err(|e| e.kind()));
+        });
+        db2.put(b"b", &[2u8; (8 << 10) + 64]).unwrap();
+        db2.flush_queue.wait(db2.flush_queue.target()).unwrap();
+        db2.read.signal_compaction();
+        assert_eq!(
+            rx2.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Err(ErrorKind::Background)
         );
     }
 }
