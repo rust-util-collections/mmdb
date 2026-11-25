@@ -44,6 +44,13 @@ These numbers depend on placement of the cold keys between the historical
 sentinel and the one hot prefix. The two-hot-prefix fixture still includes
 cold L1 files in the gap even with a native fence.
 
+**Prefix-aligned flush files.** A separate bounded-cut experiment retained
+the production full-L0 picker. On the two-hot-prefix fixture, 40 flushes
+produced 80 files instead of 40, and cold logical emissions rose from
+33,423,360 to 45,121,536 bytes. Both arms consumed the same original cold
+L1 files. Keep the existing flush cuts for this workload.
+[Prefix-cut control, results and replay](prefix-cuts/README.md)
+
 ## Workload and counters
 
 - One fresh local DB per process, two levels, eight 8-byte prefixes, 1,024

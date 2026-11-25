@@ -1,0 +1,255 @@
+diff --git a/benches/l0_profile.rs b/benches/l0_profile.rs
+index 346e854..5fd7910 100644
+--- a/benches/l0_profile.rs
++++ b/benches/l0_profile.rs
+@@ -352,8 +352,9 @@ fn main() {
+         "disabled".to_string()
+     };
+     println!(
+-        "flushes={} l0_end={} rewrite_jobs={} multi_target_jobs={} parallel_jobs={} ranges={} peak_ranges={} peak_l0={} trivial_moves={} input_file_bytes={} output_file_bytes={} initial_cold_files={} initial_cold_consumed_bytes={cold_removed} logical_cold_emitted_bytes={cold_logical}",
++        "flushes={} flushed_ssts={} l0_end={} rewrite_jobs={} multi_target_jobs={} parallel_jobs={} ranges={} peak_ranges={} peak_l0={} trivial_moves={} input_file_bytes={} output_file_bytes={} initial_cold_files={} initial_cold_consumed_bytes={cold_removed} logical_cold_emitted_bytes={cold_logical}",
+         property(&db, "stats.flushes_completed"),
++        at_close.flush_output_files,
+         property(&db, "num-files-at-level0"),
+         at_close.rewrite_jobs,
+         at_close.multiple_target_jobs,
+diff --git a/src/compaction/profile.rs b/src/compaction/profile.rs
+index baa9712..63100fd 100644
+--- a/src/compaction/profile.rs
++++ b/src/compaction/profile.rs
+@@ -16,6 +16,8 @@ pub struct L0CompactionProfile {
+     pub input_file_bytes: u64,
+     /// Sum of newly built output file lengths.
+     pub output_file_bytes: u64,
++    /// Number of SST files published through completed flush installations.
++    pub flush_output_files: u64,
+     /// Maximum of the opening L0 file count and later flush MANIFEST installs.
+     pub peak_installed_l0_files: u64,
+     /// All range entries, including a range that subsequently errored.
+diff --git a/src/db.rs b/src/db.rs
+index 03cdc93..69b419d 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -3907,25 +3907,67 @@ impl DB {
+         let mut carry = Vec::new();
+         let mut pending_cut = false;
+         let mut last_uk: Vec<u8> = Vec::new();
+-
+-        for (key, value) in mem.iter_ref() {
+-            let uk_changed = types::user_key(key) != last_uk.as_slice();
+-            if uk_changed {
+-                last_uk.clear();
+-                last_uk.extend_from_slice(types::user_key(key));
++        if mem.is_empty() {
++            return Ok(results);
++        }
++        // Experimental policy: at most one optional prefix cut in uncompressed SSTs,
++        // with at least 32 KiB of point values on both sides. These bytes
++        // are stored verbatim, independent of key-delta encoding and clipped
++        // tombstones. Mandatory metadata cuts retain their existing bounds.
++        const MIN_INPUT_BYTES: usize = 32 << 10;
++        let first_options = make_opts();
++        let prefix_len = first_options.prefix_len;
++        let eligible = prefix_len > 0 && first_options.compression == crate::CompressionType::None;
++        let mut first_options = Some(first_options);
++        let payload = |k: &[u8], v: &[u8]| {
++            if types::InternalKeyRef::new(k).value_type() == ValueType::Value {
++                v.len()
++            } else {
++                0
+             }
+-            if pending_cut
++        };
++        let mut remaining: usize = if eligible && mem.approximate_size() >= 2 * MIN_INPUT_BYTES {
++            mem.iter_ref().map(|(k, v)| payload(k, v)).sum()
++        } else {
++            0
++        };
++        if remaining < 2 * MIN_INPUT_BYTES {
++            remaining = 0;
++        }
++        let mut used_prefix_cut = false;
++        let mut current_input = 0;
++        for (key, value) in mem.iter_ref() {
++            let uk = types::user_key(key);
++            let uk_changed = uk != last_uk.as_slice();
++            let prefix_cut = !used_prefix_cut
++                && current_input >= MIN_INPUT_BYTES
++                && remaining >= MIN_INPUT_BYTES
++                && last_uk[..prefix_len.min(last_uk.len())] != uk[..prefix_len.min(uk.len())];
++            if (pending_cut || prefix_cut)
+                 && uk_changed
+                 && let Some((num, mut b)) = builder.take()
+             {
+-                carry = b.clip_at(types::user_key(key));
++                carry = b.clip_at(uk);
+                 results.push((num, b.finish().ctx()?));
+                 pending_cut = false;
++                used_prefix_cut |= prefix_cut;
++                current_input = 0;
++            }
++            if uk_changed {
++                last_uk.clear();
++                last_uk.extend_from_slice(uk);
++            }
++            if remaining > 0 && !used_prefix_cut {
++                let added = payload(key, value);
++                current_input += added;
++                remaining -= added;
+             }
+             if builder.is_none() {
+                 let num = pending.allocate().ctx()?;
+                 let sst_path = db_path.join(format!("{:06}.sst", num));
+-                let mut output = TableBuilder::new(&sst_path, make_opts()).ctx()?;
++                let mut output =
++                    TableBuilder::new(&sst_path, first_options.take().unwrap_or_else(make_opts))
++                        .ctx()?;
+                 output.start_output(snapshots, mem::take(&mut carry));
+                 builder = Some((num, output));
+             }
+@@ -5607,6 +5649,124 @@ mod tests {
+         });
+     }
+
++    #[test]
++    fn full_l0_claim_selects_the_same_cold_gap_after_disjoint_flushes() {
++        for separate_flushes in [false, true] {
++            let tmp = tempfile::tempdir().unwrap();
++            let options = DbOptions::default()
++                .with_num_levels(2)
++                .with_prefix_len(8)
++                .with_l0_compaction_trigger(usize::MAX);
++            let db = DB::open(options, tmp.path()).unwrap();
++            db.ingest_sorted([(b"cccccccc/cold".as_slice(), b"middle".as_slice())])
++                .unwrap();
++            db.put(b"aaaaaaaa/low", b"left").unwrap();
++            if separate_flushes {
++                db.flush().unwrap();
++            }
++            db.put(b"zzzzzzzz/high", b"right").unwrap();
++            db.flush().unwrap();
++            let inner = db.inner.lock();
++            let version = inner.versions.current();
++            let task = LeveledCompaction::pick_l0_compaction(&version, &HashSet::new()).unwrap();
++            assert_eq!(
++                task.input_files_level.len(),
++                if separate_flushes { 2 } else { 1 }
++            );
++            assert_eq!(task.input_files_next.len(), 1);
++            assert_eq!(
++                types::user_key(&task.input_files_next[0].meta.smallest_key),
++                b"cccccccc/cold"
++            );
++            if separate_flushes {
++                for file in &task.input_files_level {
++                    let lo = types::user_key(&file.meta.smallest_key);
++                    let hi = types::user_key(&file.meta.largest_key);
++                    assert!(hi < b"cccccccc/cold".as_slice() || lo > b"cccccccc/cold".as_slice());
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn one_prefix_cut_preserves_stripes_and_crossing_range_deletion() {
++        fn key(head: u8, n: u32) -> [u8; 12] {
++            let mut key = [head; 12];
++            key[8..].copy_from_slice(&n.to_be_bytes());
++            key
++        }
++        let tmp = tempfile::tempdir().unwrap();
++        let options = DbOptions::default()
++            .with_num_levels(2)
++            .with_prefix_len(8)
++            .with_l0_compaction_trigger(usize::MAX);
++        let db = DB::open(options.clone(), tmp.path()).unwrap();
++        for head in [b'a', b'm', b'z'] {
++            for id in 0..256 {
++                db.put(&key(head, id), &[head; 256]).unwrap();
++            }
++        }
++        let initial = db.snapshot();
++        let lo = key(b'a', 128);
++        let hi = key(b'z', 64);
++        db.delete_range(&lo, &hi).unwrap();
++        let deleted = db.snapshot();
++        let boundary = key(b'm', 0);
++        db.put(&boundary, b"new").unwrap();
++        db.flush().unwrap();
++        let current = db.snapshot();
++
++        let check = |view: &Snapshot<'_>, phase: u8| {
++            let mut expected = Vec::new();
++            for head in [b'a', b'm', b'z'] {
++                for id in 0..256 {
++                    let k = key(head, id);
++                    let value = if phase == 2 && k == boundary {
++                        Some(b"new".to_vec())
++                    } else if phase == 0 || k < lo || k >= hi {
++                        Some(vec![head; 256])
++                    } else {
++                        None
++                    };
++                    assert_eq!(view.get(&k).unwrap(), value);
++                    if let Some(value) = value {
++                        expected.push((k.to_vec(), value));
++                    }
++                }
++            }
++            let mut iter = view.iter().unwrap();
++            assert_eq!(iter.by_ref().collect::<Vec<_>>(), expected);
++            assert!(iter.error().is_none());
++        };
++        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("2"));
++        {
++            let inner = db.inner.lock();
++            let version = inner.versions.current();
++            for file in version.level_files(0) {
++                assert!(file.meta.file_size >= 32 << 10);
++            }
++        }
++        check(&initial, 0);
++        check(&deleted, 1);
++        check(&current, 2);
++        db.compact().unwrap();
++        check(&initial, 0);
++        check(&deleted, 1);
++        check(&current, 2);
++        drop((initial, deleted, current));
++        db.close().unwrap();
++        let db = DB::open(options, tmp.path()).unwrap();
++        check(&db.snapshot(), 2);
++
++        // One large prefix followed by a short tail must stay in one file.
++        for id in 0..256 {
++            db.put(&key(b'a', id), &[1; 256]).unwrap();
++        }
++        db.put(&key(b'z', 0), b"tail").unwrap();
++        db.flush().unwrap();
++        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("1"));
++    }
++
+     fn open_test_db(dir: &Path) -> DB {
+         let opts = DbOptions {
+             create_if_missing: true,
+diff --git a/src/db/flush.rs b/src/db/flush.rs
+index 6056f7a..fea5d2b 100644
+--- a/src/db/flush.rs
++++ b/src/db/flush.rs
+@@ -291,6 +291,8 @@ impl FlushContext {
+         let mut edit = VersionEdit::new();
+         edit.set_log_number(frozen.new_wal_number);
+         edit.set_last_sequence(frozen.last_sequence);
++        #[cfg(feature = "bench-metrics")]
++        let flush_output_files = outputs.len() as u64;
+         for output in outputs {
+             edit.add_file(0, file_metadata(output));
+         }
+@@ -305,6 +307,7 @@ impl FlushContext {
+             #[cfg(feature = "bench-metrics")]
+             {
+                 let mut p = self.stats.l0_profile.lock();
++                p.flush_output_files += flush_output_files;
+                 p.peak_installed_l0_files = p
+                     .peak_installed_l0_files
+                     .max(version.l0_file_count() as u64);
