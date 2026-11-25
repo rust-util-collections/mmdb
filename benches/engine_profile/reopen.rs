@@ -36,13 +36,15 @@ pub(super) fn run(config: &Config, path: &Path) {
     let start = Instant::now();
     let db = DB::open(config.options(&pool), path).unwrap();
     let reopen = start.elapsed();
+    let open_peak_kib = rss_kib("VmHWM:").unwrap_or_default();
+    let open_rss_kib = rss_kib("VmRSS:").unwrap_or_default();
     let mut expected = [0; 128];
     for i in 0..config.operations {
         value(config.seed ^ i as u64, config.entropy, &mut expected);
         assert_eq!(&*db.get_pinned(&key(0, i)).unwrap().unwrap(), &expected);
     }
     println!(
-        "reopen wal_bytes={wal_bytes} rows={} open_us={} peak_kib={}",
+        "reopen wal_bytes={wal_bytes} rows={} open_us={} open_peak_kib={open_peak_kib} open_rss_kib={open_rss_kib} after_verify_peak_kib={}",
         config.operations,
         reopen.as_micros(),
         rss_kib("VmHWM:").unwrap_or_default()

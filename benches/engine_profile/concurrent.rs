@@ -31,6 +31,7 @@ struct Stream {
 struct Sample {
     service_ns: u64,
     latency_ns: u64,
+    issue_delay_ns: u64,
     finish_ns: u64,
 }
 
@@ -135,6 +136,7 @@ fn run_stream(
     barrier.wait();
     barrier.wait();
     let start = *clock.get().unwrap();
+    let mut last_ack = start;
     for i in 0..s.count {
         let scheduled = start + s.period * i as u32;
         if !s.period.is_zero()
@@ -173,6 +175,12 @@ fn run_stream(
             }
         };
         let end = Instant::now();
+        let issue_delay_ns = if s.period.is_zero() {
+            0
+        } else {
+            nanos(dispatch.saturating_duration_since(scheduled.max(last_ack)))
+        };
+        last_ack = end;
         if let Err(error) = result {
             assert_eq!(error.kind(), mmdb::ErrorKind::Busy, "{error}");
             samples.rejected += 1;
@@ -181,6 +189,7 @@ fn run_stream(
         let service = nanos(end.duration_since(begin));
         samples.rows.push(Sample {
             service_ns: service,
+            issue_delay_ns,
             latency_ns: if s.period.is_zero() {
                 nanos(end.duration_since(dispatch))
             } else {
@@ -287,7 +296,7 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
     let streams = streams(config, memory, &placement);
     let barrier = Barrier::new(streams.len() + 1);
     let clock = OnceLock::new();
-    let (runs, peak, mem) = thread::scope(|scope| {
+    let (runs, peak, mem, cpu_ticks) = thread::scope(|scope| {
         let (tx, rx) = mpsc::channel::<()>();
         let sources = (&dbs[..], &*pool);
         let sampler = config.sample.then(|| {
@@ -312,6 +321,7 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
             ));
         }
         barrier.wait();
+        let cpu_before = super::cpu_ticks();
         clock.set(Instant::now()).unwrap();
         barrier.wait();
         let runs: Vec<_> = threads
@@ -321,7 +331,12 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         drop(tx);
         let mem = sampler.map(|t| t.join().unwrap());
         let peak = rss_kib("VmHWM:").unwrap_or_default();
-        (runs, peak, mem)
+        (
+            runs,
+            peak,
+            mem,
+            super::cpu_ticks().saturating_sub(cpu_before),
+        )
     });
     let wall = runs
         .iter()
@@ -333,7 +348,7 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
     let mut by_class: BTreeMap<Operation, Samples> = BTreeMap::new();
     for (op, mut run) in runs {
         #[cfg(feature = "bench-metrics")]
-        println!("stage operation={op:?} {:?}", run.profile);
+        println!("stage leader_stream={op:?} {:?}", run.profile);
         let all = by_class.entry(op).or_default();
         all.offered += run.offered;
         all.rejected += run.rejected;
@@ -344,7 +359,7 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
     }
     let after = sample(&dbs, &pool);
     println!(
-        "run placement={placement} dbs={count} seconds={wall:.6} rss_after_preload_kib={} peak_kib={peak} before_l0={} after_l0={} after_immutables={} flushes={} compactions={} compaction_output_bytes={} instrumented={}",
+        "run placement={placement} dbs={count} cpu_ticks={cpu_ticks} seconds={wall:.6} rss_after_preload_kib={} peak_kib={peak} before_l0={} after_l0={} after_immutables={} flushes={} compactions={} compaction_output_bytes={} instrumented={}",
         before.rss_kib,
         before.l0_files,
         after.l0_files,
@@ -364,8 +379,12 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
             *t = row.service_ns;
         }
         let (_, svc) = print_percentiles(&mut times);
+        for (t, row) in times.iter_mut().zip(&all.rows) {
+            *t = row.issue_delay_ns;
+        }
+        let (_, issue_delay) = print_percentiles(&mut times);
         println!(
-            "class op={op:?} offered={} completed={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} p99_qualified={} outstanding_half={} outstanding_end={}",
+            "class op={op:?} offered={} completed={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} issue_delay_p99_us={issue_delay:.3} p99_qualified={} outstanding_half={} outstanding_end={}",
             all.offered,
             all.rows.len(),
             all.rejected,

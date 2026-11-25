@@ -109,6 +109,22 @@ fn rss_kib(field: &str) -> Option<u64> {
         })
 }
 
+// Linux process user + system clock ticks. Sampling stays outside each request.
+fn cpu_ticks() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0;
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return 0;
+    };
+    fields
+        .split_whitespace()
+        .skip(11)
+        .take(2)
+        .map(|n| n.parse::<u64>().unwrap())
+        .sum()
+}
+
 fn main() {
     let mode = env::args()
         .nth(1)

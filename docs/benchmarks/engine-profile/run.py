@@ -168,6 +168,10 @@ with gzip.open(args.output,"xt") as output:
     fs = subprocess.check_output(["findmnt","-T",str(args.tmpdir),"-no","SOURCE,FSTYPE,OPTIONS"],text=True).strip()
     meta = {"suite":args.suite,"cpus":args.cpus,"platform":platform.platform(),
             "fs":fs,"binary_sha256":{k:hashlib.sha256(p.read_bytes()).hexdigest() for k,p in binaries.items()}}
+    meta["ticks_per_second"] = os.sysconf("SC_CLK_TCK")
+    meta["operations"] = args.ops
+    meta["rounds"] = args.rounds
+    meta["seed"] = args.seed
     if shutil.which("btrfs") and "btrfs" in fs:
         meta["directory_compression"] = subprocess.check_output(
             ["btrfs", "property", "get", str(args.tmpdir), "compression"], text=True).strip()

@@ -55,7 +55,12 @@ and memory/LSM measurements. Each trial drains its trace. Interpret p99 on
 a per-run basis. Classes below 10,000 successes are labeled
 `p99_qualified=false` and only their completion, throughput and stage
 measurements are used for decisions. Service time starts after preparing
-the key or batch. Arrival-to-ack also includes preparation and any backlog. TLS counters belong
+the key or batch. Arrival-to-ack also includes preparation and any backlog.
+The issue-delay percentile measures dispatch after the later of the
+scheduled instant and the previous acknowledgement, exposing wakeup and
+harness overhead. Linux CPU ticks cover the timed worker window. Reopen
+reports resident and peak memory immediately after open and a separate
+peak after verifying all values. TLS counters belong
 to the worker executing a stage. A follower's wait overlaps time spent in
 another worker's WAL and apply stages. RSS includes the benchmark driver,
 preload and temporary allocations. [Decision protocol](../../proposals/mmdb-v5-execution-plan.md#4-measure-the-limiting-engine-operation)
