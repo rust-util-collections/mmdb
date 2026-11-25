@@ -347,8 +347,10 @@ throughput floor. At a fixed 30 MiB nominal write-buffer allowance,
 two immutables with 10 MiB buffers gained 53.19% hot and 9.33% all-active
 saturation throughput against four with 6 MiB buffers. The one-hot
 candidate ended saturation with nine additional L0 files. The
-control-to-control latency variation exceeded the 5% p99 guardrail.
-Four with 6 MiB is the reference under that allowance. The adapter can
+20,000-request repeat found a 5.60% hot p99 regression, with the candidate
+slower in all five pairs. All-active p99 improved by a paired median of
+35.17%, with 73.98% variation between control runs. Four with 6 MiB is the
+reference under that allowance. The adapter can
 retest two with 10 MiB on collection-level traffic. The engine retains its
 existing group-commit and L0 compaction paths. [Engine trial results](../benchmarks/engine-profile/results.md) · [L0 trial results](../benchmarks/l0-profile/README.md)
 
