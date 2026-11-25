@@ -167,8 +167,12 @@ impl FileOffsetsIndex {
             .insert(block_offset);
     }
 
-    /// Eviction-listener path: drop one offset, pruning empty file sets.
-    fn remove(&self, member: u64, file_number: u64, block_offset: u64) {
+    /// Prune the offset when its cache entry leaves the store. Moka also
+    /// notifies on replacement, which leaves the new value at the same key.
+    fn on_removal(&self, &(member, file_number, block_offset): &CacheKey, cause: RemovalCause) {
+        if cause == RemovalCause::Replaced {
+            return;
+        }
         let mut map = self.shards[Self::shard_for(member, file_number)].lock();
         if let Some(set) = map.get_mut(&(member, file_number)) {
             set.remove(&block_offset);
@@ -205,6 +209,25 @@ impl FileOffsetsIndex {
         }
         out
     }
+}
+
+/// Capacity and approximate evictable charge of a whole [`BlockCachePool`].
+///
+/// Each store charges the capacity of an admitted block's byte buffer, with a
+/// minimum charge of one byte. Cache maintenance updates the charged totals
+/// asynchronously. Member-local L0 pins are accounted for by
+/// [`DB::memory_usage`](crate::DB::memory_usage).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct BlockCachePoolUsage {
+    /// Configured capacity in bytes across all segments of the main store.
+    pub segmented_capacity_bytes: u64,
+    /// Configured capacity in bytes of the separate overflow store.
+    pub overflow_capacity_bytes: u64,
+    /// Approximate charge in bytes across all segments of the main store.
+    pub segmented_weighted_bytes: u64,
+    /// Approximate charge in bytes in the overflow store.
+    pub overflow_weighted_bytes: u64,
 }
 
 /// Shared weighted storage for one or more DBs' block caches.
@@ -248,9 +271,8 @@ impl BlockCachePool {
                 value.data.capacity().max(1) as u32
             })
             .eviction_listener(
-                move |key: Arc<CacheKey>, _value: CacheValue, _cause: RemovalCause| {
-                    let (member, file_number, block_offset) = *key;
-                    listener_index.remove(member, file_number, block_offset);
+                move |key: Arc<CacheKey>, _value: CacheValue, cause: RemovalCause| {
+                    listener_index.on_removal(&key, cause);
                 },
             )
             .build();
@@ -261,9 +283,8 @@ impl BlockCachePool {
                 value.data.capacity().max(1) as u32
             })
             .eviction_listener(
-                move |key: Arc<CacheKey>, _value: CacheValue, _cause: RemovalCause| {
-                    let (member, file_number, block_offset) = *key;
-                    overflow_index.remove(member, file_number, block_offset);
+                move |key: Arc<CacheKey>, _value: CacheValue, cause: RemovalCause| {
+                    overflow_index.on_removal(&key, cause);
                 },
             )
             .build();
@@ -302,6 +323,17 @@ impl BlockCachePool {
         self.inner.entry_count() + extra
     }
 
+    /// Sample both evictable stores across every member. Count each pool once
+    /// when accounting for a group of DB handles sharing it.
+    pub fn usage(&self) -> BlockCachePoolUsage {
+        BlockCachePoolUsage {
+            segmented_capacity_bytes: self.capacity_bytes,
+            overflow_capacity_bytes: self.capacity_bytes,
+            segmented_weighted_bytes: self.inner.weighted_size(),
+            overflow_weighted_bytes: self.overflow.weighted_size(),
+        }
+    }
+
     /// Test-only: drain moka's pending maintenance so [`entry_count`](Self::entry_count)
     /// reflects inserts made earlier in the same thread.
     #[cfg(any(test, feature = "test-utils"))]
@@ -317,7 +349,7 @@ impl BlockCachePool {
 /// The member also owns its pinned entries, such as the first data block
 /// of a newly flushed L0 file. See [`insert_pinned`](Self::insert_pinned).
 pub struct BlockCache {
-    pool: Arc<BlockCachePool>,
+    pub(crate) pool: Arc<BlockCachePool>,
     member: u64,
     /// Set once by [`detach`](Self::detach); afterwards the view is a
     /// cache-bypass (misses on read, caches nothing on write). This is
@@ -438,8 +470,8 @@ impl BlockCache {
     ///
     /// Registration and insertion are not atomic: `invalidate_file()` can
     /// clear the index and invalidate the key before insertion completes.
-    /// An older entry's removal callback can also clear a replacement's
-    /// registration. The remaining cache bytes are bounded by LRU capacity
+    /// A concurrent eviction can also race a fresh insertion at the same
+    /// offset. The remaining cache bytes are bounded by LRU capacity
     /// and cannot alias another file because SST file numbers are never
     /// reused. As with detach, invalidation is a cutoff rather than a
     /// barrier against concurrent insertion.
@@ -931,6 +963,15 @@ mod tests {
         assert_eq!(*arc, vec![4]);
         assert!(a.get(1, 0).is_none());
         assert_eq!(a.entry_count(), 0);
+        assert_eq!(
+            pool.usage(),
+            BlockCachePoolUsage {
+                segmented_capacity_bytes: 0,
+                overflow_capacity_bytes: 0,
+                segmented_weighted_bytes: 0,
+                overflow_weighted_bytes: 0,
+            }
+        );
     }
 
     #[test]

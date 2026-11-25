@@ -41,6 +41,64 @@ fn assert_shared_cached_value(db: &DB, key: &[u8], want: &[u8], pool: &BlockCach
 }
 
 #[test]
+fn shared_pool_reports_weighted_charges_and_member_pin_lengths() {
+    let capacity = 8 << 20;
+    let pool = Arc::new(BlockCachePool::new(capacity));
+    let a = pool.attach();
+    let b = pool.attach();
+    let assert_charges = |segmented, overflow| {
+        pool.run_pending_tasks();
+        let usage = pool.usage();
+        assert_eq!(usage.segmented_capacity_bytes, capacity);
+        assert_eq!(usage.overflow_capacity_bytes, capacity);
+        assert_eq!(usage.segmented_weighted_bytes, segmented);
+        assert_eq!(usage.overflow_weighted_bytes, overflow);
+    };
+    assert_charges(0, 0);
+
+    a.insert(1, 0, Vec::new());
+    let mut survivor = Vec::with_capacity(100);
+    survivor.push(7);
+    let survivor_charge = survivor.capacity() as u64;
+    b.insert(1, 0, survivor);
+    assert_charges(1 + survivor_charge, 0);
+    assert!(a.get(1, 0).unwrap().is_empty());
+    assert_eq!(b.get(1, 0).unwrap().as_slice(), &[7]);
+
+    let replacement = vec![8; 18];
+    let replacement_charge = replacement.capacity() as u64;
+    a.insert(1, 0, replacement);
+    assert_charges(replacement_charge + survivor_charge, 0);
+    a.invalidate_file(1);
+    assert_charges(survivor_charge, 0);
+
+    let mut large = Vec::with_capacity(2 << 20);
+    large.push(9);
+    let large_charge = large.capacity() as u64;
+    a.insert(2, 0, vec![5]);
+    assert_charges(1 + survivor_charge, 0);
+    a.insert(2, 0, large);
+    assert_charges(survivor_charge, large_charge);
+    let larger = vec![6; 3 << 20];
+    let larger_charge = larger.capacity() as u64;
+    a.insert(2, 0, larger);
+    let mut pin = Vec::with_capacity(512);
+    pin.extend_from_slice(b"pin");
+    a.insert_pinned(2, 1, pin);
+    b.insert_pinned(2, 1, b"still pinned".to_vec());
+    assert_charges(survivor_charge, larger_charge);
+    assert_eq!(a.pinned_bytes(), 3);
+    assert_eq!(b.pinned_bytes(), 12);
+
+    a.detach();
+    assert_charges(survivor_charge, 0);
+    assert_eq!(a.pinned_bytes(), 0);
+    assert_eq!(b.pinned_bytes(), 12);
+    assert_eq!(b.get(1, 0).unwrap().as_slice(), &[7]);
+    assert_eq!(b.get(2, 1).unwrap().as_slice(), b"still pinned");
+}
+
+#[test]
 fn test_shared_pool_members_never_alias() {
     let pool = Arc::new(BlockCachePool::new(8 * 1024 * 1024));
     let dir_a = tempfile::tempdir().unwrap();
@@ -81,6 +139,9 @@ fn test_shared_pool_close_isolates_members() {
     db_b.put(b"k", b"from-b").unwrap();
     db_a.flush().unwrap();
     db_b.flush().unwrap();
+    assert!(std::ptr::eq(db_a.block_cache_pool(), &*pool));
+    let retained = db_a.get_pinned(b"k").unwrap().unwrap();
+    assert!(db_a.memory_usage().l0_pin_bytes > 0);
     db_a.compact().unwrap();
     db_b.compact().unwrap();
     assert_shared_cached_value(&db_a, b"k", b"from-a", &pool);
@@ -89,7 +150,9 @@ fn test_shared_pool_close_isolates_members() {
     // Closing one member sweeps its pool entries; the survivor keeps
     // working (and re-populates freely).
     db_a.close().unwrap();
+    assert_eq!(db_a.memory_usage().l0_pin_bytes, 0);
     drop(db_a);
+    assert_eq!(&*retained, b"from-a");
     assert_cached_value(&db_b, b"k", b"from-b");
 
     // A NEW member attached after the close gets a fresh id — reopening

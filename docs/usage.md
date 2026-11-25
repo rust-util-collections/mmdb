@@ -100,6 +100,16 @@ delete when reads must observe the deletion immediately.
 it includes unpinned entries across all members plus this member's pins.
 [Maintenance APIs and property names](../src/db.rs)
 
+Use `db.block_cache_pool().usage()` for the **byte** capacity and approximate
+evictable charge of each of the segmented and overflow stores. Sample a shared
+pool once across its DB handles. For each DB, `db.memory_usage()` reports the
+active memtable estimate, immutable table count and byte estimate, and the
+payload bytes in that DB's L0 pin map. After close, the DB-local gauges are
+zero. A caller can still hold bytes through a previously returned
+`PinnedSlice`. Measure process RSS independently to include retained readers,
+allocator overhead and memory outside these gauges.
+[Pool usage](../src/cache/block_cache.rs) · [DB memory usage](../src/db/memory.rs)
+
 ## Errors
 
 Fallible operations return `mmdb::Result<T>`. Match `err.kind()` for

@@ -70,8 +70,8 @@ mod types;
 mod wal;
 
 // ---- Primary API ----
-pub use cache::block_cache::{BlockCache, BlockCachePool};
-pub use db::{ArcSnapshot, DB, Snapshot, SnapshotRef};
+pub use cache::block_cache::{BlockCache, BlockCachePool, BlockCachePoolUsage};
+pub use db::{ArcSnapshot, DB, DbMemoryUsage, Snapshot, SnapshotRef};
 pub use error::{Error, ErrorKind, Result, ResultExt};
 pub use iterator::{BidiIterator, DBIterator};
 pub use options::{

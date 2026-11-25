@@ -3,9 +3,11 @@
 mod directory;
 mod flush;
 mod ingest;
+mod memory;
 mod read;
 mod snapshot;
 use flush::{FlushContext, FlushQueue};
+pub use memory::DbMemoryUsage;
 use read::ReadState;
 use snapshot::NEXT_DB_ID;
 pub use snapshot::{ArcSnapshot, Snapshot, SnapshotRef};

@@ -412,6 +412,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn memory_usage_follows_the_installed_flush_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"first", b"held by the caller").unwrap();
+        let retained = db.get_pinned(b"first").unwrap().unwrap();
+        let initial = db.memory_usage();
+        assert!(initial.active_memtable_bytes > 0);
+        assert_eq!(initial.immutable_memtable_count, 0);
+        assert_eq!(initial.immutable_memtable_bytes, 0);
+        assert_eq!(initial.l0_pin_bytes, 0);
+
+        let (running, release) = pause_next_flush(&db, false);
+        thread::scope(|scope| {
+            let flush = scope.spawn(|| db.flush());
+            running.recv_timeout(Duration::from_secs(2)).unwrap();
+            let parked = db.memory_usage();
+            assert_eq!(parked.active_memtable_bytes, 0);
+            assert_eq!(parked.immutable_memtable_count, 1);
+            assert_eq!(
+                parked.immutable_memtable_bytes,
+                initial.active_memtable_bytes
+            );
+
+            db.put(b"second", b"next generation").unwrap();
+            let active_bytes = db.memory_usage().active_memtable_bytes;
+            assert!(active_bytes > 0);
+            release.send(()).unwrap();
+            flush.join().unwrap().unwrap();
+            let installed = db.memory_usage();
+            assert_eq!(installed.active_memtable_bytes, active_bytes);
+            assert_eq!(installed.immutable_memtable_count, 0);
+            assert_eq!(installed.immutable_memtable_bytes, 0);
+            assert!(installed.l0_pin_bytes > 0);
+        });
+
+        db.close().unwrap();
+        let closed = db.memory_usage();
+        assert_eq!(closed.active_memtable_bytes, 0);
+        assert_eq!(closed.immutable_memtable_count, 0);
+        assert_eq!(closed.immutable_memtable_bytes, 0);
+        assert_eq!(closed.l0_pin_bytes, 0);
+        assert_eq!(&*retained, b"held by the caller");
+    }
+
     fn active_wal(db: &DB) -> PathBuf {
         db.path()
             .join(format!("{:06}.wal", db.inner.lock().wal_number))

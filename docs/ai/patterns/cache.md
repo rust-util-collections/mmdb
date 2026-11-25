@@ -20,11 +20,13 @@ Keys always carry `member_id`; IDs are monotonic and never reused after `detach(
 
 **CA3 Pin snapshots** — `get()` loads immutable pins through `ArcSwap` without `pin_updates`. Insert, unpin, and detach serialize on `pin_updates`, load the latest snapshot under the lock, and publish `entries` + `bytes` atomically. In-flight readers finish via retained `Arc<Vec<u8>>`s (including `PinnedSlice` `LazyValue::BlockRef`).
 
-**CA4 Reverse index & weight bounds** — register the offset before inserting into either store; prune on moka eviction listener + bulk invalidate using identical `shard_for` (`take_member` walks all shards). Allocations whose `capacity() > u32::MAX` bypass insertion and invalidate any prior cached entry at that key so moka `u32` weights never truncate.
+**CA4 Reverse index & weight bounds** — register the offset before insertion. The eviction listener retains the registration on `RemovalCause::Replaced` because the successor occupies that key. On removal it prunes the entry using the same `shard_for` as `take_file`. A detach sweeps all shards. Allocations whose `capacity() > u32::MAX` bypass insertion and invalidate any prior cached entry at that key.
 
 **CA5 Detach** — idempotent (`SeqCst` swap); own member only; clears `PinnedBlocks` under `pin_updates` (re-checked on `insert_pinned`); batches unpinned invalidations before one `run_pending_tasks()`. Afterwards the view is a permanent uncached pass-through.
 
 **CA6 TableReader & TableCache life** — eviction or `TableCache::close()` (`inner.store(None)` → `ErrorKind::DbClosed` on new misses) must not invalidate `Version` or iterator `Arc<TableReader>`s. `prewarm` runs unlocked before `log_and_apply_synced`; authoritative open errors happen inside `VersionSet::open_table`.
+
+**CA7 Memory gauges** — count `BlockCachePool::usage()` once per pool. Each store charges `capacity().max(1)` per admitted buffer. Test stable weighted charges after quiescent cache maintenance. `DB::memory_usage()` reports the member's L0 pin-map payload lengths and the active/immutable memtables in one published view. Caller-held blocks and retired views can outlive cache invalidation and DB close.
 
 ## Accepted races
 
@@ -35,6 +37,7 @@ Unpinned `insert` vs `invalidate_file` / `detach` is a cutoff rather than a barr
 - [ ] Keys include `(member_id, file_number, offset)` and member IDs never reuse
 - [ ] L0 `prepare_first_block_pin` runs unlocked; `unpin_file` runs on every L0 removal/move
 - [ ] Pin entry count and `pinned_bytes` stay exact across replace, unpin, and detach
+- [ ] Same-key replacement followed by invalidate/detach removes the successor's charge while preserving sibling members' data and charges
 - [ ] `u32::try_from(arc.capacity())` overflow invalidates stale key instead of under-weighing
 - [ ] Shard selection + eviction pruning consistent across add/remove/take_file/take_member
 - [ ] `detach()` idempotent, serialized with `insert_pinned`, siblings unaffected

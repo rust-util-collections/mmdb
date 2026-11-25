@@ -91,3 +91,11 @@ recovery retains the replayed entries in memory.
 - **Pins and handles.** With L0 pinning and caching enabled, flush attempts to warm the first index leaf and pin the first data block. Range-deletion-only tables have no data block to pin. Pins are member-local and charged separately. Versions and iterators retain table readers. A caller holding a `PinnedSlice` can retain an entire SST block or memtable after eviction or close.
 
 [SST builder and reader](../src/sst/) · [Bloom probes](../src/sst/filter.rs) · [Block and table caches](../src/cache/) · [Shared-cache tests](../tests/shared_cache.rs)
+
+`BlockCachePool::usage` samples the evictable stores' weighted byte counts,
+which can lag insertions and evictions while cache maintenance runs.
+`DB::memory_usage` samples the active and immutable memtables from one
+`SuperVersion` and reads the member's L0 pin-map payload length separately.
+It takes no writer lock. Flush retires a generation from the reported
+immutable set after durable installation, even if a reader still owns that
+generation. [DB memory gauges](../src/db/memory.rs)
