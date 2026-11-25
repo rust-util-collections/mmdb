@@ -26,6 +26,17 @@ and `grouped-public`.
 python3 -c 'import gzip,json; print(json.load(gzip.open("milestones.json.gz", "rt"))["checkpoints"]["l0"]["reports"]["grok"])'
 ```
 
+## Supplementary review of benchmark evidence tools
+
+Four additional reviews inspected the Python measurement tools and reproduction instructions at `5127665` against `90b220e`. All four received one English brief specific to these tools and worked in separate read-only checkouts. These records supplement the 28 implementation and release reports. The saved binaries and observations are documented with their benchmark results. [Full reports and exact brief](evidence-tools.json.gz) · [Engine profile results](../../../benchmarks/engine-profile/)
+
+| Reviewer | Finding and verification |
+|---|---|
+| Claude Code | A memory-tail run with excessive backlog and low RSS could receive `within-1-GiB`. Commit `83f1b30` sets the decision status to `offered-load-unqualified` when any of the four arms misses the offered load. Measured RSS maxima and the factual budget columns remain available even if the load fails. The grouped-read output now names the Linux read-byte counter explicitly. [Memory status tests](../../../benchmarks/engine-profile/test_summarize.py) · [Grouped output fields](../../../benchmarks/grouped-reads/results/README.md) |
+| Grok Build | Confirmed that gains use the fresh A/B control and noise uses the two independent A/A processes. Commit `452a621` identifies the conditional latency as `linux_read_ge_4kib_p99_us`. The primary p99 includes every request. `linux_read_bytes_per_request` divides by all requests in each A/B arm. Grok also asked about the actual batch width. Commit `83f1b30` verifies emitted logical bytes as well as operation counts. Each complete memory-tail process must report 2,785,280,000 batch bytes for 320,000 batches of 32 entries, 2,880,000 small-put bytes and zero read bytes in these write-payload counters. [Workload and counters](../../../../benches/engine_profile/concurrent.rs) · [Device metrics](../../../benchmarks/grouped-reads/summarize.py) |
+| OpenCode | Its claim that coverage excludes A/A rows was disproved. A synthetic complete cell with a 95.1% qualifying fraction in one A/A arm and 100% in both A/B arms reported `min_io_qualified=0.951` and 4,096 Linux read bytes per request in each A/B arm. Removing one A/B arm made the summarizer reject the cell. [Grouped summarizer](../../../benchmarks/grouped-reads/summarize.py) |
+| agy | Confirmed the 30 MiB envelope, the predeclared per-stream rates of 251 and 1,381, and 20,000 completed small writes and reads in each arm. Recalculation from the integrated grouped-read CSV gives a 37.55% median full-trace p99 reduction across five A/B pairs and a 3.87% largest absolute A/A difference. [Memory-tail driver](../../../benchmarks/engine-profile/run.py) · [Raw integration results](../../../benchmarks/grouped-reads/results/final/integration-release.csv) |
+
 ## Final release review
 
 Four fresh reviews covered the release candidate at `90b220e`, with
