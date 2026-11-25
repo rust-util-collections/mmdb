@@ -14,7 +14,7 @@ use crate::sst::filter::AlignedBytes;
 use crate::sst::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FILTER_FORMAT_BLOCKED_64B,
     FILTER_FORMAT_NAME, FOOTER_SIZE, PREFIX_FILTER_LEN_NAME, RANGE_DEL_BLOCK_NAME, decode_footer,
-    decode_index_value_with_props,
+    decode_index_entry,
 };
 use crate::sst::range::RangeFragment;
 use crate::stats::DbStats;
@@ -28,7 +28,8 @@ type RangeTombstoneEntry = (Vec<u8>, Vec<u8>, SequenceNumber);
 /// reserve enough output file numbers when compacting compressed inputs.
 pub(crate) const MAX_DECOMPRESSED_BLOCK_SIZE: usize = 64 * 1024 * 1024; // 64 MB
 
-/// Parsed index entry: separator key + block handle + optional first key + block properties.
+/// Parsed index entry: separator key + block handle + first key.
+#[cfg(test)]
 pub struct IndexEntry {
     /// Upper bound for this data block, strictly below the following block.
     pub separator_key: Vec<u8>,
@@ -36,11 +37,10 @@ pub struct IndexEntry {
     pub handle: BlockHandle,
     /// First key of the data block for deferred block reads.
     pub first_key: Vec<u8>,
-    /// Block properties collected during SST build.
-    pub properties: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// Shared index entries parsed from the SST index block.
+#[cfg(test)]
 type IndexEntries = Arc<Vec<IndexEntry>>;
 
 /// A first data block read, checksummed, and decompressed by
@@ -48,9 +48,9 @@ type IndexEntries = Arc<Vec<IndexEntry>>;
 /// shared cache by [`TableReader::publish_prepared_pin`] without further I/O.
 pub struct PreparedBlockPin {
     file_number: u64,
-    index_leaf: Option<(u64, Vec<u8>)>,
+    index_leaf: Option<(u64, Block)>,
     offset: u64,
-    data: Vec<u8>,
+    data: Block,
 }
 
 /// Bloom filter data and range-del handle read from SST metaindex.
@@ -335,27 +335,119 @@ impl TableReader {
         Ok(entries)
     }
 
-    fn index_leaf(&self, part: usize, fill_cache: bool) -> Result<IndexEntries> {
-        let Some((sep, handle)) = self.partitions.get(part) else {
-            return Ok(Arc::new(Vec::new()));
-        };
-        let block = Block::new(self.read_block_cached_opt(handle, fill_cache)?)?;
-        let entries = Self::parse_index_entries(&block)?;
-        let Some(last) = entries.last() else {
+    /// Validate all `restart_interval = 1` entries and partition bounds of an SST v2
+    /// index leaf in place with zero heap allocations.
+    fn validate_index_leaf(&self, part: usize, sep: &PartitionKey, block: &Block) -> Result<()> {
+        if block.data_end_offset() == 0 {
             return Err(Error::corruption("empty SST index leaf"));
-        };
-        if !sep.compare_internal(&last.separator_key).is_eq()
-            || (part > 0
+        }
+        let n = block.num_restarts();
+        let mut prev_sep: Option<&[u8]> = None;
+        for i in 0..n {
+            let seg_end = if i + 1 < n {
+                block.restart_point(i + 1) as usize
+            } else {
+                block.data_end_offset()
+            };
+            let (k, v, next_off) = block.decode_restart_entry(i)?;
+            if next_off != seg_end {
+                return Err(Error::corruption(
+                    "multi-entry restart segment in SST index leaf",
+                ));
+            }
+            let d = decode_index_entry(v).ctx()?;
+            decode_internal_key(k)?;
+            decode_internal_key(d.first_key)?;
+            if compare_internal_key(d.first_key, k).is_gt()
+                || prev_sep.is_some_and(|prev| !compare_internal_key(prev, d.first_key).is_lt())
+            {
+                return Err(Error::corruption("unordered SST index entries"));
+            }
+            if i == 0
+                && part > 0
                 && !self.partitions[part - 1]
                     .0
-                    .compare_internal(&entries[0].first_key)
-                    .is_lt())
-        {
-            return Err(Error::corruption(
-                "SST index leaf disagrees with partition bounds",
-            ));
+                    .compare_internal(d.first_key)
+                    .is_lt()
+            {
+                return Err(Error::corruption(
+                    "SST index leaf disagrees with partition bounds",
+                ));
+            }
+            if i + 1 == n && !sep.compare_internal(k).is_eq() {
+                return Err(Error::corruption(
+                    "SST index leaf disagrees with partition bounds",
+                ));
+            }
+            prev_sep = Some(k);
         }
-        Ok(Arc::new(entries))
+        Ok(())
+    }
+
+    /// Load and return a validated `Block` for index partition `part`.
+    /// Warm hits skip both `Block::new` restart scanning and entry/bound validation.
+    pub(super) fn index_leaf_block(&self, part: usize, fill_cache: bool) -> Result<Option<Block>> {
+        let Some((sep, handle)) = self.partitions.get(part) else {
+            return Ok(None);
+        };
+        if let Some(ref cache) = self.block_cache
+            && let Some((raw, validated)) = cache.get_cached_block(self.file_number, handle.offset)
+        {
+            if let Some(ref s) = self.stats {
+                s.record_cache_hit();
+            }
+            let block = match validated {
+                Some((block, true)) => return Ok(Some(block)),
+                Some((block, false)) => block,
+                None => Block::new(raw)?,
+            };
+            self.validate_index_leaf(part, sep, &block)?;
+            if fill_cache {
+                cache.insert_validated_block(self.file_number, handle.offset, &block, true);
+            }
+            return Ok(Some(block));
+        }
+
+        if let Some(ref s) = self.stats
+            && self.block_cache.is_some()
+        {
+            s.record_cache_miss();
+        }
+        let data = Self::read_block_data(&self.file, handle).ctx()?;
+        let block = Block::from_vec(data)?;
+        self.validate_index_leaf(part, sep, &block)?;
+        if fill_cache && let Some(ref cache) = self.block_cache {
+            cache.insert_validated_block(self.file_number, handle.offset, &block, true);
+        }
+        Ok(Some(block))
+    }
+
+    /// Binary-search a validated `restart_interval = 1` index leaf in place:
+    /// returns the first index `i` where `separator_key >= target`, or `num_restarts`.
+    #[inline]
+    pub(super) fn partition_point_index_leaf(block: &Block, target: &[u8]) -> u32 {
+        let mut left = 0u32;
+        let mut right = block.num_restarts();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let (sep, _, _) = block
+                .decode_restart_entry(mid)
+                .expect("validated index leaf entry");
+            if compare_internal_key(sep, target).is_lt() {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    }
+
+    #[cfg(test)]
+    fn index_leaf(&self, part: usize, fill_cache: bool) -> Result<IndexEntries> {
+        let Some(block) = self.index_leaf_block(part, fill_cache)? else {
+            return Ok(Arc::new(Vec::new()));
+        };
+        Ok(Arc::new(Self::parse_index_entries(&block)?))
     }
 
     #[cfg(test)]
@@ -368,11 +460,12 @@ impl TableReader {
     }
 
     /// Parse index entries from the index block, propagating decode errors.
+    #[cfg(test)]
     fn parse_index_entries(index_block: &Block) -> Result<Vec<IndexEntry>> {
         let mut iter = index_block.iter();
         let mut entries = Vec::new();
         for (k, v) in &mut iter {
-            let d = decode_index_value_with_props(&v).ctx()?;
+            let d = decode_index_entry(&v).ctx()?;
             decode_internal_key(&k)?;
             decode_internal_key(d.first_key)?;
             if compare_internal_key(d.first_key, &k).is_gt()
@@ -386,11 +479,6 @@ impl TableReader {
                 separator_key: k,
                 handle: d.handle,
                 first_key: d.first_key.to_vec(),
-                properties: d
-                    .properties
-                    .into_iter()
-                    .map(|(n, p)| (n.to_vec(), p.to_vec()))
-                    .collect(),
             });
         }
         // A corrupt index entry makes the iterator stop early with the error
@@ -468,8 +556,7 @@ impl TableReader {
             None => return Ok(None),
         };
 
-        let block_data = self.read_block_cached_opt(&handle, fill_cache).ctx()?;
-        let block = Block::new(block_data).ctx()?;
+        let block = self.read_block_cached_block(&handle, fill_cache).ctx()?;
 
         let mut encoded_ikey = SmallVec::<[u8; 128]>::new();
         match block
@@ -530,7 +617,7 @@ impl TableReader {
         else {
             return Ok(0);
         };
-        let block = Block::new(self.read_block_cached_opt(&part.handle, fill_cache)?)?;
+        let block = self.read_block_cached_block(&part.handle, fill_cache)?;
         // A tombstone's end is exclusive, so seek the first strictly greater end.
         let cmp = |end: &[u8], key: &[u8]| {
             if end <= key {
@@ -621,7 +708,7 @@ impl TableReader {
             if upper.is_some_and(|hi| part.begin.as_slice() >= hi) {
                 break;
             }
-            let block = Block::new(self.read_block_cached_opt(&part.handle, fill_cache)?)?;
+            let block = self.read_block_cached_block(&part.handle, fill_cache)?;
             let mut iter = block.iter();
             let mut prev_end = part.begin.as_slice().to_vec();
             for (end, v) in &mut iter {
@@ -680,30 +767,15 @@ impl TableReader {
         let part = self
             .partitions
             .partition_point(|(k, _)| k.compare_internal(key).is_lt());
-        let Some((sep, handle)) = self.partitions.get(part) else {
+        let Some(block) = self.index_leaf_block(part, fill_cache)? else {
             return Ok(None);
         };
-        let block = Block::new(self.read_block_cached_opt(handle, fill_cache)?)?;
-        let mut found = smallvec::SmallVec::<[u8; 128]>::new();
-        let Some(v) = block.seek_by_reuse(key, compare_internal_key, &mut found)? else {
+        let idx = Self::partition_point_index_leaf(&block, key);
+        if idx >= block.num_restarts() {
             return Err(Error::corruption("index leaf ends before its separator"));
-        };
-        let entry = decode_index_value_with_props(v)?;
-        decode_internal_key(&found)?;
-        decode_internal_key(entry.first_key)?;
-        if compare_internal_key(entry.first_key, &found).is_gt()
-            || sep.compare_internal(&found).is_lt()
-            || (part > 0
-                && !self.partitions[part - 1]
-                    .0
-                    .compare_internal(entry.first_key)
-                    .is_lt())
-        {
-            return Err(Error::corruption(
-                "SST index leaf disagrees with partition bounds",
-            ));
         }
-        Ok(Some(entry.handle))
+        let (_, v, _) = block.decode_restart_entry(idx)?;
+        Ok(Some(decode_index_entry(v)?.handle))
     }
 
     fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
@@ -903,23 +975,26 @@ impl TableReader {
         self.read_block_cached_opt(handle, true)
     }
 
-    /// Read and decompress a block on a cache miss. When
-    /// `fill_cache` is false a cache miss does **not** insert the block into
-    /// the block cache. Used by scans (user iterators with
-    /// `ReadOptions::fill_cache == false`, and compaction reads) to avoid
-    /// evicting hot point-read blocks.
-    fn read_block_cached_opt(
+    /// Read and validate a `Block`, skipping `Block::new` restart scanning on cache hits.
+    pub(super) fn read_block_cached_block(
         &self,
         handle: &BlockHandle,
         fill_cache: bool,
-    ) -> Result<Arc<Vec<u8>>> {
+    ) -> Result<Block> {
         if let Some(ref cache) = self.block_cache
-            && let Some(cached) = cache.get(self.file_number, handle.offset)
+            && let Some((raw, validated)) = cache.get_cached_block(self.file_number, handle.offset)
         {
             if let Some(ref s) = self.stats {
                 s.record_cache_hit();
             }
-            return Ok(cached);
+            if let Some((block, _)) = validated {
+                return Ok(block);
+            }
+            let block = Block::new(raw)?;
+            if fill_cache {
+                cache.insert_validated_block(self.file_number, handle.offset, &block, false);
+            }
+            return Ok(block);
         }
 
         if let Some(ref s) = self.stats
@@ -929,12 +1004,26 @@ impl TableReader {
         }
 
         let data = Self::read_block_data(&self.file, handle).ctx()?;
+        let block = Block::from_vec(data)?;
 
         if fill_cache && let Some(ref cache) = self.block_cache {
-            return Ok(cache.insert(self.file_number, handle.offset, data));
+            cache.insert_validated_block(self.file_number, handle.offset, &block, false);
         }
 
-        Ok(Arc::new(data))
+        Ok(block)
+    }
+
+    /// Read and decompress a block on a cache miss (test helper).
+    #[cfg(test)]
+    fn read_block_cached_opt(
+        &self,
+        handle: &BlockHandle,
+        fill_cache: bool,
+    ) -> Result<Arc<Vec<u8>>> {
+        Ok(self
+            .read_block_cached_block(handle, fill_cache)?
+            .data_arc()
+            .clone())
     }
 
     /// Read, checksum-verify, and decompress this file's first data block
@@ -951,31 +1040,44 @@ impl TableReader {
         if !cache.is_enabled() {
             return None;
         }
-        let leaf = self.partitions.first()?.1;
-        let cached = cache.get(self.file_number, leaf.offset);
-        let warm = cached.is_none();
-        let bytes = match cached {
-            Some(bytes) => bytes,
-            None => Arc::new(Self::read_block_data(&self.file, &leaf).ok()?),
+        let (sep, leaf) = self.partitions.first()?;
+        let cached = cache.get_cached_block(self.file_number, leaf.offset);
+        let mut warm = false;
+        let leaf_block = match cached {
+            Some((_, Some((block, true)))) => block,
+            Some((_, Some((block, false)))) => {
+                warm = true;
+                self.validate_index_leaf(0, sep, &block).ok()?;
+                block
+            }
+            Some((raw, None)) => {
+                warm = true;
+                let block = Block::new(raw).ok()?;
+                self.validate_index_leaf(0, sep, &block).ok()?;
+                block
+            }
+            None => {
+                warm = true;
+                let bytes = Self::read_block_data(&self.file, leaf).ok()?;
+                let block = Block::from_vec(bytes).ok()?;
+                self.validate_index_leaf(0, sep, &block).ok()?;
+                block
+            }
         };
         let handle = {
-            let block = Block::new(bytes.clone()).ok()?;
-            let (_, value) = block.iter().next()?;
-            decode_index_value_with_props(&value).ok()?.handle
+            let (_, value, _) = leaf_block.decode_restart_entry(0).ok()?;
+            decode_index_entry(value).ok()?.handle
         };
         if cache.get(self.file_number, handle.offset).is_some() {
             return None;
         }
-        let index_leaf = if warm {
-            Some((leaf.offset, Arc::into_inner(bytes)?))
-        } else {
-            None
-        };
+        let index_leaf = warm.then_some((leaf.offset, leaf_block));
         #[cfg(test)]
         if let Some(hook) = PREPARE_FIRST_BLOCK_PIN_HOOK.with(|h| h.borrow_mut().take()) {
             hook();
         }
-        let data = Self::read_block_data(&self.file, &handle).ok()?;
+        let raw_data = Self::read_block_data(&self.file, &handle).ok()?;
+        let data = Block::from_vec(raw_data).ok()?;
         Some(PreparedBlockPin {
             file_number: self.file_number,
             offset: handle.offset,
@@ -996,10 +1098,14 @@ impl TableReader {
             return;
         }
         if let Some(ref cache) = self.block_cache {
-            if let Some((offset, bytes)) = prepared.index_leaf {
-                cache.insert(prepared.file_number, offset, bytes);
+            if let Some((offset, leaf_block)) = prepared.index_leaf {
+                cache.insert_validated_block(prepared.file_number, offset, &leaf_block, true);
             }
-            cache.insert_pinned(prepared.file_number, prepared.offset, prepared.data);
+            cache.insert_pinned_validated_block(
+                prepared.file_number,
+                prepared.offset,
+                &prepared.data,
+            );
         }
     }
 
@@ -1528,5 +1634,62 @@ mod tests {
                 Some(ErrorKind::Corruption)
             );
         }
+    }
+
+    #[test]
+    fn warm_table_iterator_seek_allocates_zero_index_heap_bytes() {
+        use crate::cache::block_cache::BlockCache;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::TableIterator;
+        use crate::types::{InternalKey, ValueType};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_alloc_seek.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 128,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..500u32 {
+            let uk = format!("user_key_{i:06}");
+            let ik = InternalKey::new(uk.as_bytes(), 7, ValueType::Value);
+            builder.add(ik.as_bytes(), &[b'v'; 64]).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let cache = Arc::new(BlockCache::new(16 * 1024 * 1024));
+        let reader = Arc::new(TableReader::open_with_all(&path, 1, Some(cache), None).unwrap());
+        // Warm index leaf and target data block into BlockCache, and pre-size
+        // the iterator's reusable cursor key buffer on one initial seek.
+        let warm_target = InternalKey::new(b"user_key_000250", 10, ValueType::Value);
+        let mut iter = TableIterator::new(Arc::clone(&reader));
+        iter.seek(warm_target.as_bytes());
+        let _ = iter.next().unwrap();
+
+        // A fresh TableIterator open + mid-block seek on warm cache must not
+        // heap-parse the ~500-entry index leaf (previously 3*500 + 1 Vec allocs).
+        let mid_target = InternalKey::new(b"user_key_000251", 10, ValueType::Value);
+        let (_, fresh_iter_alloc) = crate::test_alloc::count_allocated(|| {
+            let mut fresh = TableIterator::new(Arc::clone(&reader));
+            fresh.seek(mid_target.as_bytes());
+            std::hint::black_box(fresh);
+        });
+        assert!(
+            fresh_iter_alloc <= 256,
+            "fresh warm TableIterator::seek allocated {fresh_iter_alloc} bytes (expected <= 256B cursor buffer)"
+        );
+
+        // Re-seeking an already-warmed TableIterator allocates 0 heap bytes.
+        let (_, reseek_alloc) = crate::test_alloc::count_allocated(|| {
+            iter.seek(mid_target.as_bytes());
+        });
+        assert_eq!(
+            reseek_alloc, 0,
+            "warm TableIterator re-seek allocated {reseek_alloc} bytes"
+        );
     }
 }

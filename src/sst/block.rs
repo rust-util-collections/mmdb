@@ -64,6 +64,7 @@ pub fn encode_varint_vec(buf: &mut Vec<u8>, value: u32) {
 }
 
 /// A read-only view of a data block.
+#[derive(Clone)]
 pub struct Block {
     data: Arc<Vec<u8>>,
     restart_offset: usize,
@@ -71,6 +72,20 @@ pub struct Block {
 }
 
 impl Block {
+    /// Construct a `Block` whose restart table was already validated on cache admission.
+    #[inline]
+    pub(crate) fn from_validated(
+        data: Arc<Vec<u8>>,
+        restart_offset: usize,
+        num_restarts: u32,
+    ) -> Self {
+        Self {
+            data,
+            restart_offset,
+            num_restarts,
+        }
+    }
+
     /// Parse a data block from shared (Arc) raw bytes — zero-copy from block cache.
     pub fn new(data: Arc<Vec<u8>>) -> Result<Self> {
         if data.len() < 4 {
@@ -121,9 +136,42 @@ impl Block {
     }
 
     /// Get the restart point offset at index `i`.
-    fn restart_point(&self, i: u32) -> u32 {
+    #[inline]
+    pub(crate) fn restart_point(&self, i: u32) -> u32 {
         let offset = self.restart_offset + (i as usize) * 4;
         u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap())
+    }
+
+    /// Decode the unshared `(key, value, next_offset)` directly at restart point `i`
+    /// with zero key/value copies. At every restart point `shared_len` must be 0.
+    #[inline]
+    pub(crate) fn decode_restart_entry(&self, i: u32) -> Result<(&[u8], &[u8], usize)> {
+        let offset = self.restart_point(i) as usize;
+        let data = self.entry_data();
+        if offset >= data.len() {
+            return Err(Error::corruption("entry offset past block data"));
+        }
+        let (shared_len, n1) = decode_varint(&data[offset..])?;
+        if shared_len != 0 {
+            return Err(Error::corruption(
+                "shared prefix exceeds previous key length",
+            ));
+        }
+        let pos = offset + n1;
+        let (unshared_len, n2) = decode_varint(&data[pos..])?;
+        let pos = pos + n2;
+        let (value_len, n3) = decode_varint(&data[pos..])?;
+        let key_start = pos + n3;
+        let key_end = key_start
+            .checked_add(unshared_len as usize)
+            .ok_or_else(|| Error::corruption("entry key length overflow"))?;
+        let val_end = key_end
+            .checked_add(value_len as usize)
+            .ok_or_else(|| Error::corruption("entry value length overflow"))?;
+        if val_end > data.len() {
+            return Err(Error::corruption("block entry truncated"));
+        }
+        Ok((&data[key_start..key_end], &data[key_end..val_end], val_end))
     }
 
     /// Entry bytes only; excludes the restart array and restart count.
@@ -181,11 +229,8 @@ impl Block {
 
         while left < right {
             let mid = left + (right - left) / 2;
-            let rp = self.restart_point(mid) as usize;
-
-            key.replace_suffix(0, &[]);
-            decode_entry_reuse(self.entry_data(), rp, key)?;
-            if compare(key, target) == Ordering::Less {
+            let (rk, _, _) = self.decode_restart_entry(mid)?;
+            if compare(rk, target) == Ordering::Less {
                 left = mid + 1;
             } else {
                 right = mid;
@@ -226,16 +271,10 @@ impl Block {
             return Ok(None);
         }
         let (mut left, mut right) = (0, self.num_restarts);
-        let mut key = Vec::new();
         while left < right {
             let mid = left + (right - left) / 2;
-            key.clear();
-            decode_entry_reuse(
-                self.entry_data(),
-                self.restart_point(mid) as usize,
-                &mut key,
-            )?;
-            if compare(&key, target) == Ordering::Greater {
+            let (rk, _, _) = self.decode_restart_entry(mid)?;
+            if compare(rk, target) == Ordering::Greater {
                 right = mid;
             } else {
                 left = mid + 1;

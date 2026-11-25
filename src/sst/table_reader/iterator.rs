@@ -2,13 +2,22 @@ use std::{cmp::Ordering, sync::Arc};
 
 use crate::error::Result;
 use crate::sst::block::{Block, decode_entry_reuse};
-use crate::sst::format::BlockHandle;
+use crate::sst::format::{BlockHandle, DecodedIndexEntry, decode_index_entry};
 use crate::types::{LazyValue, compare_internal_key, user_key};
 use crate::{Error, options::IterConfig};
 
 pub use crate::sst::format::BLOCK_TRAILER_SIZE;
 
-use super::{IndexEntries, IndexEntry, TableReader};
+use super::TableReader;
+
+#[inline]
+fn index_entry_at(block: &Block, idx: usize) -> (&[u8], DecodedIndexEntry<'_>) {
+    let (sep, val, _) = block
+        .decode_restart_entry(idx as u32)
+        .expect("validated index leaf entry");
+    let entry = decode_index_entry(val).expect("validated index value");
+    (sep, entry)
+}
 
 fn checked_readahead_range(
     first_handle: BlockHandle,
@@ -26,9 +35,10 @@ fn checked_readahead_range(
 
 pub struct TableIterator {
     reader: Arc<TableReader>,
-    /// Cached index entries (shared across all iterators for this table).
-    /// Lazily loaded on first use — `None` until first access.
-    index_entries: Option<IndexEntries>,
+    /// Pre-validated index leaf block (shared zero-copy from `BlockCache`).
+    /// Lazily loaded per partition without heap-parsing `IndexEntry` vectors.
+    index_block: Option<Block>,
+    index_loaded: bool,
     partition: usize,
     /// Current index position (next block to load on forward iteration)
     index_pos: usize,
@@ -83,7 +93,8 @@ impl TableIterator {
     pub fn new(reader: Arc<TableReader>) -> Self {
         Self {
             reader,
-            index_entries: None,
+            index_block: None,
+            index_loaded: false,
             partition: 0,
             index_pos: 0,
             current_block: None,
@@ -125,7 +136,8 @@ impl TableIterator {
     fn select_partition(&mut self, partition: usize) {
         if self.partition != partition {
             self.partition = partition;
-            self.index_entries = None;
+            self.index_block = None;
+            self.index_loaded = false;
             self.prev_block_index = usize::MAX;
             self.index_pos = 0;
         }
@@ -138,19 +150,28 @@ impl TableIterator {
             .partition_point(|(sep, _)| sep.compare_internal(target) == Ordering::Less)
     }
 
-    /// Ensure index entries are loaded. Returns a reference to them.
-    fn ensure_index(&mut self) -> &IndexEntries {
-        if self.index_entries.is_none() {
-            match self.reader.index_leaf(self.partition, self.fill_cache) {
-                Ok(entries) => self.index_entries = Some(entries),
+    /// Ensure the current partition's validated index leaf block is loaded.
+    fn ensure_index(&mut self) {
+        if !self.index_loaded {
+            self.index_loaded = true;
+            match self
+                .reader
+                .index_leaf_block(self.partition, self.fill_cache)
+            {
+                Ok(block) => self.index_block = block,
                 Err(e) => {
                     self.err = Some(e.context("decoding SST index"));
-                    // Store an empty sentinel so we don't retry.
-                    self.index_entries = Some(Arc::new(Vec::new()));
+                    self.index_block = None;
                 }
             }
         }
-        self.index_entries.as_ref().unwrap()
+    }
+
+    #[inline]
+    fn index_len(&self) -> usize {
+        self.index_block
+            .as_ref()
+            .map_or(0, |b| b.num_restarts() as usize)
     }
 
     /// Reset cursor state (called when loading a new block for forward iteration).
@@ -186,41 +207,34 @@ impl TableIterator {
         self.index_pos = usize::MAX;
     }
 
-    fn block_properties_should_skip(&self, entry: &IndexEntry) -> bool {
+    fn block_properties_should_skip(&self, entry: &DecodedIndexEntry<'_>) -> bool {
         if self.config.filters.is_empty() {
             return false;
         }
         self.config.filters.iter().any(|filter| {
             let filter_name = filter.name().as_bytes();
-            entry
-                .properties
-                .iter()
-                .any(|(name, data)| name.as_slice() == filter_name && filter.should_skip(data))
+            entry.any_property(|name, data| name == filter_name && filter.should_skip(data))
         })
     }
 
-    fn block_exceeds_upper_bound(&self, entry: &IndexEntry) -> bool {
+    fn block_exceeds_upper_bound(&self, first_key: &[u8]) -> bool {
         self.config
             .upper
             .as_ref()
-            .is_some_and(|ub| user_key(&entry.first_key) >= ub.as_slice())
+            .is_some_and(|ub| user_key(first_key) >= ub.as_slice())
     }
 
     /// Materialize the deferred block: load the data block for deferred_index_pos.
     fn materialize_deferred_block(&mut self) {
-        if let Some(ref index_entries) = self.index_entries {
-            match self.reader.read_block_cached_opt(
-                &index_entries[self.deferred_index_pos].handle,
-                self.fill_cache,
-            ) {
-                Ok(data) => match Block::new(data) {
-                    Ok(block) => {
-                        self.set_block_for_cursor(block);
-                    }
-                    Err(e) => {
-                        self.err = Some(e.context("block decode error"));
-                    }
-                },
+        if let Some(ref index_block) = self.index_block {
+            let (_, entry) = index_entry_at(index_block, self.deferred_index_pos);
+            match self
+                .reader
+                .read_block_cached_block(&entry.handle, self.fill_cache)
+            {
+                Ok(block) => {
+                    self.set_block_for_cursor(block);
+                }
                 Err(e) => {
                     self.err = Some(e.context("block read error"));
                 }
@@ -291,37 +305,40 @@ impl TableIterator {
         if self.err.is_some() {
             return;
         }
-        let index_entries = self.index_entries.as_ref().unwrap();
-
-        // Quick check: if target > file's largest key, mark exhausted.
-        if let Some(last) = index_entries.last()
-            && compare_internal_key(target, &last.separator_key) == Ordering::Greater
-        {
-            self.index_pos = index_entries.len();
+        let Some(index_block) = self.index_block.clone() else {
+            self.index_pos = 0;
             return;
+        };
+        let index_len = index_block.num_restarts() as usize;
+
+        // Quick check: if target > partition's largest key, mark exhausted.
+        if index_len > 0 {
+            let (last_sep, _) = index_entry_at(&index_block, index_len - 1);
+            if compare_internal_key(target, last_sep) == Ordering::Greater {
+                self.index_pos = index_len;
+                return;
+            }
         }
 
-        // Binary search index entries to find the first block that may contain target
-        let idx = index_entries.partition_point(|entry| {
-            compare_internal_key(&entry.separator_key, target) == Ordering::Less
-        });
+        // Binary search index leaf restarts in place (`0` allocations).
+        let idx = TableReader::partition_point_index_leaf(&index_block, target) as usize;
 
         self.index_pos = idx;
 
         // Load the found block and seek within it using the cursor
-        while self.index_pos < index_entries.len() {
-            let entry = &index_entries[self.index_pos];
-            if self.block_exceeds_upper_bound(entry) {
+        while self.index_pos < index_len {
+            let (_, entry) = index_entry_at(&index_block, self.index_pos);
+            if self.block_exceeds_upper_bound(entry.first_key) {
                 self.index_pos = usize::MAX;
                 return;
             }
             self.index_pos += 1;
-            if self.block_properties_should_skip(entry) {
+            if self.block_properties_should_skip(&entry) {
                 continue;
             }
 
             // Deferred block read: if target <= first_key, position without I/O
-            let first_key = &entry.first_key;
+            let first_key = entry.first_key;
             if compare_internal_key(target, first_key) != Ordering::Greater {
                 self.at_first_key_from_index = true;
                 self.deferred_index_pos = self.index_pos - 1;
@@ -333,16 +350,11 @@ impl TableIterator {
 
             match self
                 .reader
-                .read_block_cached_opt(&entry.handle, self.fill_cache)
+                .read_block_cached_block(&entry.handle, self.fill_cache)
             {
-                Ok(data) => match Block::new(data) {
-                    Ok(block) => {
-                        self.seek_within_block(block, target, compare_internal_key);
-                    }
-                    Err(e) => {
-                        self.err = Some(e.context("block decode error in seek"));
-                    }
-                },
+                Ok(block) => {
+                    self.seek_within_block(block, target, compare_internal_key);
+                }
                 Err(e) => {
                     self.err = Some(e.context("block read error in seek"));
                 }
@@ -365,19 +377,14 @@ impl TableIterator {
         let entry_data = &block_data[..data_end];
         let num_restarts = block.num_restarts();
 
-        // Binary search on restart points to narrow the scan range
+        // Binary search on restart points in place (`shared_len == 0` at restarts).
         let mut left = 0u32;
         let mut right = num_restarts;
-        let mut tmp_key = Vec::new();
         while left < right {
             let mid = left + (right - left) / 2;
-            let rp_offset = data_end + (mid as usize) * 4;
-            let rp = u32::from_le_bytes(block_data[rp_offset..rp_offset + 4].try_into().unwrap())
-                as usize;
-            tmp_key.clear();
-            match decode_entry_reuse(entry_data, rp, &mut tmp_key) {
-                Ok(_) => {
-                    if compare(&tmp_key, target) == Ordering::Less {
+            match block.decode_restart_entry(mid) {
+                Ok((rk, _, _)) => {
+                    if compare(rk, target) == Ordering::Less {
                         left = mid + 1;
                     } else {
                         right = mid;
@@ -393,20 +400,18 @@ impl TableIterator {
 
         // Linear scan from restart point before `left`
         let start = if left > 0 {
-            let rp_offset = data_end + ((left - 1) as usize) * 4;
-            u32::from_le_bytes(block_data[rp_offset..rp_offset + 4].try_into().unwrap()) as usize
+            block.restart_point(left - 1) as usize
         } else {
             0
         };
 
-        // Scan entries, saving key state before each decode so we can restore
-        // the prefix-compressed key buffer without a second scan.
+        // Scan entries, saving key state on stack SmallVec so we can restore
+        // the prefix-compressed key buffer without heap allocation.
         self.block_cursor_key.clear();
-        let mut prev_key_snapshot: Vec<u8> = Vec::new();
+        let mut prev_key_snapshot = smallvec::SmallVec::<[u8; 128]>::new();
         let mut offset = start;
         while offset < data_end {
             let entry_offset = offset;
-            // Save key buffer state before decoding this entry
             prev_key_snapshot.clear();
             prev_key_snapshot.extend_from_slice(&self.block_cursor_key);
 
@@ -472,28 +477,41 @@ impl TableIterator {
             return;
         }
         loop {
-            let index_entries = Arc::clone(self.index_entries.as_ref().unwrap());
-            let idx = index_entries.partition_point(|entry| {
-                compare_internal_key(&entry.separator_key, target) == Ordering::Less
+            let Some(index_block) = self.index_block.clone() else {
+                break;
+            };
+            let index_len = index_block.num_restarts() as usize;
+            let mut left = 0usize;
+            let mut right = index_len;
+            while left < right {
+                let mid = left + (right - left) / 2;
+                let (sep, _) = index_entry_at(&index_block, mid);
+                if compare_internal_key(sep, target) == Ordering::Less
                     && self
                         .config
                         .upper
                         .as_ref()
-                        .is_none_or(|ub| user_key(&entry.separator_key) < ub.as_slice())
-            });
-            for (block_index, entry) in index_entries.iter().enumerate().take(idx + 1).rev() {
-                if self.block_exceeds_upper_bound(entry)
-                    || compare_internal_key(&entry.first_key, target) == Ordering::Greater
+                        .is_none_or(|ub| user_key(sep) < ub.as_slice())
+                {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+            let end = (left + 1).min(index_len);
+            for block_index in (0..end).rev() {
+                let (_, entry) = index_entry_at(&index_block, block_index);
+                if self.block_exceeds_upper_bound(entry.first_key)
+                    || compare_internal_key(entry.first_key, target) == Ordering::Greater
                 {
                     continue;
                 }
-                if self.block_properties_should_skip(entry) {
+                if self.block_properties_should_skip(&entry) {
                     continue;
                 }
                 let positioned = self
                     .reader
-                    .read_block_cached_opt(&entry.handle, self.fill_cache)
-                    .and_then(Block::new)
+                    .read_block_cached_block(&entry.handle, self.fill_cache)
                     .and_then(|block| self.position_reverse_segment(block, block_index, target));
                 match positioned {
                     Ok(true) => return,
@@ -604,46 +622,42 @@ impl TableIterator {
                 if self.err.is_some() {
                     return None;
                 }
-                before = self.index_entries.as_ref()?.len();
+                before = self.index_len();
             }
             before -= 1;
             let prev_block_index = before;
-            let entry = &self.index_entries.as_ref()?[prev_block_index];
-            if self.block_properties_should_skip(entry) {
+            let index_block = self.index_block.as_ref()?;
+            let (_, entry) = index_entry_at(index_block, prev_block_index);
+            if self.block_properties_should_skip(&entry) {
                 continue;
             }
+            let handle = entry.handle;
             match self
                 .reader
-                .read_block_cached_opt(&entry.handle, self.fill_cache)
+                .read_block_cached_block(&handle, self.fill_cache)
             {
-                Ok(data) => match Block::new(data) {
-                    Ok(block) => {
-                        let last_restart = block.num_restarts().saturating_sub(1);
-                        match block.iter_restart_segment(last_restart) {
-                            Ok(entries) => {
-                                self.current_block_entries = entries;
-                            }
-                            Err(e) => {
-                                self.reset_positioning_state();
-                                self.err = Some(e.context("block entry decode error in prev"));
-                                return None;
-                            }
+                Ok(block) => {
+                    let last_restart = block.num_restarts().saturating_sub(1);
+                    match block.iter_restart_segment(last_restart) {
+                        Ok(entries) => {
+                            self.current_block_entries = entries;
                         }
-                        if self.current_block_entries.is_empty() {
-                            continue;
+                        Err(e) => {
+                            self.reset_positioning_state();
+                            self.err = Some(e.context("block entry decode error in prev"));
+                            return None;
                         }
-                        self.block_pos = self.current_block_entries.len() - 1;
-                        self.index_pos = prev_block_index + 1;
-                        self.current_restart_index = last_restart;
-                        self.backward_block = Some(block);
-                        self.backward_block_index = prev_block_index;
-                        return Some(self.current_block_entries[self.block_pos].clone());
                     }
-                    Err(e) => {
-                        self.reset_positioning_state();
-                        self.err = Some(e.context("block decode error in prev"));
+                    if self.current_block_entries.is_empty() {
+                        continue;
                     }
-                },
+                    self.block_pos = self.current_block_entries.len() - 1;
+                    self.index_pos = prev_block_index + 1;
+                    self.current_restart_index = last_restart;
+                    self.backward_block = Some(block);
+                    self.backward_block_index = prev_block_index;
+                    return Some(self.current_block_entries[self.block_pos].clone());
+                }
                 Err(e) => {
                     self.reset_positioning_state();
                     self.err = Some(e.context("block read error in prev"));
@@ -691,52 +705,51 @@ impl TableIterator {
             if self.err.is_some() || self.index_pos == usize::MAX {
                 return false;
             }
-            let index_entries = self.index_entries.as_ref().unwrap();
-            while self.index_pos < index_entries.len() {
+            let Some(index_block) = self.index_block.clone() else {
+                return false;
+            };
+            let index_len = index_block.num_restarts() as usize;
+            while self.index_pos < index_len {
                 let block_idx = self.index_pos;
 
-                let entry = &index_entries[block_idx];
+                let (_, entry) = index_entry_at(&index_block, block_idx);
 
                 // Skip blocks whose first_key user key >= upper_bound
-                if self.block_exceeds_upper_bound(entry) {
+                if self.block_exceeds_upper_bound(entry.first_key) {
                     self.index_pos = usize::MAX;
                     return false;
                 }
 
                 // Skip blocks based on block property filters
-                if self.block_properties_should_skip(entry) {
+                if self.block_properties_should_skip(&entry) {
                     self.index_pos += 1;
                     continue;
                 }
 
-                let handle = index_entries[self.index_pos].handle;
+                let handle = entry.handle;
                 self.index_pos += 1;
 
                 // Detect sequential access and trigger readahead
                 if block_idx == self.prev_block_index.wrapping_add(1) {
                     self.sequential_reads += 1;
                     if self.sequential_reads >= 2 {
-                        self.maybe_readahead(index_entries, block_idx);
+                        self.maybe_readahead(&index_block, block_idx);
                     }
                 } else {
                     self.sequential_reads = 0;
                 }
                 self.prev_block_index = block_idx;
 
-                match self.reader.read_block_cached_opt(&handle, self.fill_cache) {
-                    Ok(data) => match Block::new(data) {
-                        Ok(block) => {
-                            if block.data_end_offset() > 0 {
-                                self.set_block_for_cursor(block);
-                                return true;
-                            }
+                match self
+                    .reader
+                    .read_block_cached_block(&handle, self.fill_cache)
+                {
+                    Ok(block) => {
+                        if block.data_end_offset() > 0 {
+                            self.set_block_for_cursor(block);
+                            return true;
                         }
-                        Err(e) => {
-                            self.err =
-                                Some(e.context(format!("block decode error at index {block_idx}")));
-                            return false;
-                        }
-                    },
+                    }
                     Err(e) => {
                         self.err =
                             Some(e.context(format!("block read error at index {block_idx}")));
@@ -761,19 +774,20 @@ impl TableIterator {
     }
 
     /// Issue a readahead hint for upcoming blocks.
-    fn maybe_readahead(&self, index_entries: &[IndexEntry], current_idx: usize) {
+    fn maybe_readahead(&self, index_block: &Block, current_idx: usize) {
         // Prefetch the next N blocks (adaptive: starts at 2, grows to 8)
         let prefetch_count = (self.sequential_reads as usize).min(8);
         let start = current_idx + 1;
-        let end = (start + prefetch_count).min(index_entries.len());
+        let end = (start + prefetch_count).min(index_block.num_restarts() as usize);
         if start >= end {
             return;
         }
 
         // Compute the file range covering the upcoming blocks
-        let first_handle = index_entries[start].handle;
-        let last_handle = index_entries[end - 1].handle;
-        if let Some((offset, len)) = checked_readahead_range(first_handle, last_handle) {
+        let (_, first_entry) = index_entry_at(index_block, start);
+        let (_, last_entry) = index_entry_at(index_block, end - 1);
+        if let Some((offset, len)) = checked_readahead_range(first_entry.handle, last_entry.handle)
+        {
             self.reader.advise_willneed(offset, len);
         }
     }
@@ -876,7 +890,7 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
         self.select_partition(self.reader.partitions.len().saturating_sub(1));
         self.reset_positioning_state();
         if self.err.is_none() {
-            let before = self.index_entries.as_ref().unwrap().len();
+            let before = self.index_len();
             self.previous_block_end(before);
         }
     }
@@ -952,11 +966,13 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
 
     fn prefetch_first_block(&mut self) {
         self.ensure_index();
-        if let Some(index) = self.index_entries.as_ref()
-            && let Some(entry) = index.first()
-            && let Some((offset, len)) = checked_readahead_range(entry.handle, entry.handle)
+        if let Some(index) = self.index_block.as_ref()
+            && index.num_restarts() > 0
         {
-            self.reader.advise_willneed(offset, len);
+            let (_, entry) = index_entry_at(index, 0);
+            if let Some((offset, len)) = checked_readahead_range(entry.handle, entry.handle) {
+                self.reader.advise_willneed(offset, len);
+            }
         }
     }
 

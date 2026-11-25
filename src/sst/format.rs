@@ -156,16 +156,41 @@ pub fn encode_index_value_with_props(
     Ok(buf)
 }
 
-/// Decoded extended index value with optional block properties.
-pub struct DecodedIndexValue<'a> {
+/// Zero-allocation view of a decoded SST index value.
+#[derive(Clone, Copy)]
+pub struct DecodedIndexEntry<'a> {
     pub handle: BlockHandle,
     pub first_key: &'a [u8],
-    pub properties: Vec<(&'a [u8], &'a [u8])>,
+    props_raw: &'a [u8],
+    num_props: u16,
 }
 
-/// Decode an extended index value that may contain block properties.
-/// The first-key length and property count are mandatory, even when zero.
-pub fn decode_index_value_with_props(data: &[u8]) -> Result<DecodedIndexValue<'_>> {
+impl<'a> DecodedIndexEntry<'a> {
+    /// Evaluate a predicate over `(name, data)` block-property slices without allocating.
+    /// Property framing was already validated by [`decode_index_entry`].
+    #[inline]
+    pub fn any_property(&self, mut pred: impl FnMut(&'a [u8], &'a [u8]) -> bool) -> bool {
+        let mut offset = 0usize;
+        let raw = self.props_raw;
+        for _ in 0..self.num_props {
+            let name_len = u16::from_le_bytes(raw[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let name = &raw[offset..offset + name_len];
+            offset += name_len;
+            let data_len = u16::from_le_bytes(raw[offset..offset + 2].try_into().unwrap()) as usize;
+            offset += 2;
+            let prop_data = &raw[offset..offset + data_len];
+            offset += data_len;
+            if pred(name, prop_data) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Validate and decode an extended index value without heap allocation.
+pub fn decode_index_entry(data: &[u8]) -> Result<DecodedIndexEntry<'_>> {
     let handle = BlockHandle::decode(data).ctx()?;
     let first_key_len = data
         .get(16..20)
@@ -177,41 +202,39 @@ pub fn decode_index_value_with_props(data: &[u8]) -> Result<DecodedIndexValue<'_
     if rest.len() < 2 {
         return Err(Error::corruption("truncated property count"));
     }
-    let mut props = Vec::new();
-    let mut offset = 20 + len;
-    let num_props = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-    offset += 2;
+    let num_props = u16::from_le_bytes(rest[..2].try_into().unwrap());
+    let props_raw = &rest[2..];
+    let mut offset = 0usize;
     for _ in 0..num_props {
-        if data.len() < offset + 2 {
+        if props_raw.len() < offset + 2 {
             return Err(Error::corruption("truncated block property name length"));
         }
-        let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        let name_len =
+            u16::from_le_bytes(props_raw[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
-        if data.len() < offset + name_len {
+        if props_raw.len() < offset + name_len {
             return Err(Error::corruption("truncated block property name"));
         }
-        let name = &data[offset..offset + name_len];
         offset += name_len;
-        if data.len() < offset + 2 {
+        if props_raw.len() < offset + 2 {
             return Err(Error::corruption("truncated block property data length"));
         }
-        let data_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+        let data_len =
+            u16::from_le_bytes(props_raw[offset..offset + 2].try_into().unwrap()) as usize;
         offset += 2;
-        if data.len() < offset + data_len {
+        if props_raw.len() < offset + data_len {
             return Err(Error::corruption("truncated block property data"));
         }
-        let prop_data = &data[offset..offset + data_len];
         offset += data_len;
-        props.push((name, prop_data));
     }
-    if offset != data.len() {
+    if offset != props_raw.len() {
         return Err(Error::corruption("trailing bytes after block properties"));
     }
-
-    Ok(DecodedIndexValue {
+    Ok(DecodedIndexEntry {
         handle,
         first_key,
-        properties: props,
+        props_raw,
+        num_props,
     })
 }
 

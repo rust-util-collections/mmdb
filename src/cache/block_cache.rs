@@ -24,11 +24,53 @@ use arc_swap::ArcSwap;
 use moka::notification::RemovalCause;
 use parking_lot::Mutex;
 
+use crate::sst::block::Block;
+
 /// Pool cache key: (member_id, sst_file_number, block_offset).
 type CacheKey = (u64, u64, u64);
 
-/// Cached block data.
-type CacheValue = Arc<Vec<u8>>;
+/// Cached block payload alongside optional pre-validated `Block` metadata so
+/// warm hits skip `O(num_restarts)` restart-table scans and index-leaf checks.
+#[derive(Clone)]
+struct CacheValue {
+    data: Arc<Vec<u8>>,
+    /// `u32::MAX` when inserted via raw `BlockCache::insert` without `Block` validation.
+    restart_offset: u32,
+    num_restarts: u32,
+    /// True once `TableReader` has validated index-leaf ordering and partition bounds.
+    index_validated: bool,
+}
+
+impl CacheValue {
+    fn raw(data: Arc<Vec<u8>>) -> Self {
+        Self {
+            data,
+            restart_offset: u32::MAX,
+            num_restarts: 0,
+            index_validated: false,
+        }
+    }
+
+    fn from_block(block: &Block, index_validated: bool) -> Self {
+        Self {
+            data: block.data_arc().clone(),
+            restart_offset: u32::try_from(block.data_end_offset())
+                .expect("block restart_offset fits in u32"),
+            num_restarts: block.num_restarts(),
+            index_validated,
+        }
+    }
+
+    fn into_block(self) -> Option<(Block, bool)> {
+        if self.restart_offset == u32::MAX {
+            return None;
+        }
+        Some((
+            Block::from_validated(self.data, self.restart_offset as usize, self.num_restarts),
+            self.index_validated,
+        ))
+    }
+}
 
 /// Immutable member-local pins, published together with their byte total.
 #[derive(Clone, Default)]
@@ -163,6 +205,12 @@ impl FileOffsetsIndex {
 /// below 1 MiB use one segment, while pools of 64 MiB or more use 64.
 pub struct BlockCachePool {
     inner: moka::sync::SegmentedCache<CacheKey, CacheValue>,
+    /// Unsegmented fallback for valid blocks whose weight exceeds a single
+    /// segment's `capacity / segments` share (`1 MiB < weight <= capacity`).
+    overflow: moka::sync::Cache<CacheKey, CacheValue>,
+    has_overflow: AtomicBool,
+    capacity_bytes: u64,
+    segment_capacity: u64,
     /// Track which offsets belong to each (member, file) for bulk invalidation.
     index: Arc<FileOffsetsIndex>,
     /// Member-id allocator for [`attach`](Self::attach).
@@ -178,11 +226,13 @@ impl BlockCachePool {
     /// A capacity of 0 disables caching entirely.
     pub fn new(capacity_bytes: u64) -> Self {
         let index = Arc::new(FileOffsetsIndex::new());
+        let segments = lru_segments(capacity_bytes);
+        let segment_capacity = capacity_bytes / segments as u64;
         let listener_index = index.clone();
-        let inner = moka::sync::SegmentedCache::builder(lru_segments(capacity_bytes))
+        let inner = moka::sync::SegmentedCache::builder(segments)
             .max_capacity(capacity_bytes)
             .weigher(|_key: &CacheKey, value: &CacheValue| -> u32 {
-                value.capacity().max(1) as u32
+                value.data.capacity().max(1) as u32
             })
             .eviction_listener(
                 move |key: Arc<CacheKey>, _value: CacheValue, _cause: RemovalCause| {
@@ -191,8 +241,25 @@ impl BlockCachePool {
                 },
             )
             .build();
+        let overflow_index = index.clone();
+        let overflow = moka::sync::Cache::builder()
+            .max_capacity(capacity_bytes)
+            .weigher(|_key: &CacheKey, value: &CacheValue| -> u32 {
+                value.data.capacity().max(1) as u32
+            })
+            .eviction_listener(
+                move |key: Arc<CacheKey>, _value: CacheValue, _cause: RemovalCause| {
+                    let (member, file_number, block_offset) = *key;
+                    overflow_index.remove(member, file_number, block_offset);
+                },
+            )
+            .build();
         Self {
             inner,
+            overflow,
+            has_overflow: AtomicBool::new(false),
+            capacity_bytes,
+            segment_capacity,
             index,
             next_member: AtomicU64::new(0),
             disabled: capacity_bytes == 0,
@@ -215,7 +282,12 @@ impl BlockCachePool {
     /// Approximate entry count of the whole pool's LRU store (all
     /// members; pinned entries are member-local and not included).
     pub fn entry_count(&self) -> u64 {
-        self.inner.entry_count()
+        let extra = if self.has_overflow.load(Ordering::Relaxed) {
+            self.overflow.entry_count()
+        } else {
+            0
+        };
+        self.inner.entry_count() + extra
     }
 
     /// Test-only: drain moka's pending maintenance so [`entry_count`](Self::entry_count)
@@ -223,6 +295,9 @@ impl BlockCachePool {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn run_pending_tasks(&self) {
         self.inner.run_pending_tasks();
+        if self.has_overflow.load(Ordering::Relaxed) {
+            self.overflow.run_pending_tasks();
+        }
     }
 }
 
@@ -269,8 +344,7 @@ impl BlockCache {
         Arc::new(BlockCachePool::new(capacity_bytes)).attach()
     }
 
-    /// Look up a cached block. Pinned entries are checked first.
-    pub fn get(&self, file_number: u64, block_offset: u64) -> Option<Arc<Vec<u8>>> {
+    fn get_entry(&self, file_number: u64, block_offset: u64) -> Option<CacheValue> {
         if !self.is_enabled() {
             return None;
         }
@@ -278,9 +352,67 @@ impl BlockCache {
         if let Some(v) = self.pinned.load().entries.get(&(file_number, block_offset)) {
             return Some(v.clone());
         }
-        self.pool
-            .inner
-            .get(&(self.member, file_number, block_offset))
+        let key = (self.member, file_number, block_offset);
+        if let Some(v) = self.pool.inner.get(&key) {
+            return Some(v);
+        }
+        if self.pool.has_overflow.load(Ordering::Relaxed) {
+            return self.pool.overflow.get(&key);
+        }
+        None
+    }
+
+    /// Look up a cached block. Pinned entries are checked first.
+    pub fn get(&self, file_number: u64, block_offset: u64) -> Option<Arc<Vec<u8>>> {
+        self.get_entry(file_number, block_offset).map(|v| v.data)
+    }
+
+    /// Look up a cached block, returning its pre-validated `Block` metadata when present.
+    pub(crate) fn get_cached_block(
+        &self,
+        file_number: u64,
+        block_offset: u64,
+    ) -> Option<(Arc<Vec<u8>>, Option<(Block, bool)>)> {
+        let entry = self.get_entry(file_number, block_offset)?;
+        let raw = entry.data.clone();
+        Some((raw, entry.into_block()))
+    }
+
+    fn insert_entry(&self, file_number: u64, block_offset: u64, value: CacheValue) {
+        if !self.is_enabled() {
+            return;
+        }
+        let key = (self.member, file_number, block_offset);
+        // Moka weights are u32. A larger allocation cannot be charged in
+        // full, and a replacement must retire any older cached value.
+        let Ok(weight) = u32::try_from(value.data.capacity().max(1)) else {
+            self.pool.inner.invalidate(&key);
+            if self.pool.has_overflow.load(Ordering::Relaxed) {
+                self.pool.overflow.invalidate(&key);
+            }
+            return;
+        };
+        let weight_u64 = weight as u64;
+        if weight_u64 > self.pool.segment_capacity && weight_u64 <= self.pool.capacity_bytes {
+            self.pool.has_overflow.store(true, Ordering::Relaxed);
+            self.pool.inner.invalidate(&key);
+            self.pool.index.add(self.member, file_number, block_offset);
+            self.pool.overflow.insert(key, value);
+            #[cfg(test)]
+            if MAINTAIN_AFTER_INSERT.replace(false) {
+                self.pool.overflow.run_pending_tasks();
+            }
+            return;
+        }
+        if self.pool.has_overflow.load(Ordering::Relaxed) {
+            self.pool.overflow.invalidate(&key);
+        }
+        self.pool.index.add(self.member, file_number, block_offset);
+        self.pool.inner.insert(key, value);
+        #[cfg(test)]
+        if MAINTAIN_AFTER_INSERT.replace(false) {
+            self.pool.inner.run_pending_tasks();
+        }
     }
 
     /// Insert a block into the cache.
@@ -297,26 +429,42 @@ impl BlockCache {
     /// barrier against concurrent insertion.
     pub fn insert(&self, file_number: u64, block_offset: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let arc = Arc::new(data);
-        if !self.is_enabled() {
-            return arc;
-        }
-        // Moka weights are u32. A larger allocation cannot be charged in
-        // full, and a replacement must retire any older cached value.
-        if u32::try_from(arc.capacity()).is_err() {
-            self.pool
-                .inner
-                .invalidate(&(self.member, file_number, block_offset));
-            return arc;
-        }
-        self.pool.index.add(self.member, file_number, block_offset);
-        self.pool
-            .inner
-            .insert((self.member, file_number, block_offset), arc.clone());
-        #[cfg(test)]
-        if MAINTAIN_AFTER_INSERT.replace(false) {
-            self.pool.inner.run_pending_tasks();
-        }
+        self.insert_entry(file_number, block_offset, CacheValue::raw(arc.clone()));
         arc
+    }
+
+    pub(crate) fn insert_validated_block(
+        &self,
+        file_number: u64,
+        block_offset: u64,
+        block: &Block,
+        index_validated: bool,
+    ) {
+        self.insert_entry(
+            file_number,
+            block_offset,
+            CacheValue::from_block(block, index_validated),
+        );
+    }
+
+    fn insert_pinned_entry(&self, file_number: u64, block_offset: u64, value: CacheValue) {
+        if self.pool.disabled {
+            return;
+        }
+        let _update = self.pin_updates.lock();
+        // Re-checked under the mutex: `detach` sweeps this map under the
+        // same lock, so a pin can never slip in after the sweep (an
+        // unremovable leak); see the `detached` field docs.
+        if self.detached.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut pinned = (**self.pinned.load()).clone();
+        let len = value.data.len() as u64;
+        if let Some(old) = pinned.entries.insert((file_number, block_offset), value) {
+            pinned.bytes -= old.data.len() as u64;
+        }
+        pinned.bytes += len;
+        self.pinned.store(Arc::new(pinned));
     }
 
     /// Insert a pinned block — never evicted by LRU.
@@ -330,28 +478,21 @@ impl BlockCache {
         data: Vec<u8>,
     ) -> Arc<Vec<u8>> {
         let arc = Arc::new(data);
-        if self.pool.disabled {
-            return arc;
-        }
-        {
-            let _update = self.pin_updates.lock();
-            // Re-checked under the mutex: `detach` sweeps this map under the
-            // same lock, so a pin can never slip in after the sweep (an
-            // unremovable leak); see the `detached` field docs.
-            if self.detached.load(Ordering::Relaxed) {
-                return arc;
-            }
-            let mut pinned = (**self.pinned.load()).clone();
-            if let Some(old) = pinned
-                .entries
-                .insert((file_number, block_offset), arc.clone())
-            {
-                pinned.bytes -= old.len() as u64;
-            }
-            pinned.bytes += arc.len() as u64;
-            self.pinned.store(Arc::new(pinned));
-        }
+        self.insert_pinned_entry(file_number, block_offset, CacheValue::raw(arc.clone()));
         arc
+    }
+
+    pub(crate) fn insert_pinned_validated_block(
+        &self,
+        file_number: u64,
+        block_offset: u64,
+        block: &Block,
+    ) {
+        self.insert_pinned_entry(
+            file_number,
+            block_offset,
+            CacheValue::from_block(block, false),
+        );
     }
 
     /// Unpin all entries for a specific file (e.g., when L0 file is compacted away).
@@ -368,7 +509,7 @@ impl BlockCache {
         let mut removed_bytes = 0u64;
         pinned.entries.retain(|&(f, _), v| {
             if f == file_number {
-                removed_bytes += v.len() as u64;
+                removed_bytes += v.data.len() as u64;
                 false
             } else {
                 true
@@ -391,13 +532,19 @@ impl BlockCache {
             return;
         }
         self.unpin_file(file_number);
+        let has_overflow = self.pool.has_overflow.load(Ordering::Relaxed);
         if let Some(offsets) = self.pool.index.take_file(self.member, file_number) {
             for offset in offsets {
-                self.pool
-                    .inner
-                    .invalidate(&(self.member, file_number, offset));
+                let key = (self.member, file_number, offset);
+                self.pool.inner.invalidate(&key);
+                if has_overflow {
+                    self.pool.overflow.invalidate(&key);
+                }
             }
             self.pool.inner.run_pending_tasks();
+            if has_overflow {
+                self.pool.overflow.run_pending_tasks();
+            }
         }
     }
 
@@ -421,17 +568,23 @@ impl BlockCache {
         // maintenance ONCE (per-file `run_pending_tasks` would drain the
         // whole pool's queue repeatedly).
         let files = self.pool.index.take_member(self.member);
+        let has_overflow = self.pool.has_overflow.load(Ordering::Relaxed);
         let mut any = false;
         for (file_number, offsets) in files {
             for offset in offsets {
-                self.pool
-                    .inner
-                    .invalidate(&(self.member, file_number, offset));
+                let key = (self.member, file_number, offset);
+                self.pool.inner.invalidate(&key);
+                if has_overflow {
+                    self.pool.overflow.invalidate(&key);
+                }
                 any = true;
             }
         }
         if any {
             self.pool.inner.run_pending_tasks();
+            if has_overflow {
+                self.pool.overflow.run_pending_tasks();
+            }
         }
     }
 
@@ -615,7 +768,7 @@ mod tests {
             cache.unpin_file(0);
         });
         assert!(cache.get(0, 0).is_none());
-        assert_eq!(retired.entries.get(&(0, 0)).unwrap().as_slice(), &[0]);
+        assert_eq!(retired.entries.get(&(0, 0)).unwrap().data.as_slice(), &[0]);
         for file in 1..=8 {
             assert_eq!(
                 cache.get(file, 0).unwrap().as_slice(),
@@ -761,5 +914,28 @@ mod tests {
         assert_eq!(*arc, vec![4]);
         assert!(a.get(1, 0).is_none());
         assert_eq!(a.entry_count(), 0);
+    }
+
+    #[test]
+    fn oversized_block_above_segment_share_is_retained_and_invalidated() {
+        // Default 64 MiB pool splits `inner` into 64 segments (1 MiB each).
+        // A 2 MiB block must still be retained via the pool overflow store.
+        let pool = Arc::new(BlockCachePool::new(64 * 1024 * 1024));
+        let cache = pool.attach();
+        cache.insert(7, 0, vec![0xCD; 2 * 1024 * 1024]);
+        pool.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.get(7, 0).unwrap().len(), 2 * 1024 * 1024);
+
+        cache.invalidate_file(7);
+        assert!(cache.get(7, 0).is_none());
+        assert_eq!(cache.entry_count(), 0);
+
+        cache.insert(8, 0, vec![0xEF; 2 * 1024 * 1024]);
+        pool.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 1);
+        cache.detach();
+        assert!(cache.get(8, 0).is_none());
+        assert_eq!(pool.entry_count(), 0);
     }
 }
