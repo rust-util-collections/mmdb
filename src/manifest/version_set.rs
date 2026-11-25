@@ -231,6 +231,14 @@ impl VersionSet {
                 e.context(note)
             }
         })?;
+        if reader.file_size() != meta.file_size {
+            return Err(Error::corruption(format!(
+                "MANIFEST records {} bytes for SST {}, file contains {} bytes",
+                meta.file_size,
+                meta.number,
+                reader.file_size()
+            )));
+        }
         if reader.has_range_deletions() != meta.has_range_deletions {
             return Err(Error::corruption(format!(
                 "MANIFEST range-deletion flag disagrees with SST {}",
@@ -1718,6 +1726,49 @@ mod tests {
         fs::rename(original, sst).unwrap();
         let reader = crate::DB::open_read_only(dir.path()).unwrap();
         assert_eq!(reader.get(b"a").unwrap().as_deref(), Some(&b"value"[..]));
+    }
+
+    #[test]
+    fn mismatched_sst_size_rejected_on_apply_and_recovery() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        let mut builder =
+            TableBuilder::new(&path.join("000010.sst"), TableBuildOptions::default()).unwrap();
+        let key = InternalKey::new(b"k", 1, ValueType::Value).into_bytes();
+        builder.add(&key, b"v").unwrap();
+        let result = builder.finish().unwrap();
+        let mut edit = VersionEdit::new();
+        edit.add_file(
+            0,
+            FileMetaData {
+                number: 10,
+                file_size: result.file_size + 1,
+                smallest_key: key.clone(),
+                largest_key: key,
+                has_range_deletions: false,
+            },
+        );
+
+        assert_eq!(
+            vs.log_and_apply(edit.clone()).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
+        assert_eq!(vs.current().total_files(), 0);
+        vs.manifest_writer
+            .lock()
+            .as_mut()
+            .unwrap()
+            .add_record(&edit.encode())
+            .unwrap();
+        vs.sync_manifest().unwrap();
+        drop(vs);
+        let error = crate::DB::open_read_only(path).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Corruption);
+        assert!(error.message().contains("file contains"));
     }
 
     #[test]

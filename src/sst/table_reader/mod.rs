@@ -182,6 +182,10 @@ pub struct TableReader {
 }
 
 impl TableReader {
+    pub(crate) fn file_size(&self) -> u64 {
+        self.file.size
+    }
+
     fn validate_prefix_filter_metadata(
         prefix_filter: Option<&[u8]>,
         prefix_len: Option<usize>,
