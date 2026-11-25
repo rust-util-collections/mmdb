@@ -12,12 +12,6 @@
 
 ## Open
 
-### [MEDIUM] SST: partitioned index leaves are not validated against their directory partition bounds
-- **Where**: `src/sst/table_reader/mod.rs:338-388`, `src/sst/table_reader/mod.rs:660-673`, `src/sst/table_reader/iterator.rs:296-302`
-- **What**: When a corrupt SST index directory handle or re-CRC'd index leaf disagrees with `TableReader::partitions`, point lookups and iterators/compaction should surface `ErrorKind::Corruption` (matching the `range_partitions` checks in `covering_sequence` and `visit_ranges`). Instead, `find_data_block` returns `Ok(None)` when `seek_by_reuse` misses inside a selected partition, and `index_leaf` / `TableIterator` accept empty or out-of-partition leaves as clean data (`iter_error() == None`), allowing silent key loss or a `TableBuilder::add` ordering panic during compaction.
-- **Why**: `IndexWriter` guarantees each partition `part` points to a non-empty leaf ending at `partitions[part].0` and (when `part > 0`) starting strictly after `partitions[part - 1].0`. `index_leaf` only validates intra-leaf entry pairs via `parse_index_entries`, and `find_data_block` neither rejects `seek_by_reuse == None` nor checks `decode_internal_key` / `(partitions[part - 1].0, partitions[part].0]` bounds on the matched entry.
-- **Fix**: In `TableReader::index_leaf`, reject empty leaves, require `sep.compare_internal(&entries.last().unwrap().separator_key).is_eq()`, and when `part > 0` require `self.partitions[part - 1].0.compare_internal(&entries[0].first_key).is_lt()`. In `TableReader::find_data_block`, return `Err(Error::corruption("index leaf ends before its separator"))` on `None` and validate `decode_internal_key` plus partition bounds on the matched entry.
-
 ### [MEDIUM] SST: `TableIterator::seek`, `seek_for_prev`, and `load_next_block` read out-of-bounds index leaves past `upper_bound`
 - **Where**: `src/sst/table_reader/iterator.rs:275-293`, `src/sst/table_reader/iterator.rs:448-458`, `src/sst/table_reader/iterator.rs:673-677`
 - **What**: Seeking an upper-bounded iterator (`iterate_upper_bound = Some(ub)`) to `target >= ub` should exhaust or clamp to `ub` without reading, caching, or failing on excluded SST index partitions. Instead, `TableIterator::seek` calls `select_partition(seek_partition(target))` before checking `user_key(target) >= ub`, `load_next_block` calls `ensure_index()` before checking `index_pos == usize::MAX`, and `seek_for_prev` loads excluded partitions between `target` and `ub` before clamping.

@@ -336,11 +336,26 @@ impl TableReader {
     }
 
     fn index_leaf(&self, part: usize, fill_cache: bool) -> Result<IndexEntries> {
-        let Some((_, handle)) = self.partitions.get(part) else {
+        let Some((sep, handle)) = self.partitions.get(part) else {
             return Ok(Arc::new(Vec::new()));
         };
         let block = Block::new(self.read_block_cached_opt(handle, fill_cache)?)?;
-        Ok(Arc::new(Self::parse_index_entries(&block)?))
+        let entries = Self::parse_index_entries(&block)?;
+        let Some(last) = entries.last() else {
+            return Err(Error::corruption("empty SST index leaf"));
+        };
+        if !sep.compare_internal(&last.separator_key).is_eq()
+            || (part > 0
+                && !self.partitions[part - 1]
+                    .0
+                    .compare_internal(&entries[0].first_key)
+                    .is_lt())
+        {
+            return Err(Error::corruption(
+                "SST index leaf disagrees with partition bounds",
+            ));
+        }
+        Ok(Arc::new(entries))
     }
 
     #[cfg(test)]
@@ -665,15 +680,30 @@ impl TableReader {
         let part = self
             .partitions
             .partition_point(|(k, _)| k.compare_internal(key).is_lt());
-        let Some((_, handle)) = self.partitions.get(part) else {
+        let Some((sep, handle)) = self.partitions.get(part) else {
             return Ok(None);
         };
         let block = Block::new(self.read_block_cached_opt(handle, fill_cache)?)?;
         let mut found = smallvec::SmallVec::<[u8; 128]>::new();
-        block
-            .seek_by_reuse(key, compare_internal_key, &mut found)?
-            .map(|v| decode_index_value_with_props(v).map(|entry| entry.handle))
-            .transpose()
+        let Some(v) = block.seek_by_reuse(key, compare_internal_key, &mut found)? else {
+            return Err(Error::corruption("index leaf ends before its separator"));
+        };
+        let entry = decode_index_value_with_props(v)?;
+        decode_internal_key(&found)?;
+        decode_internal_key(entry.first_key)?;
+        if compare_internal_key(entry.first_key, &found).is_gt()
+            || sep.compare_internal(&found).is_lt()
+            || (part > 0
+                && !self.partitions[part - 1]
+                    .0
+                    .compare_internal(entry.first_key)
+                    .is_lt())
+        {
+            return Err(Error::corruption(
+                "SST index leaf disagrees with partition bounds",
+            ));
+        }
+        Ok(Some(entry.handle))
     }
 
     fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
@@ -1344,5 +1374,159 @@ mod tests {
         assert!(TableReader::validate_filter_format(true, Some(1)).is_err());
         assert!(TableReader::validate_filter_format(true, Some(FILTER_FORMAT_BLOCKED_64B)).is_ok());
         assert!(TableReader::validate_filter_format(false, None).is_ok());
+    }
+
+    #[test]
+    fn index_leaf_disagreeing_with_partition_bounds_returns_corruption() {
+        use super::{BlockHandle, CompressionType, FOOTER_SIZE};
+        use crate::ErrorKind;
+        use crate::iterator::source::SeekableIterator;
+        use crate::sst::block_builder::BlockBuilder;
+        use crate::sst::format::{decode_footer, encode_index_value_with_props};
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::TableIterator;
+        use crate::types::{InternalKey, ValueType, user_key};
+        use std::fs;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partition_bounds.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..40u32 {
+            // Step by 3 so consecutive keys have room strictly between them
+            // at fixed 5-byte shortened-separator width.
+            let mut uk = format!("k{:04}_", i * 3).into_bytes();
+            uk.resize(2048, b'x');
+            let ik = InternalKey::new(&uk, 1, ValueType::Value);
+            builder.add(ik.as_bytes(), b"v").unwrap();
+        }
+        builder.finish().unwrap();
+
+        let clean = TableReader::open(&path).unwrap();
+        assert!(
+            clean.partitions.len() >= 2,
+            "expected multi-partition SST, got {}",
+            clean.partitions.len()
+        );
+        let first_leaf_entries = clean.index_leaf(0, false).unwrap();
+        let part0_handle = clean.partitions[0].1;
+        let part1_handle = clean.partitions[1].1;
+        let second_leaf_entries = clean.index_leaf(1, false).unwrap();
+
+        let write_rechecksummed_block = |file_bytes: &mut [u8], offset: usize, raw: &[u8]| {
+            file_bytes[offset..offset + raw.len()].copy_from_slice(raw);
+            let comp_byte = CompressionType::None as u8;
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(raw);
+            hasher.update(&[comp_byte]);
+            let crc = hasher.finalize();
+            file_bytes[offset + raw.len()] = comp_byte;
+            file_bytes[offset + raw.len() + 1..offset + raw.len() + 5]
+                .copy_from_slice(&crc.to_le_bytes());
+        };
+
+        // Case A: Leaf 0 ends strictly before partitions[0].0 while keeping
+        // intra-leaf ordering valid (rebuild a 1-entry leaf and pad? No:
+        // keep all entries except replace the last entry's separator with a
+        // same-length key between its first_key and partitions[0].0: since
+        // step is 3, last entry is k(3m)_xxx and next partition starts at
+        // k(3m+3)_xxx; if shorten_separator shortened at digit 4, e.g. 3m=81
+        // vs 84 -> sep is "k0082", lowering first_key to k0080_z.. and sep to
+        // "k0081"? Even simpler: build a fresh 1-entry leaf at the start of
+        // part0_handle and update part0_handle.size in the directory block!).
+        {
+            let mut short_leaf = BlockBuilder::new(1);
+            let e0 = &first_leaf_entries[0];
+            let val0 = encode_index_value_with_props(&e0.handle, &e0.first_key, &[]).unwrap();
+            short_leaf.add(&e0.separator_key, &val0);
+            let raw = short_leaf.finish();
+
+            let mut bytes = fs::read(&path).unwrap();
+            write_rechecksummed_block(&mut bytes, part0_handle.offset as usize, &raw);
+            // Update partition 0's BlockHandle size in a rewritten index directory + footer.
+            let footer_slice: &[u8; FOOTER_SIZE] =
+                bytes[bytes.len() - FOOTER_SIZE..].try_into().unwrap();
+            let (meta_handle, index_dir_handle) = decode_footer(footer_slice).unwrap();
+            let mut dir_builder = BlockBuilder::new(16);
+            for (idx, (pk, h)) in clean.partitions.iter().enumerate() {
+                let mut h = *h;
+                if idx == 0 {
+                    h.size = raw.len() as u64;
+                }
+                let mut ik = pk.prefix.to_vec();
+                ik.extend_from_slice(&pk.trailer);
+                dir_builder.add(&ik, &h.encode());
+            }
+            let mut dir_raw = dir_builder.finish();
+            dir_raw.extend_from_slice(&BlockHandle::default().encode());
+            let dir_offset = index_dir_handle.offset as usize;
+            bytes.resize(dir_offset + dir_raw.len() + 5, 0);
+            write_rechecksummed_block(&mut bytes, dir_offset, &dir_raw);
+            let new_dir_handle = BlockHandle {
+                offset: index_dir_handle.offset,
+                size: dir_raw.len() as u64,
+            };
+            bytes.extend_from_slice(&crate::sst::format::encode_footer(
+                &meta_handle,
+                &new_dir_handle,
+            ));
+
+            let bad_path = dir.path().join("short_sep.sst");
+            fs::write(&bad_path, &bytes).unwrap();
+
+            let reader = Arc::new(TableReader::open(&bad_path).unwrap());
+            let last_p0_uk = user_key(&first_leaf_entries.last().unwrap().first_key);
+            let err = reader.get(last_p0_uk).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Corruption);
+
+            let mut iter = TableIterator::new(reader);
+            iter.seek_to_first();
+            assert_eq!(
+                iter.iter_error().map(|e| e.kind()),
+                Some(ErrorKind::Corruption)
+            );
+        }
+
+        // Case B: Leaf 1 first_key <= partitions[0].0 (violates lower partition bound).
+        {
+            let mut leaf_builder = BlockBuilder::new(1);
+            for (idx, e) in second_leaf_entries.iter().enumerate() {
+                let mut fk = e.first_key.clone();
+                if idx == 0 {
+                    fk[1] = b'0';
+                    fk[2] = b'0';
+                    fk[3] = b'0';
+                    fk[4] = b'0';
+                }
+                let val = encode_index_value_with_props(&e.handle, &fk, &[]).unwrap();
+                leaf_builder.add(&e.separator_key, &val);
+            }
+            let raw = leaf_builder.finish();
+            assert_eq!(raw.len() as u64, part1_handle.size);
+            let mut bytes = fs::read(&path).unwrap();
+            write_rechecksummed_block(&mut bytes, part1_handle.offset as usize, &raw);
+            let bad_path = dir.path().join("low_first_key.sst");
+            fs::write(&bad_path, &bytes).unwrap();
+
+            let reader = Arc::new(TableReader::open(&bad_path).unwrap());
+            let first_p1_uk = user_key(&second_leaf_entries[0].first_key);
+            let err = reader.get(first_p1_uk).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Corruption);
+
+            let mut iter = TableIterator::new(reader);
+            iter.seek(&second_leaf_entries[0].first_key);
+            assert_eq!(
+                iter.iter_error().map(|e| e.kind()),
+                Some(ErrorKind::Corruption)
+            );
+        }
     }
 }
