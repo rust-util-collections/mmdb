@@ -223,7 +223,7 @@ fn verify(mut iter: DBIterator, mode: Mode, updates: usize, seed: u64) {
 
 fn main() {
     let mode = match env::args().nth(1).as_deref() {
-        Some("gap") => Mode::Gap,
+        None | Some("--bench" | "gap") => Mode::Gap,
         Some("native") => Mode::Native,
         Some("sentinel") => Mode::Sentinel,
         _ => panic!("expected gap, native or sentinel"),
@@ -268,7 +268,7 @@ fn main() {
     let fence = WriteOptions::default().with_durability(DurabilityMode::WalSync);
     let ready = Barrier::new(2);
     let first = std::sync::OnceLock::new();
-    let (mut writes, mut reads, counters, write_time) = thread::scope(|s| {
+    let (mut writes, mut reads, mut fences, counters, write_time) = thread::scope(|s| {
         let reader = s.spawn(|| {
             let mut times = Times::new(n);
             ready.wait();
@@ -284,6 +284,7 @@ fn main() {
             times
         });
         let mut times = Times::new(n);
+        let mut fences = Times::new(n / 256);
         take_thread_write_profile();
         ready.wait();
         let start = *first.get_or_init(Instant::now);
@@ -296,16 +297,18 @@ fn main() {
             db.put(&k, &v).unwrap();
             times.record(scheduled, service);
             if (i + 1) % 256 == 0 {
+                let fence_start = Instant::now();
                 if mode == Mode::Sentinel {
                     db.delete_with_options(&fence, &[1]).unwrap();
                 } else {
                     db.sync_wal().unwrap();
                 }
+                fences.record(scheduled, fence_start);
             }
         }
         let write_time = start.elapsed();
         let counters = take_thread_write_profile();
-        (times, reader.join().unwrap(), counters, write_time)
+        (times, reader.join().unwrap(), fences, counters, write_time)
     });
     let after = db.l0_compaction_profile();
     if let (Some(preload), Some(peak)) = (preloaded_rss, rss_kib("VmHWM:")) {
@@ -316,6 +319,9 @@ fn main() {
     let logical = (n * (KEY_SIZE + VALUE_SIZE)) as u64;
     writes.report("write");
     reads.report("read");
+    if !fences.service_ns.is_empty() {
+        fences.report("fence");
+    }
     println!(
         "mode={mode:?} seed={seed} rate={rate} subs={subs} trace_cold={trace_cold} user_bytes={logical} writer_ns={} l0_slowdowns={} l0_stops={} l0_drains={} l0_stall_ns={} immutable_wait_ns={}",
         write_time.as_nanos(),
@@ -334,7 +340,7 @@ fn main() {
     verify(db.iter().unwrap(), mode, n, seed);
     drop(snapshot);
     db.close().unwrap();
-    let settled = db.l0_compaction_profile();
+    let at_close = db.l0_compaction_profile();
     let cold_removed = cold_files
         .iter()
         .filter(|(p, _)| !p.exists())
@@ -349,15 +355,15 @@ fn main() {
         "flushes={} l0_end={} rewrite_jobs={} multi_target_jobs={} parallel_jobs={} ranges={} peak_ranges={} peak_l0={} trivial_moves={} input_file_bytes={} output_file_bytes={} initial_cold_files={} initial_cold_consumed_bytes={cold_removed} logical_cold_emitted_bytes={cold_logical}",
         property(&db, "stats.flushes_completed"),
         property(&db, "num-files-at-level0"),
-        settled.rewrite_jobs,
-        settled.multiple_target_jobs,
-        settled.parallel_jobs,
-        settled.ranges_started,
-        settled.peak_active_ranges,
-        settled.peak_installed_l0_files,
-        settled.trivial_moves,
-        settled.input_file_bytes,
-        settled.output_file_bytes,
+        at_close.rewrite_jobs,
+        at_close.multiple_target_jobs,
+        at_close.parallel_jobs,
+        at_close.ranges_started,
+        at_close.peak_active_ranges,
+        at_close.peak_installed_l0_files,
+        at_close.trivial_moves,
+        at_close.input_file_bytes,
+        at_close.output_file_bytes,
         cold_files.len()
     );
     let reopened = DB::open(opts, tmp.path()).unwrap();

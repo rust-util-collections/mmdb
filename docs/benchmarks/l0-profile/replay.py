@@ -4,6 +4,7 @@ import csv
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 def execute(args, binary, mode, subranges, cold, seed):
@@ -25,6 +26,9 @@ def execute(args, binary, mode, subranges, cold, seed):
     assert int(metrics["l1_start"]) == 24
     assert int(metrics["multi_target_jobs"]) > 0
     assert (int(metrics["parallel_jobs"]) > 0) == (subranges > 1)
+    assert 1 <= int(metrics["peak_ranges"]) <= subranges
+    if subranges > 1:
+        assert int(metrics["peak_ranges"]) > 1
     return metrics
 
 
@@ -51,6 +55,7 @@ def main():
         writer = None
         for pair in range(1, 6):
             for kind in args.comparisons:
+                end_states = []
                 reverse = (pair + int(kind in ("ab", "observer"))) % 2
                 for order, arm in enumerate((1, 0) if reverse else (0, 1), 1):
                     name, mode, subranges, cold = arms[kind][arm]
@@ -66,6 +71,10 @@ def main():
                         writer.writeheader()
                     writer.writerow(row)
                     output.flush()
+                    end_states.append((metrics["l0_end"], metrics["rewrite_jobs"]))
+                if end_states[0] != end_states[1]:
+                    print(f"Pair {pair} ({kind}) ended with different L0 counts or rewrite jobs: "
+                          f"{end_states}; compare in-window metrics separately.", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -1266,11 +1266,17 @@ impl DB {
 
         let (l0_file_count, super_version) = {
             let g = inner.lock();
-            let l0 = Arc::new(AtomicUsize::new(g.versions.current().l0_file_count()));
+            let version = g.versions.current();
+            let files = version.l0_file_count();
+            let l0 = Arc::new(AtomicUsize::new(files));
+            #[cfg(feature = "bench-metrics")]
+            {
+                stats.l0_profile.lock().peak_installed_l0_files = files as u64;
+            }
             let sv = Arc::new(ArcSwap::from_pointee(SuperVersion {
                 active_memtable: g.active_memtable.clone(),
                 immutable_memtables: g.immutable_memtables.iter().cloned().collect(),
-                version: g.versions.current(),
+                version,
                 ingest_ceiling: g.ingest_ceiling.clone(),
             }));
             (l0, sv)

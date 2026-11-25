@@ -16,7 +16,7 @@ pub struct L0CompactionProfile {
     pub input_file_bytes: u64,
     /// Sum of newly built output file lengths.
     pub output_file_bytes: u64,
-    /// Peak L0 file count at a flush MANIFEST install in this handle.
+    /// Maximum of the opening L0 file count and later flush MANIFEST installs.
     pub peak_installed_l0_files: u64,
     /// All range entries, including a range that subsequently errored.
     pub ranges_started: u64,
@@ -46,6 +46,24 @@ impl Drop for ActiveRange<'_> {
 #[cfg(test)]
 mod tests {
     use crate::{DB, DbOptions};
+
+    #[test]
+    fn reopened_handle_starts_with_its_installed_l0_file_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions::default().with_l0_compaction_trigger(usize::MAX);
+        let db = DB::open(options.clone(), dir.path()).unwrap();
+        db.put(b"a", b"value").unwrap();
+        db.flush().unwrap();
+        db.close().unwrap();
+        let reopened = DB::open(options, dir.path()).unwrap();
+        assert_eq!(
+            reopened.get_property("num-files-at-level0").as_deref(),
+            Some("1")
+        );
+        let profile = reopened.l0_compaction_profile();
+        assert_eq!(profile.peak_installed_l0_files, 1);
+        assert_eq!(profile.ranges_started, 0);
+    }
 
     #[test]
     fn a_trivial_move_writes_zero_bytes_and_a_serial_multi_target_job_starts_one_range() {

@@ -89,13 +89,13 @@ index 2a808ff..f69bbf8 100644
 
          // Build sub-tasks
 diff --git a/src/db.rs b/src/db.rs
-index 20eb490..9e7ea8d 100644
+index 20eb490..a0e310b 100644
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -4815,6 +4815,106 @@ mod tests {
-     /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0
-     /// was empty it ran level-size compactions inline — in the stop-trigger
-     /// path while holding `write_queue`, stalling every writer.
+@@ -4812,6 +4812,106 @@ mod tests {
+         }
+     }
+
 +    #[test]
 +    fn split_l0_preserves_snapshot_stripes_and_concurrent_flush_across_boundaries() {
 +        use std::sync::mpsc;
@@ -196,9 +196,9 @@ index 20eb490..9e7ea8d 100644
 +        }
 +    }
 +
-     #[test]
-     fn drain_l0_leaves_deeper_levels_to_background_workers() {
-         let dir = tempfile::tempdir().unwrap();
+     /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0
+     /// was empty it ran level-size compactions inline — in the stop-trigger
+     /// path while holding `write_queue`, stalling every writer.
 diff --git a/src/options.rs b/src/options.rs
 index 81a32a6..23b11ee 100644
 --- a/src/options.rs

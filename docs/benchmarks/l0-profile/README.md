@@ -56,7 +56,8 @@ cold L1 files in the gap even with a native fence.
   L0 compaction/slowdown/stop counts 2/3/5, default private block cache and
   uncompressed SSTs. One background compaction coordinator; a single whole-L0
   claim limits the workload to one L0 job at once. Both binaries were confined
-  to the same four physical cores (4–7) of a Ryzen 9 5900X under Linux
+  to the same four physical cores (4–7) with the same local device and
+  disabled software rate limiter, on a Ryzen 9 5900X under Linux
   7.0.0-44-generic. Temporary DB directories inherited the Btrfs `NOCOMPRESS`
   inode attribute. The NVMe filesystem otherwise has `compress=zstd:3`.
 - One scalar reader and one writer used identical seeded scheduled arrivals
@@ -64,7 +65,10 @@ cold L1 files in the gap even with a native fence.
   about 28,800 puts/s. The write path uses WAL-enabled ordinary puts and
   the selected per-256 fence. A worker records both service time and
   scheduled arrival through acknowledgement; fence delay can therefore
-  carry into subsequent writes. The full pre-update snapshot, live rows
+  carry into subsequent writes. The current driver also prints separate
+  fence service and arrival percentiles (arrival begins at the associated
+  put's scheduled time). The recorded CSV predates these extra fence fields.
+  The full pre-update snapshot, live rows
   and writable-reopened rows are checked independently against the generated
   key order and expected version for every row.
 - `l0_stall_ns` sums only actual slowdown sleep and stop-barrier/drain time
@@ -81,7 +85,11 @@ cold L1 files in the gap even with a native fence.
 - Timed measurements end at foreground completion. Counters suffixed
   `after_workers` are captured after the workers join. Lifetime totals
   include the explicit final flush and work completed by background threads
-  before close. `ranges` counts starts (it can include an unsuccessful
+  before close. The explicit flush and close may leave a sub-trigger L0 file.
+  All 30 archived pairs ended with matching L0 counts and completed rewrite
+  counts within each pair. For a rerun with different closing debt, compare
+  the measured-window counters and report the difference before interpreting
+  lifetime output byte totals. `ranges` counts starts (it can include an unsuccessful
   build), `multi_target_jobs` counts completed rewrites selecting multiple
   L1 input files, and `parallel_jobs` counts rewrites that successfully
   joined more than one range. `peak_ranges` measures overlapping execution
