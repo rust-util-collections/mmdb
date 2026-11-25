@@ -691,14 +691,30 @@ mod tests {
         db.put(b"sealed", &[1; (8 << 10) + 1]).unwrap();
         running.recv_timeout(Duration::from_secs(2)).unwrap();
         db.put(b"fenced", b"2").unwrap();
+        db.put(b"map-0001/gone", b"old").unwrap();
         let path = dir
             .path()
             .join(format!("{:06}.wal", db.inner.lock().wal_number));
         let end = fs::metadata(&path).unwrap().len();
+        let active_inode = fs::metadata(&path).unwrap().ino();
         let seq = db.read.current_sequence();
         db.sync_wal().unwrap();
         assert_eq!(fs::metadata(&path).unwrap().len(), end);
         assert_eq!(db.read.current_sequence(), seq);
+        assert_eq!(durable.lock().get(&active_inode), Some(&end));
+
+        let mut batch = WriteBatch::new();
+        batch.delete_range(b"map-0001", b"map-0002");
+        batch.put_prefixed(b"map-0001", b"/new", b"");
+        batch.put_prefixed(b"map-0002", b"/ref", b"linked");
+        db.write_with_options(
+            &WriteOptions::default().with_durability(DurabilityMode::WalSync),
+            batch,
+        )
+        .unwrap();
+        let synced_end = fs::metadata(&path).unwrap().len();
+        assert!(synced_end > end);
+        assert_eq!(durable.lock().get(&active_inode), Some(&synced_end));
         db.put_with_options(
             &WriteOptions::default().with_durability(DurabilityMode::WalAsync),
             b"suffix",
@@ -731,14 +747,26 @@ mod tests {
             }
         }
         release.send(()).unwrap();
-        let survivor = DB::open(options(), recovered.path()).unwrap();
-        assert_eq!(
-            survivor.get(b"sealed").unwrap(),
-            Some(vec![1; (8 << 10) + 1])
-        );
-        assert_eq!(survivor.get(b"fenced").unwrap().as_deref(), Some(&b"2"[..]));
-        assert_eq!(survivor.get(b"suffix").unwrap(), None);
-        assert_eq!(survivor.get(b"volatile").unwrap(), None);
+        for read_only in [true, false] {
+            let survivor = if read_only {
+                DB::open_read_only(recovered.path()).unwrap()
+            } else {
+                DB::open(options(), recovered.path()).unwrap()
+            };
+            assert_eq!(
+                survivor.get(b"sealed").unwrap(),
+                Some(vec![1; (8 << 10) + 1])
+            );
+            assert_eq!(survivor.get(b"fenced").unwrap().as_deref(), Some(&b"2"[..]));
+            assert_eq!(survivor.get(b"map-0001/gone").unwrap(), None);
+            assert_eq!(survivor.get(b"map-0001/new").unwrap(), Some(Vec::new()));
+            assert_eq!(
+                survivor.get(b"map-0002/ref").unwrap().as_deref(),
+                Some(b"linked".as_slice())
+            );
+            assert_eq!(survivor.get(b"suffix").unwrap(), None);
+            assert_eq!(survivor.get(b"volatile").unwrap(), None);
+        }
     }
     #[test]
     fn l0_epoch_change_discards_unlocked_rewrite_and_moves_current_files_into_l1() {

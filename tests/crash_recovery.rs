@@ -215,6 +215,90 @@ fn test_crash_with_batch_writes() {
 }
 
 #[test]
+fn two_prefix_wipe_and_replacements_are_visible_together_after_wal_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = DbOptions::default().with_prefix_len(8);
+    let db = DB::open(options.clone(), dir.path()).unwrap();
+    let mut initial = WriteBatch::new();
+    initial.put_prefixed(b"map-0001", b"/gone", b"stale");
+    initial.put_prefixed(b"map-0001", b"/row", b"old");
+    initial.put_prefixed(b"map-0002", b"/row", b"paired old");
+    db.write(initial).unwrap();
+    db.flush().unwrap();
+
+    let before = db.snapshot();
+    let mut update = WriteBatch::new();
+    update.delete_range(b"map-0001", b"map-0002");
+    update.put_prefixed(b"map-0001", b"/row", b"");
+    update.put_prefixed(b"map-0002", b"/row", b"paired new");
+    db.write_with_options(
+        &WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync),
+        update,
+    )
+    .unwrap();
+
+    let keys: [&[u8]; 4] = [
+        b"map-0001/gone",
+        b"map-0001/row",
+        b"map-0002/row",
+        b"map-0002/missing",
+    ];
+    let previous = [
+        Some(b"stale".as_slice()),
+        Some(b"old".as_slice()),
+        Some(b"paired old".as_slice()),
+        None,
+    ];
+    let published = [
+        None,
+        Some(b"".as_slice()),
+        Some(b"paired new".as_slice()),
+        None,
+    ];
+    let check = |snapshot: &mmdb::Snapshot<'_>, expected: [Option<&[u8]>; 4]| {
+        for (key, value) in keys.into_iter().zip(expected) {
+            assert_eq!(snapshot.get(key).unwrap().as_deref(), value);
+            assert_eq!(snapshot.get_pinned(key).unwrap().as_deref(), value);
+            assert_eq!(snapshot.contains_key(key).unwrap(), value.is_some());
+        }
+    };
+    check(&before, previous);
+    let after = db.snapshot();
+    assert_eq!(after.sequence(), before.sequence() + 3);
+    check(&after, published);
+    drop(after);
+    drop(before);
+    db.simulate_crash();
+
+    // A second image cuts the batch during its append. All three edits must
+    // replay together or all disappear, even though they span two prefixes.
+    let interrupted = tempfile::tempdir().unwrap();
+    let mut nonempty_wals = 0;
+    for entry in dir.path().read_dir().unwrap() {
+        let entry = entry.unwrap();
+        let dest = interrupted.path().join(entry.file_name());
+        let len = fs::copy(entry.path(), &dest).unwrap();
+        if dest.extension().is_some_and(|ext| ext == "wal") && len > 0 {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&dest)
+                .unwrap()
+                .set_len(len - 1)
+                .unwrap();
+            nonempty_wals += 1;
+        }
+    }
+    assert_eq!(nonempty_wals, 1);
+    for (path, state) in [(interrupted.path(), previous), (dir.path(), published)] {
+        let read_only = DB::open_read_only(path).unwrap();
+        check(&read_only.snapshot(), state);
+        read_only.close().unwrap();
+        let writable = DB::open(options.clone(), path).unwrap();
+        check(&writable.snapshot(), state);
+    }
+}
+
+#[test]
 fn test_multiple_reopen_cycles() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().to_path_buf();
