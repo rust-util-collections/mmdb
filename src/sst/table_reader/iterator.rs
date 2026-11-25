@@ -277,11 +277,6 @@ impl TableIterator {
             self.reset_positioning_state();
             return;
         }
-        self.select_partition(self.seek_partition(target));
-        self.reset_positioning_state();
-        if self.err.is_some() {
-            return;
-        }
         if self
             .config
             .upper
@@ -289,6 +284,11 @@ impl TableIterator {
             .is_some_and(|ub| user_key(target) >= ub.as_slice())
         {
             self.exhaust_at_upper_bound();
+            return;
+        }
+        self.select_partition(self.seek_partition(target));
+        self.reset_positioning_state();
+        if self.err.is_some() {
             return;
         }
         let index_entries = self.index_entries.as_ref().unwrap();
@@ -450,6 +450,19 @@ impl TableIterator {
             self.reset_positioning_state();
             return;
         }
+        let clamped_target;
+        let target = if let Some(ub) = self.config.upper.as_deref()
+            && user_key(target) >= ub
+        {
+            clamped_target = crate::types::InternalKey::new(
+                ub,
+                crate::types::MAX_SEQUENCE_NUMBER,
+                crate::types::ValueType::RangeDeletion,
+            );
+            clamped_target.as_bytes()
+        } else {
+            target
+        };
         self.select_partition(
             self.seek_partition(target)
                 .min(self.reader.partitions.len().saturating_sub(1)),
@@ -670,6 +683,9 @@ impl TableIterator {
                 }
             }
         }
+        if self.err.is_some() || self.index_pos == usize::MAX {
+            return false;
+        }
         self.ensure_index();
         loop {
             if self.err.is_some() || self.index_pos == usize::MAX {
@@ -729,6 +745,15 @@ impl TableIterator {
                 }
             }
             if self.partition + 1 >= self.reader.partitions.len() {
+                return false;
+            }
+            if self
+                .config
+                .upper
+                .as_deref()
+                .is_some_and(|ub| self.reader.partitions[self.partition].0.prefix.as_ref() >= ub)
+            {
+                self.index_pos = usize::MAX;
                 return false;
             }
             self.select_partition(self.partition + 1);
@@ -2186,6 +2211,74 @@ mod tests {
         assert_eq!(
             iter.next().map(|(k, _)| user_key(&k).to_vec()),
             Some(b"b".to_vec())
+        );
+    }
+
+    #[test]
+    fn upper_bound_never_reads_excluded_index_partitions() {
+        use crate::iterator::merge::SeekableIterator;
+        use crate::types::InternalKey;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upper_bound_partitions.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..40u32 {
+            let mut uk = format!("k{:04}_", i * 3).into_bytes();
+            uk.resize(2048, b'x');
+            let ik = InternalKey::new(&uk, 10, ValueType::Value);
+            builder.add(ik.as_bytes(), b"v").unwrap();
+        }
+        builder.finish().unwrap();
+
+        let clean = TableReader::open(&path).unwrap();
+        assert!(clean.partitions.len() >= 2);
+        let part0_sep_uk = clean.partitions[0].0.prefix.to_vec();
+        let part1_leaf = clean.partitions[1].1;
+
+        // Corrupt partition 1's index leaf CRC on disk so any read of leaf 1 errors.
+        let mut bytes = fs::read(&path).unwrap();
+        let crc_pos = (part1_leaf.offset + part1_leaf.size + 1) as usize;
+        bytes[crc_pos] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let mut iter = TableIterator::new(reader);
+        SeekableIterator::set_bounds(&mut iter, None, Some(&part0_sep_uk));
+
+        // 1. Out-of-bound forward seek + next() must not read partition 1's leaf.
+        let mut oob = b"k9999_".to_vec();
+        oob.resize(2048, b'x');
+        let seek_oob = InternalKey::new(&oob, 100, ValueType::Value);
+        iter.seek(seek_oob.as_bytes());
+        assert!(iter.iter_error().is_none());
+        assert!(iter.next().is_none());
+        assert!(iter.iter_error().is_none());
+
+        // 2. Out-of-bound seek_for_prev and seek_to_last clamp to upper_bound -> partition 0.
+        iter.seek_for_prev(seek_oob.as_bytes());
+        assert!(iter.iter_error().is_none());
+        assert!(iter.current().is_some());
+
+        SeekableIterator::seek_to_last(&mut iter);
+        assert!(iter.iter_error().is_none());
+        assert!(iter.current().is_some());
+
+        // 3. Full forward scan across partition 0 stops before loading partition 1's leaf.
+        SeekableIterator::seek_to_first(&mut iter);
+        while iter.next().is_some() {}
+        assert!(
+            iter.iter_error().is_none(),
+            "forward scan at upper_bound must not read excluded index partition: {:?}",
+            iter.iter_error()
         );
     }
 }

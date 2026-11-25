@@ -12,12 +12,6 @@
 
 ## Open
 
-### [MEDIUM] SST: `TableIterator::seek`, `seek_for_prev`, and `load_next_block` read out-of-bounds index leaves past `upper_bound`
-- **Where**: `src/sst/table_reader/iterator.rs:275-293`, `src/sst/table_reader/iterator.rs:448-458`, `src/sst/table_reader/iterator.rs:673-677`
-- **What**: Seeking an upper-bounded iterator (`iterate_upper_bound = Some(ub)`) to `target >= ub` should exhaust or clamp to `ub` without reading, caching, or failing on excluded SST index partitions. Instead, `TableIterator::seek` calls `select_partition(seek_partition(target))` before checking `user_key(target) >= ub`, `load_next_block` calls `ensure_index()` before checking `index_pos == usize::MAX`, and `seek_for_prev` loads excluded partitions between `target` and `ub` before clamping.
-- **Why**: `DBIterator::seek` forwards `target >= ub` directly to `merger.seek_opt`. In v4 the flat index was already resident on `TableReader`; in v5 `select_partition` / `ensure_index` perform disk `pread`, decompression, block-cache insertion, and corruption latching on ~64 KiB index leaves. Existing upper-bound tests used single-partition SSTs and corrupted only excluded data blocks.
-- **Fix**: Check `user_key(target) >= ub` and call `exhaust_at_upper_bound()` before `select_partition` in `TableIterator::seek`; check `self.err.is_some() || self.index_pos == usize::MAX` before `self.ensure_index()` in `load_next_block`; and clamp `target` with `user_key(target) >= ub` to `InternalKey::new(ub, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion)` at the start of `TableIterator::seek_for_prev`.
-
 ### [LOW] docs: `DB::open_read_only` and `DB::open_read_only_with_options` rustdoc contradicts v5 MANIFEST geometry recovery
 - **Where**: `src/db.rs:763-767`, `src/db.rs:793-796`
 - **What**: Public rustdoc on `DB::open_read_only` and `DB::open_read_only_with_options` should match v5 behavior (`src/lib.rs:34-35`, `README.md:418`), where `num_levels` and `prefix_len` are stored in the MANIFEST `DBHeader` and adopted automatically on read-only open. Instead, both docstrings still state `num_levels` is not stored in the MANIFEST and instruct callers to pass the writer's `num_levels`.
