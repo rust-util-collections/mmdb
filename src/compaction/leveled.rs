@@ -743,10 +743,7 @@ fn execute_sub_compaction_io(
     }
 
     if let Some(e) = merger.error() {
-        return Err(Error::background(format!(
-            "sub-compaction merge error: {}",
-            e
-        )));
+        return Err(e.clone().context("sub-compaction merge error"));
     }
 
     Ok(SubCompactionOutput {
@@ -2988,6 +2985,42 @@ mod tests {
             unit_opts.max_bytes_for_level_base
         );
         assert_eq!(super::LEVEL_BUDGET_MULS.with(|n| n.get()), 0);
+    }
+
+    #[test]
+    fn sub_compaction_preserves_typed_corruption_and_io_errors() {
+        use crate::{DB, ErrorKind};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_l0_compaction_trigger(usize::MAX)
+            .with_pin_l0_first_block_and_warm_index(false);
+        let db = DB::open(opts, dir.path()).unwrap();
+        db.put(b"k1", b"value_1").unwrap();
+        db.flush().unwrap();
+        db.put(b"k2", b"value_2").unwrap();
+        db.flush().unwrap();
+
+        let sst_path = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| p.extension().is_some_and(|ext| ext == "sst"))
+            .unwrap();
+        let mut bytes = fs::read(&sst_path).unwrap();
+        bytes[0] ^= 0xff;
+        fs::write(&sst_path, &bytes).unwrap();
+
+        let err = db.compact().unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Corruption,
+            "expected Corruption, got {err:?}"
+        );
+        // Engine remains usable for reads on uncorrupted memtable keys since
+        // synchronous compact() did not fail-stop background state.
+        db.put(b"live", b"ok").unwrap();
+        assert_eq!(db.get(b"live").unwrap().as_deref(), Some(b"ok".as_slice()));
     }
 }
 
