@@ -11,19 +11,28 @@
   the interrupted primary run at `09b8e29`. Review identified premature
   returned-byte accounting on an error and unnecessary cache churn on seeks
   past a third file's last partition. These observations precede both fixes.
-- `final/` is reserved for measurements of the corrected runtime at
+- `final/` contains measurements of the corrected runtime at
   `fca4802`. Instrumented trials use that same release executable for the scalar
   and grouped arms. Separate production-build guards compare normal MMDB
   dependencies on the parent revision `72d1dd9` and the corrected candidate.
+  The integrated production check uses `277ef08` and `736b87e`.
 
 Each measured duration uses one snapshot. The CSVs record A/A and A/B
 pair identity, order, trace seed and request count. The per-matrix JSON
 records the binary digest, fixture and host configuration. Only complete
 paired series for the corrected runtime enter the final decision.
 
+For a device cell, the printed `p99_us` includes every completed request in
+each A/B arm. `io_positive_only_p99_us` uses the requests with at least 4 KiB
+of observed Linux storage reads. `min_io_qualified` is the lowest qualifying
+fraction in any A/A or A/B process. `linux_read_bytes_per_request` divides
+the process's Linux `read_bytes` by all completed requests, then reports the
+median of each A/B arm. The raw `peak_pin_bytes` column measures the maximum
+capacity of distinct SST data allocations retained by one request.
+
 ## Check out the measured source
 
-The trials used detached development commits. The [34 KiB Git bundle](measured-revisions.bundle)
+The trials used detached development commits. The [Git bundle](measured-revisions.bundle)
 contains the eight prototype and candidate commits ending at `fca4802` and
 the two integration commits ending at `736b87e`. Their prerequisites
 `72d1dd9` and `277ef08` are in the main history. From a full MMDB clone

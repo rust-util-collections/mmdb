@@ -57,7 +57,7 @@ for filename in sys.argv[1:]:
             device_details = (f" io_positive_only_p99_us={median(device_a_us):.2f}/"
                               f"{median(device_b_us):.2f} "
                               f"min_io_qualified={min(qualified_fractions):.3f} "
-                              f"bytes_per_request={median(storage_a):.0f}/{median(storage_b):.0f}")
+                              f"linux_read_bytes_per_request={median(storage_a):.0f}/{median(storage_b):.0f}")
         print(f"{path.name} {cell} p99_us={median(control_us):.2f}/{median(grouped_us):.2f} "
               f"p99_ranges_us={min(control_us):.2f}..{max(control_us):.2f}/"
               f"{min(grouped_us):.2f}..{max(grouped_us):.2f} "
