@@ -148,16 +148,17 @@ impl ReadState {
             sources.push(
                 IterSource::from_memtable(MemTableCursorIter::new(mem.clone())).with_level(0),
             );
-            if mem.has_range_deletions() {
+            mem.with_range_tombstones(|ranges| {
                 tombstones.extend(
-                    mem.get_range_tombstones()
-                        .into_iter()
-                        .filter(|(b, e, s)| {
-                            *s <= sequence && tombstone_overlaps_bounds(b, e, lower, upper)
+                    ranges
+                        .iter()
+                        .filter(|rt| {
+                            rt.seq <= sequence
+                                && tombstone_overlaps_bounds(&rt.begin, &rt.end, lower, upper)
                         })
-                        .map(|(b, e, s)| (b, e, s, 0)),
+                        .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq, 0)),
                 );
-            }
+            });
         }
 
         let mut config = IterConfig::new(lower, upper, &options.block_property_filters);
@@ -328,6 +329,37 @@ impl ReadState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn memtable_scan_copies_only_visible_overlapping_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"z", b"visible").unwrap();
+        let snapshot = db.snapshot();
+        for i in 0..256u16 {
+            let mut begin = vec![b'a'; 1024];
+            begin[1..3].copy_from_slice(&i.to_be_bytes());
+            let mut end = begin.clone();
+            end[1023] += 1;
+            db.delete_range(&begin, &end).unwrap();
+        }
+        // First scan excludes every deletion by key. The snapshot scans the
+        // full keyspace and excludes the same deletions by sequence.
+        for (options, lower) in [
+            (ReadOptions::default(), Some(&b"z"[..])),
+            (snapshot.read_options(), None),
+        ] {
+            let (mut iter, bytes) = crate::test_alloc::count_allocated(|| {
+                db.iter_with_range(&options, lower, None).unwrap()
+            });
+            assert!(bytes < 32 * 1024, "cursor allocated {bytes} bytes");
+            assert_eq!(
+                iter.step_next().unwrap(),
+                Some((b"z".as_slice(), b"visible".as_slice()))
+            );
+            assert!(iter.step_next().unwrap().is_none());
+        }
+    }
+
     #[test]
     fn warm_point_reads_do_not_allocate_the_result_value() {
         let dir = tempfile::tempdir().unwrap();

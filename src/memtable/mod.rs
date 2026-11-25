@@ -279,17 +279,25 @@ impl MemTable {
         max_seq
     }
 
-    /// Return all range tombstones as (begin, end, seq) triples.
-    /// Used by DBIterator for upfront tombstone loading at creation time.
-    pub fn get_range_tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
+    /// Borrow the list for the duration of a read, so callers can select endpoints before copying them.
+    pub(crate) fn with_range_tombstones<R>(
+        &self,
+        read: impl FnOnce(&[MemRangeTombstone]) -> R,
+    ) -> R {
         if !self.has_range_deletions() {
-            return Vec::new();
+            return read(&[]);
         }
-        let tombstones = self.range_tombstones.read();
-        tombstones
-            .iter()
-            .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq))
-            .collect()
+        read(&self.range_tombstones.read())
+    }
+
+    /// Return all range tombstones as (begin, end, seq) triples.
+    pub fn get_range_tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
+        self.with_range_tombstones(|ranges| {
+            ranges
+                .iter()
+                .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq))
+                .collect()
+        })
     }
 
     /// Return true if empty.
