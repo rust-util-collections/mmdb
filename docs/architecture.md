@@ -27,11 +27,12 @@ existing file. Duplicates, out-of-order input, excessive entry sizes, and
 overlap return `InvalidArgument`. On a usable writable handle empty input
 returns zero.
 
-All ingested rows share one fresh sequence. The files are installed in one
-MANIFEST edit so earlier snapshots keep their previous view. Before install,
-failed builds are cleaned up through `PendingSsts`. If the edit has been
-applied but its sync fails, MMDB retains the referenced files and latches the
-failure. [Implementation and tests](../src/db/ingest.rs)
+All ingested rows share one fresh sequence. Ingest holds a compaction claim
+on its new SSTs until it publishes that sequence and the read view. The files
+are installed in one MANIFEST edit so earlier snapshots keep their previous
+view. Before install, failed builds are cleaned up through `PendingSsts`.
+If the edit has been applied but its sync fails, MMDB retains the referenced
+files and latches the failure. [Implementation and tests](../src/db/ingest.rs)
 
 ## Reading a point and scanning a range
 

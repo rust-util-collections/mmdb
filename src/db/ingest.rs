@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_INGEST_INSTALL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct WriteLeaderGuard<'a>(&'a DB);
 
 impl Drop for WriteLeaderGuard<'_> {
@@ -227,7 +233,7 @@ impl DB {
         let synced = sync_new_sst_parent_dir(&self.dir_sync, &self.read.manifest_poisoned)?;
         self.table_cache.prewarm(outputs.iter().map(|m| m.number));
 
-        let manifest_handle = {
+        let (manifest_handle, claim) = {
             let mut inner = self.inner.lock();
             if let Err(e) = self.read.check_usable() {
                 for m in &outputs {
@@ -257,9 +263,21 @@ impl DB {
             }
             pending.keep();
             self.sequence.store(ingest_seq + 1, Ordering::Release);
-            inner.versions.manifest_sync_handle()
+            // Snapshots can still register at the pre-ingest sequence while
+            // the MANIFEST sync runs. Keep compaction from picking these files
+            // with an older snapshot list and zeroing their sequence numbers.
+            let claim = CompactionClaim {
+                claims: self.compacting_files.clone(),
+                numbers: outputs.iter().map(|m| m.number).collect(),
+            };
+            claim.claims.lock().extend(claim.numbers.iter().copied());
+            (inner.versions.manifest_sync_handle(), claim)
         };
 
+        #[cfg(test)]
+        if let Some(hook) = AFTER_INGEST_INSTALL.take() {
+            hook();
+        }
         if let Err(e) = confirm_manifest_durable(&manifest_handle, &self.read.manifest_poisoned) {
             self.set_bg_error(format!("ingest_sorted manifest sync failed: {e}"));
             return Err(e).ctx();
@@ -267,12 +285,13 @@ impl DB {
 
         {
             let inner = self.inner.lock();
+            self.install_super_version(&inner);
             self.read
                 .committed_sequence
                 .store(ingest_seq, Ordering::Release);
             self.read.stats.record_write(total_user_bytes);
-            self.install_super_version(&inner);
         }
+        drop(claim);
 
         Ok(count)
     }
@@ -282,6 +301,74 @@ impl DB {
 mod tests {
     use super::*;
     use crate::ErrorKind;
+
+    #[test]
+    fn ingest_sorted_protects_unpublished_files_from_compaction() {
+        use std::{sync::mpsc, thread};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions::default()
+                .with_num_levels(2)
+                .with_target_file_size_base(1),
+            dir.path(),
+        )
+        .unwrap();
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        thread::scope(|scope| {
+            let db = &db;
+            let ingest = scope.spawn(move || {
+                AFTER_INGEST_INSTALL.set(Some(Box::new(move || {
+                    installed_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                })));
+                db.ingest_sorted([(b"a", b"1"), (b"b", b"2")])
+            });
+            installed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let snapshot = db.snapshot();
+            let files_protected = {
+                let inner = db.inner.lock();
+                let version = inner.versions.current();
+                let claimed = db.compacting_files.lock();
+                let files = version.level_files(1);
+                files.len() == 2 && files.iter().all(|f| claimed.contains(&f.meta.number))
+            };
+            let compact = scope.spawn(|| db.compact());
+            resume_tx.send(()).unwrap();
+            assert_eq!(ingest.join().unwrap().unwrap(), 2);
+            compact.join().unwrap().unwrap();
+            assert!(
+                files_protected,
+                "compaction could pick an unpublished ingest"
+            );
+            assert!(db.compacting_files.lock().is_empty());
+            for (key, value) in [(b"a", b"1"), (b"b", b"2")] {
+                assert_eq!(snapshot.get(key).unwrap(), None);
+                assert_eq!(db.get(key).unwrap().as_deref(), Some(value.as_slice()));
+            }
+        });
+    }
+
+    #[test]
+    fn ingest_sorted_sync_failure_releases_claims_and_retains_referenced_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default().with_num_levels(2), dir.path()).unwrap();
+        AFTER_INGEST_INSTALL.set(Some(Box::new(|| {
+            crate::wal::writer::FAIL_NEXT_SYNC.set(true);
+        })));
+        assert_eq!(
+            db.ingest_sorted([(b"a", b"v")]).unwrap_err().kind(),
+            ErrorKind::Io
+        );
+        assert_eq!(db.get(b"a").unwrap_err().kind(), ErrorKind::Background);
+        assert!(db.compacting_files.lock().is_empty());
+        let version = db.inner.lock().versions.current();
+        let files = version.level_files(1);
+        assert_eq!(files.len(), 1);
+        let number = files[0].meta.number;
+        assert!(dir.path().join(format!("{number:06}.sst")).exists());
+    }
 
     #[test]
     fn ingest_sorted_splits_into_bottommost_level_with_zero_wal_bytes() {
