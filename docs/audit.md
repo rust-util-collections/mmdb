@@ -12,12 +12,6 @@
 
 ## Open
 
-### [LOW] build/CI: `make ci` omits `tools/v4-export` tests, CI `fmt`/`clippy` skip `tools/v4-export`, and `.gitignore` leaves `tools/v4-export/target/` untracked
-- **Where**: `Makefile:21-35`, `.github/workflows/ci.yml:21-44`, `.github/workflows/ci.yml:65`, `.gitignore:1`
-- **What**: `Makefile` `ci` (documented as `# Same gate as .github/workflows/ci.yml`) omits `cargo test --manifest-path tools/v4-export/Cargo.toml`, neither `Makefile` nor `.github/workflows/ci.yml` runs `fmt --check` or `clippy --all-targets -- -D warnings` on `tools/v4-export`, and `.gitignore` uses root-anchored `/target` so building/testing `tools/v4-export` leaves `?? tools/v4-export/target/` untracked.
-- **Why**: `tools/v4-export` is excluded from the root Cargo workspace (`exclude = ["tools/v4-export"]`) because it depends on both `mmdb = "=4.3.15"` and path `../..`, so root Cargo commands skip it unless `--manifest-path tools/v4-export/Cargo.toml` is passed explicitly.
-- **Fix**: Add `--manifest-path tools/v4-export/Cargo.toml` test/lint/fmt checks to `Makefile` and `.github/workflows/ci.yml`, and change `/target` to `target/` in `.gitignore`.
-
 ---
 
 ## Won't Fix
