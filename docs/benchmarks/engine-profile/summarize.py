@@ -204,7 +204,8 @@ def summarize(meta, records, writer):
     require(groups.keys() == expected.keys(), f"missing or unexpected cases: {set(groups) ^ set(expected)}")
     writer.writerow(["case", "arm", "metric", "pairs", "control_median", "arm_median", "paired_gain_pct",
                      "aa_max_abs_pct", "improved_pairs", "gain_min_pct", "gain_max_pct", "arm_min",
-                     "arm_max", "eligible_pairs", "load_kept_pairs", "status"])
+                     "arm_max", "eligible_pairs", "load_kept_pairs", "status", "reference_max",
+                     "reference_rss_status", "arm_rss_status", "matched_rss_budget"])
     for case, arms in sorted(expected.items()):
         trials = groups[case]
         require(set(trials) == set(rounds), f"incomplete rounds in {case}")
@@ -226,10 +227,17 @@ def summarize(meta, records, writer):
                 triples = [(a[key], b[key], a2[key]) for a, b, a2 in observed]
                 eligible = sum(all(x is not None for x in row) for row in triples)
                 columns = [""] * 9
+                reference_max = reference_budget = candidate_budget = matched_budget = ""
                 if eligible < len(rounds):
                     status = "insufficient-p99-samples" if key.endswith("_p99_us") else "undefined-denominator"
                 else:
                     baseline, values, duplicates = zip(*triples)
+                    reference_max = round(max(max(baseline), max(duplicates)), 3)
+                    if suite == "memory" and key == "peak_kib":
+                        budget_kib = 1 << 20
+                        reference_budget = "within" if reference_max <= budget_kib else "over"
+                        candidate_budget = "within" if max(values) <= budget_kib else "over"
+                        matched_budget = "both-within" if reference_budget == candidate_budget == "within" else "limited"
                     columns[:2] = [round(median(baseline), 3), round(median(values), 3)]
                     columns[7:9] = [round(min(values), 3), round(max(values), 3)]
                     if any(x == 0 for x in baseline):
@@ -241,7 +249,8 @@ def summarize(meta, records, writer):
                         columns[2:7] = [round(median(gains), 3), round(noise, 3), sum(g > 0 for g in gains),
                                         round(min(gains), 3), round(max(gains), 3)]
                         status = guard(suite, case, key, values, gains, noise, all(load_ok))
-                writer.writerow([case, arm, key, len(rounds), *columns, eligible, sum(load_ok), status])
+                writer.writerow([case, arm, key, len(rounds), *columns, eligible, sum(load_ok), status, reference_max,
+                                 reference_budget, candidate_budget, matched_budget])
 
 
 if __name__ == "__main__":

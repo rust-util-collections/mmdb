@@ -69,6 +69,34 @@ class SummaryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mismatched SEED"):
             summary("handoff", records)
 
+    def test_memory_reports_candidate_and_both_reference_rss_peaks_separately(self):
+        records = []
+        sweeps = {"buffer": ((4, 16), (1, 16), (2, 16)), "envelope": ((4, 6), (1, 15), (2, 10))}
+        for sweep, (control, *candidates) in sweeps.items():
+            for placement in ("hot", "all"):
+                for q, b in (control, *candidates):
+                    for name in (["A1", "A2"] if (q, b) == control else [f"q{q}-b{b}"]):
+                        for load in ("paced", "saturation"):
+                            # Only the second control run crosses 1 GiB.
+                            rss = (1 << 20) + 1 if name == "A2" else (1 << 20) - 1
+                            classes = {op: {"offered": 10000, "completed": 10000, "sampled": 10000,
+                                            "bytes": 1000, "rejected": 0, "outstanding_half": 0,
+                                            "outstanding_end": 0, "arrival_p99_us": 100}
+                                       for op in ("SmallPut", "Batch", "Read")}
+                            rec = {"case": f"{sweep}-{placement}-{load}", "arm": name, "round": 1,
+                                   "mode": "memory", "settings": {"IMMUTABLES": q, "BUFFER_MIB": b},
+                                   "run": {"seconds": 1, "peak_kib": rss, "compaction_output_bytes": 50},
+                                   "classes": classes}
+                            records.append(rec)
+                    records.append({**rec, "round": 0, "case": f"gauge-{sweep}-{placement}",
+                                    "arm": f"q{q}-b{b}", "sampled_peaks": {"active_bytes": 10}})
+        rss_rows = [r for r in summary("memory", records, rounds=1) if r["metric"] == "peak_kib"]
+        self.assertEqual(len(rss_rows), 16)
+        for r in rss_rows:
+            self.assertEqual((int(r["reference_max"]), int(r["arm_max"])), ((1 << 20) + 1, (1 << 20) - 1))
+            self.assertEqual((r["reference_rss_status"], r["arm_rss_status"], r["matched_rss_budget"]),
+                             ("over", "within", "limited"))
+
     def test_reopen_separates_geometry_and_mode(self):
         records = []
         for size in (10_000, 100_000):
