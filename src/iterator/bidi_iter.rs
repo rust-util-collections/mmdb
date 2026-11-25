@@ -131,8 +131,9 @@ impl BidiIterator {
                 back,
                 forward_only,
             } => {
-                if let Some(error) = cursor.error() {
-                    return Err(error.clone());
+                if let Some(error) = cursor.error().cloned() {
+                    cursor.halt_on_error();
+                    return Err(error);
                 }
                 if *forward_only {
                     return Ok(None);

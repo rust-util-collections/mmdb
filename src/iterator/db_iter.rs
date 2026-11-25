@@ -223,7 +223,7 @@ impl DBIterator {
     }
 
     #[inline]
-    fn halt_on_error(&mut self) {
+    pub(super) fn halt_on_error(&mut self) {
         self.recycle_current();
         self.needs_advance = false;
         self.prev_overshoot = None;
@@ -2095,13 +2095,42 @@ mod tests {
 
         // 3. next_prefix() after valid() must halt instead of clearing the failure
         let mut iter3 = DBIterator::from_sources(
-            vec![IterSource::from_table_iter(TableIterator::new(file.reader)).with_level(0)],
+            vec![
+                IterSource::from_table_iter(TableIterator::new(file.reader.clone())).with_level(0),
+            ],
             100,
         );
         assert!(iter3.valid());
         iter3.next_prefix(0);
         assert!(!iter3.valid());
         assert!(iter3.error().is_some_and(|e| e.to_string().contains("CRC")));
+
+        // 4. BidiIterator::step_prev / next_back after valid() must halt cursor.current
+        //    so subsequent next() returns None instead of yielding the buffered entry.
+        let mut iter4 = DBIterator::from_sources(
+            vec![
+                IterSource::from_table_iter(TableIterator::new(file.reader.clone())).with_level(0),
+            ],
+            100,
+        );
+        assert!(iter4.valid());
+        let mut bidi_prev = BidiIterator::lazy(iter4);
+        assert_eq!(
+            bidi_prev.step_prev().unwrap_err().kind(),
+            crate::ErrorKind::Corruption
+        );
+        assert_eq!(bidi_prev.next(), None);
+        assert!(bidi_prev.error().is_some());
+
+        let mut iter5 = DBIterator::from_sources(
+            vec![IterSource::from_table_iter(TableIterator::new(file.reader)).with_level(0)],
+            100,
+        );
+        assert!(iter5.valid());
+        let mut bidi_back = BidiIterator::lazy(iter5);
+        assert_eq!(bidi_back.next_back(), None);
+        assert!(bidi_back.error().is_some());
+        assert_eq!(bidi_back.next(), None);
     }
 
     #[test]
