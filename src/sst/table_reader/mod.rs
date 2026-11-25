@@ -2,14 +2,21 @@
 mod iterator;
 pub use iterator::TableIterator;
 
-use std::{cmp::Ordering, fs::File, io, path::Path, sync::Arc};
+use std::{
+    cmp::Ordering,
+    fs::File,
+    io,
+    path::Path,
+    sync::{Arc, atomic::Ordering as AtomicOrdering},
+};
 
 #[cfg(not(unix))]
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 
-use crate::cache::block_cache::BlockCache;
+use crate::cache::block_cache::{BlockCache, ValidatedKind};
 use crate::error::{Error, Result, ResultExt};
-use crate::sst::block::Block;
+use crate::sst::block::{Block, decode_entry_reuse};
 use crate::sst::filter::AlignedBytes;
 use crate::sst::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FILTER_FORMAT_BLOCKED_64B,
@@ -18,7 +25,10 @@ use crate::sst::format::{
 };
 use crate::sst::range::RangeFragment;
 use crate::stats::DbStats;
-use crate::types::{SequenceNumber, ValueType, compare_internal_key, decode_internal_key};
+use crate::types::{
+    MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key, decode_internal_key,
+    pack_sequence_and_type, tombstone_overlaps_bounds,
+};
 
 /// A range tombstone: (begin_key, end_key, sequence_number).
 type RangeTombstoneEntry = (Vec<u8>, Vec<u8>, SequenceNumber);
@@ -48,8 +58,9 @@ type IndexEntries = Arc<Vec<IndexEntry>>;
 /// shared cache by [`TableReader::publish_prepared_pin`] without further I/O.
 pub struct PreparedBlockPin {
     file_number: u64,
-    index_leaf: Option<(u64, Block)>,
+    index_leaf: Option<(u64, u64, Block)>,
     offset: u64,
+    compressed_size: u64,
     data: Block,
 }
 
@@ -59,6 +70,7 @@ struct MetaIndexData {
     prefix: Option<Vec<u8>>,
     prefix_len: Option<usize>,
     range_del_handle: Option<BlockHandle>,
+    min_offset: u64,
 }
 
 // Test-only seam: fires once, immediately before `prepare_first_block_pin`
@@ -154,6 +166,16 @@ struct RangePartition {
     handle: BlockHandle,
 }
 
+fn handles_strictly_ascending(prev: BlockHandle, next: BlockHandle) -> bool {
+    prev.size > 0
+        && next.size > 0
+        && prev
+            .offset
+            .checked_add(prev.size)
+            .and_then(|n| n.checked_add(BLOCK_TRAILER_SIZE as u64))
+            .is_some_and(|end| end <= next.offset)
+}
+
 fn decode_interval(value: &[u8]) -> Result<(&[u8], &[u8])> {
     let length = value
         .get(..4)
@@ -172,6 +194,8 @@ fn decode_interval(value: &[u8]) -> Result<(&[u8], &[u8])> {
 pub struct TableReader {
     file_number: u64,
     partitions: Vec<(PartitionKey, BlockHandle)>,
+    index_dir_pages: Vec<BlockHandle>,
+    meta_min_offset: u64,
     filter_data: Option<AlignedBytes>,
     prefix_filter_data: Option<AlignedBytes>,
     prefix_filter_len: Option<usize>,
@@ -238,21 +262,27 @@ impl TableReader {
             ));
         }
         let mut last_user = None;
-        let partitions = Self::read_directory(&file, index_handle, |key, value| {
-            if value.len() != 16 {
-                return Err(Error::corruption("invalid index partition handle"));
-            }
-            Ok((
-                PartitionKey::decode(&key, &mut last_user)?,
-                BlockHandle::decode(&value)?,
-            ))
-        })?;
-        if partitions.windows(2).any(|p| p[0].0 >= p[1].0) {
+        let (partitions, index_dir_pages) =
+            Self::read_directory(&file, index_handle, |key, value| {
+                if value.len() != 16 {
+                    return Err(Error::corruption("invalid index partition handle"));
+                }
+                Ok((
+                    PartitionKey::decode(&key, &mut last_user)?,
+                    BlockHandle::decode(&value)?,
+                ))
+            })?;
+        if partitions.iter().any(|(_, h)| h.size == 0)
+            || partitions
+                .windows(2)
+                .any(|p| p[0].0 >= p[1].0 || !handles_strictly_ascending(p[0].1, p[1].1))
+        {
             return Err(Error::corruption("unordered SST index partitions"));
         }
         let meta = Self::read_metaindex(&file, &metaindex_handle).ctx()?;
+        let mut meta_min_offset = index_handle.offset.min(meta.min_offset);
         let range_partitions = if let Some(handle) = meta.range_del_handle {
-            let parts = Self::read_directory(&file, handle, |end, value| {
+            let (parts, range_dir_pages) = Self::read_directory(&file, handle, |end, value| {
                 let handle = BlockHandle::decode(&value)?;
                 let begin = &value[16..];
                 if begin >= end.as_slice() {
@@ -264,9 +294,17 @@ impl TableReader {
                     handle,
                 })
             })?;
-            if parts.is_empty() || parts.windows(2).any(|p| p[0].end > p[1].begin) {
+            if parts.is_empty()
+                || parts.iter().any(|p| p.handle.size == 0)
+                || parts.windows(2).any(|p| {
+                    p[0].end > p[1].begin || !handles_strictly_ascending(p[0].handle, p[1].handle)
+                })
+            {
                 return Err(Error::corruption("invalid range directory"));
             }
+            meta_min_offset = meta_min_offset
+                .min(range_dir_pages[0].offset)
+                .min(parts[0].handle.offset);
             parts
         } else {
             Vec::new()
@@ -275,6 +313,8 @@ impl TableReader {
         let reader = Self {
             file_number,
             partitions,
+            index_dir_pages,
+            meta_min_offset,
             filter_data: meta
                 .bloom
                 .as_deref()
@@ -293,6 +333,9 @@ impl TableReader {
 
             range_partitions,
         };
+        for part in &reader.range_partitions {
+            reader.range_leaf_block(part, true)?;
+        }
 
         Ok(reader)
     }
@@ -301,9 +344,11 @@ impl TableReader {
         file: &SstFile,
         mut page: BlockHandle,
         mut entry: impl FnMut(Vec<u8>, Vec<u8>) -> Result<T>,
-    ) -> Result<Vec<T>> {
+    ) -> Result<(Vec<T>, Vec<BlockHandle>)> {
         let mut entries = Vec::new();
+        let mut pages = Vec::new();
         loop {
+            pages.push(page);
             let mut data = Self::read_block_data(file, &page)?;
             let tail = data
                 .len()
@@ -336,7 +381,40 @@ impl TableReader {
             page = previous;
         }
         entries.reverse();
-        Ok(entries)
+        pages.reverse();
+        Ok((entries, pages))
+    }
+
+    fn check_index_leaf_partition_bounds(
+        &self,
+        part: usize,
+        sep: &PartitionKey,
+        block: &Block,
+    ) -> Result<()> {
+        let n = block.num_restarts();
+        if n == 0 || block.data_end_offset() == 0 {
+            return Err(Error::corruption("empty SST index leaf"));
+        }
+        if part > 0 {
+            let (_, v0, _) = block.decode_restart_entry(0)?;
+            let d0 = decode_index_entry(v0).ctx()?;
+            if !self.partitions[part - 1]
+                .0
+                .compare_internal(d0.first_key)
+                .is_lt()
+            {
+                return Err(Error::corruption(
+                    "SST index leaf disagrees with partition bounds",
+                ));
+            }
+        }
+        let (k_last, _, _) = block.decode_restart_entry(n - 1)?;
+        if !sep.compare_internal(k_last).is_eq() {
+            return Err(Error::corruption(
+                "SST index leaf disagrees with partition bounds",
+            ));
+        }
+        Ok(())
     }
 
     /// Validate all `restart_interval = 1` entries and partition bounds of an SST v2
@@ -347,6 +425,7 @@ impl TableReader {
         }
         let n = block.num_restarts();
         let mut prev_sep: Option<&[u8]> = None;
+        let mut prev_handle: Option<BlockHandle> = None;
         for i in 0..n {
             let seg_end = if i + 1 < n {
                 block.restart_point(i + 1) as usize
@@ -360,6 +439,34 @@ impl TableReader {
                 ));
             }
             let d = decode_index_entry(v).ctx()?;
+            let leaf_handle = self.partitions[part].1;
+            let earlier = &self.partitions[..part];
+            let pos = earlier.partition_point(|(_, h)| h.offset <= d.handle.offset);
+            let overlaps_earlier_leaf = (pos > 0
+                && !handles_strictly_ascending(earlier[pos - 1].1, d.handle))
+                || (pos < part && !handles_strictly_ascending(d.handle, earlier[pos].1));
+            let dir_pos = self
+                .index_dir_pages
+                .partition_point(|h| h.offset <= d.handle.offset);
+            let overlaps_dir_page = (dir_pos > 0
+                && !handles_strictly_ascending(self.index_dir_pages[dir_pos - 1], d.handle))
+                || (dir_pos < self.index_dir_pages.len()
+                    && !handles_strictly_ascending(d.handle, self.index_dir_pages[dir_pos]));
+            let past_meta = d
+                .handle
+                .offset
+                .checked_add(d.handle.size)
+                .and_then(|end| end.checked_add(BLOCK_TRAILER_SIZE as u64))
+                .is_none_or(|end| end > self.meta_min_offset);
+            if d.handle.size == 0
+                || !handles_strictly_ascending(d.handle, leaf_handle)
+                || overlaps_earlier_leaf
+                || overlaps_dir_page
+                || past_meta
+                || prev_handle.is_some_and(|prev| !handles_strictly_ascending(prev, d.handle))
+            {
+                return Err(Error::corruption("unordered SST data block handles"));
+            }
             decode_internal_key(k)?;
             decode_internal_key(d.first_key)?;
             if compare_internal_key(d.first_key, k).is_gt()
@@ -367,47 +474,44 @@ impl TableReader {
             {
                 return Err(Error::corruption("unordered SST index entries"));
             }
-            if i == 0
-                && part > 0
-                && !self.partitions[part - 1]
-                    .0
-                    .compare_internal(d.first_key)
-                    .is_lt()
-            {
-                return Err(Error::corruption(
-                    "SST index leaf disagrees with partition bounds",
-                ));
-            }
-            if i + 1 == n && !sep.compare_internal(k).is_eq() {
-                return Err(Error::corruption(
-                    "SST index leaf disagrees with partition bounds",
-                ));
-            }
             prev_sep = Some(k);
+            prev_handle = Some(d.handle);
         }
-        Ok(())
+        self.check_index_leaf_partition_bounds(part, sep, block)
     }
 
     /// Load and return a validated `Block` for index partition `part`.
-    /// Warm hits skip both `Block::new` restart scanning and entry/bound validation.
+    /// Warm hits skip `Block::new` and full-leaf entry scans while preserving `O(1)` bound checks.
     pub(super) fn index_leaf_block(&self, part: usize, fill_cache: bool) -> Result<Option<Block>> {
         let Some((sep, handle)) = self.partitions.get(part) else {
             return Ok(None);
         };
         if let Some(ref cache) = self.block_cache
-            && let Some((raw, validated)) = cache.get_cached_block(self.file_number, handle.offset)
+            && let Some((raw, cached_size, validated)) =
+                cache.get_cached_block(self.file_number, handle.offset)
         {
+            if cached_size != u64::MAX && cached_size != handle.size {
+                return Err(Error::corruption("SST index leaf block size mismatch"));
+            }
             if let Some(ref s) = self.stats {
                 s.record_cache_hit();
             }
             let block = match validated {
-                Some((block, true)) => return Ok(Some(block)),
-                Some((block, false)) => block,
+                Some((block, ValidatedKind::Index, _)) => {
+                    return Ok(Some(block));
+                }
+                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
                 None => Block::new(raw)?,
             };
             self.validate_index_leaf(part, sep, &block)?;
             if fill_cache {
-                cache.insert_validated_block(self.file_number, handle.offset, &block, true);
+                cache.insert_validated_block(
+                    self.file_number,
+                    handle.offset,
+                    handle.size,
+                    &block,
+                    ValidatedKind::Index,
+                );
             }
             return Ok(Some(block));
         }
@@ -421,7 +525,13 @@ impl TableReader {
         let block = Block::from_vec(data)?;
         self.validate_index_leaf(part, sep, &block)?;
         if fill_cache && let Some(ref cache) = self.block_cache {
-            cache.insert_validated_block(self.file_number, handle.offset, &block, true);
+            cache.insert_validated_block(
+                self.file_number,
+                handle.offset,
+                handle.size,
+                &block,
+                ValidatedKind::Index,
+            );
         }
         Ok(Some(block))
     }
@@ -540,9 +650,6 @@ impl TableReader {
         sequence: SequenceNumber,
         fill_cache: bool,
     ) -> Result<Option<(Option<V>, SequenceNumber)>> {
-        use crate::types::pack_sequence_and_type;
-        use smallvec::SmallVec;
-
         // Check bloom filter with user key
         if let Some(ref filter) = self.filter_data
             && !filter.may_match(user_key)
@@ -555,12 +662,15 @@ impl TableReader {
             &(!pack_sequence_and_type(sequence, ValueType::RangeDeletion)).to_be_bytes(),
         );
 
-        let handle = match self.find_data_block(&seek_key, fill_cache).ctx()? {
-            Some(handle) => handle,
-            None => return Ok(None),
+        let Some((index_block, idx)) = self.find_data_block(&seek_key, fill_cache).ctx()? else {
+            return Ok(None);
         };
+        let (sep, val, _) = index_block.decode_restart_entry(idx)?;
+        let index_entry = decode_index_entry(val).ctx()?;
 
-        let block = self.read_block_cached_block(&handle, fill_cache).ctx()?;
+        let block = self
+            .read_data_block_ordered(&index_entry.handle, index_entry.first_key, sep, fill_cache)
+            .ctx()?;
 
         let mut encoded_ikey = SmallVec::<[u8; 128]>::new();
         match block
@@ -580,7 +690,12 @@ impl TableReader {
                                     value.len() as u32,
                                 )
                             })),
-                            ValueType::Deletion | ValueType::RangeDeletion => None,
+                            ValueType::Deletion => None,
+                            ValueType::RangeDeletion => {
+                                return Err(Error::corruption(
+                                    "range deletion in point data block",
+                                ));
+                            }
                         },
                         entry_seq,
                     )));
@@ -605,6 +720,115 @@ impl TableReader {
         self.covering_sequence(user_key, read_seq, true)
     }
 
+    fn validate_range_leaf(part: &RangePartition, block: &Block) -> Result<()> {
+        let data_end = block.data_end_offset();
+        if data_end == 0 || block.num_restarts() == 0 {
+            return Err(Error::corruption("empty SST range leaf"));
+        }
+        let mut prev_end = SmallVec::<[u8; 128]>::from_slice(part.begin.as_slice());
+        let mut end = SmallVec::<[u8; 128]>::new();
+        let mut offset = 0usize;
+        let mut next_restart = 1u32;
+        let mut seg_end = if block.num_restarts() > 1 {
+            block.restart_point(1) as usize
+        } else {
+            data_end
+        };
+        let mut first_entry = true;
+        while offset < data_end {
+            if offset == seg_end {
+                end.clear();
+                let r = next_restart;
+                next_restart = r + 1;
+                seg_end = if r + 1 < block.num_restarts() {
+                    block.restart_point(r + 1) as usize
+                } else {
+                    data_end
+                };
+            }
+            let (vs, vl, next_off) =
+                decode_entry_reuse(&block.data()[..seg_end], offset, &mut end)?;
+            let v = &block.data()[vs..vs + vl];
+            let (begin, seqs) = decode_interval(v)?;
+            if first_entry {
+                if begin != part.begin.as_slice() {
+                    return Err(Error::corruption("incorrect range partition begin"));
+                }
+                first_entry = false;
+            }
+            if begin < prev_end.as_slice() || begin >= end.as_slice() {
+                return Err(Error::corruption("overlapping range intervals"));
+            }
+            let stripes = seqs.as_chunks::<8>().0;
+            if u64::from_le_bytes(stripes[0]) == 0
+                || u64::from_le_bytes(*stripes.last().unwrap()) > MAX_SEQUENCE_NUMBER
+                || stripes
+                    .windows(2)
+                    .any(|pair| u64::from_le_bytes(pair[0]) >= u64::from_le_bytes(pair[1]))
+            {
+                return Err(Error::corruption(
+                    "invalid range sequence ordering or maximum",
+                ));
+            }
+            prev_end.clear();
+            prev_end.extend_from_slice(&end);
+            offset = next_off;
+        }
+        if first_entry || prev_end.as_slice() != part.end.as_slice() {
+            return Err(Error::corruption("incorrect range partition end"));
+        }
+        Ok(())
+    }
+
+    fn range_leaf_block(&self, part: &RangePartition, fill_cache: bool) -> Result<Block> {
+        if let Some(ref cache) = self.block_cache
+            && let Some((raw, cached_size, validated)) =
+                cache.get_cached_block(self.file_number, part.handle.offset)
+        {
+            if cached_size != u64::MAX && cached_size != part.handle.size {
+                return Err(Error::corruption("SST range leaf block size mismatch"));
+            }
+            if let Some(ref s) = self.stats {
+                s.record_cache_hit();
+            }
+            let block = match validated {
+                Some((block, ValidatedKind::RangeDel, _)) => return Ok(block),
+                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
+                None => Block::new(raw)?,
+            };
+            Self::validate_range_leaf(part, &block)?;
+            if fill_cache {
+                cache.insert_validated_block(
+                    self.file_number,
+                    part.handle.offset,
+                    part.handle.size,
+                    &block,
+                    ValidatedKind::RangeDel,
+                );
+            }
+            return Ok(block);
+        }
+
+        if let Some(ref s) = self.stats
+            && self.block_cache.is_some()
+        {
+            s.record_cache_miss();
+        }
+        let data = Self::read_block_data(&self.file, &part.handle).ctx()?;
+        let block = Block::from_vec(data)?;
+        Self::validate_range_leaf(part, &block)?;
+        if fill_cache && let Some(ref cache) = self.block_cache {
+            cache.insert_validated_block(
+                self.file_number,
+                part.handle.offset,
+                part.handle.size,
+                &block,
+                ValidatedKind::RangeDel,
+            );
+        }
+        Ok(block)
+    }
+
     pub fn covering_sequence(
         &self,
         user_key: &[u8],
@@ -621,7 +845,7 @@ impl TableReader {
         else {
             return Ok(0);
         };
-        let block = self.read_block_cached_block(&part.handle, fill_cache)?;
+        let block = self.range_leaf_block(part, fill_cache)?;
         // A tombstone's end is exclusive, so seek the first strictly greater end.
         let cmp = |end: &[u8], key: &[u8]| {
             if end <= key {
@@ -630,12 +854,17 @@ impl TableReader {
                 Ordering::Greater
             }
         };
-        let Some(v) =
-            block.seek_by_reuse(user_key, cmp, &mut smallvec::SmallVec::<[u8; 128]>::new())?
-        else {
+        let mut end_key = SmallVec::<[u8; 128]>::new();
+        let Some(v) = block.seek_by_reuse(user_key, cmp, &mut end_key)? else {
             return Err(Error::corruption("range leaf ends before its separator"));
         };
         let (begin, seqs) = decode_interval(v)?;
+        if begin < part.begin.as_slice()
+            || begin >= end_key.as_slice()
+            || end_key.as_slice() > part.end.as_slice()
+        {
+            return Err(Error::corruption("overlapping range intervals"));
+        }
         if begin > user_key {
             return Ok(0);
         }
@@ -722,38 +951,40 @@ impl TableReader {
             self.range_partitions
                 .partition_point(|p| p.end.as_slice() <= lo)
         });
+        let mut end = SmallVec::<[u8; 128]>::new();
         for part in &self.range_partitions[first..] {
             if upper.is_some_and(|hi| part.begin.as_slice() >= hi) {
                 break;
             }
-            let block = self.read_block_cached_block(&part.handle, fill_cache)?;
-            let mut iter = block.iter();
-            let mut prev_end = part.begin.as_slice().to_vec();
-            for (end, v) in &mut iter {
-                let (begin, seqs) = decode_interval(&v)?;
-                if begin < prev_end.as_slice() || begin >= end.as_slice() {
-                    return Err(Error::corruption("overlapping range intervals"));
+            let block = self.range_leaf_block(part, fill_cache)?;
+            let data_end = block.data_end_offset();
+            let mut offset = 0usize;
+            let mut next_restart = 1u32;
+            let mut seg_end = if block.num_restarts() > 1 {
+                block.restart_point(1) as usize
+            } else {
+                data_end
+            };
+            end.clear();
+            while offset < data_end {
+                if offset == seg_end {
+                    end.clear();
+                    let r = next_restart;
+                    next_restart = r + 1;
+                    seg_end = if r + 1 < block.num_restarts() {
+                        block.restart_point(r + 1) as usize
+                    } else {
+                        data_end
+                    };
                 }
+                let (vs, vl, next_off) =
+                    decode_entry_reuse(&block.data()[..seg_end], offset, &mut end)?;
+                let (begin, seqs) = decode_interval(&block.data()[vs..vs + vl])?;
                 let stripes = seqs.as_chunks::<8>().0;
-                if u64::from_le_bytes(*stripes.last().unwrap()) > crate::types::MAX_SEQUENCE_NUMBER
-                    || stripes
-                        .windows(2)
-                        .any(|pair| u64::from_le_bytes(pair[0]) >= u64::from_le_bytes(pair[1]))
-                {
-                    return Err(Error::corruption(
-                        "invalid range sequence ordering or maximum",
-                    ));
-                }
-                if crate::types::tombstone_overlaps_bounds(begin, &end, lower, upper) {
+                if tombstone_overlaps_bounds(begin, &end, lower, upper) {
                     visit(begin, &end, stripes);
                 }
-                prev_end = end;
-            }
-            if let Some(e) = iter.error() {
-                return Err(e.clone());
-            }
-            if prev_end != part.end {
-                return Err(Error::corruption("incorrect range partition end"));
+                offset = next_off;
             }
         }
         Ok(())
@@ -780,8 +1011,9 @@ impl TableReader {
         Ok(result)
     }
 
-    /// Find the data block handle that might contain the given key.
-    fn find_data_block(&self, key: &[u8], fill_cache: bool) -> Result<Option<BlockHandle>> {
+    /// Find the index leaf and entry index that might contain `key`.
+    #[inline]
+    fn find_data_block(&self, key: &[u8], fill_cache: bool) -> Result<Option<(Block, u32)>> {
         let part = self
             .partitions
             .partition_point(|(k, _)| k.compare_internal(key).is_lt());
@@ -792,8 +1024,7 @@ impl TableReader {
         if idx >= block.num_restarts() {
             return Err(Error::corruption("index leaf ends before its separator"));
         }
-        let (_, v, _) = block.decode_restart_entry(idx)?;
-        Ok(Some(decode_index_entry(v)?.handle))
+        Ok(Some((block, idx)))
     }
 
     fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
@@ -921,14 +1152,17 @@ impl TableReader {
         let mut prefix_len = None;
         let mut filter_format = None;
         let mut range_del_handle = None;
+        let mut min_offset = metaindex_handle.offset;
 
         let mut iter = metaindex.iter();
         for (key, value) in &mut iter {
             if key == b"filter.bloom" {
                 let handle = BlockHandle::decode(&value).ctx()?;
+                min_offset = min_offset.min(handle.offset);
                 bloom = Some(Self::read_block_data(file, &handle).ctx()?);
             } else if key == b"filter.prefix" {
                 let handle = BlockHandle::decode(&value).ctx()?;
+                min_offset = min_offset.min(handle.offset);
                 prefix = Some(Self::read_block_data(file, &handle).ctx()?);
             } else if key == FILTER_FORMAT_NAME.as_bytes() {
                 if value.len() != 1 {
@@ -948,7 +1182,9 @@ impl TableReader {
                     Error::corruption("prefix filter length overflows usize".to_string())
                 })?);
             } else if key == RANGE_DEL_BLOCK_NAME.as_bytes() {
-                range_del_handle = Some(BlockHandle::decode(&value).ctx()?);
+                let handle = BlockHandle::decode(&value).ctx()?;
+                min_offset = min_offset.min(handle.offset);
+                range_del_handle = Some(handle);
             }
         }
         if let Some(e) = iter.error() {
@@ -961,8 +1197,8 @@ impl TableReader {
             bloom,
             prefix,
             prefix_len,
-
             range_del_handle,
+            min_offset,
         })
     }
 
@@ -994,25 +1230,52 @@ impl TableReader {
     }
 
     /// Read and validate a `Block`, skipping `Block::new` restart scanning on cache hits.
+    /// Returns `(block, is_data_ordered)`.
     pub(super) fn read_block_cached_block(
         &self,
         handle: &BlockHandle,
+        bounds: Option<(&[u8], &[u8])>,
         fill_cache: bool,
-    ) -> Result<Block> {
+    ) -> Result<(Block, bool)> {
         if let Some(ref cache) = self.block_cache
-            && let Some((raw, validated)) = cache.get_cached_block(self.file_number, handle.offset)
+            && let Some((raw, cached_size, validated)) =
+                cache.get_cached_block(self.file_number, handle.offset)
         {
+            if cached_size != u64::MAX && cached_size != handle.size {
+                return Err(Error::corruption("SST data block size mismatch"));
+            }
             if let Some(ref s) = self.stats {
                 s.record_cache_hit();
             }
-            if let Some((block, _)) = validated {
-                return Ok(block);
+            match validated {
+                Some((block, ValidatedKind::DataOrdered, _)) => return Ok((block, true)),
+                Some((block, ValidatedKind::Data, _)) => return Ok((block, false)),
+                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
+                None => {
+                    let block = Block::new(raw)?;
+                    if fill_cache && cache.is_enabled() {
+                        if let Some((first_key, sep)) = bounds {
+                            block.validate_point_block_ordered(first_key, sep)?;
+                            cache.insert_validated_block(
+                                self.file_number,
+                                handle.offset,
+                                handle.size,
+                                &block,
+                                ValidatedKind::DataOrdered,
+                            );
+                            return Ok((block, true));
+                        }
+                        cache.insert_validated_block(
+                            self.file_number,
+                            handle.offset,
+                            handle.size,
+                            &block,
+                            ValidatedKind::Data,
+                        );
+                    }
+                    return Ok((block, false));
+                }
             }
-            let block = Block::new(raw)?;
-            if fill_cache {
-                cache.insert_validated_block(self.file_number, handle.offset, &block, false);
-            }
-            return Ok(block);
         }
 
         if let Some(ref s) = self.stats
@@ -1024,10 +1287,103 @@ impl TableReader {
         let data = Self::read_block_data(&self.file, handle).ctx()?;
         let block = Block::from_vec(data)?;
 
-        if fill_cache && let Some(ref cache) = self.block_cache {
-            cache.insert_validated_block(self.file_number, handle.offset, &block, false);
+        if fill_cache
+            && let Some(ref cache) = self.block_cache
+            && cache.is_enabled()
+        {
+            if let Some((first_key, sep)) = bounds {
+                block.validate_point_block_ordered(first_key, sep)?;
+                cache.insert_validated_block(
+                    self.file_number,
+                    handle.offset,
+                    handle.size,
+                    &block,
+                    ValidatedKind::DataOrdered,
+                );
+                return Ok((block, true));
+            }
+            cache.insert_validated_block(
+                self.file_number,
+                handle.offset,
+                handle.size,
+                &block,
+                ValidatedKind::Data,
+            );
         }
 
+        Ok((block, false))
+    }
+
+    /// Read a point data block and ensure its entries are strictly ordered within `[first_key, sep]`.
+    /// Warm hits on `ValidatedKind::DataOrdered` skip full-block scans.
+    pub(super) fn read_data_block_ordered(
+        &self,
+        handle: &BlockHandle,
+        first_key: &[u8],
+        sep: &[u8],
+        fill_cache: bool,
+    ) -> Result<Block> {
+        if let Some(ref cache) = self.block_cache
+            && let Some((raw, cached_size, validated)) =
+                cache.get_cached_block(self.file_number, handle.offset)
+        {
+            if cached_size != u64::MAX && cached_size != handle.size {
+                return Err(Error::corruption("SST data block size mismatch"));
+            }
+            if let Some(ref s) = self.stats {
+                s.record_cache_hit();
+            }
+            match validated {
+                Some((block, ValidatedKind::DataOrdered, _)) => {
+                    let (k0, _, _) = block.decode_restart_entry(0)?;
+                    let (kl, _, _) = block.decode_restart_entry(block.num_restarts() - 1)?;
+                    if k0 != first_key || compare_internal_key(kl, sep).is_gt() {
+                        return Err(Error::corruption(
+                            "SST data block disagrees with index bounds",
+                        ));
+                    }
+                    return Ok(block);
+                }
+                Some((block, ValidatedKind::Data, ordered_flag)) => {
+                    block.validate_point_block_ordered(first_key, sep)?;
+                    ordered_flag.store(true, AtomicOrdering::Release);
+                    return Ok(block);
+                }
+                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
+                None => {
+                    let block = Block::new(raw)?;
+                    block.validate_point_block_ordered(first_key, sep)?;
+                    if fill_cache {
+                        cache.insert_validated_block(
+                            self.file_number,
+                            handle.offset,
+                            handle.size,
+                            &block,
+                            ValidatedKind::DataOrdered,
+                        );
+                    }
+                    return Ok(block);
+                }
+            }
+        }
+
+        if let Some(ref s) = self.stats
+            && self.block_cache.is_some()
+        {
+            s.record_cache_miss();
+        }
+        let data = Self::read_block_data(&self.file, handle).ctx()?;
+        let block = Block::from_vec(data)?;
+        block.validate_point_block_ordered(first_key, sep)?;
+        if fill_cache && let Some(ref cache) = self.block_cache {
+            cache.insert_validated_block(
+                self.file_number,
+                handle.offset,
+                handle.size,
+                &block,
+                ValidatedKind::DataOrdered,
+            );
+        }
         Ok(block)
     }
 
@@ -1039,7 +1395,8 @@ impl TableReader {
         fill_cache: bool,
     ) -> Result<Arc<Vec<u8>>> {
         Ok(self
-            .read_block_cached_block(handle, fill_cache)?
+            .read_block_cached_block(handle, None, fill_cache)?
+            .0
             .data_arc()
             .clone())
     }
@@ -1062,13 +1419,16 @@ impl TableReader {
         let cached = cache.get_cached_block(self.file_number, leaf.offset);
         let mut warm = false;
         let leaf_block = match cached {
-            Some((_, Some((block, true)))) => block,
-            Some((_, Some((block, false)))) => {
-                warm = true;
-                self.validate_index_leaf(0, sep, &block).ok()?;
+            Some((_, cached_size, _)) if cached_size != u64::MAX && cached_size != leaf.size => {
+                return None;
+            }
+            Some((_, _, Some((block, ValidatedKind::Index, _)))) => {
+                self.check_index_leaf_partition_bounds(0, sep, &block)
+                    .ok()?;
                 block
             }
-            Some((raw, None)) => {
+            Some((_, _, Some((_, _, _)))) => return None,
+            Some((raw, _, None)) => {
                 warm = true;
                 let block = Block::new(raw).ok()?;
                 self.validate_index_leaf(0, sep, &block).ok()?;
@@ -1082,23 +1442,27 @@ impl TableReader {
                 block
             }
         };
-        let handle = {
-            let (_, value, _) = leaf_block.decode_restart_entry(0).ok()?;
-            decode_index_entry(value).ok()?.handle
+        let (sep0, entry0) = {
+            let (sep0, value, _) = leaf_block.decode_restart_entry(0).ok()?;
+            (sep0, decode_index_entry(value).ok()?)
         };
+        let handle = entry0.handle;
         if cache.get(self.file_number, handle.offset).is_some() {
             return None;
         }
-        let index_leaf = warm.then_some((leaf.offset, leaf_block));
+        let index_leaf = warm.then_some((leaf.offset, leaf.size, leaf_block.clone()));
         #[cfg(test)]
         if let Some(hook) = PREPARE_FIRST_BLOCK_PIN_HOOK.with(|h| h.borrow_mut().take()) {
             hook();
         }
         let raw_data = Self::read_block_data(&self.file, &handle).ok()?;
         let data = Block::from_vec(raw_data).ok()?;
+        data.validate_point_block_ordered(entry0.first_key, sep0)
+            .ok()?;
         Some(PreparedBlockPin {
             file_number: self.file_number,
             offset: handle.offset,
+            compressed_size: handle.size,
             index_leaf,
             data,
         })
@@ -1116,13 +1480,21 @@ impl TableReader {
             return;
         }
         if let Some(ref cache) = self.block_cache {
-            if let Some((offset, leaf_block)) = prepared.index_leaf {
-                cache.insert_validated_block(prepared.file_number, offset, &leaf_block, true);
+            if let Some((offset, size, leaf_block)) = prepared.index_leaf {
+                cache.insert_validated_block(
+                    prepared.file_number,
+                    offset,
+                    size,
+                    &leaf_block,
+                    ValidatedKind::Index,
+                );
             }
             cache.insert_pinned_validated_block(
                 prepared.file_number,
                 prepared.offset,
+                prepared.compressed_size,
                 &prepared.data,
+                ValidatedKind::DataOrdered,
             );
         }
     }
@@ -1510,8 +1882,7 @@ mod tests {
         use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
         use crate::sst::table_reader::TableIterator;
         use crate::types::{InternalKey, ValueType, user_key};
-        use std::fs;
-        use std::sync::Arc;
+        use std::{fs, sync::Arc};
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("partition_bounds.sst");
@@ -1709,5 +2080,217 @@ mod tests {
             reseek_alloc, 0,
             "warm TableIterator re-seek allocated {reseek_alloc} bytes"
         );
+    }
+
+    #[test]
+    fn corrupt_directory_handles_range_stripes_and_point_blocks_return_corruption() {
+        use super::{BlockHandle, CompressionType, FOOTER_SIZE};
+        use crate::ErrorKind;
+        use crate::cache::block_cache::BlockCache;
+        use crate::iterator::source::SeekableIterator;
+        use crate::sst::block_builder::BlockBuilder;
+        use crate::sst::format::{decode_footer, encode_footer, encode_index_value_with_props};
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::sst::table_reader::TableIterator;
+        use crate::types::{InternalKey, ValueType};
+        use std::{fs, sync::Arc};
+
+        let rechecksum = |raw: &[u8]| -> Vec<u8> {
+            let mut out = raw.to_vec();
+            out.push(CompressionType::None as u8);
+            let crc = crc32fast::hash(&out);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out
+        };
+
+        // 1. Aliased index partition leaf BlockHandles must be rejected at open even with BlockCache.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("aliased_parts.sst");
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    block_size: 1,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for i in 0..40u32 {
+                let mut uk = format!("k{:04}_", i * 3).into_bytes();
+                uk.resize(2048, b'x');
+                builder
+                    .add(InternalKey::new(&uk, 1, ValueType::Value).as_bytes(), b"v")
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+            let clean = TableReader::open(&path).unwrap();
+            assert!(clean.partitions.len() >= 2);
+            let mut bytes = fs::read(&path).unwrap();
+            let (meta_h, idx_h) =
+                decode_footer(bytes[bytes.len() - FOOTER_SIZE..].try_into().unwrap()).unwrap();
+            let mut dir_b = BlockBuilder::new(16);
+            let p0_handle = clean.partitions[0].1;
+            for (pk, _) in &clean.partitions {
+                let mut ik = pk.prefix.to_vec();
+                ik.extend_from_slice(&pk.trailer);
+                dir_b.add(&ik, &p0_handle.encode());
+            }
+            let mut dir_raw = dir_b.finish();
+            dir_raw.extend_from_slice(&BlockHandle::default().encode());
+            bytes.truncate(idx_h.offset as usize);
+            let dir_framed = rechecksum(&dir_raw);
+            let new_idx_h = BlockHandle::new(idx_h.offset, dir_raw.len() as u64);
+            bytes.extend_from_slice(&dir_framed);
+            bytes.extend_from_slice(&encode_footer(&meta_h, &new_idx_h));
+            let bad_path = dir.path().join("bad_aliased.sst");
+            fs::write(&bad_path, &bytes).unwrap();
+            let cache = Arc::new(BlockCache::new(8 << 20));
+            let err = TableReader::open_with_all(&bad_path, 1, Some(cache), None)
+                .err()
+                .expect("aliased partition handles must fail open");
+            assert_eq!(err.kind(), ErrorKind::Corruption);
+        }
+
+        // 2. Unordered rangedel stripes and shifted first-interval begin fail covering_sequence & read_tombstones.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bad_range.sst");
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            builder.start_output(&[5, 15, 20], vec![]);
+            for s in [20u64, 15, 5] {
+                builder
+                    .add(
+                        InternalKey::new(b"a", s, ValueType::RangeDeletion).as_bytes(),
+                        b"z",
+                    )
+                    .unwrap();
+            }
+            builder
+                .add(
+                    InternalKey::new(b"c", 4, ValueType::Value).as_bytes(),
+                    b"val",
+                )
+                .unwrap();
+            builder.finish().unwrap();
+            let clean = TableReader::open(&path).unwrap();
+            let rpart = &clean.range_partitions[0];
+
+            for shifted_begin in [false, true] {
+                let mut leaf_b = BlockBuilder::new(1);
+                let mut val = Vec::new();
+                let begin: &[u8] = if shifted_begin { b"f" } else { b"a" };
+                val.extend_from_slice(&(begin.len() as u32).to_le_bytes());
+                val.extend_from_slice(begin);
+                let seqs: &[u64] = if shifted_begin {
+                    &[5, 15, 20]
+                } else {
+                    &[20, 15, 5]
+                };
+                for &s in seqs {
+                    val.extend_from_slice(&s.to_le_bytes());
+                }
+                leaf_b.add(b"z", &val);
+                let raw_leaf = leaf_b.finish();
+                assert_eq!(raw_leaf.len() as u64, rpart.handle.size);
+                let mut bytes = fs::read(&path).unwrap();
+                let framed = rechecksum(&raw_leaf);
+                bytes[rpart.handle.offset as usize..rpart.handle.offset as usize + framed.len()]
+                    .copy_from_slice(&framed);
+                let bad_path = dir.path().join(format!("range_{shifted_begin}.sst"));
+                fs::write(&bad_path, &bytes).unwrap();
+                assert_eq!(
+                    TableReader::open(&bad_path).err().unwrap().kind(),
+                    ErrorKind::Corruption
+                );
+            }
+        }
+
+        // 3. ValueType::RangeDeletion in a point data block is rejected by both point_value and TableIterator.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rangedel_in_point.sst");
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            builder
+                .add(
+                    InternalKey::new(b"k", 10, ValueType::Value).as_bytes(),
+                    b"z",
+                )
+                .unwrap();
+            builder
+                .add(InternalKey::new(b"k", 5, ValueType::Value).as_bytes(), b"v")
+                .unwrap();
+            builder.finish().unwrap();
+
+            let mut data_b = BlockBuilder::new(16);
+            let bad_first = InternalKey::new(b"k", 10, ValueType::RangeDeletion);
+            let second = InternalKey::new(b"k", 5, ValueType::Value);
+            data_b.add(bad_first.as_bytes(), b"z");
+            data_b.add(second.as_bytes(), b"v");
+            let raw_data = data_b.finish();
+            let framed_data = rechecksum(&raw_data);
+
+            let mut idx_leaf = BlockBuilder::new(1);
+            let data_h = BlockHandle::new(0, raw_data.len() as u64);
+            let idx_val =
+                encode_index_value_with_props(&data_h, bad_first.as_bytes(), &[]).unwrap();
+            idx_leaf.add(second.as_bytes(), &idx_val);
+            let raw_leaf = idx_leaf.finish();
+            let framed_leaf = rechecksum(&raw_leaf);
+
+            let mut meta_b = BlockBuilder::new(1);
+            meta_b.add(b"props.none", b"");
+            let raw_meta = meta_b.finish();
+            let framed_meta = rechecksum(&raw_meta);
+
+            let mut dir_b = BlockBuilder::new(1);
+            let leaf_h = BlockHandle::new(framed_data.len() as u64, raw_leaf.len() as u64);
+            dir_b.add(second.as_bytes(), &leaf_h.encode());
+            let mut raw_dir = dir_b.finish();
+            raw_dir.extend_from_slice(&BlockHandle::default().encode());
+            let framed_dir = rechecksum(&raw_dir);
+
+            let meta_h = BlockHandle::new(
+                (framed_data.len() + framed_leaf.len()) as u64,
+                raw_meta.len() as u64,
+            );
+            let dir_h = BlockHandle::new(
+                (framed_data.len() + framed_leaf.len() + framed_meta.len()) as u64,
+                raw_dir.len() as u64,
+            );
+            let mut image = Vec::new();
+            image.extend_from_slice(&framed_data);
+            image.extend_from_slice(&framed_leaf);
+            image.extend_from_slice(&framed_meta);
+            image.extend_from_slice(&framed_dir);
+            image.extend_from_slice(&encode_footer(&meta_h, &dir_h));
+            fs::write(&path, &image).unwrap();
+
+            let reader = Arc::new(TableReader::open(&path).unwrap());
+            assert_eq!(
+                reader.get_internal(b"k", 10).unwrap_err().kind(),
+                ErrorKind::Corruption
+            );
+            let mut iter = TableIterator::new(reader);
+            assert!(iter.next().is_none());
+            assert_eq!(
+                iter.iter_error().map(|e| e.kind()),
+                Some(ErrorKind::Corruption)
+            );
+        }
     }
 }

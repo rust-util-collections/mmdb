@@ -20,45 +20,67 @@ use crate::sst::block::Block;
 /// Pool cache key: (member_id, sst_file_number, block_offset).
 type CacheKey = (u64, u64, u64);
 
+/// Role of a pre-validated `Block` stored in [`BlockCache`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ValidatedKind {
+    Data,
+    DataOrdered,
+    Index,
+    RangeDel,
+}
+
 /// Cached block payload alongside optional pre-validated `Block` metadata so
-/// warm hits skip `O(num_restarts)` restart-table scans and index-leaf checks.
+/// warm hits skip `O(num_restarts)` restart-table scans and leaf checks.
 #[derive(Clone)]
 struct CacheValue {
     data: Arc<Vec<u8>>,
+    /// On-disk payload size from `BlockHandle::size`, or `u64::MAX` for raw inserts.
+    compressed_size: u64,
     /// `u32::MAX` when inserted via raw `BlockCache::insert` without `Block` validation.
     restart_offset: u32,
     num_restarts: u32,
-    /// True once `TableReader` has validated index-leaf ordering and partition bounds.
-    index_validated: bool,
+    kind: Option<ValidatedKind>,
+    /// Upgrades `ValidatedKind::Data` to `DataOrdered` in place with zero allocations.
+    data_ordered: Arc<AtomicBool>,
 }
 
 impl CacheValue {
     fn raw(data: Arc<Vec<u8>>) -> Self {
         Self {
             data,
+            compressed_size: u64::MAX,
             restart_offset: u32::MAX,
             num_restarts: 0,
-            index_validated: false,
+            kind: None,
+            data_ordered: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    fn from_block(block: &Block, index_validated: bool) -> Self {
+    fn from_block(block: &Block, compressed_size: u64, kind: ValidatedKind) -> Self {
+        let ordered = kind == ValidatedKind::DataOrdered;
         Self {
             data: block.data_arc().clone(),
+            compressed_size,
             restart_offset: u32::try_from(block.data_end_offset())
                 .expect("block restart_offset fits in u32"),
             num_restarts: block.num_restarts(),
-            index_validated,
+            kind: Some(kind),
+            data_ordered: Arc::new(AtomicBool::new(ordered)),
         }
     }
 
-    fn into_block(self) -> Option<(Block, bool)> {
+    fn into_block(self) -> Option<(Block, ValidatedKind, Arc<AtomicBool>)> {
+        let mut kind = self.kind?;
         if self.restart_offset == u32::MAX {
             return None;
         }
+        if kind == ValidatedKind::Data && self.data_ordered.load(Ordering::Acquire) {
+            kind = ValidatedKind::DataOrdered;
+        }
         Some((
             Block::from_validated(self.data, self.restart_offset as usize, self.num_restarts),
-            self.index_validated,
+            kind,
+            self.data_ordered,
         ))
     }
 }
@@ -318,9 +340,13 @@ pub struct BlockCache {
     pin_updates: Mutex<()>,
 }
 
-/// Raw cached block payload paired with optional pre-validated `Block` metadata
-/// (`(block, index_validated)`).
-pub(crate) type CachedBlockLookup = (Arc<Vec<u8>>, Option<(Block, bool)>);
+/// Raw cached block payload paired with its recorded compressed size (`u64::MAX`
+/// when unknown) and optional pre-validated `(Block, ValidatedKind, data_ordered_flag)`.
+pub(crate) type CachedBlockLookup = (
+    Arc<Vec<u8>>,
+    u64,
+    Option<(Block, ValidatedKind, Arc<AtomicBool>)>,
+);
 
 impl BlockCache {
     pub(crate) fn is_enabled(&self) -> bool {
@@ -364,7 +390,8 @@ impl BlockCache {
     ) -> Option<CachedBlockLookup> {
         let entry = self.get_entry(file_number, block_offset)?;
         let raw = entry.data.clone();
-        Some((raw, entry.into_block()))
+        let compressed_size = entry.compressed_size;
+        Some((raw, compressed_size, entry.into_block()))
     }
 
     fn insert_entry(&self, file_number: u64, block_offset: u64, value: CacheValue) {
@@ -426,13 +453,14 @@ impl BlockCache {
         &self,
         file_number: u64,
         block_offset: u64,
+        compressed_size: u64,
         block: &Block,
-        index_validated: bool,
+        kind: ValidatedKind,
     ) {
         self.insert_entry(
             file_number,
             block_offset,
-            CacheValue::from_block(block, index_validated),
+            CacheValue::from_block(block, compressed_size, kind),
         );
     }
 
@@ -475,12 +503,14 @@ impl BlockCache {
         &self,
         file_number: u64,
         block_offset: u64,
+        compressed_size: u64,
         block: &Block,
+        kind: ValidatedKind,
     ) {
         self.insert_pinned_entry(
             file_number,
             block_offset,
-            CacheValue::from_block(block, false),
+            CacheValue::from_block(block, compressed_size, kind),
         );
     }
 

@@ -20,6 +20,8 @@
 
 use std::{cmp::Ordering, sync::Arc};
 
+use smallvec::SmallVec;
+
 use crate::error::{Error, Result};
 
 /// Decode a varint from the given buffer. Returns (value, bytes_consumed).
@@ -169,31 +171,23 @@ impl Block {
     #[inline]
     pub(crate) fn decode_restart_entry(&self, i: u32) -> Result<(&[u8], &[u8], usize)> {
         let offset = self.restart_point(i) as usize;
-        let data = self.entry_data();
-        if offset >= data.len() {
-            return Err(Error::corruption("entry offset past block data"));
+        let seg_end = if i + 1 < self.num_restarts {
+            self.restart_point(i + 1) as usize
+        } else {
+            self.restart_offset
+        };
+        let data = &self.data[..seg_end];
+        if let Some(&[0, b1, b2]) = offset.checked_add(3).and_then(|end| data.get(offset..end))
+            && (b1 | b2) & 0x80 == 0
+        {
+            let key_start = offset + 3;
+            let key_end = key_start + b1 as usize;
+            let val_end = key_end + b2 as usize;
+            if val_end <= data.len() {
+                return Ok((&data[key_start..key_end], &data[key_end..val_end], val_end));
+            }
         }
-        let (shared_len, n1) = decode_varint(&data[offset..])?;
-        if shared_len != 0 {
-            return Err(Error::corruption(
-                "shared prefix exceeds previous key length",
-            ));
-        }
-        let pos = offset + n1;
-        let (unshared_len, n2) = decode_varint(&data[pos..])?;
-        let pos = pos + n2;
-        let (value_len, n3) = decode_varint(&data[pos..])?;
-        let key_start = pos + n3;
-        let key_end = key_start
-            .checked_add(unshared_len as usize)
-            .ok_or_else(|| Error::corruption("entry key length overflow"))?;
-        let val_end = key_end
-            .checked_add(value_len as usize)
-            .ok_or_else(|| Error::corruption("entry value length overflow"))?;
-        if val_end > data.len() {
-            return Err(Error::corruption("block entry truncated"));
-        }
-        Ok((&data[key_start..key_end], &data[key_end..val_end], val_end))
+        decode_restart_entry_slow(data, offset)
     }
 
     /// Entry bytes only; excludes the restart array and restart count.
@@ -207,9 +201,16 @@ impl Block {
     /// (as it would on clean exhaustion) but records the failure — call
     /// `error()` after iteration ends to distinguish the two cases.
     pub fn iter(&self) -> BlockIterator<'_> {
+        let seg_end = if self.num_restarts > 1 {
+            self.restart_point(1) as usize
+        } else {
+            self.restart_offset
+        };
         BlockIterator {
             block: self,
             offset: 0,
+            next_restart_idx: 1,
+            seg_end,
             key: Vec::new(),
             value_start: 0,
             value_len: 0,
@@ -259,31 +260,48 @@ impl Block {
             }
         }
 
-        // Start scanning
-        let start = if left > 0 {
-            self.restart_point(left - 1) as usize
+        // Start scanning bounded to the selected restart segment so an entry
+        // with an inflated length cannot straddle into the next segment.
+        let (start, seg_end) = if left > 0 {
+            let s = self.restart_point(left - 1) as usize;
+            let e = if left < self.num_restarts {
+                self.restart_point(left) as usize
+            } else {
+                self.restart_offset
+            };
+            (s, e)
         } else {
-            0
+            let e = if self.num_restarts > 1 {
+                self.restart_point(1) as usize
+            } else {
+                self.restart_offset
+            };
+            (0, e)
         };
 
         let mut offset = start;
         key.replace_suffix(0, &[]);
+        let seg_data = &self.data[..seg_end];
 
-        while offset < self.restart_offset {
-            let (value_start, value_len, next_off) =
-                decode_entry_reuse(self.entry_data(), offset, key)?;
+        while offset < seg_end {
+            let (value_start, value_len, next_off) = decode_entry_reuse(seg_data, offset, key)?;
             if compare(key, target) != Ordering::Less {
-                return Ok(Some(
-                    &self.entry_data()[value_start..value_start + value_len],
-                ));
+                return Ok(Some(&seg_data[value_start..value_start + value_len]));
             }
             offset = next_off;
+        }
+
+        if left < self.num_restarts {
+            let (rk, val, _) = self.decode_restart_entry(left)?;
+            key.replace_suffix(0, rk);
+            return Ok(Some(val));
         }
 
         Ok(None)
     }
 
     /// Find the last restart whose first key is at or below the target.
+    #[cfg(test)]
     pub fn restart_for_prev(
         &self,
         target: &[u8],
@@ -327,7 +345,7 @@ impl Block {
         };
 
         let mut offset = start;
-        let mut current_key = smallvec::SmallVec::<[u8; 128]>::new();
+        let mut current_key = SmallVec::<[u8; 128]>::new();
         while offset < end {
             let (val_start, val_len, next_off) =
                 decode_entry_reuse(&self.entry_data()[..end], offset, &mut current_key)?;
@@ -394,6 +412,57 @@ impl Block {
     /// Used by LazyValue to keep the block alive without copying values.
     pub fn data_arc(&self) -> &Arc<Vec<u8>> {
         &self.data
+    }
+
+    /// Validate that this block is a non-empty SST point data block whose entries
+    /// obey restart-segment boundaries, point `InternalKey` encoding, strict
+    /// `compare_internal_key` monotonicity, and index `[first_key, sep]` bounds.
+    pub(crate) fn validate_point_block_ordered(&self, first_key: &[u8], sep: &[u8]) -> Result<()> {
+        if self.restart_offset == 0 || self.num_restarts == 0 {
+            return Err(Error::corruption("empty SST data block"));
+        }
+        let mut key_buf = SmallVec::<[u8; 128]>::new();
+        let mut offset = 0usize;
+        let mut next_restart = 1u32;
+        let mut seg_end = if self.num_restarts > 1 {
+            self.restart_point(1) as usize
+        } else {
+            self.restart_offset
+        };
+        let mut first = true;
+        while offset < self.restart_offset {
+            let mut at_restart = first;
+            if offset == seg_end {
+                at_restart = true;
+                let r = next_restart;
+                next_restart = r + 1;
+                seg_end = if r + 1 < self.num_restarts {
+                    self.restart_point(r + 1) as usize
+                } else {
+                    self.restart_offset
+                };
+            }
+            let (_, _, next_off) = decode_point_entry_monotonic(
+                &self.data[..seg_end],
+                offset,
+                !first,
+                at_restart,
+                &mut key_buf,
+            )?;
+            if first {
+                if key_buf.as_slice() != first_key {
+                    return Err(Error::corruption(
+                        "SST data block disagrees with index bounds",
+                    ));
+                }
+                first = false;
+            }
+            offset = next_off;
+        }
+        if crate::types::compare_internal_key(&key_buf, sep).is_gt() {
+            return Err(Error::corruption("SST data block exceeds index separator"));
+        }
+        Ok(())
     }
 
     /// Binary search for a key using restart points, then linear scan.
@@ -521,30 +590,65 @@ impl KeyBuffer for Vec<u8> {
         self.extend_from_slice(suffix);
     }
 }
-impl KeyBuffer for smallvec::SmallVec<[u8; 128]> {
+impl KeyBuffer for SmallVec<[u8; 128]> {
+    #[inline]
     fn replace_suffix(&mut self, shared: usize, suffix: &[u8]) {
         self.truncate(shared);
         self.extend_from_slice(suffix);
     }
 }
 
-/// Decode one entry at `offset`, reusing `key_buf` for the key (zero-alloc for key).
-/// Returns (value_start, value_len, next_offset) — value is a slice into `data`.
-/// The key is reconstructed in-place in `key_buf`.
-///
-/// See `decode_entry_at`'s doc comment: every caller-supplied `offset` is already
-/// guaranteed in-bounds, so any internal failure here means corruption, not clean
-/// EOF, and must be surfaced as an error.
-pub(crate) fn decode_entry_reuse(
+fn decode_restart_entry_slow(data: &[u8], offset: usize) -> Result<(&[u8], &[u8], usize)> {
+    if offset >= data.len() {
+        return Err(Error::corruption("entry offset past block data"));
+    }
+    let (shared_len, n1) = decode_varint(&data[offset..])?;
+    if shared_len != 0 {
+        return Err(Error::corruption(
+            "shared prefix exceeds previous key length",
+        ));
+    }
+    let pos = offset + n1;
+    let (unshared_len, n2) = decode_varint(&data[pos..])?;
+    let pos = pos + n2;
+    let (value_len, n3) = decode_varint(&data[pos..])?;
+    let key_start = pos + n3;
+    let key_end = key_start
+        .checked_add(unshared_len as usize)
+        .ok_or_else(|| Error::corruption("entry key length overflow"))?;
+    let val_end = key_end
+        .checked_add(value_len as usize)
+        .ok_or_else(|| Error::corruption("entry value length overflow"))?;
+    if val_end > data.len() {
+        return Err(Error::corruption("block entry truncated"));
+    }
+    Ok((&data[key_start..key_end], &data[key_end..val_end], val_end))
+}
+
+#[inline]
+fn decode_entry_header(data: &[u8], offset: usize) -> Result<(usize, usize, usize, usize, usize)> {
+    if let Some(&[b0, b1, b2]) = offset.checked_add(3).and_then(|end| data.get(offset..end))
+        && (b0 | b1 | b2) & 0x80 == 0
+    {
+        let pos = offset + 3;
+        let key_end = pos + b1 as usize;
+        let value_end = key_end + b2 as usize;
+        if value_end <= data.len() {
+            return Ok((b0 as usize, b1 as usize, b2 as usize, pos, key_end));
+        }
+    }
+    decode_entry_header_slow(data, offset)
+}
+
+#[cold]
+fn decode_entry_header_slow(
     data: &[u8],
     offset: usize,
-    key_buf: &mut impl KeyBuffer,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize, usize)> {
     if offset > data.len() {
         return Err(Error::corruption("block entry offset past end of data"));
     }
     let mut pos = offset;
-
     let (shared_len, n) = decode_varint(&data[pos..])?;
     pos += n;
     if pos > data.len() {
@@ -561,7 +665,6 @@ pub(crate) fn decode_entry_reuse(
     let shared = shared_len as usize;
     let unshared = unshared_len as usize;
     let vlen = value_len as usize;
-
     let key_end = pos
         .checked_add(unshared)
         .ok_or_else(|| Error::corruption("block entry key length overflow"))?;
@@ -571,6 +674,23 @@ pub(crate) fn decode_entry_reuse(
     if value_end > data.len() {
         return Err(Error::corruption("block entry extends past end of data"));
     }
+    Ok((shared, unshared, vlen, pos, key_end))
+}
+
+/// Decode one entry at `offset`, reusing `key_buf` for the key (zero-alloc for key).
+/// Returns (value_start, value_len, next_offset) — value is a slice into `data`.
+/// The key is reconstructed in-place in `key_buf`.
+///
+/// See `decode_entry_at`'s doc comment: every caller-supplied `offset` is already
+/// guaranteed in-bounds, so any internal failure here means corruption, not clean
+/// EOF, and must be surfaced as an error.
+#[inline]
+pub(crate) fn decode_entry_reuse(
+    data: &[u8],
+    offset: usize,
+    key_buf: &mut impl KeyBuffer,
+) -> Result<(usize, usize, usize)> {
+    let (shared, _unshared, vlen, pos, key_end) = decode_entry_header(data, offset)?;
     if shared > key_buf.len() {
         return Err(Error::corruption(
             "block entry shared prefix exceeds previous key length",
@@ -579,9 +699,145 @@ pub(crate) fn decode_entry_reuse(
 
     // Reconstruct key in-place: truncate to shared prefix, append unshared suffix
     key_buf.replace_suffix(shared, &data[pos..key_end]);
-    let value_start = key_end;
+    Ok((key_end, vlen, key_end + vlen))
+}
 
-    Ok((value_start, vlen, value_end))
+#[cold]
+#[inline(never)]
+fn invalid_point_ikey_type(inv_vt: u8) -> Error {
+    if inv_vt == 2 {
+        Error::corruption("range deletion in point data block")
+    } else {
+        Error::corruption(format!("internal key has invalid value_type: {inv_vt}"))
+    }
+}
+
+#[inline]
+pub(crate) fn validate_point_ikey(ikey: &[u8]) -> Result<()> {
+    if ikey.len() < 8 {
+        return Err(Error::corruption("internal key too short"));
+    }
+    let inv_vt = !ikey[ikey.len() - 1];
+    if inv_vt <= 1 {
+        Ok(())
+    } else {
+        Err(invalid_point_ikey_type(inv_vt))
+    }
+}
+
+/// Decode one SST point data-block entry at `offset` within segment slice `data`,
+/// enforcing `shared_len == 0` at restarts, valid point `InternalKey`s (`Value`
+/// or `Deletion`), and strict `compare_internal_key` monotonicity over `key_buf`.
+#[inline]
+pub(crate) fn decode_point_entry_monotonic(
+    data: &[u8],
+    offset: usize,
+    has_prev_key: bool,
+    at_restart: bool,
+    key_buf: &mut impl KeyBuffer,
+) -> Result<(usize, usize, usize)> {
+    if !at_restart
+        && has_prev_key
+        && let Some(&[b0, b1, b2]) = offset.checked_add(3).and_then(|end| data.get(offset..end))
+        && (b0 | b1 | b2) & 0x80 == 0
+    {
+        let shared = b0 as usize;
+        let unshared = b1 as usize;
+        let vlen = b2 as usize;
+        let pos = offset + 3;
+        let key_end = pos + unshared;
+        let value_end = key_end + vlen;
+        let prev_len = key_buf.len();
+        if unshared > 8
+            && shared + 8 < prev_len
+            && value_end <= data.len()
+            && (!data[key_end - 1]) <= 1
+            && key_buf[shared] < data[pos]
+        {
+            key_buf.replace_suffix(shared, &data[pos..key_end]);
+            return Ok((key_end, vlen, value_end));
+        }
+    }
+    decode_point_entry_monotonic_general(data, offset, has_prev_key, at_restart, key_buf)
+}
+
+#[inline(never)]
+fn decode_point_entry_monotonic_general(
+    data: &[u8],
+    offset: usize,
+    has_prev_key: bool,
+    at_restart: bool,
+    key_buf: &mut impl KeyBuffer,
+) -> Result<(usize, usize, usize)> {
+    let (shared, unshared, vlen, pos, key_end) = decode_entry_header(data, offset)?;
+    let value_end = key_end + vlen;
+
+    if at_restart && shared != 0 {
+        return Err(Error::corruption(
+            "block entry shared prefix exceeds previous key length",
+        ));
+    }
+
+    if !has_prev_key {
+        if shared != 0 {
+            return Err(Error::corruption(
+                "block entry shared prefix exceeds previous key length",
+            ));
+        }
+        if unshared < 8 {
+            return Err(Error::corruption("internal key too short"));
+        }
+        let inv_vt = !data[key_end - 1];
+        if inv_vt > 1 {
+            return Err(invalid_point_ikey_type(inv_vt));
+        }
+        key_buf.replace_suffix(0, &data[pos..key_end]);
+        return Ok((key_end, vlen, value_end));
+    }
+
+    let prev_len = key_buf.len();
+    if shared > prev_len {
+        return Err(Error::corruption(
+            "block entry shared prefix exceeds previous key length",
+        ));
+    }
+    let new_len = shared + unshared;
+    if new_len < 8 {
+        return Err(Error::corruption("internal key too short"));
+    }
+    let inv_vt = !if unshared > 0 {
+        data[key_end - 1]
+    } else {
+        key_buf[shared - 1]
+    };
+    if inv_vt > 1 {
+        return Err(invalid_point_ikey_type(inv_vt));
+    }
+
+    let up = prev_len - 8;
+    let un = new_len - 8;
+    let ordered = if shared < up && shared < un && key_buf[shared] != data[pos] {
+        key_buf[shared] < data[pos]
+    } else if shared <= up.min(un) {
+        match key_buf[shared..up].cmp(&data[pos..key_end - 8]) {
+            Ordering::Less => true,
+            Ordering::Greater => false,
+            Ordering::Equal => {
+                u64::from_be_bytes(key_buf[up..prev_len].try_into().unwrap())
+                    < u64::from_be_bytes(data[key_end - 8..key_end].try_into().unwrap())
+            }
+        }
+    } else if up == un {
+        key_buf[shared..prev_len] < data[pos..key_end]
+    } else {
+        up < un
+    };
+    if !ordered {
+        return Err(Error::corruption("unordered point keys in SST data block"));
+    }
+
+    key_buf.replace_suffix(shared, &data[pos..key_end]);
+    Ok((key_end, vlen, value_end))
 }
 
 /// Iterator over entries in a block.
@@ -592,6 +848,8 @@ pub(crate) fn decode_entry_reuse(
 pub struct BlockIterator<'a> {
     block: &'a Block,
     offset: usize,
+    next_restart_idx: u32,
+    seg_end: usize,
     key: Vec<u8>,
     value_start: usize,
     value_len: usize,
@@ -613,8 +871,18 @@ impl<'a> Iterator for BlockIterator<'a> {
         if self.error.is_some() || self.offset >= self.block.restart_offset {
             return None;
         }
+        if self.offset == self.seg_end {
+            self.key.clear();
+            let r = self.next_restart_idx;
+            self.next_restart_idx = r + 1;
+            self.seg_end = if r + 1 < self.block.num_restarts {
+                self.block.restart_point(r + 1) as usize
+            } else {
+                self.block.restart_offset
+            };
+        }
 
-        match decode_entry_at(self.block.entry_data(), self.offset, &self.key) {
+        match decode_entry_at(&self.block.data[..self.seg_end], self.offset, &self.key) {
             Ok((key, value, next_off)) => {
                 self.key = key.clone();
                 self.value_start = next_off - value.len();
@@ -965,5 +1233,46 @@ mod tests {
             block.seek_by(b"abc", |a, b| a.cmp(b)).is_err(),
             "seek must propagate an entry that crosses into restart metadata"
         );
+    }
+
+    #[test]
+    fn non_initial_restart_prefix_and_straddling_segment_are_corruption() {
+        // 1. Non-zero shared_len at restarts[1] must error in BlockIterator and seek_by.
+        let mut builder = BlockBuilder::new(1);
+        builder.add(b"aaa", b"1");
+        builder.add(b"aab", b"2");
+        let mut data = builder.finish();
+        let restart_offset = data.len() - 12;
+        let r1 = u32::from_le_bytes(
+            data[restart_offset + 4..restart_offset + 8]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        // Rewrite entry at r1 to claim shared_len = 2, unshared_len = 1 ('b'), val_len = 3 ("2xx")
+        // keeping exact byte length (3 varints + 1 key + 3 val = 7 bytes vs 3 varints + 3 key + 1 val = 7 bytes).
+        data[r1..restart_offset].copy_from_slice(&[2, 1, 3, b'b', b'2', b'x', b'x']);
+        let block = Block::from_vec(data).unwrap();
+        let mut iter = block.iter();
+        assert_eq!(iter.next().unwrap().0, b"aaa");
+        assert!(iter.next().is_none());
+        assert!(iter.error().is_some());
+        assert!(block.seek_by(b"aab", <[u8]>::cmp).is_err());
+
+        // 2. Entry in segment 0 straddling restarts[1] must error in BlockIterator and seek_by.
+        let mut raw = Vec::new();
+        // Entry 0 at offset 0: shared=0, unshared=1 ('a'), val_len=9 -> ends at 13 > r1 (5)!
+        raw.extend_from_slice(&[0, 1, 9, b'a', 0]);
+        // At offset r1 = 5: valid restart entry for "m" -> "v" (shared=0, unshared=1, val=1, 'm', 'v') + 2 pad bytes
+        let r1_off = raw.len() as u32;
+        raw.extend_from_slice(&[0, 1, 3, b'm', b'v', b'y', b'z']);
+        // Restarts = [0, 5], num_restarts = 2
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&r1_off.to_le_bytes());
+        raw.extend_from_slice(&2u32.to_le_bytes());
+        let straddle = Block::from_vec(raw).unwrap();
+        let mut siter = straddle.iter();
+        assert!(siter.next().is_none());
+        assert!(siter.error().is_some());
+        assert!(straddle.seek_by(b"b", <[u8]>::cmp).is_err());
     }
 }
