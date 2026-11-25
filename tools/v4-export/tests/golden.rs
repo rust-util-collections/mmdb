@@ -5,12 +5,24 @@ fn exports_residual_wal_and_snapshot_striped_sst() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/v4.3.15");
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("v5");
-    let output = Command::new(env!("CARGO_BIN_EXE_mmdb-v4-export"))
-        .arg(fixture)
-        .arg(&dest)
-        .args(["3", "2"])
-        .output()
-        .unwrap();
+    let mut export = Command::new(env!("CARGO_BIN_EXE_mmdb-v4-export"));
+    export.arg(fixture).arg(&dest).args(["3", "2"]);
+    let output = export.output().unwrap();
+    if !output.status.success()
+        && String::from_utf8_lossy(&output.stderr)
+            .contains("export requires an exclusive directory rename")
+    {
+        assert!(
+            !(cfg!(target_os = "linux") && std::env::var_os("CI").is_some()),
+            "the Linux CI filesystem must support exclusive directory publication"
+        );
+        assert!(!dest.exists());
+        let retry = export.output().unwrap();
+        assert!(!retry.status.success());
+        assert_eq!(output.stderr, retry.stderr);
+        assert_eq!(tmp.path().read_dir().unwrap().count(), 0);
+        return;
+    }
     assert!(
         output.status.success(),
         "{}",

@@ -18,7 +18,15 @@ Omitting both selects the v4 defaults of seven levels and a zero prefix length.
 1. The exporter opens the source read-only with MMDB 4.3.15, including valid residual WAL records.
 2. It creates a staging directory under the destination parent. It preserves the prefix length and clamps the destination level count to 2–16.
 3. It streams visible pairs in key order through `DB::ingest_sorted` and checks the source iterator's final error. Ingestion writes bottommost SSTs directly. The new database contains the visible values with a new sequence history.
-4. After closing both databases, the exporter publishes the staging directory by rename. On Unix it reserves the destination name first and syncs the parent directory after the rename.
+4. After closing both databases, the exporter moves the staging directory into place with an exclusive rename. If another process has created the destination, its contents are preserved. Unix builds sync the parent directory after publication.
+
+Publication requires a filesystem and OS that support an exclusive directory
+rename. The exporter uses a native operation on Linux, Android, Apple
+platforms, Redox, FreeBSD with `renameat2`, and Windows. An unsupported
+rename returns an error. An interruption before the move leaves the destination
+name available for retry. If the final directory sync fails on Unix, the
+completed store is already visible and its survival across power loss is
+uncertain.
 
 Use the destination's geometry for a subsequent writable open. To inspect
 the result, `DB::open_read_only` adopts those values automatically. The
