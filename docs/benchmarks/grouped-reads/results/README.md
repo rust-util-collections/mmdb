@@ -23,7 +23,7 @@ records the binary digest, fixture and host configuration. Only complete
 paired series for the corrected runtime enter the final decision.
 
 For a device cell, the printed `p99_us` includes every completed request in
-each A/B arm. `io_positive_only_p99_us` uses the requests with at least 4 KiB
+each A/B arm. `linux_read_ge_4kib_p99_us` uses the requests with at least 4 KiB
 of observed Linux storage reads. `min_io_qualified` is the lowest qualifying
 fraction in any A/A or A/B process. `linux_read_bytes_per_request` divides
 the process's Linux `read_bytes` by all completed requests, then reports the

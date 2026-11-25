@@ -54,7 +54,7 @@ for filename in sys.argv[1:]:
                                                for row in (a, b))
         device_details = ""
         if device_a_us:
-            device_details = (f" io_positive_only_p99_us={median(device_a_us):.2f}/"
+            device_details = (f" linux_read_ge_4kib_p99_us={median(device_a_us):.2f}/"
                               f"{median(device_b_us):.2f} "
                               f"min_io_qualified={min(qualified_fractions):.3f} "
                               f"linux_read_bytes_per_request={median(storage_a):.0f}/{median(storage_b):.0f}")
