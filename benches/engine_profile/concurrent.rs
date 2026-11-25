@@ -29,6 +29,7 @@ struct Stream {
 }
 
 struct Sample {
+    weight: f64,
     service_ns: u64,
     latency_ns: u64,
     issue_delay_ns: u64,
@@ -38,6 +39,8 @@ struct Sample {
 #[derive(Default)]
 struct Samples {
     offered: usize,
+    completed: usize,
+    last_ack_ns: u64,
     rejected: usize,
     bytes: u64,
     outstanding_half: usize,
@@ -54,7 +57,8 @@ fn streams(config: &Config, memory: bool, placement: &str) -> Vec<Stream> {
     let control = setting("CONTROL", String::from("mixed"));
     assert!(matches!(control.as_str(), "mixed" | "writer" | "reader"));
     let mut streams = Vec::new();
-    let mut add = |operation, db, prefix, entries, ratio: u32| {
+    let mut add = |operation, db, prefix, entries: usize, ratio: u32| {
+        assert!(entries > 0 && entries.checked_mul(256).is_some() && ratio > 0);
         streams.push(Stream {
             operation,
             db,
@@ -120,7 +124,6 @@ fn run_stream(
     barrier: &Barrier,
     clock: &OnceLock<Instant>,
 ) -> Samples {
-    assert!(s.entries > 0 && s.count > 0 && s.count <= u32::MAX as usize);
     let opts = config.write_options();
     let held = (s.operation == Operation::HeldSnapshot).then(|| db.snapshot());
     // Use distinct precomputed values for scalar puts too. A repeated single
@@ -129,16 +132,29 @@ fn run_stream(
     let mut corpus = vec![0; slots * 256];
     value(config.seed ^ s.prefix, config.entropy, &mut corpus);
     let mut samples = Samples {
-        offered: s.count,
-        rows: Vec::with_capacity(s.count),
+        rows: Vec::with_capacity(if config.seconds > 0 {
+            config.operations
+        } else {
+            s.count
+        }),
         ..Default::default()
     };
     barrier.wait();
     barrier.wait();
     let start = *clock.get().unwrap();
     let mut last_ack = start;
-    for i in 0..s.count {
-        let scheduled = start + s.period * i as u32;
+    let deadline = (config.seconds > 0).then(|| start + Duration::from_secs(config.seconds));
+    loop {
+        let i = samples.offered;
+        if deadline.map_or(i == s.count, |limit| Instant::now() >= limit) {
+            break;
+        }
+        samples.offered += 1;
+        let scheduled = if s.period.is_zero() {
+            start
+        } else {
+            start + s.period * i as u32
+        };
         if !s.period.is_zero()
             && let Some(delay) = scheduled.checked_duration_since(Instant::now())
         {
@@ -187,7 +203,10 @@ fn run_stream(
             continue;
         }
         let service = nanos(end.duration_since(begin));
-        samples.rows.push(Sample {
+        samples.completed += 1;
+        samples.last_ack_ns = nanos(end.duration_since(start));
+        let sample = Sample {
+            weight: 1.0,
             service_ns: service,
             issue_delay_ns,
             latency_ns: if s.period.is_zero() {
@@ -195,8 +214,19 @@ fn run_stream(
             } else {
                 nanos(end.duration_since(scheduled))
             },
-            finish_ns: nanos(end.duration_since(start)),
-        });
+            finish_ns: samples.last_ack_ns,
+        };
+        if samples.rows.len() < samples.rows.capacity() {
+            samples.rows.push(sample);
+        } else {
+            // Uniform bounded sample in duration-based saturation runs. Every
+            // successful request still contributes to the throughput/byte totals.
+            let slot =
+                (mix(samples.completed as u64 ^ config.seed) % samples.completed as u64) as usize;
+            if slot < samples.rows.len() {
+                samples.rows[slot] = sample;
+            }
+        }
         samples.bytes += match s.operation {
             Operation::SmallPut => 144,
             Operation::Batch => (s.entries * (16 + 256)) as u64,
@@ -205,7 +235,7 @@ fn run_stream(
     }
     if !s.period.is_zero() {
         let outstanding = |offered: usize| {
-            let cut = nanos(s.period * offered as u32);
+            let cut = nanos(s.period * offered.saturating_sub(1) as u32);
             offered.saturating_sub(samples.rows.partition_point(|r| r.finish_ns <= cut))
         };
         samples.outstanding_half = outstanding(s.count / 2);
@@ -224,7 +254,6 @@ struct Observation {
     immutable_bytes: u64,
     generations: u64,
     pin_bytes: u64,
-    l0_files: u64,
     segmented_bytes: u64,
     overflow_bytes: u64,
     rss_kib: u64,
@@ -236,7 +265,6 @@ impl Observation {
         self.immutable_bytes = self.immutable_bytes.max(sample.immutable_bytes);
         self.generations = self.generations.max(sample.generations);
         self.pin_bytes = self.pin_bytes.max(sample.pin_bytes);
-        self.l0_files = self.l0_files.max(sample.l0_files);
         self.segmented_bytes = self.segmented_bytes.max(sample.segmented_bytes);
         self.overflow_bytes = self.overflow_bytes.max(sample.overflow_bytes);
         self.rss_kib = self.rss_kib.max(sample.rss_kib);
@@ -257,15 +285,24 @@ fn sample(dbs: &[DB], pool: &BlockCachePool) -> Observation {
         totals.immutable_bytes += m.immutable_memtable_bytes as u64;
         totals.generations += m.immutable_memtable_count as u64;
         totals.pin_bytes += m.l0_pin_bytes;
-        totals.l0_files += property(db, "num-files-at-level0");
     }
     totals
 }
 
-fn print_percentiles(values: &mut [u64]) -> (f64, f64) {
-    values.sort_unstable();
-    let percentile = |p: usize| values[(values.len() * p).div_ceil(100) - 1] as f64 / 1000.0;
-    (percentile(50), percentile(99))
+fn percentiles(values: &mut [(u64, f64)]) -> (f64, f64) {
+    values.sort_unstable_by_key(|v| v.0);
+    let total: f64 = values.iter().map(|v| v.1).sum();
+    let percentile = |fraction: f64| {
+        let mut seen = 0.0;
+        for &(ns, weight) in values.iter() {
+            seen += weight;
+            if seen >= total * fraction {
+                return ns as f64 / 1000.0;
+            }
+        }
+        unreachable!("nonempty sample has positive weights")
+    };
+    (percentile(0.50), percentile(0.99))
 }
 
 pub(super) fn run(config: &Config, mode: &str, path: &Path) {
@@ -288,8 +325,15 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         preload(&db, config);
         dbs.push(db);
     }
+    // Only DB zero serves scalar lookups. Warm it after seeding every member
+    // so the intended control starts with the same resident scalar data.
+    for i in 0..KEYS {
+        assert_eq!(dbs[0].get_pinned(&key(0, i)).unwrap().unwrap().len(), 128);
+    }
     let before = sample(&dbs, &pool);
     let prop_sum = |name| dbs.iter().map(|db| property(db, name)).sum::<u64>();
+    let l0_before = prop_sum("num-files-at-level0");
+    let misses_before = prop_sum("stats.block_cache_misses");
     let flush_before = prop_sum("stats.flushes_completed");
     let compact_before = prop_sum("stats.compactions_completed");
     let writes_before = prop_sum("stats.compaction_bytes_written");
@@ -340,8 +384,7 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
     });
     let wall = runs
         .iter()
-        .filter_map(|(_, run)| run.rows.last())
-        .map(|row| row.finish_ns)
+        .map(|(_, run)| run.last_ack_ns)
         .max()
         .expect("no successful requests") as f64
         / 1e9;
@@ -351,54 +394,65 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         println!("stage leader_stream={op:?} {:?}", run.profile);
         let all = by_class.entry(op).or_default();
         all.offered += run.offered;
+        all.completed += run.completed;
         all.rejected += run.rejected;
         all.bytes += run.bytes;
         all.outstanding_half += run.outstanding_half;
         all.outstanding_end += run.outstanding_end;
+        // A faster closed-loop worker represents more calls per reservoir
+        // sample than a slower peer. Weight them before merging one class.
+        let weight = run.completed as f64 / run.rows.len().max(1) as f64;
+        for row in &mut run.rows {
+            row.weight = weight;
+        }
         all.rows.append(&mut run.rows);
     }
     let after = sample(&dbs, &pool);
     println!(
-        "run placement={placement} dbs={count} cpu_ticks={cpu_ticks} seconds={wall:.6} rss_after_preload_kib={} peak_kib={peak} before_l0={} after_l0={} after_immutables={} flushes={} compactions={} compaction_output_bytes={} instrumented={}",
+        "run placement={placement} dbs={count} cpu_ticks={cpu_ticks} seconds={wall:.6} rss_after_preload_kib={} peak_kib={peak} before_l0={} after_l0={} after_immutables={} flushes={} compactions={} compaction_output_bytes={} cache_misses={} instrumented={}",
         before.rss_kib,
-        before.l0_files,
-        after.l0_files,
+        l0_before,
+        prop_sum("num-files-at-level0"),
         after.generations,
         prop_sum("stats.flushes_completed") - flush_before,
         prop_sum("stats.compactions_completed") - compact_before,
         prop_sum("stats.compaction_bytes_written") - writes_before,
+        prop_sum("stats.block_cache_misses") - misses_before,
         cfg!(feature = "bench-metrics")
     );
     if let Some(sampled) = mem {
         println!("sampled_peaks {sampled:?}");
     }
     for (op, all) in by_class {
-        let mut times: Vec<_> = all.rows.iter().map(|r| r.latency_ns).collect();
-        let (p50, p99) = print_percentiles(&mut times);
-        for (t, row) in times.iter_mut().zip(&all.rows) {
-            *t = row.service_ns;
-        }
-        let (_, svc) = print_percentiles(&mut times);
-        for (t, row) in times.iter_mut().zip(&all.rows) {
-            *t = row.issue_delay_ns;
-        }
-        let (_, issue_delay) = print_percentiles(&mut times);
-        println!(
-            "class op={op:?} offered={} completed={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} issue_delay_p99_us={issue_delay:.3} p99_qualified={} outstanding_half={} outstanding_end={}",
+        assert!(
+            all.completed > 0 && all.completed == all.offered,
+            "{op:?}: offered {}, completed {}, rejected {}",
             all.offered,
+            all.completed,
+            all.rejected
+        );
+        let mut times: Vec<_> = all.rows.iter().map(|r| (r.latency_ns, r.weight)).collect();
+        let (p50, p99) = percentiles(&mut times);
+        for (t, row) in times.iter_mut().zip(&all.rows) {
+            *t = (row.service_ns, row.weight);
+        }
+        let (_, svc) = percentiles(&mut times);
+        for (t, row) in times.iter_mut().zip(&all.rows) {
+            *t = (row.issue_delay_ns, row.weight);
+        }
+        let (_, issue_delay) = percentiles(&mut times);
+        println!(
+            "class op={op:?} offered={} completed={} sampled={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} issue_delay_p99_us={issue_delay:.3} p99_qualified={} outstanding_half={} outstanding_end={}",
+            all.offered,
+            all.completed,
             all.rows.len(),
             all.rejected,
             all.bytes,
             all.bytes as f64 / wall,
-            all.rows.len() as f64 / wall,
+            all.completed as f64 / wall,
             all.rows.len() >= 10_000,
             all.outstanding_half,
             all.outstanding_end
-        );
-        assert_eq!(
-            all.rows.len(),
-            all.offered,
-            "all offered requests must complete"
         );
     }
     for db in dbs {

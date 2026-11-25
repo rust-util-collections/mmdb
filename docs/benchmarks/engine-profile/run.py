@@ -23,6 +23,8 @@ parser.add_argument("--tmpdir", type=Path, required=True, help="filesystem for f
 parser.add_argument("--ops", type=int, default=10_000, help="requests per primary foreground stream")
 parser.add_argument("--rounds", type=int, default=5)
 parser.add_argument("--seed", type=int, default=20261125)
+parser.add_argument("--saturation-seconds", type=int, default=8,
+                    help="common closed-loop measurement window with every stream active")
 args = parser.parse_args()
 if args.rounds < 1 or args.ops < 1:
     parser.error("ops and rounds must be positive")
@@ -76,10 +78,38 @@ def trial(out, mode, case, arm, settings, round_no=0, binary="control"):
     return record
 
 
-def rate(record):
-    # All foreground streams in the fixed trace finish equal request counts
-    # over one common makespan; the calibrated rate is per scalar stream.
-    return max(1, int(0.7 * record["classes"]["SmallPut"]["ops_s"]))
+def calibrate(out, mode, case, fixed):
+    # A finite trace gives an initial rate estimate. Confirm the sustainable
+    # boundary at the actual request mix with all arrivals on the shared clock.
+    guess = trial(out, mode, "initial-rate-" + case, "finite-trace", fixed)
+    estimate = max(1, int(guess["classes"]["SmallPut"]["ops_s"]))
+    low, high = 0, None
+    for _ in range(8):
+        test = trial(out, mode, "paced-capacity-" + case, str(estimate), {**fixed, "RATE": estimate})
+        sustained = test["classes"]["SmallPut"]["ops_s"] >= 0.98 * estimate
+        for row in test["classes"].values():
+            tolerance = max(2, row["offered"] // 100)
+            sustained &= (row["outstanding_end"] <= tolerance
+                          and row["outstanding_end"] - row["outstanding_half"] <= tolerance)
+        if sustained:
+            low = estimate
+        else:
+            high = estimate
+        if low and high and high <= low * 1.2:
+            break
+        if not low and estimate == 1:
+            raise RuntimeError("could not sustain one scheduled foreground request per second")
+        if high is None:
+            estimate = max(low + 1, int(low * 1.25))
+        elif not low:
+            estimate = max(1, int(high * 0.75))
+        else:
+            estimate = (low + high) // 2
+    if not low:
+        raise RuntimeError("repeat calibration using a lower starting rate")
+    chosen = max(1, int(0.70 * low))
+    print("paced", case, "rate", chosen, "control sustained", low, "next failing", high, flush=True)
+    return chosen
 
 
 def memory(out):
@@ -95,15 +125,15 @@ def memory(out):
         for placement in ["hot", "all"]:
             fixed = {"PLACEMENT": placement, "POOL_MIB": 256, "BATCH_ENTRIES": 32}
             base = {"BUFFER_MIB": b, "IMMUTABLES": q, **fixed}
-            calibration = trial(out, "memory", "calibrate-" + sweep, placement, base)
-            controls[sweep, placement] = fixed, rate(calibration)
+            controls[sweep, placement] = fixed, calibrate(out, "memory", sweep + "-" + placement, base)
     for i in range(1, args.rounds + 1):
         # Reuse bracketing controls only within the same sweep, layout and load.
         blocks = list(itertools.product(controls, ["paced", "saturation"]))
         rng.shuffle(blocks)
         for (sweep, placement), load in blocks:
             fixed, offered = controls[sweep, placement]
-            fixed = {**fixed, "RATE": offered if load == "paced" else 0}
+            fixed = {**fixed, "RATE": offered if load == "paced" else 0,
+                     "SECONDS": args.saturation_seconds if load == "saturation" else 0}
             case = f"{sweep}-{placement}-{load}"
             (cq, cb), *variants = sweeps[sweep]
             rng.shuffle(variants)
@@ -116,15 +146,16 @@ def memory(out):
     for (sweep, placement), (fixed, offered) in controls.items():
         for q, b in sweeps[sweep]:
             trial(out, "memory", "gauge-" + sweep + "-" + placement, f"q{q}-b{b}",
-                  {**fixed, "RATE": offered, "SAMPLE": "true", "BUFFER_MIB": b, "IMMUTABLES": q})
+                  {**fixed, "RATE": offered, "SAMPLE": "true", "BUFFER_MIB": b,
+                   "IMMUTABLES": q, "SEED": args.seed + 1}, binary="metrics" if args.metrics else "control")
 
 
 def mixed(out):
-    kinds = list(itertools.product(["false","true"],["false","true"]))
+    kinds = list(itertools.product(["false", "true"], ["true", "false"]))
     rates = {}
     for sync,entropy in kinds:
         fixed = {"SYNC":sync,"ENTROPY":entropy}
-        rates[sync,entropy] = rate(trial(out,"mixed","calibrate","hot",fixed))
+        rates[sync,entropy] = calibrate(out, "mixed", f"sync-{sync}-entropy-{entropy}", fixed)
     for i in range(1,args.rounds+1):
         rng.shuffle(kinds)
         for sync,entropy in kinds:
@@ -145,7 +176,7 @@ def mixed(out):
 def handoff(out):
     # Primary: incompressible, WalAsync, one DB. Separately check controls.
     for sync in ["false","true"]:
-        offered = rate(trial(out,"mixed","calibrate",sync,{"SYNC":sync}))
+        offered = calibrate(out, "mixed", "handoff-" + sync, {"SYNC":sync})
         for i in range(1,args.rounds+1):
             arms = [("A1","control"),("B","candidate"),("A2","control")]
             if i%2==0:
@@ -169,6 +200,7 @@ with gzip.open(args.output,"xt") as output:
     meta = {"suite":args.suite,"cpus":args.cpus,"platform":platform.platform(),
             "fs":fs,"binary_sha256":{k:hashlib.sha256(p.read_bytes()).hexdigest() for k,p in binaries.items()}}
     meta["ticks_per_second"] = os.sysconf("SC_CLK_TCK")
+    meta["saturation_seconds"] = args.saturation_seconds
     meta["operations"] = args.ops
     meta["rounds"] = args.rounds
     meta["seed"] = args.seed

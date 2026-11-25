@@ -24,6 +24,7 @@ where
 struct Config {
     operations: usize,
     rate: u64,
+    seconds: u64,
     buffer: usize,
     depth: usize,
     pool_mib: u64,
@@ -38,6 +39,7 @@ impl Config {
         let config = Self {
             operations: setting("OPS", 10_000),
             rate: setting("RATE", 0),
+            seconds: setting("SECONDS", 0),
             buffer: setting("BUFFER_MIB", 16),
             depth: setting("IMMUTABLES", 4),
             pool_mib: setting("POOL_MIB", 64),
@@ -46,7 +48,12 @@ impl Config {
             sync: setting("SYNC", false),
             sample: setting("SAMPLE", false),
         };
-        assert!(config.operations > 0 && config.buffer > 0 && config.depth > 0);
+        assert!(
+            config.rate == 0 || config.seconds == 0,
+            "set either RATE or SECONDS"
+        );
+        assert!((1..=u32::MAX as usize).contains(&config.operations));
+        assert!(config.buffer > 0 && config.depth > 0);
         config
     }
 
@@ -138,9 +145,10 @@ fn main() {
     }
     let dir = tempfile::tempdir().unwrap();
     println!(
-        "config mode={mode} ops={} rate={} buffer_mib={} depth={} pool_mib={} seed={} entropy={} sync={} sample={} arch={}",
+        "config mode={mode} ops={} rate={} seconds={} buffer_mib={} depth={} pool_mib={} seed={} entropy={} sync={} sample={} arch={}",
         config.operations,
         config.rate,
+        config.seconds,
         config.buffer,
         config.depth,
         config.pool_mib,
