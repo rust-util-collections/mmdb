@@ -2,6 +2,15 @@
 //! published only after the corresponding MANIFEST edit is durable.
 use super::*;
 
+#[cfg(test)]
+type FlushNotifyHook = Box<dyn FnOnce(&FlushContext)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_FLUSH_NOTIFY: std::cell::RefCell<Option<FlushNotifyHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Default)]
 struct Progress {
     submitted: u64,
@@ -177,7 +186,7 @@ impl FlushContext {
         }
         let synced = sync_new_sst_parent_dir(&self.storage_path, &self.manifest_poisoned)?;
         let output_numbers: Vec<_> = edit.new_files.iter().map(|(_, m)| m.number).collect();
-        let (_claim, manifest) = {
+        let (claim, manifest) = {
             let mut inner = self.inner.lock();
             edit.set_next_file_number(inner.versions.next_file_number());
             inner.versions.log_and_apply_synced(edit, synced).ctx()?;
@@ -214,12 +223,19 @@ impl FlushContext {
                 .store(inner.versions.current().l0_file_count(), Ordering::Relaxed);
             refresh_super_version(&self.super_version, &inner);
         }
+        // Release the durable L0 claim before waking mmdb-compaction so an
+        // immediate pick_l0_compaction does not see the new L0 SSTs in_flight.
+        drop(claim);
         self.stats.record_flush();
         let old_wal = self
             .storage_path
             .join(format!("{:06}.wal", frozen.old_wal_number));
         if let Err(e) = fs::remove_file(&old_wal) {
             tracing::warn!("failed to remove old WAL {}: {}", old_wal.display(), e);
+        }
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_FLUSH_NOTIFY.with(|h| h.borrow_mut().take()) {
+            hook(self);
         }
         *self.compaction_notify.0.lock() = true;
         self.compaction_notify.1.notify_one();
@@ -709,5 +725,34 @@ mod tests {
             rx2.recv_timeout(Duration::from_secs(3)).unwrap(),
             Err(ErrorKind::Background)
         );
+    }
+
+    #[test]
+    fn flush_releases_l0_claim_before_signaling_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_write_buffer_size(8 << 10)
+            .with_l0_compaction_trigger(1);
+        let db = DB::open(opts, dir.path()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        db.flush_queue.on_next_build(move || {
+            BEFORE_FLUSH_NOTIFY.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |ctx| {
+                    let version = ctx.inner.lock().versions.current();
+                    let in_flight = ctx.claims.lock().clone();
+                    let picked =
+                        LeveledCompaction::pick_compaction(&version, &ctx.options, &in_flight)
+                            .is_some();
+                    tx.send((in_flight.is_empty(), picked)).unwrap();
+                }));
+            });
+        });
+        db.put(b"k", &[1u8; (8 << 10) + 64]).unwrap();
+        let (claims_empty, pickable) = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            claims_empty,
+            "new L0 claim must drop before compaction_notify"
+        );
+        assert!(pickable, "woken compaction worker must be able to pick L0");
     }
 }
