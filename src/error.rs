@@ -48,8 +48,9 @@ pub enum ErrorKind {
     /// The database was opened without write capability.
     ReadOnly,
     /// The engine is fail-stopped: an earlier flush, compaction, WAL sync, or
-    /// MANIFEST write failed. Every operation except `close` returns this
-    /// kind until the database is reopened.
+    /// MANIFEST write failed. Fallible operations on the open handle return
+    /// this kind, and `close` releases resources before surfacing it; reopen
+    /// the database to recover.
     Background,
 }
 
