@@ -1,0 +1,43 @@
+{
+  "host_and_single_sst": "primary.metadata.json",
+  "engine_features": "default (empty); guard crate enables its own grouped-api feature only for the new method",
+  "rust_profile": "release, opt-level=3, lto=thin, codegen-units=1, distinct Cargo target directories",
+  "per_run_fields": "Each CSV includes CPU affinity, seed, count, arm order, binary hash, query shape and fixture name",
+  "original_guard": {
+    "baseline": {
+      "revision": "72d1dd976218a4d9508b87571c3ed318cf09d20f",
+      "sha256": "d8483975d846af220ea68a3ffd0dedfc4e748ff62d25a110063db439ce950777"
+    },
+    "candidate": {
+      "revision": "fca480295fdecf053bb2e2c568abadaddc33f9ac",
+      "sha256": "e7d6297b087b668702e152e9fa2b9d4cfd1ef7ba45d19fc3e0472658d8553aae"
+    }
+  },
+  "integrated_guard": {
+    "baseline": {
+      "revision": "277ef08e5e0fa9ebf66b61084c4aea957f68c80a",
+      "sha256": "9b4552dd029db1827ff239e1019eacbf67f219c9b250f3b8f23f6986a0c3c9b9"
+    },
+    "candidate": {
+      "revision": "736b87ebccfb94c63a2b9adf922733006c43b593",
+      "sha256": "cf36ce388db04a3fc1460e24ac3e0236ba6bad616e033cc36f8beaf8479ad31b"
+    }
+  },
+  "overlap_fixture": {
+    "keys": 262144,
+    "value_bytes": 128,
+    "layout": "all keys in one L6 SST plus odd-key replacements in one L0 SST",
+    "tables": [
+      {
+        "name": "000003.sst",
+        "bytes": 38155840,
+        "sha256": "4ad73ccc7a5eec3d28d0120608ede712b91404c35e5bc5e74f55f5386c62523b"
+      },
+      {
+        "name": "000005.sst",
+        "bytes": 19291475,
+        "sha256": "ded5ead1d9be3072d0ff5b48334d0e3c88194960fe6c711f5756d31f6ba8e289"
+      }
+    ]
+  }
+}
