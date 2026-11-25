@@ -6,7 +6,7 @@ use super::{Config, MIB, key, rss_kib, value};
 
 pub(super) fn prepare(config: &Config, path: &Path) {
     let pool = Arc::new(BlockCachePool::new(config.pool_mib * MIB as u64));
-    let db = DB::open(config.options(&pool), path).unwrap();
+    let db = DB::open(config.options(&pool).with_error_if_exists(true), path).unwrap();
     let mut bytes = [0; 128];
     for i in 0..config.operations {
         value(config.seed ^ i as u64, config.entropy, &mut bytes);
@@ -20,6 +20,10 @@ pub(super) fn prepare(config: &Config, path: &Path) {
 pub(super) fn run(config: &Config, path: &Path) {
     assert!(
         process::Command::new(env::current_exe().unwrap())
+            .env(
+                "MMDB_PROFILE_BUFFER_MIB",
+                super::setting("PREPARE_MIB", config.buffer).to_string()
+            )
             .arg("prepare-reopen")
             .arg(path)
             .status()
@@ -34,7 +38,12 @@ pub(super) fn run(config: &Config, path: &Path) {
     assert!(wal_bytes > 0, "fixture must retain WAL data");
     let pool = Arc::new(BlockCachePool::new(config.pool_mib * MIB as u64));
     let start = Instant::now();
-    let db = DB::open(config.options(&pool), path).unwrap();
+    let db = if super::setting("READ_ONLY", false) {
+        DB::open_read_only_with_options(config.options(&pool), path)
+    } else {
+        DB::open(config.options(&pool), path)
+    }
+    .unwrap();
     let reopen = start.elapsed();
     let open_peak_kib = rss_kib("VmHWM:").unwrap_or_default();
     let open_rss_kib = rss_kib("VmRSS:").unwrap_or_default();

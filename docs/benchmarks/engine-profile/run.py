@@ -16,6 +16,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("suite", choices=["memory", "mixed", "handoff", "reopen"])
 parser.add_argument("binary", type=Path)
 parser.add_argument("output", type=Path)
+parser.add_argument("--handoff-rates", nargs=2, type=int, metavar=("WAL_ASYNC", "WAL_SYNC"),
+                    help="reuse the high-entropy rates from the mixed control calibration")
 parser.add_argument("--candidate", type=Path, help="handoff candidate compiled with the same driver")
 parser.add_argument("--metrics", type=Path, help="instrumented copy of the control")
 parser.add_argument("--cpus", required=True, help="Linux CPU list passed to taskset")
@@ -175,23 +177,34 @@ def mixed(out):
 
 def handoff(out):
     # Primary: incompressible, WalAsync, one DB. Separately check controls.
-    for sync in ["false","true"]:
-        offered = calibrate(out, "mixed", "handoff-" + sync, {"SYNC":sync})
+    for index, sync in enumerate(["false", "true"]):
+        offered = (args.handoff_rates[index] if args.handoff_rates
+                   else calibrate(out, "mixed", "handoff-" + sync, {"SYNC":sync}))
+        if offered < 1:
+            raise ValueError("handoff rate must be positive")
         for i in range(1,args.rounds+1):
             arms = [("A1","control"),("B","candidate"),("A2","control")]
             if i%2==0:
                 arms.reverse()
             for arm,binary in arms:
                 trial(out,"mixed","same-db-"+sync,arm,{"SYNC":sync,"RATE":offered},i,binary)
-            for control in ["writer","reader"]:
-                for arm,binary in arms:
-                    trial(out,"mixed",control+"-"+sync,arm,{"SYNC":sync,"CONTROL":control},i,binary)
+            for control in ["writer", "reader"]:
+                for arm, binary in arms:
+                    trial(out, "mixed", control + "-" + sync, arm, {"SYNC":sync, "CONTROL":control}, i, binary)
+                    trial(out, "mixed", control + "-paced-" + sync, arm,
+                          {"SYNC":sync, "CONTROL":control, "RATE":offered}, i, binary)
 
 
 def reopen(out):
-    for size in [10_000,100_000]:
-        for i in range(1,args.rounds+1):
-            trial(out,"reopen","durable-residual-wal",str(size),{"OPS":size,"BUFFER_MIB":64},i)
+    for size in [10_000, 100_000]:
+        for i in range(1, args.rounds + 1):
+            profiles = [(4,16), (2,16), (1,16), (1,15), (2,10), (4,6)]
+            rng.shuffle(profiles)
+            for q, b in profiles:
+                trial(out, "reopen", "durable-residual-wal", f"q{q}-b{b}",
+                      {"OPS":size, "BUFFER_MIB":b, "IMMUTABLES":q, "PREPARE_MIB":64}, i)
+            trial(out, "reopen", "read-only", str(size),
+                  {"OPS":size, "BUFFER_MIB":6, "PREPARE_MIB":64, "READ_ONLY":"true"}, i)
 
 
 args.tmpdir.mkdir(parents=True,exist_ok=True)

@@ -41,7 +41,11 @@ Throughput includes every completion. A bounded per-worker reservoir keeps
 latency memory stable in duration-based trials, with percentile weights
 proportional to each stream's completions.
 The reopen child writes deterministic rows, syncs the WAL and exits without
-dropping its handle. The parent measures writable open and verifies all rows.
+dropping its handle. The matrix sets `MMDB_PROFILE_PREPARE_MIB=64` so
+writable replay can use a smaller buffer than the original writer. It also
+includes a `MMDB_PROFILE_READ_ONLY=true` arm. The parent measures open, then
+checks every recovered row. Record open-time memory separately from the
+verification scan.
 
 For paired runs, build each benchmark target with `--no-run`, save its
 executable at a distinct path, then invoke the matrix driver. The final line
