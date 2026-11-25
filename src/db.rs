@@ -306,7 +306,8 @@ fn l0_build_opts(options: &DbOptions) -> TableBuildOptions {
     TableBuildOptions {
         block_size: options.block_size,
         block_restart_interval: options.block_restart_interval,
-        bloom_bits_per_key: options.bloom_bits_per_key,
+        bloom_bits_per_key: options.bloom_bits_for_level(0),
+        prefix_bloom_bits_per_key: Some(options.bloom_bits_per_key),
         compression,
         prefix_len: options.prefix_len,
         block_property_collectors: options
@@ -6397,5 +6398,115 @@ mod tests {
         let db = DB::open(DbOptions::read_heavy(), dir2.path()).unwrap();
         db.put(b"test", b"value").unwrap();
         assert_eq!(db.get(b"test").unwrap(), Some(b"value".to_vec()));
+    }
+
+    #[test]
+    fn monkey_level_bloom_budgets_and_optimize_filters_for_hits() {
+        // 1. Monkey per-level schedule (`num_levels = 3`, `b = 12`, `R = 10`):
+        //    L0 -> 22 bpk, L1 -> 17 bpk, L2 (bottom) -> 11 bpk.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_num_levels(3)
+            .with_bloom_bits_per_key(12)
+            .with_l0_compaction_trigger(usize::MAX);
+        assert_eq!(opts.bloom_bits_for_level(0), 22);
+        assert_eq!(opts.bloom_bits_for_level(1), 17);
+        assert_eq!(opts.bloom_bits_for_level(2), 11);
+
+        let db = DB::open(opts, dir.path()).unwrap();
+        for i in 0..1000u32 {
+            db.put(format!("p1_{i:04}").as_bytes(), b"v1").unwrap();
+        }
+        db.flush().unwrap();
+        {
+            let v = db.inner.lock().versions.current();
+            assert_eq!(v.level_files(0).len(), 1);
+            assert_eq!(
+                v.level_files(0)[0].reader.bloom_filter_byte_len(),
+                Some(BloomFilter::projected_size(1000, 22))
+            );
+        }
+
+        for i in 0..1000u32 {
+            db.put(format!("p2_{i:04}").as_bytes(), b"v2").unwrap();
+        }
+        db.flush().unwrap();
+        db.drain_l0(true).unwrap();
+        {
+            let v = db.inner.lock().versions.current();
+            assert_eq!(v.level_files(0).len(), 0);
+            assert_eq!(v.level_files(1).len(), 1);
+            assert_eq!(
+                v.level_files(1)[0].reader.bloom_filter_byte_len(),
+                Some(BloomFilter::projected_size(2000, 17))
+            );
+        }
+
+        db.compact_range(Some(b""), None).unwrap();
+        {
+            let v = db.inner.lock().versions.current();
+            assert_eq!(v.level_files(2).len(), 1);
+            assert_eq!(
+                v.level_files(2)[0].reader.bloom_filter_byte_len(),
+                Some(BloomFilter::projected_size(2000, 11))
+            );
+        }
+
+        // 2. `optimize_filters_for_hits(true)` omits `filter.bloom` on bottommost
+        //    SSTs while still building `filter.prefix` when `prefix_len > 0`.
+        let dir2 = tempfile::tempdir().unwrap();
+        let hit_opts = DbOptions::default()
+            .with_num_levels(2)
+            .with_bloom_bits_per_key(12)
+            .with_prefix_len(3)
+            .with_optimize_filters_for_hits(true)
+            .with_l0_compaction_trigger(usize::MAX);
+        assert_eq!(hit_opts.bloom_bits_for_level(0), 17);
+        assert_eq!(hit_opts.bloom_bits_for_level(1), 0);
+
+        let db2 = DB::open(hit_opts, dir2.path()).unwrap();
+        for i in 0..200u32 {
+            db2.put(format!("aa_{i:04}").as_bytes(), b"va").unwrap();
+        }
+        db2.flush().unwrap();
+        for i in 0..200u32 {
+            db2.put(format!("bb_{i:04}").as_bytes(), b"vb").unwrap();
+        }
+        db2.flush().unwrap();
+        {
+            let v = db2.inner.lock().versions.current();
+            assert_eq!(v.level_files(0).len(), 2);
+            assert!(v.level_files(0)[0].reader.bloom_filter_byte_len().is_some());
+        }
+
+        db2.compact_range(None, None).unwrap();
+        {
+            let v = db2.inner.lock().versions.current();
+            assert_eq!(v.level_files(1).len(), 1);
+            let bottom_reader = &v.level_files(1)[0].reader;
+            assert_eq!(
+                bottom_reader.bloom_filter_byte_len(),
+                None,
+                "bottommost SST must omit point filter.bloom when optimize_filters_for_hits=true"
+            );
+            assert!(bottom_reader.prefix_may_match(b"aa_"));
+            assert!(
+                !bottom_reader.prefix_may_match(b"zz_"),
+                "bottommost SST must still retain prefix Bloom filter"
+            );
+        }
+
+        assert_eq!(
+            db2.get(b"aa_0042").unwrap().as_deref(),
+            Some(b"va".as_slice())
+        );
+        assert_eq!(db2.get(b"missing_key").unwrap(), None);
+        assert!(db2.contains_key(b"bb_0199").unwrap());
+        assert!(!db2.contains_key(b"missing_key").unwrap());
+        let aa_count = db2
+            .iter_with_prefix(b"aa_", &ReadOptions::default())
+            .unwrap()
+            .count();
+        assert_eq!(aa_count, 200);
     }
 }

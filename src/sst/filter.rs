@@ -31,15 +31,37 @@ impl AlignedBytes {
         bits.into_iter()
             .all(|bit| data[bit / 8] & (1 << (bit % 8)) != 0)
     }
+
+    #[cfg(test)]
+    pub(crate) fn byte_len(&self) -> usize {
+        self.0.len() * 64
+    }
 }
 
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+#[inline]
 fn probes(hash: u64, lines: usize) -> (usize, [usize; 8]) {
     let line = (((hash >> 32) * lines as u64) >> 32) as usize;
-    let low = hash as u32;
-    let step = low.rotate_left(15) | 1;
+    let h1 = mix64(hash);
+    let h2 = mix64(hash.wrapping_add(0x9e3779b97f4a7c15));
     (
         line,
-        std::array::from_fn(|i| (low.wrapping_add(step.wrapping_mul(i as u32)) & 511) as usize),
+        [
+            (h1 & 511) as usize,
+            ((h1 >> 9) & 511) as usize,
+            ((h1 >> 18) & 511) as usize,
+            ((h1 >> 27) & 511) as usize,
+            (h2 & 511) as usize,
+            ((h2 >> 9) & 511) as usize,
+            ((h2 >> 18) & 511) as usize,
+            ((h2 >> 27) & 511) as usize,
+        ],
     )
 }
 
@@ -116,16 +138,54 @@ mod tests {
     fn pinned_key_and_prefix_probes() {
         assert_eq!(
             probes(bloom_hash(b"key_000001"), 5),
-            (4, [443, 38, 145, 252, 359, 466, 61, 168])
+            (4, [434, 436, 327, 465, 186, 458, 95, 345])
         );
         assert_eq!(
             probes(bloom_hash(b"a"), 5),
-            (4, [31, 362, 181, 0, 331, 150, 481, 300])
+            (4, [176, 450, 27, 371, 320, 129, 467, 235])
         );
         let bytes = AlignedBytes::decode(&[0; 128]).unwrap();
         for line in &bytes.0 {
             assert_eq!(line.0.as_ptr() as usize % 64, 0);
         }
+    }
+
+    #[test]
+    fn independent_probes_reach_poisson_fpr_without_progression_floor() {
+        let keys: Vec<Vec<u8>> = (0..10_000)
+            .map(|i| format!("present_{i:06}").into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+
+        // 12 bpk: independent intra-line probes achieve ~0.41% (vs ~0.57% affine).
+        let f12 =
+            AlignedBytes::decode(&BloomFilter::new(12).create_filter(&key_refs).unwrap()).unwrap();
+        // 24 bpk: independent intra-line probes achieve ~0.009% (vs ~0.067% affine floor).
+        let f24 =
+            AlignedBytes::decode(&BloomFilter::new(24).create_filter(&key_refs).unwrap()).unwrap();
+
+        let mut fp12 = 0usize;
+        let mut fp24 = 0usize;
+        const QUERIES: usize = 200_000;
+        for i in 0..QUERIES {
+            let q = format!("absent_{i:07}");
+            if f12.may_match(q.as_bytes()) {
+                fp12 += 1;
+            }
+            if f24.may_match(q.as_bytes()) {
+                fp24 += 1;
+            }
+        }
+        let rate12 = fp12 as f64 / QUERIES as f64;
+        let rate24 = fp24 as f64 / QUERIES as f64;
+        assert!(
+            rate12 < 0.0048,
+            "12-bpk blocked Bloom FPR {rate12:.5} exceeded independent bound"
+        );
+        assert!(
+            rate24 < 0.00025,
+            "24-bpk blocked Bloom FPR {rate24:.5} hit progression floor"
+        );
     }
 
     #[test]

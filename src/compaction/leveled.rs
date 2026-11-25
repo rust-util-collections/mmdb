@@ -1085,7 +1085,8 @@ impl LeveledCompaction {
         let build_opts = TableBuildOptions {
             block_size: ctx.options.block_size,
             block_restart_interval: ctx.options.block_restart_interval,
-            bloom_bits_per_key: ctx.options.bloom_bits_per_key,
+            bloom_bits_per_key: ctx.options.bloom_bits_for_level(target_level),
+            prefix_bloom_bits_per_key: Some(ctx.options.bloom_bits_per_key),
             compression: target_compression,
             prefix_len: ctx.options.prefix_len,
             block_property_collectors: Vec::new(),

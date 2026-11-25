@@ -648,6 +648,11 @@ impl TableReader {
         !self.range_partitions.is_empty()
     }
 
+    #[cfg(test)]
+    pub(crate) fn bloom_filter_byte_len(&self) -> Option<usize> {
+        self.filter_data.as_ref().map(AlignedBytes::byte_len)
+    }
+
     pub(crate) fn range_partition_extents(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
         self.range_partitions
             .iter()

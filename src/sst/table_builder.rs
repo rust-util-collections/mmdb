@@ -56,6 +56,8 @@ pub struct TableBuildOptions {
     pub block_size: usize,
     pub block_restart_interval: usize,
     pub bloom_bits_per_key: u32,
+    /// Optional separate budget for `filter.prefix`; `None` uses `bloom_bits_per_key`.
+    pub prefix_bloom_bits_per_key: Option<u32>,
     /// Compression type for data blocks.
     pub compression: CompressionType,
     /// Fixed prefix length for prefix bloom filter. 0 = disabled.
@@ -70,6 +72,7 @@ impl Clone for TableBuildOptions {
             block_size: self.block_size,
             block_restart_interval: self.block_restart_interval,
             bloom_bits_per_key: self.bloom_bits_per_key,
+            prefix_bloom_bits_per_key: self.prefix_bloom_bits_per_key,
             compression: self.compression,
             prefix_len: self.prefix_len,
             // Collectors are per-build; a clone starts with empty collectors
@@ -84,6 +87,7 @@ impl Default for TableBuildOptions {
             block_size: 4096,
             block_restart_interval: 16,
             bloom_bits_per_key: 12,
+            prefix_bloom_bits_per_key: None,
             compression: CompressionType::None,
             prefix_len: 0,
             block_property_collectors: Vec::new(),
@@ -333,6 +337,13 @@ impl TableBuilder {
         size
     }
 
+    #[inline]
+    fn prefix_bloom_bits(&self) -> u32 {
+        self.options
+            .prefix_bloom_bits_per_key
+            .unwrap_or(self.options.bloom_bits_per_key)
+    }
+
     fn projected_filter_size(&self) -> usize {
         if self.options.bloom_bits_per_key == 0 || self.filter_key_hashes.is_empty() {
             return 0;
@@ -344,13 +355,11 @@ impl TableBuilder {
     }
 
     fn projected_prefix_filter_size(&self) -> usize {
-        if self.options.prefix_len == 0
-            || self.options.bloom_bits_per_key == 0
-            || self.prefix_set.is_empty()
-        {
+        let prefix_bits = self.prefix_bloom_bits();
+        if self.options.prefix_len == 0 || prefix_bits == 0 || self.prefix_set.is_empty() {
             return 0;
         }
-        BloomFilter::projected_size(self.prefix_set.len(), self.options.bloom_bits_per_key)
+        BloomFilter::projected_size(self.prefix_set.len(), prefix_bits)
     }
 
     /// Largest projected single-block metadata structure. Callers that can
@@ -440,19 +449,6 @@ impl TableBuilder {
                 self.filter_key_hashes.len().saturating_add(1),
                 self.options.bloom_bits_per_key,
             )?;
-
-            if self.options.prefix_len > 0 && user_key_for_bloom.len() >= self.options.prefix_len {
-                let prefix = &user_key_for_bloom[..self.options.prefix_len];
-                let prefix_count = self
-                    .prefix_set
-                    .len()
-                    .saturating_add(usize::from(!self.prefix_set.contains(prefix)));
-                BloomFilter::checked_size(
-                    "prefix bloom filter",
-                    prefix_count,
-                    self.options.bloom_bits_per_key,
-                )?;
-            }
             let hash = bloom_hash(user_key_for_bloom);
             self.filter_key_hashes.push(hash);
             let bloom_key = self.bloom_user_key.get_or_insert_with(Vec::new);
@@ -460,13 +456,21 @@ impl TableBuilder {
             bloom_key.extend_from_slice(user_key_for_bloom);
         }
 
-        // Collect prefix for prefix bloom filter only when Bloom is enabled.
-        if self.options.bloom_bits_per_key > 0
+        // Collect prefix for prefix bloom filter when prefix Bloom is enabled.
+        let prefix_bits = self.prefix_bloom_bits();
+        if prefix_bits > 0
             && self.options.prefix_len > 0
             && user_key_for_bloom.len() >= self.options.prefix_len
         {
-            self.prefix_set
-                .insert(user_key_for_bloom[..self.options.prefix_len].to_vec());
+            let prefix = &user_key_for_bloom[..self.options.prefix_len];
+            if !self.prefix_set.contains(prefix) {
+                BloomFilter::checked_size(
+                    "prefix bloom filter",
+                    self.prefix_set.len().saturating_add(1),
+                    prefix_bits,
+                )?;
+                self.prefix_set.insert(prefix.to_vec());
+            }
         }
 
         // Flush the current data block if it is full, or if adding this entry would
@@ -689,22 +693,16 @@ impl TableBuilder {
     }
 
     fn write_prefix_filter_block(&mut self) -> Result<BlockHandle> {
-        if self.options.prefix_len == 0
-            || self.options.bloom_bits_per_key == 0
-            || self.prefix_set.is_empty()
-        {
+        let prefix_bits = self.prefix_bloom_bits();
+        if self.options.prefix_len == 0 || prefix_bits == 0 || self.prefix_set.is_empty() {
             return Ok(BlockHandle::default());
         }
 
-        BloomFilter::checked_size(
-            "prefix bloom filter",
-            self.prefix_set.len(),
-            self.options.bloom_bits_per_key,
-        )?;
+        BloomFilter::checked_size("prefix bloom filter", self.prefix_set.len(), prefix_bits)?;
         let mut prefixes: Vec<&[u8]> = self.prefix_set.iter().map(|p| p.as_slice()).collect();
         prefixes.sort();
 
-        let bf = BloomFilter::new(self.options.bloom_bits_per_key);
+        let bf = BloomFilter::new(prefix_bits);
         let filter_data = bf.create_filter(&prefixes).ctx()?;
 
         self.write_raw_block(&filter_data).ctx()
