@@ -89,10 +89,10 @@ index 2a808ff..f69bbf8 100644
 
          // Build sub-tasks
 diff --git a/src/db.rs b/src/db.rs
-index 20eb490..75f5183 100644
+index 20eb490..9e7ea8d 100644
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -4815,6 +4815,98 @@ mod tests {
+@@ -4815,6 +4815,106 @@ mod tests {
      /// Regression: `drain_l0` looped on the full `pick_compaction`, so once L0
      /// was empty it ran level-size compactions inline — in the stop-trigger
      /// path while holding `write_queue`, stalling every writer.
@@ -113,16 +113,17 @@ index 20eb490..75f5183 100644
 +
 +        for subs in [1, 3] {
 +            let dir = tempfile::tempdir().unwrap();
-+            let gate = Arc::new(Mutex::new(None::<(mpsc::Sender<()>, mpsc::Receiver<()>)>));
++            let gate = Arc::new(Mutex::new(None::<mpsc::Sender<mpsc::Sender<()>>>));
 +            let factory_gate = Arc::clone(&gate);
 +            let opts = DbOptions::default()
 +                .with_num_levels(2)
 +                .with_l0_compaction_trigger(usize::MAX)
 +                .with_max_subcompactions(subs)
 +                .with_block_property_collectors(vec![Arc::new(move || {
-+                    let barrier = factory_gate.lock().take();
-+                    if let Some((entered, release)) = barrier {
-+                        entered.send(()).unwrap();
++                    let entered = factory_gate.lock().clone();
++                    if let Some(entered) = entered {
++                        let (resume, release) = mpsc::channel();
++                        entered.send(resume).unwrap();
 +                        release.recv_timeout(Duration::from_secs(10)).unwrap();
 +                    }
 +                    Box::new(Collector)
@@ -143,23 +144,30 @@ index 20eb490..75f5183 100644
 +            let replaced = db.snapshot();
 +
 +            let (entered, picked) = mpsc::channel();
-+            let (resume, release) = mpsc::channel();
-+            *gate.lock() = Some((entered, release));
++            *gate.lock() = Some(entered);
 +            thread::scope(|threads| {
 +                let job = threads.spawn(|| db.drain_l0(true));
-+                picked.recv_timeout(Duration::from_secs(10)).unwrap();
++                // Keep the first output build of each range parked at once.
++                // No thread can report a second entry until the test releases it.
++                let parked: Vec<_> = (0..subs)
++                    .map(|_| picked.recv_timeout(Duration::from_secs(5)).unwrap())
++                    .collect();
++                *gate.lock() = None;
 +                // A newer L0 file lands while the original inputs are claimed.
 +                db.put(b"k", &[2]).unwrap();
 +                db.flush().unwrap();
-+                resume.send(()).unwrap();
++                for resume in parked {
++                    resume.send(()).unwrap();
++                }
 +                job.join().unwrap().unwrap();
 +            });
 +            #[cfg(feature = "bench-metrics")]
 +            {
 +                let measured = db.l0_compaction_profile();
 +                assert!(measured.multiple_target_jobs > 0);
++                assert_eq!(measured.peak_active_ranges, subs as u64);
 +                assert_eq!(measured.parallel_jobs > 0, subs > 1);
-+                assert_eq!(measured.ranges_executed > measured.rewrite_jobs, subs > 1);
++                assert_eq!(measured.ranges_started > measured.rewrite_jobs, subs > 1);
 +            }
 +
 +            fn rows(mut iter: DBIterator) -> Vec<(u8, u8)> {

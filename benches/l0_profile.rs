@@ -352,7 +352,7 @@ fn main() {
         settled.rewrite_jobs,
         settled.multiple_target_jobs,
         settled.parallel_jobs,
-        settled.ranges_executed,
+        settled.ranges_started,
         settled.peak_active_ranges,
         settled.peak_installed_l0_files,
         settled.trivial_moves,

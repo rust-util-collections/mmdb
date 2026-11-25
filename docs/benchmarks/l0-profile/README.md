@@ -81,7 +81,12 @@ cold L1 files in the gap even with a native fence.
 - Timed measurements end at foreground completion. Counters suffixed
   `after_workers` are captured after the workers join. Lifetime totals
   include the explicit final flush and work completed by background threads
-  before close. Reported peak RSS is sampled after both workers finish.
+  before close. `ranges` counts starts (it can include an unsuccessful
+  build), `multi_target_jobs` counts completed rewrites selecting multiple
+  L1 input files, and `parallel_jobs` counts rewrites that successfully
+  joined more than one range. `peak_ranges` measures overlapping execution
+  on this DB only. All recorded runs returned success. Reported peak RSS is
+  sampled after both workers finish.
   The run covers one active DB. It does not establish a cross-DB worker
   budget or prove multi-shard scheduling behavior.
 
@@ -89,9 +94,12 @@ cold L1 files in the gap even with a native fence.
 
 Start from the revision containing this driver, create a second worktree,
 and apply the patch there. Compile each binary separately with the same
-toolchain and features. The test below fails on the serial engine with
+toolchain and features. The recorded runs used the same counter semantics
+as this driver. After review, the range-entry counter was renamed from
+`ranges_executed` to `ranges_started` and its unit test clarified. The
+CSV field remains `ranges`. The test below fails on the serial engine with
 the prototype test added alone and passes after the split is enabled.
-The test parks the output builder, installs a newer L0 file, and checks
+The test parks the first output builder of each range simultaneously, installs a newer L0 file, and checks
 multiple snapshots across a spanning range tombstone and two split-boundary
 rewrites before writable reopen.
 
