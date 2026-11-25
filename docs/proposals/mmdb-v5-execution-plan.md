@@ -22,8 +22,12 @@ p99 rose 5.08% in a noisy control. Production keeps the serial L0 job. A
 separate bounded prefix cut doubled the file count at the same number of
 flushes and increased cold logical emissions by 35% on the gap fixture.
 Bounded grouped point reads reduced warm clustered 32-key request p99 by
-33.30% and passed both extended singleton controls. The engine exposes
-`DB::get_many_pinned` and `DB::get_many_pinned_with_options`. [Grouped point-read measurements](../benchmarks/grouped-reads/README.md)
+33.30% and passed both extended singleton controls. In the secondary
+trials, 32 clustered keys improved full-request p99 by 94.68% when only
+the OS cache was warm and by 69.63% in the storage-read regime. With 32 scattered keys on the larger device-read fixture, a
+10.10% median gain stayed within the 10.26% control noise band.
+The engine exposes `DB::get_many_pinned` and
+`DB::get_many_pinned_with_options`. [Grouped point-read measurements](../benchmarks/grouped-reads/README.md)
 [Usage](../usage.md) · [Engine workloads](../benchmarks/engine-profile/README.md) · [L0 results and replay](../benchmarks/l0-profile/README.md) · [Write-stage replay](../benchmarks/engine-profile/writer-trace/README.md)
 
 ## Order of work
