@@ -33,9 +33,17 @@ The equal-envelope sweep brackets alternatives with depth 4 and 6 MiB,
 and holds `(1 + depth) × buffer size` at 30 MiB per member. Each sweep
 calibrates its own offered load. Both use the same process RSS ceiling.
 Separate sampled runs cover every placement and geometry in both sweeps.
+Current runs include the post-worker observation in component maxima and
+print it as `sampled_after`. Archived runs without this field used the initial
+and periodic 50 ms observations only. A brief high between samples can still
+be missed. Process peak RSS is the independent OS high-water mark.
 The paced calibration starts with a finite trace only as a rate estimate,
 then brackets a sustainable rate with time-stamped arrivals in the requested
-mix. The chosen offer is 70% of the best verified rate. Saturation runs use
+mix. The chosen offer is 70% of the best verified rate. Backlog at each cut
+includes the last scheduled arrival of each active stream. Both calibration
+and load qualification allow the maximum of two requests, the contributing
+stream count and 1% of offered requests (rounded down) per class.
+Saturation runs use
 one common deadline so a fast reader does not exit before slow writers.
 Throughput includes every completion. A bounded per-worker reservoir keeps
 latency memory stable in duration-based trials, with percentile weights

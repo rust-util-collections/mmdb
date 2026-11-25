@@ -110,6 +110,8 @@ class SummaryTest(unittest.TestCase):
                                     "reopen": {"rows": size, "wal_bytes": size * 160, "open_us": b + i,
                                                "open_rss_kib": 512, "open_peak_kib": 600,
                                                "after_verify_peak_kib": 800}})
+        # A 4 KiB allocation between Linux HWM and RSS samples is observable.
+        records[-1]["reopen"]["open_rss_kib"] = records[-1]["reopen"]["open_peak_kib"] + 4
         rows = summary("reopen", records)
         self.assertEqual(len(rows), 14)
         self.assertTrue(all(int(r["repetitions"]) == 5 for r in rows))

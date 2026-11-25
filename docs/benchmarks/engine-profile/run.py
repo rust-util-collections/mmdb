@@ -12,6 +12,8 @@ import re
 import shutil
 import subprocess
 
+from paced_load import load_kept
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("suite", choices=["memory", "mixed", "handoff", "reopen"])
 parser.add_argument("binary", type=Path)
@@ -88,11 +90,7 @@ def calibrate(out, mode, case, fixed):
     low, high = 0, None
     for _ in range(8):
         test = trial(out, mode, "paced-capacity-" + case, str(estimate), {**fixed, "RATE": estimate})
-        sustained = test["classes"]["SmallPut"]["ops_s"] >= 0.98 * estimate
-        for row in test["classes"].values():
-            tolerance = max(2, row["offered"] // 100)
-            sustained &= (row["outstanding_end"] <= tolerance
-                          and row["outstanding_end"] - row["outstanding_half"] <= tolerance)
+        sustained = test["classes"]["SmallPut"]["ops_s"] >= 0.98 * estimate and load_kept(test)
         if sustained:
             low = estimate
         else:

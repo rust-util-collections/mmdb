@@ -38,6 +38,7 @@ struct Sample {
 
 #[derive(Default)]
 struct Samples {
+    streams: usize,
     offered: usize,
     completed: usize,
     last_ack_ns: u64,
@@ -388,11 +389,13 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         .max()
         .expect("no successful requests") as f64
         / 1e9;
+    let after = sample(&dbs, &pool);
     let mut by_class: BTreeMap<Operation, Samples> = BTreeMap::new();
     for (op, mut run) in runs {
         #[cfg(feature = "bench-metrics")]
         println!("stage leader_stream={op:?} {:?}", run.profile);
         let all = by_class.entry(op).or_default();
+        all.streams += usize::from(run.offered != 0);
         all.offered += run.offered;
         all.completed += run.completed;
         all.rejected += run.rejected;
@@ -407,7 +410,6 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         }
         all.rows.append(&mut run.rows);
     }
-    let after = sample(&dbs, &pool);
     println!(
         "run placement={placement} dbs={count} cpu_ticks={cpu_ticks} seconds={wall:.6} rss_after_preload_kib={} peak_kib={peak} before_l0={} after_l0={} after_immutables={} flushes={} compactions={} compaction_output_bytes={} cache_misses={} instrumented={}",
         before.rss_kib,
@@ -420,7 +422,9 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         prop_sum("stats.block_cache_misses") - misses_before,
         cfg!(feature = "bench-metrics")
     );
-    if let Some(sampled) = mem {
+    if let Some(mut sampled) = mem {
+        sampled.observe_peak(after);
+        println!("sampled_after {after:?}");
         println!("sampled_peaks {sampled:?}");
     }
     for (op, all) in by_class {
@@ -442,7 +446,8 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
         }
         let (_, issue_delay) = percentiles(&mut times);
         println!(
-            "class op={op:?} offered={} completed={} sampled={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} issue_delay_p99_us={issue_delay:.3} p99_qualified={} outstanding_half={} outstanding_end={}",
+            "class op={op:?} streams={} offered={} completed={} sampled={} rejected={} bytes={} bytes_s={:.0} ops_s={:.0} arrival_p50_us={p50:.3} arrival_p99_us={p99:.3} service_p99_us={svc:.3} issue_delay_p99_us={issue_delay:.3} p99_qualified={} outstanding_half={} outstanding_end={}",
+            all.streams,
             all.offered,
             all.completed,
             all.rows.len(),

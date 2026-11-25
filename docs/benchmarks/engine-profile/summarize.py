@@ -7,6 +7,8 @@ import json
 from statistics import median
 import sys
 
+from paced_load import load_kept
+
 
 MEMORY_ARMS = {"buffer": [(4, 16), (1, 16), (2, 16)], "envelope": [(4, 6), (1, 15), (2, 10)]}
 
@@ -75,16 +77,6 @@ def validate_record(record):
     for op, c in classes.items():
         require(c["offered"] == c["completed"] > 0 and c["rejected"] == 0
                 and 0 < sample_count(record, c) <= c["completed"], f"incomplete {record['case']} {op}")
-
-
-def load_kept(record):
-    if not record["settings"].get("RATE", 0):
-        return True
-    for c in record["classes"].values():
-        allowance = max(2, c["offered"] // 100)
-        if c["outstanding_end"] > allowance or c["outstanding_end"] - c["outstanding_half"] > allowance:
-            return False
-    return True
 
 
 def check_pair(control, other):
@@ -157,7 +149,10 @@ def summarize_reopen(records, rounds, writer):
         require(iteration not in cells[key], f"duplicate reopen round {key} {iteration}")
         require(settings["PREPARE_MIB"] == 64 and result["rows"] == size and result["wal_bytes"] > 0,
                 f"invalid recovery fixture {key}")
-        require(result["open_peak_kib"] >= result["open_rss_kib"] > 0, f"invalid open-time memory {key}")
+        # The driver reads VmHWM and VmRSS separately. A background allocation
+        # between those reads can make the later RSS exceed the earlier peak.
+        require(result["open_peak_kib"] > 0 and result["open_rss_kib"] > 0,
+                f"missing open-time memory {key}")
         cells[key][iteration] = result
         fixture = (size, iteration)
         require(wal_bytes.setdefault(fixture, result["wal_bytes"]) == result["wal_bytes"],
