@@ -6,15 +6,35 @@ VSDB adapter is ported. An MMDB “shard” in the experiments below is an
 ordinary `DB` handle on its own temporary directory.
 [Joint release decisions](mmdb-v5-vsdb-v18-improvements.md#decisions-before-the-first-releases) · [Independent reviews and verification](reviews/mmdb-v5-plan/README.md)
 
+## Implementation record
+
+The work packages and their screening thresholds below were agreed at
+`4acd209`. MMDB now returns `Busy` for the two transient write-admission
+paths, exposes pool and DB memory gauges, and tests eight-byte-prefix
+export through writable reopen. Fresh-process mixed, memory, reopen and
+L0 drivers implement the profiling protocol. The ordered writer replay
+found a median modeled p99 gain of 0.065% on the first two-issuer trace
+and 0.167% after matching the warmup in the current driver. In a separate
+100,000-request trial, the cheaper serial handoff increased paired foreground
+p99 by 8.10%. Production keeps the existing serial writer. The two-range
+L0 prototype reduced stall time per admitted GiB by 97.94%, while read
+p99 rose 5.08% in a noisy control. Production keeps the serial L0 job. A
+separate bounded prefix cut doubled the file count at the same number of
+flushes and increased cold logical emissions by 35% on the gap fixture.
+Bounded grouped point reads reduced warm clustered 32-key request p99 by
+33.30% and passed both extended singleton controls. The engine exposes
+`DB::get_many_pinned` and `DB::get_many_pinned_with_options`. [Grouped point-read measurements](../benchmarks/grouped-reads/README.md)
+[Usage](../usage.md) · [Engine workloads](../benchmarks/engine-profile/README.md) · [L0 results and replay](../benchmarks/l0-profile/README.md) · [Write-stage replay](../benchmarks/engine-profile/writer-trace/README.md)
+
 ## Order of work
 
-| Unit | Expected benefit and pass condition | Existing check → proof still to build |
+| Unit | Expected benefit and pass condition | Implementation and verification |
 |---|---|---|
-| 1. Write admission | Both transient causes return `Busy`. Zero rejected records, sequence increments or visible rows. One retry after pressure clears applies exactly one batch. | The L0 test asserts the old error. Extend it with before/after storage checks, a stop-threshold case and an accepted-only mixed-group control. |
-| 2. Memory accounting | Count each shared evictable charge once, report member pin bytes separately, and observe outstanding immutable generations. This gives a usable budget breakdown. | Existing tests cover entries, pins, overflow and member isolation. Add byte gauges and independent byte-delta assertions across freeze, install and detach. |
-| 3. Export and API contracts | Zero missing, extra or different visible rows. Matching writable geometry succeeds and wrong geometry rejects. A successful fence preserves acknowledged WAL data. | Current v4 golden and WAL fault tests run today. Add an eight-byte prefix export, writable round trip, and missing mixed-prefix batch coverage. |
-| 4. Workload profiles | Choose a queue profile within the declared RSS/throughput/p99 budgets and identify which part of a mixed write consumes the foreground latency budget. | The existing one-DB smoke benchmark runs today. Build the paced, saturation, multi-DB and residual-WAL arms and timing counters. |
-| 5. Performance candidates | Screen for 15% lower small-write p99, 20% less L0 stall time per GiB, or 10% lower batched-read p99 in their respective workloads. | Current code supplies serial/scalar controls. The three candidate paths, their hit counters and their dedicated oracles are pending. See [the comparison protocol](#4-measure-the-limiting-engine-operation). |
+| 1. Write admission | Both transient causes return `Busy`. Zero rejected records, sequence increments or visible rows. One retry after pressure clears applies exactly one batch. | The baseline L0 test asserted the old error. The integrated tests exercise before/after storage checks, a stop-threshold case and an accepted-only mixed-group control. |
+| 2. Memory accounting | Count each shared evictable charge once, report member pin bytes separately, and observe outstanding immutable generations. This gives a usable budget breakdown. | The public gauges and independent charge assertions now cover replacement, invalidation, freeze, durable install, close and detach. |
+| 3. Export and API contracts | Zero missing, extra or different visible rows. Matching writable geometry succeeds and wrong geometry rejects. A successful fence preserves acknowledged WAL data. | The eight-byte-prefix exporter test validates the complete stream after a writable flush and reopen. WAL replay tests cover the two-prefix batch in both reopen modes. |
+| 4. Workload profiles | Choose a queue profile within the declared RSS/throughput/p99 budgets and identify which part of a mixed write consumes the foreground latency budget. | The original one-DB smoke benchmark remains available. The engine profile supplies the paced, common-duration saturation, multi-DB and residual-WAL arms, with separate optional counters. |
+| 5. Performance candidates | Screen for 15% lower small-write p99, 20% less L0 stall time per GiB, or 10% lower batched-read p99 in their respective workloads. | The serial L0 control and two-range patch have paired results. Writer eligibility is tested against the ordered trace. The read trial compares one-view grouped lookups with equivalent scalar pins. See [the comparison protocol](#4-measure-the-limiting-engine-operation). |
 
 Units 1–3 can land independently. Run the memory experiments after unit 2.
 Review the mixed-write evidence before designing a second writer stage.
@@ -24,6 +44,9 @@ collection schemas are the compatibility baseline for these units.
 
 ## 1. Make write pressure retryable
 
+The sections below preserve the agreed work packages and test oracles.
+The implementation record above tracks which candidates are in the engine.
+
 Change the L0 `no_slowdown` refusal in `DB::write_batch_inner` to return
 `ErrorKind::Busy`, matching `FlushQueue::check_capacity`. Keep malformed
 batches and invalid open options classified as `InvalidArgument`. Preserve
@@ -31,7 +54,7 @@ the existing behavior for ordinary writers and the leader's per-request
 immutable-queue check. Document the two transient conditions on
 `WriteOptions::no_slowdown` and in the usage guide.
 
-Start by changing the old expectation in `test_write_options_no_slowdown`.
+The implementation started by changing the old expectation in `test_write_options_no_slowdown`.
 In an isolated store, disable automatic L0 compaction, create three L0
 files with explicit flushes, and reject a uniquely identifiable batch.
 With other writers idle, require `Busy`, identical active WAL identity and
@@ -45,7 +68,7 @@ compare the WAL records, sequence advance and recovered rows with an
 accepted-only control. The neighbor legitimately changes both WAL and sequence.
 Keep a malformed request and an invalid open configuration as negative controls.
 Success means all three pressure cases pass and every rejected mutation has
-zero storage effects. The baseline L0 test currently passes by expecting
+zero storage effects. At the starting revision the L0 test passed by expecting
 `InvalidArgument`. Keep public calls and file observations in the integration
 test. Put assertions that need the current WAL number, leader or pause hook
 in the existing in-crate test module. Record refusal and caller completion
@@ -119,8 +142,8 @@ admission. [Pool and pins](../../src/cache/block_cache.rs) · [Memtable accounti
   and `(3, 2)` independently on the exported store, expect
   `InvalidArgument`, then perform the correct writable reopen. Run the
   publication test with `CI=1` on Linux so an unsupported exclusive rename
-  cannot count as a successful export. The existing golden fixture uses a
-  two-byte prefix and opens the result read-only.
+  cannot count as a successful export. The original golden fixture remains as a separate
+  two-byte-prefix read-only control.
 
 [Batch and encoding tests](../../src/types.rs) · [WAL fault tests](../../src/db/flush.rs) · [Pinned and geometry tests](../../tests/integration.rs) · [Exporter](../../tools/v4-export/src/main.rs) · [Exporter golden tests](../../tools/v4-export/tests/golden.rs)
 
@@ -133,12 +156,12 @@ capacity and worker counts. Keep a warm scalar read and a single writer as
 controls. Run the tests separately from the timed trials.
 [Current mixed profile](../../benches/v5_profile.rs) · [Point-operation baseline](../benchmarks/point-ops/runs.csv)
 
-**What runs today.** `v5_profile` uses one DB, a 256 KiB write buffer,
+**Original smoke control.** `v5_profile` uses one DB, a 256 KiB write buffer,
 two getters and two single-put writers. Each worker measures 10,000 calls,
 issuing the next when the last returns. It prints per-class p99/p999, flush
 counts and, on Linux, process peak RSS. It ends with a flush. Use it to
 check the profiling setup. The matched-load, multi-DB and residual-WAL
-experiments below require a new or extended driver. The old point-operation
+experiments below run through the separate [engine profile](../benchmarks/engine-profile/README.md). The old point-operation
 CSV provides engine throughput context only.
 
 | Decision | Experimental arms | Outputs for the decision |
@@ -269,7 +292,22 @@ cargo +stable test --lib compaction::leveled::tests::test_execute_compaction_io_
 cargo +stable test --test proptest_db
 ```
 
-The existing short single-DB profile can be rerun before extending it. Use
+The landed behavior has focused entry points in addition to the starting checks.
+The mixed group test compares recovered WAL contents with an accepted-only
+control. The export fixture verifies the entire visible stream after writable
+reopen. The grouped suite covers request bounds, snapshots, pins and late
+errors.
+
+```sh
+cargo +stable test --lib db::flush::tests::mixed_group_busy_member_leaves_only_the_accepted_neighbors_wal -- --exact
+cargo +stable test --lib db::flush::tests::memory_usage_follows_the_installed_flush_generation -- --exact
+cargo +stable test --test shared_cache shared_pool_reports_weighted_charges_and_member_pin_lengths -- --exact
+cargo +stable test --test crash_recovery two_prefix_wipe_and_replacements_are_visible_together_after_wal_replay -- --exact
+CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml --test golden eight_byte_prefix_shard_exports_visible_rows_and_reopens_writable -- --exact
+cargo +stable test --test grouped_reads
+```
+
+The original short single-DB profile can be rerun separately. Use
 a fresh process for each immutable limit so the Linux peak RSS measurement
 belongs to one run.
 
@@ -286,8 +324,13 @@ tests and exporter tests. There were 571 top-level passing test cases. The
 read-only suite ran its syscall probe through `strace`. During plan review,
 all ten focused commands above selected real tests and passed. Each of the
 three smoke runs completed 20,000 reads and 20,000 writes. These observations
-verify the baseline procedures. An AArch64 result and candidate performance
-measurements are pending. [Review and run record](reviews/mmdb-v5-plan/README.md#what-was-checked-during-this-review)
+verify the baseline procedures. On integrated code `90b220e`, all **25
+final-gate commands** passed for x86_64 Linux and the AArch64 target.
+Each ran 585 default runtime cases and two doctests, plus 429 overlapping
+feature-enabled library tests. The ARM suites ran as a non-root user in a
+full-system AArch64 Linux VM, including child-process recovery and actual
+guest syscall tracing. The arena pin test also passed under Miri on x86_64.
+Performance trials use x86_64 hardware. [Validation receipt](../benchmarks/engine-profile/validation.json) · [Baseline plan review](reviews/mmdb-v5-plan/README.md#what-was-checked-during-this-review) · [Implementation reviews](reviews/mmdb-v5-implementation/README.md)
 
 For the VSDB port, hand off the accepted MMDB revision, property names with
 units and ownership, the writable-reopen/export results, the raw workload
