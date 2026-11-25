@@ -26,6 +26,30 @@ and `grouped-public`.
 python3 -c 'import gzip,json; print(json.load(gzip.open("milestones.json.gz", "rt"))["checkpoints"]["l0"]["reports"]["grok"])'
 ```
 
+## Integrated-source review
+
+After the five development checkpoints, the same four CLIs independently
+reviewed the integrated snapshot `736b87e` against `4acd209`. The four
+source reviews are archived separately from the twenty milestone reports.
+The source review preceded the last evidence and documentation updates.
+[Integrated-source reports and English brief](integrated-source.json.gz)
+
+| Tool | Checked decision |
+|---|---|
+| Grok Build | Confirmed group visibility and all-or-error accounting, typed admission refusals, per-pool memory ownership, export/reopen behavior and serial L0. Its device-qualification caveat is workload-dependent. The runner rejects insufficient per-request read evidence and uses all requests to calculate p99. [Read evidence](../../../benchmarks/grouped-reads/read_evidence.py) |
+| Claude Code | The memory summarizer's one-sided RSS status was ambiguous. Commit `a5560e8` reports reference and candidate ceilings separately and tests a reference exceeding the ceiling. Under the CI command `cargo check --benches --features bench-metrics`, Cargo emitted a `grouped_reads` compiler artifact with resolved features `bench-metrics`, `default`, and `test-utils`. The root dev-dependency supplies the last feature. [Summary tests](../../../benchmarks/engine-profile/test_summarize.py) · [CI](../../../../.github/workflows/ci.yml) |
+| agy | Accepted the integrated storage, grouped-read failure accounting and WAL recovery contracts. Identified three additional validation gaps: the minimum outstanding-work tolerance on short aggregated memory streams, the final interval of the optional 50 ms memory sampler and the standalone library/rustdoc coverage of `bench-metrics`. Calibration and summaries now allow each issuing stream its just-arrived request. The sampler merges the existing post-worker observation into its maxima. CI, Make and the agent gate include isolated diagnostic-feature library Clippy and rustdoc checks. [Workload driver](../../../../benches/engine_profile/concurrent.rs) · [Repository gate](../../../ai/commit-protocol.md#final-repository-gate) |
+| OpenCode | `point_lookup` and the grouped path both retain a view before checking handle state and validating a snapshot. An empty group resolves the supplied snapshot. The read harness enables its block cache only for warm mode. L0 CSVs distinguish the 24 starting **L1** files, selected bytes, completed range-build output, and actual concurrent ranges on one DB. Paced end-to-end latency starts at scheduled arrival. [Read path](../../../../src/db/read.rs) · [Read harness](../../../../benches/grouped_reads.rs) · [L0 fields](../../../benchmarks/l0-profile/) |
+
+The short-queue regression failed on the previous allowance and passed
+with the shared check. At the recorded 10,000 operations per foreground
+stream, the memory Batch allowance is still 1,600 requests and the mixed
+Batch allowance is still two. A 26 ms sampled 16-DB run captured the final
+10,481,664 active bytes in its maxima before the 50 ms periodic interval.
+Historical records without `sampled_after` retain their original sampling
+coverage. Both new diagnostic-feature checks passed locally on x86_64.
+[Backlog tests](../../../benchmarks/engine-profile/test_paced_load.py)
+
 ## Decisions verified against code or tests
 
 | Checkpoint | Review claim | Resolution and evidence |
@@ -38,4 +62,4 @@ python3 -c 'import gzip,json; print(json.load(gzip.open("milestones.json.gz", "r
 | L0 profiler | agy and Grok flagged fence time and possible end-of-run compaction debt. | Fence service has a separate sample class. Initial cold files retired, logical cold rows emitted and new SST bytes are separate quantities. The raw trials include both timed-window and closing counters. All 30 archived pairs ended with equal L0 counts and rewrite counts within each pair. The longer test cleared the stall target but could not certify the read-tail guardrail, so the production L0 merge stays serial. [Profile source](../../../../benches/l0_profile.rs) · [Raw paired results](../../../benchmarks/l0-profile/runs-65536.csv) |
 | Grouped prototype | agy identified thrashing across overlapping SSTs and duplicate-key probes. Grok, Claude Code and OpenCode challenged periodic eviction as a sufficient device-read baseline and requested like-for-like ownership and metadata. | The revised candidate resolves one pinned view and sequence, coalesces duplicate slots, and keeps two request-local file cursors. The scalar control uses one snapshot, compares the same trace and retains results to a matching point. Trials record the fixture and binary identities, distinguish engine/page/device regimes, and classify actual device reads. A foreign snapshot is rejected by the same resolver used by scalar reads. [Grouped candidate and evaluation](../../mmdb-v5-execution-plan.md#5-promote-only-the-candidates-supported-by-the-profiles) |
 | Grouped public candidate | Claude Code identified selection bias if p99 used only I/O-positive requests from each arm. OpenCode suspected duplicate hidden keys could inflate read statistics and that closed-handle precedence was inverted. | Use all completed requests for the primary within-regime percentile, qualify device evidence separately, and require sufficient request count for the decision. A duplicate visible value records one charge per returned hit, while hidden duplicates produce no result charge. The public candidate calls `check_usable` before testing the cap. Dedicated tests cover hidden duplicate slots and closed handles. |
-| Grouped public candidate | Grok and agy traced a later corrupt key after earlier visible slots. agy also found that a probe past a file's final partition could prematurely evict a request cursor. | Treat these as acceptance checks. A group returning an error should charge zero returned bytes. A partition miss should leave the two reusable file cursors intact. Verify both on the corrected candidate, compare the actual release read path, and keep the device-read counter as a request-level qualifier. The final API disposition belongs to the [execution record](../../mmdb-v5-execution-plan.md#implementation-record). |
+| Grouped public candidate | Grok and agy traced a later corrupt key after earlier visible slots. agy also found that a probe past a file's final partition could prematurely evict a request cursor. | The promoted implementation (`c97bb5c`) posts its read-byte total once after all keys succeed. It returns from past-partition misses before changing either cursor. The regression tests cover late corruption, hidden duplicates and an interposed third SST. Both one-SST and overlapping-SST production release checks passed. Device I/O evidence qualifies the request population; the p99 comparison uses all requests. [Regression tests](../../../../tests/grouped_reads.rs) · [Published results and limits](../../../benchmarks/grouped-reads/) |
