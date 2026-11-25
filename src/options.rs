@@ -314,7 +314,9 @@ pub enum DurabilityMode {
 pub struct WriteOptions {
     /// WAL policy for this batch.
     pub durability: DurabilityMode,
-    /// If true, return an error instead of sleeping when writes are throttled.
+    /// Reject a nonempty write with [`Busy`](crate::ErrorKind::Busy) when the
+    /// immutable queue is full or L0 has reached the slowdown threshold.
+    /// Concurrent requests can still wait for their write group to complete.
     pub no_slowdown: bool,
 }
 

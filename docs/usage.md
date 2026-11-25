@@ -105,9 +105,11 @@ it includes unpinned entries across all members plus this member's pins.
 Fallible operations return `mmdb::Result<T>`. Match `err.kind()` for
 programmatic handling. For example, a writable reopen with incompatible
 geometry returns `InvalidArgument`, an unsupported MANIFEST header returns
-`Corruption`, and a write with `no_slowdown` can return `Busy` when the
-immutable queue is full. At the L0 slowdown threshold the current
-`no_slowdown` path returns `InvalidArgument`. A latched background failure
+`Corruption`, and a valid nonempty write with `no_slowdown` returns `Busy` if the
+immutable queue is full or the L0 file count reaches the slowdown threshold.
+This admission refusal leaves the batch unapplied and consumes no WAL record
+or sequence. Retry after the backlog drains. Concurrent requests can still
+wait for their write group to complete. A latched background failure
 causes subsequent reads and writes on that handle to return `Background`. The error's display includes its
 origin and propagation frames. An I/O error retains its underlying source.
 [Error kinds](../src/error.rs) · [Write admission](../src/db.rs)

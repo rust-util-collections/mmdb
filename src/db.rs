@@ -2909,8 +2909,8 @@ impl DB {
             // (the slowdown delay or the stop-trigger drain) can activate.
             let l0_count = self.l0_file_count.load(Ordering::Relaxed);
             if l0_count >= self.options.l0_slowdown_trigger {
-                return Err(Error::invalid_argument(
-                    "write stalled: no_slowdown is set".to_string(),
+                return Err(Error::busy(
+                    "L0 file count reached the write slowdown threshold",
                 ));
             }
         } else {

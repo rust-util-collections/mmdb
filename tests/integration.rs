@@ -778,30 +778,71 @@ fn test_write_options_disable_wal() {
 
 #[test]
 fn test_write_options_no_slowdown() {
-    let dir = tempfile::tempdir().unwrap();
-    let opts = DbOptions::default()
-        .with_create_if_missing(true)
-        .with_l0_compaction_trigger(usize::MAX)
-        .with_l0_slowdown_trigger(3)
-        .with_l0_stop_trigger(usize::MAX);
-    let db = DB::open(opts, dir.path()).unwrap();
+    use std::{collections::BTreeMap, fs};
 
-    let wo = WriteOptions::default().with_no_slowdown(true);
+    // Test both the slowdown window and its boundary with the stop trigger.
+    for stop in [usize::MAX, 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_l0_compaction_trigger(usize::MAX)
+            .with_l0_slowdown_trigger(3)
+            .with_l0_stop_trigger(stop);
+        let db = DB::open(opts.clone(), dir.path()).unwrap();
+        let no_wait = WriteOptions::default().with_no_slowdown(true);
+        for i in 0_u8..3 {
+            db.put_with_options(&no_wait, &[i], b"initial").unwrap();
+            db.flush().unwrap();
+        }
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("3"));
+        let wal_lengths = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "wal"))
+                .map(|entry| (entry.file_name(), entry.metadata().unwrap().len()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before_wals = wal_lengths();
+        assert!(!before_wals.is_empty());
 
-    // Normal writes with no_slowdown should succeed when no pressure
-    db.put_with_options(&wo, b"ns_key", b"ns_val").unwrap();
-    assert_eq!(db.get(b"ns_key").unwrap(), Some(b"ns_val".to_vec()));
+        let retry = || {
+            let mut batch = WriteBatch::new();
+            batch.put(b"retry-a", b"one");
+            batch.put(b"retry-b", b"two");
+            batch
+        };
+        let before = db.snapshot().sequence();
+        let error = db.write_with_options(&no_wait, retry()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Busy);
+        let bad_key = vec![0; mmdb::MAX_USER_KEY_SIZE + 1];
+        assert_eq!(
+            db.put_with_options(&no_wait, &bad_key, b"bad")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(wal_lengths(), before_wals);
+        assert_eq!(db.snapshot().sequence(), before);
+        assert_eq!(db.get(b"retry-a").unwrap(), None);
+        assert_eq!(db.get(b"retry-b").unwrap(), None);
 
-    // Build the L0 backlog deterministically. Compaction is disabled by the
-    // unreachable trigger, and each explicit flush creates one L0 file.
-    for i in 0..3 {
-        let key = format!("flood_{:06}", i);
-        db.put(key.as_bytes(), b"value").unwrap();
-        db.flush().unwrap();
+        db.compact().unwrap();
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("0"));
+        db.write_with_options(&no_wait, retry()).unwrap();
+        assert_eq!(db.snapshot().sequence(), before + 2);
+
+        db.close().unwrap();
+        let reopened = DB::open(opts, dir.path()).unwrap();
+        assert_eq!(reopened.snapshot().sequence(), before + 2);
+        assert_eq!(
+            reopened.get(b"retry-a").unwrap().as_deref(),
+            Some(&b"one"[..])
+        );
+        assert_eq!(
+            reopened.get(b"retry-b").unwrap().as_deref(),
+            Some(&b"two"[..])
+        );
     }
-
-    let err = db.put_with_options(&wo, b"blocked", b"value").unwrap_err();
-    assert_eq!(err.kind(), ErrorKind::InvalidArgument);
 }
 
 /// no_slowdown must also fail fast at the L0 stop trigger. A configuration

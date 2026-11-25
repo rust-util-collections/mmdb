@@ -412,6 +412,11 @@ mod tests {
         );
     }
 
+    fn active_wal(db: &DB) -> PathBuf {
+        db.path()
+            .join(format!("{:06}.wal", db.inner.lock().wal_number))
+    }
+
     #[test]
     fn newest_immutable_wins_while_oldest_flush_is_parked() {
         let dir = tempfile::tempdir().unwrap();
@@ -430,13 +435,19 @@ mod tests {
             Some(old.clone())
         );
         let no_wait = WriteOptions::default().with_no_slowdown(true);
+        let wal = active_wal(&db);
+        let before = fs::read(&wal).unwrap();
+        let seq = db.read.current_sequence();
         assert_eq!(
             db.put_with_options(&no_wait, b"blocked", b"v")
                 .unwrap_err()
                 .kind(),
             ErrorKind::Busy
         );
-        let seq = db.read.current_sequence();
+        assert_eq!(db.read.current_sequence(), seq);
+        assert_eq!(active_wal(&db), wal);
+        assert_eq!(fs::read(wal).unwrap(), before);
+        assert_eq!(db.get(b"blocked").unwrap(), None);
         db.sync_wal().unwrap();
         assert_eq!(db.read.current_sequence(), seq);
         thread::scope(|s| {
@@ -461,6 +472,97 @@ mod tests {
             DB::open(options(), dir.path()).unwrap().get(b"k").unwrap(),
             Some(new)
         );
+    }
+
+    #[test]
+    fn mixed_group_busy_member_leaves_only_the_accepted_neighbors_wal() {
+        fn wait_for(mut predicate: impl FnMut() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !predicate() {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                thread::yield_now();
+            }
+            true
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let reference_dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default().with_max_immutable_memtables(1);
+        let synced = WriteOptions::default().with_durability(DurabilityMode::WalSync);
+        let reference = DB::open(opts.clone(), reference_dir.path()).unwrap();
+        reference.put(b"seed", b"initial").unwrap();
+        reference.flush().unwrap();
+        reference
+            .put_with_options(&synced, b"admitted", b"value")
+            .unwrap();
+        let expected_wal = fs::read(active_wal(&reference)).unwrap();
+        assert!(!expected_wal.is_empty());
+
+        let db = DB::open(opts.clone(), dir.path()).unwrap();
+        db.put(b"seed", b"initial").unwrap();
+        let before = db.snapshot().sequence();
+        let (running, release) = pause_next_flush(&db, false);
+        thread::scope(|scope| {
+            // Both calls pass public admission before our synthetic leader freezes
+            // the generation. The real group leader must recheck capacity.
+            db.write_queue.lock().leader_active = true;
+            let refused = scope.spawn(|| {
+                db.put_with_options(
+                    &WriteOptions::default().with_no_slowdown(true),
+                    b"refused",
+                    b"absent",
+                )
+            });
+            let admitted = scope.spawn(|| db.put_with_options(&synced, b"admitted", b"value"));
+            let queued = wait_for(|| db.write_queue.lock().queue.len() == 2);
+            let freeze = db.submit_active();
+            db.write_queue.lock().leader_active = false;
+            db.write_cv.notify_all();
+            freeze.unwrap();
+            running.recv_timeout(Duration::from_secs(5)).unwrap();
+            // The flush worker is parked in the build hook. Only the group leader
+            // waits on changed, after recording Busy and before any WAL append.
+            let leader_waiting = wait_for(|| db.flush_queue.changed.notify_one());
+            let wal = active_wal(&db);
+            let wal_before_release = fs::read(&wal).unwrap();
+            let sequence_before_release = db.snapshot().sequence();
+            let group_pending = !refused.is_finished() && !admitted.is_finished();
+            release.send(()).unwrap();
+            assert_eq!(refused.join().unwrap().unwrap_err().kind(), ErrorKind::Busy);
+            admitted.join().unwrap().unwrap();
+            assert!(
+                queued,
+                "both public calls must have passed initial admission"
+            );
+            assert!(
+                leader_waiting,
+                "the admitted neighbor must wait for capacity"
+            );
+            assert!(group_pending, "group completion preceded the flush release");
+            assert!(wal_before_release.is_empty());
+            assert_eq!(sequence_before_release, before);
+            assert_eq!(active_wal(&db), wal);
+            assert_eq!(fs::read(wal).unwrap(), expected_wal);
+        });
+        assert_eq!(db.snapshot().sequence(), before + 1);
+        assert_eq!(db.get(b"refused").unwrap(), None);
+        db.simulate_crash();
+        reference.simulate_crash();
+        for path in [dir.path(), reference_dir.path()] {
+            let restored = DB::open(opts.clone(), path).unwrap();
+            assert_eq!(restored.snapshot().sequence(), before + 1);
+            assert_eq!(
+                restored.get(b"admitted").unwrap().as_deref(),
+                Some(&b"value"[..])
+            );
+            assert_eq!(restored.get(b"refused").unwrap(), None);
+            assert_eq!(
+                restored.get(b"seed").unwrap().as_deref(),
+                Some(&b"initial"[..])
+            );
+        }
     }
 
     #[test]
