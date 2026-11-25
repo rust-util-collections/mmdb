@@ -129,21 +129,27 @@ performs at most one patch bump (`X.Y.Z` → `X.Y.(Z+1)`) after the Final
 repository gate passes with zero in-scope `Open` findings and zero unreviewed
 ledger gaps.
 
-A bump is owed only when **shipped library inputs** changed since the latest
-commit that modified `package.version` in `Cargo.toml` — specifically production
-library Rust files (`src/**/*.rs` excluding `#[cfg(test)]`-only
-`src/test_alloc.rs`) or shipped `[dependencies]` / `[target.*.dependencies]` /
-`[features]` entries in root `Cargo.toml`:
+A bump is owed **only** when **shipped library inputs** changed since the latest
+commit that modified `package.version` in `Cargo.toml`. This is a whitelist: a
+change owes a bump only if it touches one of the following; every other path
+never owes a bump, whether or not it is enumerated here.
+
+- Production library Rust sources: `src/**/*.rs`, excluding the
+  `#[cfg(test)]`-only `src/test_alloc.rs`.
+- Shipped `[dependencies]` / `[target.*.dependencies]` / `[features]` entries in
+  the root `Cargo.toml`.
 
 ```sh
 base=$(git log -1 --format=%H -G'^version = ' -- Cargo.toml)
-git diff --name-only "$base" HEAD -- 'src/*.rs' 'src/**/*.rs' ':(exclude)src/test_alloc.rs'
+git diff --name-only "$base" HEAD -- 'src/*.rs' 'src/**/*.rs' ':(exclude)src/test_alloc.rs' Cargo.toml
 ```
 
-Changes confined to `tools/v4-export/` (`publish = false`), `tests/`,
-`benches/`, `examples/`, `src/test_alloc.rs`, `docs/`, `README.md`,
-`COMPARISON.md`, `TODO.md`, `Makefile`, `.github/`, `.gitignore`, or `.agents/`
-do **not** owe a version bump.
+For a root `Cargo.toml` hit, inspect the diff and confirm the changed lines are
+shipped dependency or feature entries; pure `package.version` or manifest
+metadata edits do not owe a bump. Work outside the whitelist — documentation and
+other non-source content, the audit registry, tests, benches, examples, the
+separate `tools/` crates, CI configuration, and repository meta files — never
+triggers a version change, including when those paths contain `.rs` files.
 
 Scope eligibility:
 
@@ -154,7 +160,7 @@ Scope eligibility:
   `<rev1>..<rev2>`): finalize one owed patch bump **only if** this invocation
   itself committed a shipped library change, or the frozen reviewed commit range
   itself contains shipped library changes since `$base`. Do not bump
-  `Cargo.toml` during a docs/tests/benches/tools-only narrow overhaul merely
+  `Cargo.toml` during a narrow overhaul that touches no whitelist path merely
   because unrelated earlier commits sit after `$base`.
 - **Dirty `Cargo.toml` baseline**: if `Cargo.toml` already had uncommitted
   baseline edits at preflight, leave `Cargo.toml` untouched and report the
