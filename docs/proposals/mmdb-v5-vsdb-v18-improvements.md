@@ -6,6 +6,11 @@ point-operation runs used MMDB `f1cb8f6`. Proposed performance gains still
 require measurement on the ported stack.
 [Four independent reports, claim checks and test results](reviews/v5-v18/README.md)
 
+The recommendations and peer comparison below describe their cited
+revisions. For current engine API behavior see the [usage guide](../usage.md).
+For the implementation, trials and disposition of individual candidates see
+the [MMDB execution record](mmdb-v5-execution-plan.md).
+
 ## Decisions before the first releases
 
 Adopt MMDB v5 in `vsdb_core` and define the joint upgrade path first. For
@@ -61,7 +66,7 @@ verified v5 dependency before the v18 crates that consume it.
   including the heap fallback for long keys. A whole-map wipe still uses
   the successor of the map prefix and precedes replacement rows in the batch.
   [VSDB batch builder][vs-adapter] · [MMDB prefixed encoding](../../src/types.rs)
-- **Make a retry decision possible.** Today a valid `no_slowdown` write can
+- **Make a retry decision possible.** At the reviewed revision a valid `no_slowdown` write can
   return `Busy` at the full immutable queue and `InvalidArgument` at the L0
   slowdown threshold. Propose `Busy` for either transient admission refusal,
   with a corresponding retryable classification in VSDB's fallible API.

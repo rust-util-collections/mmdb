@@ -70,13 +70,17 @@ cargo +stable test --test integration
 cargo +stable doc --no-deps --open
 cargo +stable bench --bench benchmarks -- warm
 cargo +stable bench --bench v5_profile
+cargo +stable bench --bench engine_profile -- mixed
 ```
 
 The Criterion suite includes warm-cache and small-block-cache workloads. Both
 can read from the OS page cache. The separate v5 profile exercises concurrent
 readers and writers. Set `MMDB_PROFILE_IMMUTABLES` on separate runs to compare
 queue limits (the profile defaults to two).
-[Criterion benchmarks](benches/benchmarks.rs) · [v5 profile](benches/v5_profile.rs)
+The engine profile separates foreground writes, bulk batches and snapshot
+reads. It also measures shared-pool memory and reopen with residual WALs.
+Use `bench-metrics` for diagnostic stage timings.
+[Criterion benchmarks](benches/benchmarks.rs) · [v5 profile](benches/v5_profile.rs) · [Engine workloads and reproduction](docs/benchmarks/engine-profile/README.md) · [L0 results](docs/benchmarks/l0-profile/README.md)
 
 ## License
 

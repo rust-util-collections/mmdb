@@ -28,6 +28,14 @@ name available for retry. If the final directory sync fails on Unix, the
 completed store is already visible and its survival across power loss is
 uncertain.
 
+Verify the destination through a writable reopen with the geometry the caller
+will actually use. For a v4 shard with three levels and an eight-byte prefix,
+pass `3 8` to the exporter. A v5 read-only open adopts the recorded geometry
+and can succeed even if the export used the wrong prefix length. Check the
+visible rows in key order and the final iterator status on both sides before
+switching the caller. The exporter preserves the visible contents at the
+offline cut and assigns fresh engine sequence history.
+
 Use the destination's geometry for a subsequent writable open. To inspect
 the result, `DB::open_read_only` adopts those values automatically. The
 exporter works on MMDB key/value pairs. Changes to vsdb collection formats

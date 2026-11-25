@@ -99,3 +99,15 @@ which can lag insertions and evictions while cache maintenance runs.
 It takes no writer lock. Flush retires a generation from the reported
 immutable set after durable installation, even if a reader still owns that
 generation. [DB memory gauges](../src/db/memory.rs)
+
+## Profiling foreground and background work
+
+A build with `bench-metrics` exposes `take_thread_write_profile()`. It
+drains counters for the calling OS thread. A group leader accumulates WAL
+and memtable work for all batches it serves. A follower's wait can overlap
+those same stages. Compute group-stage shares from leader work and measure
+request p99 separately at the caller. Normal builds omit the diagnostic
+clocks. The per-DB L0 profile counts selected input file lengths and new
+output file sizes. File lengths measure the scope of a rewrite. They do
+not measure device reads, and a trivial file move writes no new SST.
+[Engine workloads](benchmarks/engine-profile/README.md) · [L0 experiment](benchmarks/l0-profile/README.md)
