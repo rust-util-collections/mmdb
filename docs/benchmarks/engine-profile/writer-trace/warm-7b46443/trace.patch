@@ -1,0 +1,274 @@
+diff --git a/benches/engine_profile/concurrent.rs b/benches/engine_profile/concurrent.rs
+index fd60611..c67ad82 100644
+--- a/benches/engine_profile/concurrent.rs
++++ b/benches/engine_profile/concurrent.rs
+@@ -48,6 +48,8 @@ struct Samples {
+     rows: Vec<Sample>,
+     #[cfg(feature = "bench-metrics")]
+     profile: mmdb::ThreadWriteProfile,
++    #[cfg(feature = "bench-metrics")]
++    trace: Option<mmdb::write_trace::Trace>,
+ }
+
+ fn streams(config: &Config, memory: bool, placement: &str) -> Vec<Stream> {
+@@ -139,6 +141,12 @@ fn run_stream(
+         }),
+         ..Default::default()
+     };
++    #[cfg(feature = "bench-metrics")]
++    if matches!(s.operation, Operation::SmallPut | Operation::Batch)
++        && std::env::var_os("MMDB_GROUP_TRACE").is_some()
++    {
++        mmdb::write_trace::begin(s.count);
++    }
+     barrier.wait();
+     barrier.wait();
+     let start = *clock.get().unwrap();
+@@ -244,6 +252,7 @@ fn run_stream(
+     #[cfg(feature = "bench-metrics")]
+     {
+         samples.profile = mmdb::take_thread_write_profile();
++        samples.trace = mmdb::write_trace::finish();
+     }
+     samples
+ }
+@@ -393,6 +402,13 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
+         #[cfg(feature = "bench-metrics")]
+         println!("stage leader_stream={op:?} {:?}", run.profile);
+         let all = by_class.entry(op).or_default();
++        #[cfg(feature = "bench-metrics")]
++        if let Some(trace) = run.trace.take() {
++            assert!(
++                all.trace.replace(trace).is_none(),
++                "trace requires one worker per recorded write class"
++            );
++        }
+         all.offered += run.offered;
+         all.completed += run.completed;
+         all.rejected += run.rejected;
+@@ -423,6 +439,44 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
+     if let Some(sampled) = mem {
+         println!("sampled_peaks {sampled:?}");
+     }
++    #[cfg(feature = "bench-metrics")]
++    if let Some(path) = std::env::var_os("MMDB_GROUP_TRACE") {
++        use std::io::Write;
++        let mut output = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
++        let offset = |time: Instant| nanos(time.duration_since(*clock.get().unwrap()));
++        for (op, run) in &by_class {
++            let Some(trace) = &run.trace else { continue };
++            assert_eq!(trace.enqueued.len(), run.rows.len());
++            for (i, (queued, row)) in trace.enqueued.iter().zip(&run.rows).enumerate() {
++                writeln!(
++                    output,
++                    "R,{op:?},{i},{},{},{}",
++                    row.finish_ns - row.latency_ns,
++                    offset(*queued),
++                    row.finish_ns
++                )
++                .unwrap();
++            }
++            for g in &trace.groups {
++                writeln!(
++                    output,
++                    "G,{},{},{},{},{},{},{},{},{},{}",
++                    g.sequence,
++                    g.requests,
++                    g.operations,
++                    g.generation,
++                    offset(g.start),
++                    offset(g.wal_start),
++                    offset(g.wal_end),
++                    offset(g.apply_start),
++                    offset(g.apply_end),
++                    offset(g.release.unwrap())
++                )
++                .unwrap();
++            }
++        }
++        output.flush().unwrap();
++    }
+     for (op, all) in by_class {
+         assert!(
+             all.completed > 0 && all.completed == all.offered,
+diff --git a/src/db.rs b/src/db.rs
+index 03cdc93..28002f4 100644
+--- a/src/db.rs
++++ b/src/db.rs
+@@ -2995,6 +2995,8 @@ impl DB {
+         // group commit to actually batch writes.
+         let mut wq = self.write_queue.lock();
+         wq.queue.push_back(req_ptr);
++        #[cfg(feature = "bench-metrics")]
++        crate::write_trace::enqueue();
+
+         let mut group_flushed = false;
+         #[cfg(feature = "bench-metrics")]
+@@ -3021,6 +3023,8 @@ impl DB {
+
+             // Signal everyone in this batch
+             wq = self.write_queue.lock();
++            #[cfg(feature = "bench-metrics")]
++            crate::write_trace::release();
+             for &rp in &batch_group {
+                 // SAFETY: all request pointers came from queue entries whose
+                 // callers are blocked until this leader sets `done`.
+@@ -3135,6 +3139,8 @@ impl DB {
+     /// the leader can harvest settled dead-key registrations after it has
+     /// woken the group's waiters.
+     fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<bool> {
++        #[cfg(feature = "bench-metrics")]
++        let trace_start = crate::write_trace::stamp();
+         self.check_writable()?;
+         let mut group = Vec::with_capacity(batch_group.len());
+         for &ptr in batch_group {
+@@ -3206,6 +3212,8 @@ impl DB {
+             ));
+         }
+         self.sequence.store(last_group_seq + 1, Ordering::Release);
++        #[cfg(feature = "bench-metrics")]
++        let trace_wal = crate::write_trace::stamp();
+
+         let mut assigned = Vec::with_capacity(batch_group.len());
+         let mut append_error: Option<Error> = None;
+@@ -3256,6 +3264,8 @@ impl DB {
+         } else {
+             None
+         };
++        #[cfg(feature = "bench-metrics")]
++        let trace_written = crate::write_trace::stamp();
+         if let Some(e) = wal_sync_err {
+             self.set_bg_error(format!("WAL sync failed: {}", e));
+             for &rp in batch_group {
+@@ -3268,6 +3278,8 @@ impl DB {
+
+         {
+             crate::profile::time_scope!(apply_ns);
++            #[cfg(feature = "bench-metrics")]
++            let trace_apply = crate::write_trace::stamp();
+             let mut applied_last_seq = None;
+             for &(req_ptr, first_seq) in &assigned {
+                 // SAFETY: request pointers are still owned by this leader.
+@@ -3293,6 +3305,33 @@ impl DB {
+                     self.synced_wal_seq.store(last_seq, Ordering::Release);
+                 }
+             }
++            #[cfg(feature = "bench-metrics")]
++            if let (
++                Some(start),
++                Some(wal_start),
++                Some(wal_end),
++                Some(apply_start),
++                Some(apply_end),
++            ) = (
++                trace_start,
++                trace_wal,
++                trace_written,
++                trace_apply,
++                crate::write_trace::stamp(),
++            ) {
++                crate::write_trace::record(crate::write_trace::Group {
++                    sequence: first_group_seq,
++                    requests: batch_group.len(),
++                    operations: total_ops,
++                    generation: inner.wal_number,
++                    start,
++                    wal_start,
++                    wal_end,
++                    apply_start,
++                    apply_end,
++                    release: None,
++                });
++            }
+         }
+
+         if let Some(e) = append_error {
+diff --git a/src/lib.rs b/src/lib.rs
+index 1e26549..da3ffd9 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -69,6 +69,9 @@ mod stats;
+ mod test_alloc;
+ mod types;
+ mod wal;
++#[doc(hidden)]
++#[cfg(feature = "bench-metrics")]
++pub mod write_trace;
+
+ // ---- Primary API ----
+ pub use cache::block_cache::{BlockCache, BlockCachePool, BlockCachePoolUsage};
+diff --git a/src/write_trace.rs b/src/write_trace.rs
+new file mode 100644
+index 0000000..7b05796
+--- /dev/null
++++ b/src/write_trace.rs
+@@ -0,0 +1,69 @@
++//! Trace-only instrumentation for the detached writer-stage replay experiment.
++use std::{cell::RefCell, time::Instant};
++
++#[derive(Debug)]
++pub struct Group {
++    pub sequence: u64,
++    pub requests: usize,
++    pub operations: u64,
++    pub generation: u64,
++    pub start: Instant,
++    pub wal_start: Instant,
++    pub wal_end: Instant,
++    pub apply_start: Instant,
++    pub apply_end: Instant,
++    pub release: Option<Instant>,
++}
++
++#[derive(Default)]
++pub struct Trace {
++    pub enqueued: Vec<Instant>,
++    pub groups: Vec<Group>,
++}
++
++thread_local! {
++    static TRACE: RefCell<Option<Trace>> = const { RefCell::new(None) };
++}
++
++pub fn begin(capacity: usize) {
++    TRACE.with_borrow_mut(|trace| {
++        *trace = Some(Trace {
++            enqueued: Vec::with_capacity(capacity),
++            groups: Vec::with_capacity(capacity),
++        })
++    });
++}
++
++pub fn finish() -> Option<Trace> {
++    TRACE.with_borrow_mut(Option::take)
++}
++
++pub(crate) fn stamp() -> Option<Instant> {
++    TRACE.with_borrow(|trace| trace.is_some().then(Instant::now))
++}
++
++pub(crate) fn enqueue() {
++    TRACE.with_borrow_mut(|trace| {
++        if let Some(trace) = trace {
++            trace.enqueued.push(Instant::now());
++        }
++    });
++}
++
++pub(crate) fn record(group: Group) {
++    TRACE.with_borrow_mut(|trace| {
++        if let Some(trace) = trace {
++            trace.groups.push(group);
++        }
++    });
++}
++
++pub(crate) fn release() {
++    TRACE.with_borrow_mut(|trace| {
++        if let Some(group) = trace.as_mut().and_then(|t| t.groups.last_mut())
++            && group.release.is_none()
++        {
++            group.release = Some(Instant::now());
++        }
++    });
++}

@@ -47,6 +47,12 @@ includes a `MMDB_PROFILE_READ_ONLY=true` arm. The parent measures open, then
 checks every recovered row. Record open-time memory separately from the
 verification scan.
 
+The [short-group candidate](short-group.patch) applies at `7b46443` in a
+separate checkout. It stores short request lists inline and skips a wakeup
+only for an uncontended leader serving itself alone. Use matching source
+and compilation settings for the control. Pass the observed asynchronous
+and synchronous control rates to `--handoff-rates` to reuse the mixed trace.
+
 For paired runs, build each benchmark target with `--no-run`, save its
 executable at a distinct path, then invoke the matrix driver. The final line
 of Cargo's `--no-run` output identifies the executable. Use an uncompressed

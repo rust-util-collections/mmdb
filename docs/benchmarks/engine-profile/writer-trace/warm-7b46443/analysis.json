@@ -1,0 +1,89 @@
+{
+  "base": "7b4644369d65b4d7a0a09a582840b99991518e16",
+  "contexts": {
+    "rate": 18911,
+    "small": 10000,
+    "bulk": 79,
+    "burst": 4096,
+    "cpus": "4-7",
+    "filesystem": "Btrfs directory NOCOMPRESS",
+    "same_recorded_arrivals_as_prior": true,
+    "trace_patch_sha256": "0a4538687df0e9e77f5c76d20cc0de2579d782b33e1135dcf946bd1b9d02f6fb",
+    "executable_sha256": "0f5ada5a25a46dbab5f324798901f322ebb022da8c13a96c9613ccc0d98b773c"
+  },
+  "paired": [
+    {
+      "rep": 1,
+      "groups": 10074,
+      "observed_ms": 7.199279,
+      "modeled_ms": 7.187229,
+      "gain": 0.1673778721452468,
+      "sensitivity_gain": 0.2237862986001815,
+      "overlaps": 65,
+      "overlap_ms": 0.531044,
+      "observer_delta": 16.781551208972335,
+      "wal_ms": 148.38116,
+      "apply_ms": 129.284085,
+      "warm_control_cache_misses": 12630
+    },
+    {
+      "rep": 2,
+      "groups": 10075,
+      "observed_ms": 5.300283,
+      "modeled_ms": 5.300283,
+      "gain": 0.0,
+      "sensitivity_gain": 0.0,
+      "overlaps": 68,
+      "overlap_ms": 0.588268,
+      "observer_delta": -73.91697754657096,
+      "wal_ms": 155.267981,
+      "apply_ms": 132.269462,
+      "warm_control_cache_misses": 12584
+    },
+    {
+      "rep": 3,
+      "groups": 10073,
+      "observed_ms": 4.992377,
+      "modeled_ms": 4.977782,
+      "gain": 0.2923457102698812,
+      "sensitivity_gain": 0.2923457102698812,
+      "overlaps": 65,
+      "overlap_ms": 0.558245,
+      "observer_delta": -36.26366822127144,
+      "wal_ms": 150.026608,
+      "apply_ms": 132.25824,
+      "warm_control_cache_misses": 12583
+    },
+    {
+      "rep": 4,
+      "groups": 10078,
+      "observed_ms": 6.312196,
+      "modeled_ms": 6.312196,
+      "gain": 0.0,
+      "sensitivity_gain": 0.0,
+      "overlaps": 64,
+      "overlap_ms": 1.674083,
+      "observer_delta": 43.82025031966656,
+      "wal_ms": 145.958528,
+      "apply_ms": 121.72798,
+      "warm_control_cache_misses": 12289
+    },
+    {
+      "rep": 5,
+      "groups": 10076,
+      "observed_ms": 3.793367,
+      "modeled_ms": 3.781641,
+      "gain": 0.3091185218830672,
+      "sensitivity_gain": 0.41113870606245273,
+      "overlaps": 69,
+      "overlap_ms": 0.541543,
+      "observer_delta": -21.75354524457953,
+      "wal_ms": 152.506992,
+      "apply_ms": 126.918285,
+      "warm_control_cache_misses": 12450
+    }
+  ],
+  "median_gain": 0.1673778721452468,
+  "passing_15pct": 0,
+  "qualifies": false
+}

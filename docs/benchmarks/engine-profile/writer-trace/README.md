@@ -8,6 +8,12 @@ durations improved small-put p99 by a median of 0.065%; the largest modeled
 gain was 4.23%. This is a feasibility estimate. The engine executed its
 existing serial writer in all ten processes.
 
+A [second five-pair screen with the warmed driver at 7b46443](warm-7b46443/README.md)
+replayed the identical scheduled arrivals after warming the scalar cache.
+It found a median modeled p99 gain of 0.167%, with a maximum of 0.309%.
+Both screens support deferring the pipeline on this trace. The measurements
+below retain the first driver's original preload behavior.
+
 ## Measured trace and projection
 
 One synchronous API caller supplied 10,000 small puts, another supplied 79
