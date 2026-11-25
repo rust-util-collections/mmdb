@@ -29,10 +29,12 @@ equal keys and restores the original order of its result slots. Each of the
 two request-local file cursors owns an index leaf. Each leaf belongs
 to a file number and partition. The cached data slot belongs to that same
 leaf. Replacing a file cursor or changing its partition drops the cached data
-slot before reuse.
-Check scalar and grouped results against the same snapshot, including covered
-keys outside SST point bounds, duplicate keys, misses, and a malformed block.
-Check storage writes, compaction and reopen independently of cached pins.
+slot before reuse. A seek past a table's final partition leaves both cursors
+intact. Check scalar and grouped results at the same snapshot for covered
+keys outside SST point bounds, duplicates, misses and a malformed later
+block. A failed request drops its earlier pins and leaves the returned-byte
+counter unchanged. Compare the real block acquisitions when two SSTs
+alternate, including a third table with only a post-snapshot record.
 
 ## Checklist
 
