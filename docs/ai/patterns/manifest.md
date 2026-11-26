@@ -2,7 +2,9 @@
 
 **Files:** `version_set.rs`, `version_edit.rs`, `version.rs`, `file_numbers.rs`, `mod.rs`; tests: `crash_recovery.rs`, `integration.rs`, `read_only.rs`.
 
-**Arch:** v5 `MANIFEST-*` is WAL-framed: record #0 is the 16-byte `DBHeader` (`"MMDB" || 5u32 || levels: u32 || prefix_len: u32`), followed by incremental `VersionEdit`s; `CURRENT` names the active MANIFEST. `Version` (`files: Vec<Arc<LevelFiles>>`, with a separate list of range-deletion readers per level) shares unchanged levels across versions via `Arc::make_mut`. `FileNumbers` provides one checked `AtomicU64` sequence across WAL, MANIFEST, and SST files; `PendingSsts` owns one job's uncommitted SST numbers and unlinks only its own files on drop until `.keep()` transfers responsibility to the install path.
+`CURRENT` names the active `MANIFEST-*`. The MANIFEST starts with a WAL-framed 16-byte `DBHeader` (`"MMDB" || 5u32 || levels: u32 || prefix_len: u32`). Each subsequent record contains a `VersionEdit`.
+
+`Version` (`files: Vec<Arc<LevelFiles>>`, with a separate list of range-deletion readers per level) shares unchanged levels across versions via `Arc::make_mut`. `FileNumbers` provides one checked `AtomicU64` sequence across WAL, MANIFEST, and SST files. `PendingSsts` owns one job's uncommitted SST numbers and unlinks only its own files on drop until `.keep()` transfers responsibility to the install path.
 
 ## Invariants
 

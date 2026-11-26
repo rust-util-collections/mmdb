@@ -51,7 +51,7 @@ edits publish one changed working root. [VSDB v18](https://github.com/rust-util-
 The VSDB v18 experiments measured complete caller operations on MMDB v5
 on x86_64 Linux.
 
-- On the v5 adapter, atomic registration reduced engine writes per DagMap child
+- Atomic registration reduced engine writes per DagMap child
   from two to one. [Publication trials](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-publication/README.md)
 - The selected 2 GiB namespace profile
   uses four immutable slots, a 16 MiB per-shard buffer and 256 MiB for
@@ -83,12 +83,12 @@ reader/writer profile, or the engine mixed workload with stable Rust.
 
 ```sh
 cargo +stable bench --bench benchmarks -- warm
-cargo +stable bench --bench v5_profile
+cargo +stable bench --bench read_write_profile
 cargo +stable bench --bench engine_profile -- mixed
 ```
 
 Both the warm-cache and small-block-cache Criterion workloads can read from
-the OS page cache. The v5 profile defaults to two immutable memtables. Use
-`MMDB_PROFILE_IMMUTABLES` to compare queue limits across runs. The engine
+the OS page cache. The concurrent reader/writer profile defaults to two immutable
+memtables. Use `MMDB_PROFILE_IMMUTABLES` to compare queue limits across runs. The engine
 profile records diagnostic stage timings in a separate `bench-metrics` build.
-[Criterion driver](../../benches/benchmarks.rs) · [v5 profile](../../benches/v5_profile.rs) · [Engine profile settings](engine-profile/README.md#workloads)
+[Criterion driver](../../benches/benchmarks.rs) · [Concurrent reader/writer profile](../../benches/read_write_profile.rs) · [Engine profile settings](engine-profile/README.md#workloads)

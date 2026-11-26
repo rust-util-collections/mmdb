@@ -13,10 +13,8 @@ copy-on-write mutations, and compaction-driven garbage collection. Each
 database is a local directory. The caller reads and writes byte strings through
 the Rust API. Optimization work targets the vsdb workload. A writable handle runs flush and compaction workers in-process.
 
-MMDB 6 opens v5 databases in place. To upgrade a v4 database, first
-convert it with MMDB 5, then open the resulting directory with MMDB 6.
-The converter and all 5.x releases are maintained on the
-[v5 branch](https://github.com/rust-util-collections/mmdb/tree/v5).
+MMDB 6 opens v5 databases in place. For a v4 database, first run the
+converter from the [v5 maintenance branch](https://github.com/rust-util-collections/mmdb/tree/v5).
 
 ## Supported architectures
 
@@ -57,7 +55,7 @@ with prefix scans, bounded iteration, and typed errors. [Example source](example
 |------|------------|
 | Choose durability, configure a store, read a snapshot, or scan a range | [Using MMDB v6](docs/usage.md) |
 | Inspect a stable copy without writing to it | [Read-only databases](docs/usage.md#read-only-databases) |
-| Upgrade a database to v6 | [Upgrade path and reopening a v5 store](docs/migration.md), [changelog](CHANGELOG.md) |
+| Upgrade a database to v6 | [Upgrade guide](docs/migration.md), [changelog](CHANGELOG.md) |
 | Trace a write through the WAL, flush, recovery, and compaction, or follow a point lookup | [Storage architecture](docs/architecture.md) |
 | Find public methods, options, defaults, and error types | [Crate API](https://docs.rs/mmdb), [exports in this checkout](src/lib.rs) |
 | Compare engines or reproduce a benchmark | [Benchmark reports and workloads](docs/benchmarks/README.md), [VSDB v18 application results](docs/benchmarks/README.md#vsdb-application-results) |

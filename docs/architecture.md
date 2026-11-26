@@ -7,9 +7,9 @@ opens no network sockets, runs no external daemon, and enforces no multi-tenant
 privilege boundary. Correctness is guaranteed on 64-bit x86 (`x86_64`) and
 64-bit ARM (`aarch64`).
 
-For caller-facing operations, see [Using MMDB v6](usage.md). For existing
-v5 databases, see [Upgrading to v6](migration.md). Measured workloads and
-release decisions are in the [benchmark reports](benchmarks/README.md).
+For caller-facing operations, see [Using MMDB v6](usage.md) and the
+[upgrade guide](migration.md). Measured workloads and release decisions
+are in the [benchmark reports](benchmarks/README.md).
 
 ## Global system overview
 
@@ -55,7 +55,7 @@ flowchart TD
 
     subgraph Storage["Local Database Directory"]
         LOCKF["LOCK (Unix cooperative flock)"]
-        MANF["CURRENT & MANIFEST-* (v5 DBHeader + WAL-framed VersionEdits)"]
+        MANF["CURRENT & MANIFEST-* (DBHeader + WAL-framed VersionEdits)"]
         WALF["*.wal (32 KiB blocks, CRC32 fragments)"]
         SSTF["*.sst (SST v2: L0 overlapping, L1..L(N-1) sorted disjoint)"]
     end
@@ -415,7 +415,7 @@ lifetime.
 flowchart TD
     O1["DB::open / DB::open_read_only*"] --> O2["Validate options; create_durable if missing & writable; canonicalize path"]
     O2 --> O3["Acquire DirLock: LOCK_EX (writable) or LOCK_SH / unlocked (read-only)"]
-    O3 --> O4["Read CURRENT -> open MANIFEST-* -> validate 16-byte v5 DBHeader"]
+    O3 --> O4["Read CURRENT -> open MANIFEST-* -> validate 16-byte DBHeader"]
     O4 -- "Missing or unsupported header" --> CORR1["Return ErrorKind::Corruption (before tail repair)"]
     O4 -- "Writable (num_levels, prefix_len) mismatch" --> INV["Return ErrorKind::InvalidArgument"]
     O4 -- "Valid (Read-only adopts stored geometry)" --> O5["Replay VersionEdits; open & validate live SSTs and L1+ disjointness"]

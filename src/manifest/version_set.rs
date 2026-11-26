@@ -134,9 +134,10 @@ impl DBHeader {
             || &data[..4] != b"MMDB"
             || data[4..8] != Self::FORMAT_VERSION.to_le_bytes()
         {
-            return Err(Error::corruption(
-                "missing or unsupported MMDB v5 MANIFEST header",
-            ));
+            return Err(Error::corruption(format!(
+                "missing or unsupported MMDB MANIFEST header (expected format {})",
+                Self::FORMAT_VERSION
+            )));
         }
         let levels = u32::from_le_bytes(data[8..12].try_into().unwrap());
         if !(2..=16).contains(&levels) {

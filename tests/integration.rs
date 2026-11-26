@@ -2649,7 +2649,7 @@ fn empty_and_inverted_compact_range_do_not_flush_or_rewrite_spanning_ssts() {
 }
 
 #[test]
-fn v5_manifest_geometry_precedes_repair_and_read_only_adopts_it() {
+fn manifest_geometry_precedes_repair_and_read_only_adopts_it() {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions::default().with_num_levels(3).with_prefix_len(2);
     let db = DB::open(opts.clone(), dir.path()).unwrap();
@@ -2726,7 +2726,7 @@ fn native_v5_store_recovers_and_accepts_new_writes() {
 }
 
 #[test]
-fn v5_snapshot_and_pins_survive_rotation_compaction_and_close() {
+fn snapshot_and_pins_survive_rotation_compaction_and_close() {
     let dir = tempfile::tempdir().unwrap();
     let other_dir = tempfile::tempdir().unwrap();
     let db = make_db(dir.path());

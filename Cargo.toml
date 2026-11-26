@@ -47,7 +47,7 @@ bench-metrics = []  # Optional diagnostic instrumentation for engine profiles
 test-utils = []  # Exposes test helpers like DB::simulate_crash()
 
 [[bench]]
-name = "v5_profile"
+name = "read_write_profile"
 harness = false
 
 [[bench]]
