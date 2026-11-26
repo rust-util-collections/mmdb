@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import run
+from summarize import summarize
 
 
 class ResumeTests(unittest.TestCase):
@@ -93,6 +94,18 @@ class ResumeTests(unittest.TestCase):
         sst.write_bytes(b'def')
         os.utime(sst, ns=(original.st_atime_ns, original.st_mtime_ns))
         self.assertNotEqual(first, run.fixture_identity(self.fixture, lambda p: p.read_bytes().hex()))
+
+    def test_summary_rejects_invalid_or_mislabeled_arms(self):
+        with mock.patch.dict(os.environ, {'FAIL_AT': '-1'}):
+            self.invoke()
+        packet = [json.loads(line) for line in self.args.output.read_text().splitlines()]
+        self.assertEqual(summarize(self.args.output, 0, 2)['rounds'], self.args.rounds)
+        for field, value in [('invalid_output', 'unexpected phase'), ('capacity_mib', 7), ('seed', -1)]:
+            with self.subTest(field=field):
+                rows = [*packet[:-1], {**packet[-1], field: value}]
+                self.args.output.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                with self.assertRaises(ValueError):
+                    summarize(self.args.output, 0, 2)
 
 
 if __name__ == '__main__':

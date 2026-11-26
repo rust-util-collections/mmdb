@@ -22,10 +22,13 @@ def summarize(path, min_large_mib, max_small_mib):
         return m['hit_probes'] / (m['hit_probes'] + m['miss_probes'])
     for i, pair, arm in sorted(expected):
         t = pairs[i, pair, arm]
+        if t['exit_code'] or 'invalid_output' in t:
+            raise ValueError(f'unsuccessful result for round {i} {pair} {arm}')
         m = t['measured']
         cap = meta['large_mib'] if (pair, arm) == ('AB', 'comparison') else meta['small_mib']
-        if (t['exit_code'] or m['seed'] != meta['seed'] + (i - 1) * 1021
-                or m['samples'] != meta['samples'] or m['capacity_mib'] != cap or m['rows'] != meta['rows']):
+        seed = meta['seed'] + (i - 1) * 1021
+        if (t['seed'] != seed or m['seed'] != seed or t['capacity_mib'] != cap or m['capacity_mib'] != cap
+                or m['samples'] != meta['samples'] or m['rows'] != meta['rows']):
             raise ValueError(f'unmatched result for round {i} {pair} {arm}')
         other = pairs[i, pair, 'comparison' if arm == 'control' else 'control']
         if sorted([t['order'], other['order']]) != [1, 2]:
