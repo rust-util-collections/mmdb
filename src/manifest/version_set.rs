@@ -126,8 +126,7 @@ impl DBHeader {
         bytes
     }
 
-    fn read(reader: &mut WalReader) -> Result<Self> {
-        let data = reader.read_record().ctx()?.unwrap_or_default();
+    fn decode(data: &[u8]) -> Result<Self> {
         if data.len() != 16 || &data[..4] != b"MMDB" || data[4..8] != 5u32.to_le_bytes() {
             return Err(Error::corruption(
                 "missing or unsupported MMDB v5 MANIFEST header",
@@ -141,6 +140,11 @@ impl DBHeader {
             levels,
             prefix_len: u32::from_le_bytes(data[12..].try_into().unwrap()),
         })
+    }
+
+    fn read(reader: &mut WalReader) -> Result<Self> {
+        let data = reader.read_record().ctx()?.unwrap_or_default();
+        Self::decode(&data)
     }
 }
 
@@ -311,8 +315,100 @@ impl VersionSet {
         Self::create_with_cache(db_path, num_levels, 0, None)
     }
 
-    /// Create a new VersionSet with an optional table cache.
-    pub fn create_with_cache(
+    fn validate_uncommitted_initial_manifest(path: &Path) -> Result<()> {
+        let mut reader = WalReader::new(path).ctx()?;
+        match reader.read_record() {
+            Ok(None) => return Ok(()),
+            Ok(Some(data)) => {
+                DBHeader::decode(&data)?;
+            }
+            Err(_)
+                if reader.last_error_is_truncation()
+                    && reader.rest_is_zero_padding().unwrap_or(false) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+        let mut edits = 0usize;
+        loop {
+            match reader.read_record() {
+                Ok(None) => return Ok(()),
+                Ok(Some(data)) => {
+                    edits += 1;
+                    let edit = VersionEdit::decode(&data).ctx()?;
+                    if edits > 1
+                        || edit.log_number.is_some()
+                        || edit.last_sequence.unwrap_or(0) != 0
+                        || !edit.new_files.is_empty()
+                        || !edit.deleted_files.is_empty()
+                    {
+                        return Err(Error::corruption(
+                            "CURRENT is missing alongside persisted MANIFEST state",
+                        ));
+                    }
+                }
+                Err(_)
+                    if reader.last_error_is_truncation()
+                        && reader.rest_is_zero_padding().unwrap_or(false) =>
+                {
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn ensure_creatable_store_dir(db_path: &Path) -> Result<()> {
+        for entry in fs::read_dir(db_path).with_ctx(|| "reading DB directory")? {
+            let entry = entry.with_ctx(|| "reading DB directory entry")?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".sst") {
+                return Err(Error::corruption(
+                    "CURRENT is missing alongside existing SST files",
+                ));
+            }
+            if name.ends_with(".wal") {
+                return Err(Error::corruption(
+                    "CURRENT is missing alongside existing WAL files",
+                ));
+            }
+            if let Some(rest) = name.strip_prefix("MANIFEST-")
+                && rest.parse::<u64>().is_ok()
+            {
+                if rest != "000001" {
+                    return Err(Error::corruption(format!(
+                        "CURRENT is missing alongside existing {name}"
+                    )));
+                }
+                Self::validate_uncommitted_initial_manifest(&entry.path()).ctx()?;
+            } else if let Some(rest) = name.strip_prefix("CURRENT.tmp.")
+                && rest.parse::<u64>().is_ok_and(|n| n != 1)
+            {
+                return Err(Error::corruption(format!(
+                    "CURRENT is missing alongside rotated {name}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a new database store's VersionSet, rejecting directories that
+    /// already hold persisted store files without `CURRENT`.
+    pub fn create_db_with_cache(
+        db_path: &Path,
+        num_levels: usize,
+        prefix_len: usize,
+        table_cache: Option<Arc<TableCache>>,
+    ) -> Result<Self> {
+        DBHeader::new(num_levels, prefix_len)?;
+        Self::ensure_creatable_store_dir(db_path)?;
+        Self::create_with_cache(db_path, num_levels, prefix_len, table_cache)
+    }
+
+    /// Create a new VersionSet with an optional table cache (internal / unit-test helper).
+    pub(crate) fn create_with_cache(
         db_path: &Path,
         num_levels: usize,
         prefix_len: usize,
@@ -1391,9 +1487,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         FAIL_NEXT_SYNC.with(|flag| flag.set(true));
-        assert!(VersionSet::create_with_cache(path, 3, 5, None).is_err());
+        assert!(VersionSet::create_db_with_cache(path, 3, 5, None).is_err());
         assert!(!path.join("CURRENT").exists());
-        let mut vs = VersionSet::create_with_cache(path, 3, 5, None).unwrap();
+        let mut vs = VersionSet::create_db_with_cache(path, 3, 5, None).unwrap();
         let first = vs.manifest_number();
         vs.edits_since_snapshot = 1000;
         vs.maybe_compact_manifest();

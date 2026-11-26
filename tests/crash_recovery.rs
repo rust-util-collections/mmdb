@@ -1420,3 +1420,90 @@ fn missing_manifest_wal_rejects_partial_recovery_in_both_modes() {
     let db = DB::open_read_only(dir.path()).unwrap();
     assert_eq!(db.get(b"latest").unwrap().as_deref(), Some(&b"durable"[..]));
 }
+
+#[test]
+fn missing_current_preserves_existing_store_files_until_restored() {
+    // Case 1: Flushed store missing CURRENT must reject default writable open
+    // with Corruption before truncating MANIFEST-000001 or unlinking SSTs/WALs.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"flushed", b"v1").unwrap();
+        db.flush().unwrap();
+        let sync = WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync);
+        db.put_with_options(&sync, b"wal_only", b"v2").unwrap();
+        db.simulate_crash();
+
+        let saved_current = fs::read(dir.path().join("CURRENT")).unwrap();
+        fs::remove_file(dir.path().join("CURRENT")).unwrap();
+
+        let snapshot_before: std::collections::BTreeMap<String, Vec<u8>> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        assert!(snapshot_before.keys().any(|k| k.ends_with(".sst")));
+        assert!(snapshot_before.keys().any(|k| k.ends_with(".wal")));
+
+        let err = match DB::open(DbOptions::default(), dir.path()) {
+            Ok(_) => panic!("writable open must not overwrite store missing CURRENT"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), mmdb::ErrorKind::Corruption);
+        assert!(!dir.path().join("CURRENT").exists());
+
+        for (name, bytes) in &snapshot_before {
+            if name != "LOCK" {
+                assert_eq!(&fs::read(dir.path().join(name)).unwrap(), bytes, "{name}");
+            }
+        }
+
+        fs::write(dir.path().join("CURRENT"), &saved_current).unwrap();
+        let reopened = DB::open(DbOptions::default(), dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"flushed").unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert_eq!(
+            reopened.get(b"wal_only").unwrap().as_deref(),
+            Some(&b"v2"[..])
+        );
+        reopened.close().unwrap();
+    }
+
+    // Case 2: WAL-only store (zero SSTs) missing CURRENT is likewise preserved.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        let sync = WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync);
+        db.put_with_options(&sync, b"only_wal", b"keep").unwrap();
+        db.simulate_crash();
+
+        let saved_current = fs::read(dir.path().join("CURRENT")).unwrap();
+        let manifest_before = fs::read(dir.path().join("MANIFEST-000001")).unwrap();
+        fs::remove_file(dir.path().join("CURRENT")).unwrap();
+
+        let err = match DB::open(DbOptions::default(), dir.path()) {
+            Ok(_) => panic!("writable open must reject WAL-backed store missing CURRENT"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), mmdb::ErrorKind::Corruption);
+        assert_eq!(
+            fs::read(dir.path().join("MANIFEST-000001")).unwrap(),
+            manifest_before
+        );
+
+        fs::write(dir.path().join("CURRENT"), &saved_current).unwrap();
+        let reopened = DB::open(DbOptions::default(), dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"only_wal").unwrap().as_deref(),
+            Some(&b"keep"[..])
+        );
+        reopened.close().unwrap();
+    }
+}

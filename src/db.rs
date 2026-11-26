@@ -1105,7 +1105,7 @@ impl DB {
             )
             .ctx()?
         } else if options.create_if_missing {
-            VersionSet::create_with_cache(
+            VersionSet::create_db_with_cache(
                 &path,
                 options.num_levels,
                 options.prefix_len,
