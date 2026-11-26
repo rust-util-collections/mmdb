@@ -23,9 +23,13 @@ pub struct DBIterator {
     sequence: SequenceNumber,
     /// Source zero contains the uncommitted batch when an overlay is present.
     has_batch_overlay: bool,
-    /// Reusable buffer for last user key (for deduplication).
+    /// Reusable buffer for internal forward user-key deduplication.
+    dedup_user_key: Vec<u8>,
+    /// Whether `dedup_user_key` holds a seen user key in the current forward run.
+    has_dedup_key: bool,
+    /// Reusable buffer for the last resolved visible user key.
     last_user_key: Vec<u8>,
-    /// Whether last_user_key has been set at least once.
+    /// Whether `last_user_key` holds a resolved visible user key.
     has_last_key: bool,
     /// Buffered current entry for valid()/key()/value() API.
     current: Option<(Vec<u8>, LazyValue)>,
@@ -85,6 +89,8 @@ impl DBIterator {
             merger,
             sequence,
             has_batch_overlay: false,
+            dedup_user_key: Vec::new(),
+            has_dedup_key: false,
             last_user_key: Vec::new(),
             has_last_key: false,
             current: None,
@@ -198,6 +204,8 @@ impl DBIterator {
             return;
         }
         self.recycle_current();
+        self.has_dedup_key = false;
+        self.has_last_key = false;
         self.needs_advance = true;
         self.needs_lower_prime = false;
         self.prev_overshoot = None;
@@ -223,6 +231,8 @@ impl DBIterator {
     #[inline]
     pub(super) fn halt_on_error(&mut self) {
         self.recycle_current();
+        self.has_dedup_key = false;
+        self.has_last_key = false;
         self.needs_advance = false;
         self.needs_lower_prime = false;
         self.prev_overshoot = None;
@@ -283,6 +293,7 @@ impl DBIterator {
                     InternalKey::new(&target, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
                 self.merger.seek_opt(seek_key.as_bytes(), true);
                 self.last_seek_key = Some(target);
+                self.has_dedup_key = false;
                 self.has_last_key = false;
                 self.needs_advance = true;
                 self.recycle_current();
@@ -313,6 +324,7 @@ impl DBIterator {
         if self.backward_positioned {
             self.backward_positioned = false;
             self.prev_overshoot = None;
+            self.has_dedup_key = false;
             if self.has_last_key {
                 use crate::types::InternalKey;
                 let seek_key = InternalKey::new(&self.last_user_key, 0, ValueType::Deletion);
@@ -367,21 +379,21 @@ impl DBIterator {
                                 return false;
                             } else if vt == ValueType::RangeDeletion {
                                 // Skip RangeDeletion entries — tombstones are pre-loaded.
-                                // Do NOT update last_user_key: RangeDeletion is not a point
+                                // Do NOT update dedup_user_key: RangeDeletion is not a point
                                 // mutation for this user key. Updating it would suppress a
                                 // same-key Value via-dedup instead of the proper range
                                 // tombstone coverage check (which uses strict >).
                                 Action::Skip
-                            } else if self.has_last_key
-                                && self.last_user_key.as_slice() == &ikey_ref[..uk_len]
+                            } else if self.has_dedup_key
+                                && self.dedup_user_key.as_slice() == &ikey_ref[..uk_len]
                             {
                                 // Duplicate user key — already saw newest version
                                 Action::Skip
                             } else {
                                 // New user key — update dedup state
-                                self.last_user_key.clear();
-                                self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
-                                self.has_last_key = true;
+                                self.dedup_user_key.clear();
+                                self.dedup_user_key.extend_from_slice(&ikey_ref[..uk_len]);
+                                self.has_dedup_key = true;
 
                                 if vt == ValueType::Deletion {
                                     Action::Skip
@@ -417,7 +429,7 @@ impl DBIterator {
                         None
                     };
                     let covered = self.range_tombstones.max_covering_tombstone_seq_for_level(
-                        &self.last_user_key,
+                        &self.dedup_user_key,
                         self.tombstone_snapshot(),
                         level_filter,
                     ) > seq;
@@ -440,6 +452,9 @@ impl DBIterator {
                     {
                         continue;
                     }
+                    self.last_user_key.clear();
+                    self.last_user_key.extend_from_slice(&self.scratch_key);
+                    self.has_last_key = true;
                     return true;
                 }
                 Action::Take { uk_len } => {
@@ -458,6 +473,9 @@ impl DBIterator {
                     {
                         continue;
                     }
+                    self.last_user_key.clear();
+                    self.last_user_key.extend_from_slice(&self.scratch_key);
+                    self.has_last_key = true;
                     return true;
                 }
             }
@@ -476,6 +494,7 @@ impl DBIterator {
         if self.backward_positioned {
             self.backward_positioned = false;
             self.prev_overshoot = None;
+            self.has_dedup_key = false;
             if self.has_last_key {
                 use crate::types::InternalKey;
                 let seek_key = InternalKey::new(&self.last_user_key, 0, ValueType::Deletion);
@@ -522,16 +541,16 @@ impl DBIterator {
 
             // Dedup + deletion check
             if vt == ValueType::RangeDeletion
-                || (self.has_last_key && self.last_user_key.as_slice() == &ikey_ref[..uk_len])
+                || (self.has_dedup_key && self.dedup_user_key.as_slice() == &ikey_ref[..uk_len])
             {
                 self.merger.advance_entry();
                 continue;
             }
 
             // New user key
-            self.last_user_key.clear();
-            self.last_user_key.extend_from_slice(&ikey_ref[..uk_len]);
-            self.has_last_key = true;
+            self.dedup_user_key.clear();
+            self.dedup_user_key.extend_from_slice(&ikey_ref[..uk_len]);
+            self.has_dedup_key = true;
 
             if vt == ValueType::Deletion {
                 self.merger.advance_entry();
@@ -545,6 +564,9 @@ impl DBIterator {
                 return false;
             }
             self.scratch_key.truncate(uk_len);
+            self.last_user_key.clear();
+            self.last_user_key.extend_from_slice(&self.scratch_key);
+            self.has_last_key = true;
             return true;
         }
     }
@@ -667,6 +689,7 @@ impl DBIterator {
             .is_some_and(|prev| target.as_slice() > prev.as_slice());
         self.merger.seek_opt(seek_key.as_bytes(), try_next);
         self.last_seek_key = Some(target);
+        self.has_dedup_key = false;
         self.has_last_key = false;
         self.needs_advance = true;
         self.recycle_current();
@@ -694,6 +717,7 @@ impl DBIterator {
             return;
         }
         self.merger.seek_to_first();
+        self.has_dedup_key = false;
         self.has_last_key = false;
         self.needs_advance = true;
         self.recycle_current();
@@ -717,6 +741,7 @@ impl DBIterator {
         if self.config.lower.as_deref().is_some_and(|lb| target < lb) {
             self.recycle_current();
             self.needs_advance = false;
+            self.has_dedup_key = false;
             self.has_last_key = false;
             self.prev_overshoot = None;
             self.backward_positioned = false;
@@ -739,6 +764,7 @@ impl DBIterator {
         // Use merger backward seek to find the last internal key below the effective bound.
         self.merger.seek_for_prev(seek_key.as_bytes());
         self.prev_overshoot = None;
+        self.has_dedup_key = false;
         self.has_last_key = false;
 
         // Walk backward with inline resolution.
@@ -904,6 +930,7 @@ impl DBIterator {
                             self.last_user_key.clear();
                             self.last_user_key.extend_from_slice(&uk);
                             self.has_last_key = true;
+                            self.has_dedup_key = false;
                             self.backward_positioned = true;
                             self.current = Some((uk, val));
                             self.needs_advance = false;
@@ -969,6 +996,7 @@ impl DBIterator {
             self.merger.seek_to_last_merge();
         }
 
+        self.has_dedup_key = false;
         self.has_last_key = false;
         self.prev_overshoot = None;
 
@@ -976,8 +1004,8 @@ impl DBIterator {
         self.resolve_prev_user_key(resolve_bound.as_deref());
     }
 
-    /// Return the last user key seen by next_visible(), if any.
-    /// Used by BidiIterator for re-seeking on direction change.
+    /// Return the most recently resolved visible user key since the last seek,
+    /// configuration update, or latched error.
     pub fn last_user_key(&self) -> Option<&[u8]> {
         if self.has_last_key {
             Some(&self.last_user_key)
@@ -2422,5 +2450,59 @@ mod tests {
         assert_eq!(bidi.step_prev().unwrap(), None);
         assert_eq!(bidi.step_next().unwrap(), None);
         assert!(bidi.error().is_none());
+    }
+
+    #[test]
+    fn last_user_key_tracks_only_visible_keys_and_clears_on_error() {
+        // 1. Point-deleted trailing keys must not overwrite or populate `last_user_key`.
+        let mut clean = DBIterator::new(
+            vec![vec![
+                make_entry(b"a", 3, ValueType::Value, b"1"),
+                make_entry(b"m", 2, ValueType::Deletion, b""),
+                make_entry(b"z", 1, ValueType::Deletion, b""),
+            ]],
+            10,
+        );
+        clean.seek_to_first();
+        assert_eq!(clean.last_user_key(), None);
+        assert_eq!(clean.next(), Some((b"a".to_vec(), b"1".to_vec())));
+        assert_eq!(clean.last_user_key(), Some(b"a".as_slice()));
+        assert_eq!(clean.next(), None);
+        assert_eq!(clean.last_user_key(), Some(b"a".as_slice()));
+
+        clean.seek(b"m");
+        assert_eq!(clean.next(), None);
+        assert_eq!(clean.last_user_key(), None);
+
+        // 2. Range-deleted and skip_point-filtered keys must not leak into `last_user_key`.
+        let mut filtered = DBIterator::new(
+            vec![vec![
+                make_entry(b"a", 1, ValueType::Value, b"1"),
+                make_entry(b"c", 1, ValueType::Value, b"covered"),
+                make_entry(b"s", 1, ValueType::Value, b"skipped"),
+            ]],
+            10,
+        );
+        filtered.set_range_tombstones(vec![(b"b".to_vec(), b"f".to_vec(), 5)]);
+        filtered.set_skip_point(Arc::new(|k: &[u8]| k == b"s"));
+        filtered.seek_to_first();
+        assert_eq!(filtered.next(), Some((b"a".to_vec(), b"1".to_vec())));
+        assert_eq!(filtered.next(), None);
+        assert_eq!(filtered.last_user_key(), Some(b"a".as_slice()));
+
+        // 3. Latching a decode/source error halts the iterator and clears `last_user_key`.
+        let mut corrupt = DBIterator::new(
+            vec![vec![
+                make_entry(b"a", 2, ValueType::Value, b"1"),
+                (b"short".to_vec(), b"bad".to_vec()),
+            ]],
+            10,
+        );
+        corrupt.seek_to_first();
+        assert_eq!(corrupt.next(), Some((b"a".to_vec(), b"1".to_vec())));
+        assert_eq!(corrupt.last_user_key(), Some(b"a".as_slice()));
+        assert_eq!(corrupt.next(), None);
+        assert!(corrupt.error().is_some());
+        assert_eq!(corrupt.last_user_key(), None);
     }
 }
