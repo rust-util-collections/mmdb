@@ -1176,59 +1176,60 @@ impl TableReader {
         ))
     }
 
+    /// First data-block key and the final point-index separator.
+    fn point_directory_bounds(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let Some(block) = self.index_leaf_block(0, false)? else {
+            return Err(Error::corruption("SST index partition has no leaf"));
+        };
+        let (_, raw, _) = block.decode_restart_entry(0)?;
+        let first = decode_index_entry(raw)?.first_key.to_vec();
+        let last_sep = &self
+            .partitions
+            .last()
+            .ok_or_else(|| Error::corruption("SST index partition has no separator"))?
+            .0;
+        let mut last = Vec::with_capacity(last_sep.prefix.len() + last_sep.trailer.len());
+        last.extend_from_slice(&last_sep.prefix);
+        last.extend_from_slice(&last_sep.trailer);
+        Ok((first, last))
+    }
+
     pub(crate) fn validate_manifest_bounds(
         &self,
         smallest_key: &[u8],
         largest_key: &[u8],
     ) -> Result<()> {
-        let (_, _, s_vt) = decode_internal_key(smallest_key)?;
-        let (_, _, l_vt) = decode_internal_key(largest_key)?;
-        match (
-            self.partitions.first().zip(self.partitions.last()),
-            self.range_key_bounds.as_ref(),
-        ) {
-            (Some((first_part, last_part)), None) => {
-                if s_vt == ValueType::RangeDeletion
-                    || l_vt == ValueType::RangeDeletion
-                    || first_part.0.compare_internal(smallest_key).is_lt()
-                    || !last_part.0.compare_internal(largest_key).is_eq()
-                {
-                    return Err(Error::corruption(
-                        "MANIFEST file bounds disagree with point-only SST",
-                    ));
-                }
-            }
-            (None, Some((range_min, range_max))) => {
-                if smallest_key != range_min.as_slice() || largest_key != range_max.as_slice() {
-                    return Err(Error::corruption(
-                        "MANIFEST file bounds disagree with range-only SST",
-                    ));
-                }
-            }
-            (Some((first_part, last_part)), Some((range_min, range_max))) => {
-                let largest_matches = if last_part.0.compare_internal(range_max).is_lt() {
-                    largest_key == range_max.as_slice()
+        let point = if self.partitions.is_empty() {
+            None
+        } else {
+            Some(self.point_directory_bounds()?)
+        };
+        let (expect_small, expect_large) = match (point.as_ref(), self.range_key_bounds.as_ref()) {
+            (Some((first, last)), None) => (first.as_slice(), last.as_slice()),
+            (None, Some((range_min, range_max))) => (range_min.as_slice(), range_max.as_slice()),
+            (Some((first, last)), Some((range_min, range_max))) => {
+                let small = if compare_internal_key(first, range_min).is_lt() {
+                    first.as_slice()
                 } else {
-                    last_part.0.compare_internal(largest_key).is_eq()
+                    range_min.as_slice()
                 };
-                let smallest_valid = if compare_internal_key(smallest_key, range_min).is_eq() {
-                    first_part.0.compare_internal(smallest_key).is_ge()
+                let large = if compare_internal_key(last, range_max).is_gt() {
+                    last.as_slice()
                 } else {
-                    s_vt != ValueType::RangeDeletion
-                        && compare_internal_key(smallest_key, range_min).is_lt()
-                        && first_part.0.compare_internal(smallest_key).is_ge()
+                    range_max.as_slice()
                 };
-                if !smallest_valid || !largest_matches {
-                    return Err(Error::corruption(
-                        "MANIFEST file bounds disagree with mixed SST directories",
-                    ));
-                }
+                (small, large)
             }
             (None, None) => {
                 return Err(Error::corruption(
                     "SST has neither data blocks nor range deletions",
                 ));
             }
+        };
+        if smallest_key != expect_small || largest_key != expect_large {
+            return Err(Error::corruption(
+                "MANIFEST file bounds disagree with SST directories",
+            ));
         }
         Ok(())
     }

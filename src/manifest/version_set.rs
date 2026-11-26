@@ -2636,6 +2636,101 @@ mod tests {
         );
     }
 
+    /// A point SST's manifest `smallest_key` is the file's first point key.
+    /// Raising it above that key must not install: L0 and L1 lookups skip any
+    /// user key below `smallest_key`, so `DB::get` would return `Ok(None)`.
+    #[test]
+    fn raised_point_smallest_key_is_rejected() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let point = {
+            let mut b = TableBuilder::new(
+                &path.join("000010.sst"),
+                TableBuildOptions {
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"a", 1, ValueType::Value).as_bytes(),
+                b"va",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"z", 1, ValueType::Value).as_bytes(),
+                b"vz",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 10,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+        let mixed = {
+            let mut b =
+                TableBuilder::new(&path.join("000011.sst"), TableBuildOptions::default()).unwrap();
+            b.add(
+                InternalKey::new(b"a", 1, ValueType::Value).as_bytes(),
+                b"va",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"m", 2, ValueType::RangeDeletion).as_bytes(),
+                b"n",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"z", 1, ValueType::Value).as_bytes(),
+                b"vz",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 11,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: true,
+            }
+        };
+
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        let honest_point = point.clone();
+        let honest_mixed = mixed.clone();
+        for bad in [
+            FileMetaData {
+                smallest_key: InternalKey::new(b"m", 1, ValueType::Value).into_bytes(),
+                ..point
+            },
+            FileMetaData {
+                smallest_key: InternalKey::new(b"m", 2, ValueType::RangeDeletion).into_bytes(),
+                ..mixed
+            },
+        ] {
+            let mut edit = VersionEdit::new();
+            edit.add_file(1, bad);
+            assert_eq!(
+                vs.log_and_apply(edit).unwrap_err().kind(),
+                ErrorKind::Corruption,
+                "raised smallest_key must not install"
+            );
+        }
+        for honest in [honest_point, honest_mixed] {
+            let mut edit = VersionEdit::new();
+            edit.add_file(0, honest);
+            vs.log_and_apply(edit).unwrap();
+        }
+    }
+
     #[test]
     fn missing_current_referenced_manifest_returns_corruption_with_io_source() {
         use std::error::Error as StdError;
