@@ -424,15 +424,29 @@ struct LevelRewrite<'a> {
     l0_count: &'a AtomicUsize,
 }
 
+struct LevelRewriteOutcome {
+    swept: bool,
+    blocked_by_snapshot: bool,
+}
+
 impl LevelRewrite<'_> {
-    fn run(&self, level: usize, ctx: &CompactionContext<'_>, mut move_l0: bool) -> Result<bool> {
+    fn run(
+        &self,
+        level: usize,
+        ctx: &CompactionContext<'_>,
+        mut move_l0: bool,
+    ) -> Result<LevelRewriteOutcome> {
         let _build = ctx.builds.enter();
+        let mut blocked_by_snapshot = false;
         loop {
             let (task, numbers, snapshots, bottom, epoch, claim) = {
                 let inner = self.inner.lock();
                 let version = inner.versions.current();
                 if level == 0 && !inner.immutable_memtables.is_empty() && !move_l0 {
-                    return Ok(false);
+                    return Ok(LevelRewriteOutcome {
+                        swept: false,
+                        blocked_by_snapshot,
+                    });
                 }
                 let mut claimed = self.claims.lock();
                 let task = if level == 0 && move_l0 {
@@ -447,7 +461,10 @@ impl LevelRewrite<'_> {
                         self.claims.wait_until_empty();
                         continue;
                     }
-                    return Ok(level != 0 || inner.immutable_memtables.is_empty());
+                    return Ok(LevelRewriteOutcome {
+                        swept: level != 0 || inner.immutable_memtables.is_empty(),
+                        blocked_by_snapshot,
+                    });
                 };
                 let inputs: Vec<_> = task
                     .input_files_level
@@ -463,6 +480,7 @@ impl LevelRewrite<'_> {
                     continue;
                 }
                 let snapshots = self.snapshots.as_sorted_vec();
+                blocked_by_snapshot |= !snapshots.is_empty();
                 let bottom = LeveledCompaction::is_bottommost_level(
                     &version,
                     level,
@@ -492,7 +510,10 @@ impl LevelRewrite<'_> {
                         .as_ref()
                         .is_none_or(|f| f.is_noop()))
             {
-                return Ok(true);
+                return Ok(LevelRewriteOutcome {
+                    swept: true,
+                    blocked_by_snapshot,
+                });
             }
             let ctx = CompactionContext {
                 active_snapshots: &snapshots,
@@ -516,6 +537,8 @@ impl LevelRewrite<'_> {
                     move_l0 = true;
                     continue;
                 }
+                let live_snapshots = !self.snapshots.is_empty();
+                blocked_by_snapshot |= live_snapshots;
                 let cleanup = LeveledCompaction::install_compaction(
                     output,
                     &mut inner.versions,
@@ -523,7 +546,7 @@ impl LevelRewrite<'_> {
                     Some(self.block_cache),
                     ctx.db_path,
                     ctx.stats,
-                    !self.snapshots.is_empty(),
+                    live_snapshots,
                 )?;
                 if cleanup.installed && level == 0 {
                     for tf in &task.input_files_level {
@@ -542,7 +565,10 @@ impl LevelRewrite<'_> {
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, ctx.db_path);
             // Retry the sweep after the outstanding generation publishes its
             // L0 files. This move may also have introduced work at L1.
-            return Ok(!move_l0);
+            return Ok(LevelRewriteOutcome {
+                swept: !move_l0,
+                blocked_by_snapshot,
+            });
         }
     }
 }
@@ -1897,14 +1923,15 @@ impl DB {
                                                 super_version: &bg_sv,
                                                 l0_count: &bg_l0_count,
                                             };
-                                            let swept = rewrite
+                                            let outcome = rewrite
                                                 .run(level, &ctx, level == 0 && retry_l0)
                                                 .map_err(|e| {
                                                     format!("dead-key sweep error at L{level}: {e}")
                                                 })?;
+                                            blocked_by_snapshot |= outcome.blocked_by_snapshot;
                                             if level == 0 {
-                                                deferred_l0 = !swept;
-                                                retry_l0 = !swept && !retry_l0;
+                                                deferred_l0 = !outcome.swept;
+                                                retry_l0 = !outcome.swept && !retry_l0;
                                             }
                                             blocked_by_snapshot |= !bg_snapshot_list.is_empty();
                                         }
@@ -5827,8 +5854,8 @@ mod tests {
                 active_snapshots: &snapshots,
             };
             {
-                let swept = db.level_rewrite().run(0, &ctx, false).unwrap();
-                assert!(!swept, "L0 sweep must wait for the in-flight flush");
+                let outcome = db.level_rewrite().run(0, &ctx, false).unwrap();
+                assert!(!outcome.swept, "L0 sweep must wait for the in-flight flush");
             }
             db.flush_context().flush(&frozen).unwrap();
             assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"v2"[..]));
@@ -8122,5 +8149,118 @@ mod tests {
         close_rx
             .recv_timeout(Duration::from_millis(800))
             .expect("DB::close stalled behind uninterruptible RateLimiter sleep");
+    }
+
+    #[test]
+    fn snapshot_around_level_rewrite_retains_pending_dead_key_sweep() {
+        use crate::options::BlockPropertyCollector;
+        use std::sync::mpsc;
+
+        type GateStep = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
+        struct TwoStepCollector {
+            steps: Arc<Mutex<std::collections::VecDeque<GateStep>>>,
+        }
+        impl BlockPropertyCollector for TwoStepCollector {
+            fn add(&mut self, key: &[u8]) {
+                if key == b"z_gate"
+                    && let Some((entered_tx, release_rx)) = self.steps.lock().pop_front()
+                {
+                    let _ = entered_tx.send(());
+                    release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                }
+            }
+            fn finish_block(&mut self) -> Vec<u8> {
+                Vec::new()
+            }
+            fn name(&self) -> &str {
+                "two-step-sweep-gate"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let steps: Arc<Mutex<std::collections::VecDeque<GateStep>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let steps_factory = Arc::clone(&steps);
+        let opts = DbOptions {
+            num_levels: 2,
+            max_background_compactions: 1,
+            l0_compaction_trigger: usize::MAX,
+            l0_slowdown_trigger: usize::MAX,
+            l0_stop_trigger: usize::MAX,
+            lazy_delete_compaction_threshold: 1,
+            block_property_collectors: vec![Arc::new(move || {
+                Box::new(TwoStepCollector {
+                    steps: Arc::clone(&steps_factory),
+                })
+            })],
+            ..Default::default()
+        };
+        let db = DB::open(opts, dir.path()).unwrap();
+        assert_eq!(db.ingest_sorted([(b"a_dead", b"v")]).unwrap(), 1);
+        assert_eq!(db.ingest_sorted([(b"z_gate", b"g")]).unwrap(), 1);
+
+        let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
+            assert!(
+                std::time::Instant::now() < startup_deadline,
+                "startup compaction pass did not complete"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        let (iter1_tx, iter1_rx) = mpsc::channel();
+        let (go1_tx, go1_rx) = mpsc::channel();
+        let (iter2_tx, iter2_rx) = mpsc::channel();
+        let (go2_tx, go2_rx) = mpsc::channel();
+        {
+            let mut q = steps.lock();
+            q.push_back((iter1_tx, go1_rx));
+            q.push_back((iter2_tx, go2_rx));
+        }
+
+        db.lazy_delete(b"a_dead");
+        iter1_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sweep pass never entered first L1 rewrite");
+
+        // Snapshot arrives after `blocked_by_snapshot` was sampled before L1
+        // started; iteration 1 discards its filtered output and retries L1.
+        let snap = db.snapshot();
+        go1_tx.send(()).unwrap();
+
+        iter2_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("sweep pass never retried L1 under active snapshot");
+
+        // Reader releases `snapshot_list` before L1's post-check, then is
+        // preempted before calling `retry_after_snapshot_release()`.
+        let seq = snap.sequence();
+        mem::forget(snap);
+        db.snapshot_list.release(seq);
+        go2_tx.send(()).unwrap();
+
+        let pass_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 2 {
+            assert!(
+                std::time::Instant::now() < pass_deadline,
+                "sweep pass did not finish"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        if db.dead_key_sweep.retry_after_snapshot_release() {
+            db.read.signal_compaction();
+        }
+
+        let sweep_deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while db.get(b"a_dead").unwrap().is_some() {
+            assert!(
+                std::time::Instant::now() < sweep_deadline,
+                "dead key remained in L1 after snapshot release because sweep state dropped to Idle"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(db.get(b"z_gate").unwrap().as_deref(), Some(b"g".as_slice()));
+        db.close().unwrap();
     }
 }

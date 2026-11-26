@@ -925,7 +925,7 @@ mod tests {
             db.flush().unwrap();
             assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"new".as_slice()));
             release.send(()).unwrap();
-            assert!(!rewrite.join().unwrap());
+            assert!(!rewrite.join().unwrap().swept);
         });
         assert_eq!(db.inner.lock().versions.current().l0_file_count(), 0);
         assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"new".as_slice()));
