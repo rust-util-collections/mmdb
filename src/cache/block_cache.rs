@@ -156,6 +156,8 @@ const FO_SHARDS: usize = 16;
 #[cfg(test)]
 thread_local! {
     static MAINTAIN_AFTER_INSERT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BEFORE_TAKE_FILE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Maximum number of internal segments in the pool's LRU store.
@@ -238,6 +240,10 @@ impl FileOffsetsIndex {
 
     /// Remove and return every tracked offset of one (member, file).
     fn take_file(&self, member: u64, file_number: u64) -> Option<HashSet<u64, FastBuildHasher>> {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_TAKE_FILE.with(|cell| cell.borrow_mut().take()) {
+            hook();
+        }
         self.shards[Self::shard_for(member, file_number)]
             .lock()
             .remove(&(member, file_number))
@@ -370,7 +376,7 @@ impl BlockCachePool {
 
     /// Approximate entry count across both stores and all members, excluding pins.
     pub fn entry_count(&self) -> u64 {
-        let extra = if self.has_overflow.load(Ordering::Relaxed) {
+        let extra = if self.has_overflow.load(Ordering::Acquire) {
             self.overflow.entry_count()
         } else {
             0
@@ -394,7 +400,7 @@ impl BlockCachePool {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn run_pending_tasks(&self) {
         self.inner.run_pending_tasks();
-        if self.has_overflow.load(Ordering::Relaxed) {
+        if self.has_overflow.load(Ordering::Acquire) {
             self.overflow.run_pending_tasks();
         }
     }
@@ -462,7 +468,7 @@ impl BlockCache {
         if let Some(v) = self.pool.inner.get(&key) {
             return Some(v.0);
         }
-        if self.pool.has_overflow.load(Ordering::Relaxed) {
+        if self.pool.has_overflow.load(Ordering::Acquire) {
             return self.pool.overflow.get(&key).map(|v| v.0);
         }
         None
@@ -483,14 +489,14 @@ impl BlockCache {
         // full, and a replacement must retire any older cached value.
         let Ok(weight) = u32::try_from(value.0.raw_arc().capacity().max(1)) else {
             self.pool.inner.invalidate(&key);
-            if self.pool.has_overflow.load(Ordering::Relaxed) {
+            if self.pool.has_overflow.load(Ordering::Acquire) {
                 self.pool.overflow.invalidate(&key);
             }
             return;
         };
         let weight_u64 = weight as u64;
         if weight_u64 > self.pool.segment_capacity && weight_u64 <= self.pool.capacity_bytes {
-            self.pool.has_overflow.store(true, Ordering::Relaxed);
+            self.pool.has_overflow.store(true, Ordering::Release);
             self.pool.inner.invalidate(&key);
             self.pool.index.add(self.member, file_number, block_offset);
             self.pool.overflow.insert(key, value);
@@ -500,7 +506,7 @@ impl BlockCache {
             }
             return;
         }
-        if self.pool.has_overflow.load(Ordering::Relaxed) {
+        if self.pool.has_overflow.load(Ordering::Acquire) {
             self.pool.overflow.invalidate(&key);
         }
         self.pool.index.add(self.member, file_number, block_offset);
@@ -634,8 +640,8 @@ impl BlockCache {
             return;
         }
         self.unpin_file(file_number);
-        let has_overflow = self.pool.has_overflow.load(Ordering::Relaxed);
         if let Some(offsets) = self.pool.index.take_file(self.member, file_number) {
+            let has_overflow = self.pool.has_overflow.load(Ordering::Acquire);
             for offset in offsets {
                 let key = (self.member, file_number, offset);
                 self.pool.inner.invalidate(&key);
@@ -671,7 +677,7 @@ impl BlockCache {
         // maintenance ONCE (per-file `run_pending_tasks` would drain the
         // whole pool's queue repeatedly).
         let files = self.pool.index.take_member(self.member);
-        let has_overflow = self.pool.has_overflow.load(Ordering::Relaxed);
+        let has_overflow = self.pool.has_overflow.load(Ordering::Acquire);
         let mut any = false;
         for (file_number, offsets) in files {
             for offset in offsets {
@@ -1056,5 +1062,29 @@ mod tests {
         cache.detach();
         assert!(cache.get(8, 0).is_none());
         assert_eq!(pool.entry_count(), 0);
+    }
+
+    #[test]
+    fn first_overflow_insert_racing_invalidate_file_is_not_stranded() {
+        let pool = Arc::new(BlockCachePool::new(64 * 1024 * 1024));
+        let cache = Arc::new(pool.attach());
+        let cache_for_hook = Arc::clone(&cache);
+        BEFORE_TAKE_FILE.with(|cell| {
+            *cell.borrow_mut() = Some(Box::new(move || {
+                cache_for_hook.insert(7, 0, vec![0xAB; 2 * 1024 * 1024]);
+            }));
+        });
+
+        cache.invalidate_file(7);
+        let hit_after_invalidate = cache.get(7, 0).is_some();
+
+        cache.detach();
+        pool.run_pending_tasks();
+        assert!(
+            !hit_after_invalidate,
+            "invalidate_file left first oversized block readable"
+        );
+        assert_eq!(pool.entry_count(), 0);
+        assert_eq!(pool.usage().overflow_weighted_bytes, 0);
     }
 }
