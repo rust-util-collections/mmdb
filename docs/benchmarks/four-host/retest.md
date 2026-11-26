@@ -89,7 +89,7 @@ report; regenerate expanded CSVs and session journals outside Git.
 The [freeze record](retest-5.0.1.json) identifies the production tree,
 runner sources and lock digests. Use Python 3.9 or later. Run
 `python3 -B derive_locks.py "$locks"` in this directory and copy the
-resulting four locks to their respective private build trees. Use the
+resulting three locks to their respective private build trees. Use the
 historical locks for the old control. In both engine checkouts install
 the frozen `benches/engine_profile/concurrent.rs` instrumentation from
 the workflow commit, then build as in the [original instructions](reproduce.md).
