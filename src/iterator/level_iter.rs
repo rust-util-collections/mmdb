@@ -360,7 +360,13 @@ impl super::merge::SeekableIterator for LevelIterator {
             self.file_index = 0;
             return;
         }
-        if self.has_empty_bounds() {
+        if self.has_empty_bounds()
+            || self
+                .config
+                .lower
+                .as_deref()
+                .is_some_and(|lb| user_key_from_internal(target) < lb)
+        {
             self.file_index = 0;
             self.current_iter = None;
             return;

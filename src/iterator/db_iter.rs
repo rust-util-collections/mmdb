@@ -713,6 +713,15 @@ impl DBIterator {
             return;
         }
         self.prefix_exhausted = false;
+        self.last_seek_key = None;
+        if self.config.lower.as_deref().is_some_and(|lb| target < lb) {
+            self.recycle_current();
+            self.needs_advance = false;
+            self.has_last_key = false;
+            self.prev_overshoot = None;
+            self.backward_positioned = false;
+            return;
+        }
 
         let upper_clamps_target = self.config.upper.as_deref().is_some_and(|ub| ub <= target);
         let (seek_key, bound) = if upper_clamps_target {
@@ -2317,5 +2326,101 @@ mod tests {
         let (k, _) = pfx_iter.step_next().unwrap().unwrap();
         assert!(k.starts_with(b"key_0001"));
         assert!(k >= b"key_000150".as_slice());
+    }
+
+    #[test]
+    fn reverse_scan_and_seek_for_prev_ignore_corrupt_blocks_below_lower_bound() {
+        use crate::{BidiIterator, DB, DbOptions, ErrorKind, ReadOptions};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_block_size(64)
+            .with_bloom_bits_per_key(0)
+            .with_pin_l0_first_block_and_warm_index(false)
+            .with_l0_compaction_trigger(usize::MAX);
+        let db = DB::open(opts.clone(), dir.path()).unwrap();
+        db.put(b"a", &[b'a'; 128]).unwrap();
+        db.put(b"z", b"old_z").unwrap();
+        let snap = db.snapshot();
+        db.put(b"z", b"new_z").unwrap();
+        db.flush().unwrap();
+        drop(snap);
+        db.close().unwrap();
+
+        let sst_path = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "sst"))
+            .unwrap();
+        let reader = crate::sst::table_reader::TableReader::open(&sst_path).unwrap();
+        let entries = reader.cached_index_entries().unwrap();
+        assert!(entries.len() >= 2, "expected >= 2 data blocks");
+        assert_eq!(crate::types::user_key(&entries[0].separator_key), b"a");
+        let block0 = entries[0].handle;
+        drop(reader);
+
+        // Corrupt block 0 ("a") CRC on disk while leaving block 1 ("z"@2, "z"@1) intact.
+        let mut bytes = fs::read(&sst_path).unwrap();
+        let crc_pos = (block0.offset + block0.size + 1) as usize;
+        bytes[crc_pos] ^= 0xff;
+        fs::write(&sst_path, &bytes).unwrap();
+
+        let db = DB::open_read_only_with_options(opts, dir.path()).unwrap();
+        assert_eq!(db.get(b"a").unwrap_err().kind(), ErrorKind::Corruption);
+        assert_eq!(db.get(b"z").unwrap().as_deref(), Some(b"new_z".as_slice()));
+
+        // Forward scan of [z, ∞) succeeds cleanly.
+        let mut fwd = db
+            .iter_with_range(&ReadOptions::default(), Some(b"z"), None)
+            .unwrap();
+        assert_eq!(
+            fwd.step_next().unwrap(),
+            Some((b"z".as_slice(), b"new_z".as_slice()))
+        );
+        assert_eq!(fwd.step_next().unwrap(), None);
+        assert!(fwd.error().is_none());
+
+        // Reverse scan of [z, ∞) must also deliver "z" cleanly without reading block 0.
+        let mut rev = db
+            .iter_with_range(&ReadOptions::default(), Some(b"z"), None)
+            .unwrap();
+        assert_eq!(
+            rev.step_prev().unwrap(),
+            Some((b"z".as_slice(), b"new_z".as_slice()))
+        );
+        assert_eq!(rev.step_prev().unwrap(), None);
+        assert!(rev.error().is_none());
+
+        // Reverse seeks at or below lower_bound must not read block 0 either.
+        let mut seek_it = db
+            .iter_with_range(&ReadOptions::default(), Some(b"z"), None)
+            .unwrap();
+        seek_it.seek_for_prev(b"a");
+        assert_eq!(seek_it.step_prev().unwrap(), None);
+        assert!(seek_it.error().is_none());
+        seek_it.seek_for_prev(b"y");
+        assert_eq!(seek_it.step_prev().unwrap(), None);
+        assert!(seek_it.error().is_none());
+        seek_it.seek_for_prev(b"z");
+        assert_eq!(
+            seek_it.step_prev().unwrap(),
+            Some((b"z".as_slice(), b"new_z".as_slice()))
+        );
+        assert_eq!(seek_it.step_prev().unwrap(), None);
+        assert!(seek_it.error().is_none());
+
+        // BidiIterator::lazy over [z, ∞) consuming from the back stays clean.
+        let mut bidi = BidiIterator::lazy(
+            db.iter_with_range(&ReadOptions::default(), Some(b"z"), None)
+                .unwrap(),
+        );
+        assert_eq!(
+            bidi.step_prev().unwrap(),
+            Some((b"z".as_slice(), b"new_z".as_slice()))
+        );
+        assert_eq!(bidi.step_prev().unwrap(), None);
+        assert_eq!(bidi.step_next().unwrap(), None);
+        assert!(bidi.error().is_none());
     }
 }

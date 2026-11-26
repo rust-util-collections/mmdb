@@ -312,6 +312,11 @@ impl TableIterator {
         self.index_pos = usize::MAX;
     }
 
+    fn exhaust_at_lower_bound(&mut self) {
+        self.reset_positioning_state();
+        self.index_pos = 0;
+    }
+
     fn block_properties_should_skip(&self, entry: &DecodedIndexEntry<'_>) -> bool {
         if self.config.filters.is_empty() {
             return false;
@@ -327,6 +332,20 @@ impl TableIterator {
             .upper
             .as_ref()
             .is_some_and(|ub| user_key(first_key) >= ub.as_slice())
+    }
+
+    fn block_precedes_lower_bound(&self, sep: &[u8]) -> bool {
+        self.config
+            .lower
+            .as_ref()
+            .is_some_and(|lb| user_key(sep) < lb.as_slice())
+    }
+
+    fn partition_precedes_lower_bound(&self, part: usize) -> bool {
+        self.config
+            .lower
+            .as_ref()
+            .is_some_and(|lb| self.reader.partitions[part].0.prefix.as_ref() < lb.as_slice())
     }
 
     /// Materialize the deferred block: load the data block for deferred_index_pos.
@@ -661,6 +680,21 @@ impl TableIterator {
             self.reset_positioning_state();
             return;
         }
+        if self
+            .config
+            .lower
+            .as_deref()
+            .is_some_and(|lb| user_key(target) < lb)
+            || self
+                .config
+                .lower
+                .as_deref()
+                .zip(self.config.upper.as_deref())
+                .is_some_and(|(lb, ub)| lb >= ub)
+        {
+            self.exhaust_at_lower_bound();
+            return;
+        }
         let clamped_target;
         let target = if let Some(ub) = self.config.upper.as_deref()
             && user_key(target) >= ub
@@ -670,10 +704,14 @@ impl TableIterator {
         } else {
             target
         };
-        self.select_partition(
-            self.seek_partition(target)
-                .min(self.reader.partitions.len().saturating_sub(1)),
-        );
+        let part = self
+            .seek_partition(target)
+            .min(self.reader.partitions.len().saturating_sub(1));
+        if self.reader.partitions.is_empty() || self.partition_precedes_lower_bound(part) {
+            self.exhaust_at_lower_bound();
+            return;
+        }
+        self.select_partition(part);
         self.reset_positioning_state();
         if self.err.is_some() {
             return;
@@ -700,6 +738,10 @@ impl TableIterator {
             let end = (left + 1).min(index_len);
             for block_index in (0..end).rev() {
                 let (sep, entry) = index_entry_at(&index_block, block_index);
+                if self.block_precedes_lower_bound(sep) {
+                    self.exhaust_at_lower_bound();
+                    return;
+                }
                 if self.block_exceeds_upper_bound(entry.first_key)
                     || compare_internal_key(entry.first_key, target) == Ordering::Greater
                 {
@@ -721,7 +763,10 @@ impl TableIterator {
                     }
                 }
             }
-            if self.err.is_some() || self.partition == 0 {
+            if self.err.is_some()
+                || self.partition == 0
+                || self.partition_precedes_lower_bound((self.partition - 1) as usize)
+            {
                 break;
             }
             self.select_partition((self.partition - 1) as usize);
@@ -919,9 +964,10 @@ impl TableIterator {
     fn previous_block_end_step(&mut self, mut before: usize) -> bool {
         loop {
             while before == 0 {
-                if self.partition == 0 {
-                    self.reset_positioning_state();
-                    self.index_pos = 0;
+                if self.partition == 0
+                    || self.partition_precedes_lower_bound((self.partition - 1) as usize)
+                {
+                    self.exhaust_at_lower_bound();
                     return false;
                 }
                 self.select_partition((self.partition - 1) as usize);
@@ -936,6 +982,10 @@ impl TableIterator {
                 return false;
             };
             let (sep, entry) = index_entry_at(index_block, prev_block_index);
+            if self.block_precedes_lower_bound(sep) {
+                self.exhaust_at_lower_bound();
+                return false;
+            }
             if self.block_properties_should_skip(&entry) {
                 continue;
             }
@@ -1213,12 +1263,27 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             self.reset_positioning_state();
             return;
         }
+        if self
+            .config
+            .lower
+            .as_deref()
+            .zip(self.config.upper.as_deref())
+            .is_some_and(|(lb, ub)| lb >= ub)
+        {
+            self.exhaust_at_lower_bound();
+            return;
+        }
         if let Some(ub) = self.config.upper.clone() {
             let target = InternalKey::new(&ub, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion);
             self.seek_for_prev(target.as_bytes());
             return;
         }
-        self.select_partition(self.reader.partitions.len().saturating_sub(1));
+        let last_part = self.reader.partitions.len().saturating_sub(1);
+        if self.reader.partitions.is_empty() || self.partition_precedes_lower_bound(last_part) {
+            self.exhaust_at_lower_bound();
+            return;
+        }
+        self.select_partition(last_part);
         self.reset_positioning_state();
         if self.err.is_none() {
             let before = self.index_len();
@@ -2695,6 +2760,78 @@ mod tests {
         assert!(
             ranges2.is_empty(),
             "empty clipped readahead window must skip advise_willneed, got {ranges2:?}"
+        );
+    }
+
+    #[test]
+    fn lower_bound_never_reads_excluded_index_partitions() {
+        use crate::iterator::merge::SeekableIterator;
+        use crate::types::{InternalKey, user_key};
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lower_bound_partitions.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 1,
+                bloom_bits_per_key: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..40u32 {
+            let mut uk = format!("k{:04}_", i * 3).into_bytes();
+            uk.resize(2048, b'x');
+            let ik = InternalKey::new(&uk, 10, ValueType::Value);
+            builder.add(ik.as_bytes(), b"v").unwrap();
+        }
+        builder.finish().unwrap();
+
+        let clean = TableReader::open(&path).unwrap();
+        assert!(clean.partitions.len() >= 2);
+        let part0_leaf = clean.partitions[0].1;
+        let part1_leaf_block = clean.index_leaf_block(1, false).unwrap().unwrap();
+        let (_, v0, _) = part1_leaf_block.decode_restart_entry(0).unwrap();
+        let part1_first_uk = user_key(
+            crate::sst::format::decode_index_entry(v0)
+                .unwrap()
+                .first_key,
+        )
+        .to_vec();
+
+        // Corrupt partition 0's index leaf CRC on disk so any read of leaf 0 fails.
+        let mut bytes = fs::read(&path).unwrap();
+        let crc_pos = (part0_leaf.offset + part0_leaf.size + 1) as usize;
+        bytes[crc_pos] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let mut iter = TableIterator::new(reader);
+        SeekableIterator::set_bounds(&mut iter, Some(&part1_first_uk), None);
+
+        // 1. Out-of-bound seek_for_prev below lower_bound must not read partition 0's leaf.
+        let mut oob = b"k0000_".to_vec();
+        oob.resize(2048, b'x');
+        let seek_oob = InternalKey::new(&oob, 100, ValueType::Value);
+        iter.seek_for_prev(seek_oob.as_bytes());
+        assert!(iter.iter_error().is_none());
+        assert!(iter.current().is_none());
+
+        // 2. Full reverse scan across partition >= 1 stops before loading partition 0's leaf.
+        SeekableIterator::seek_to_last(&mut iter);
+        let mut count = 0usize;
+        if iter.current().is_some() {
+            count += 1;
+            while SeekableIterator::prev(&mut iter).is_some() {
+                count += 1;
+            }
+        }
+        assert!(count > 0);
+        assert!(
+            iter.iter_error().is_none(),
+            "reverse scan at lower_bound must not read excluded index partition: {:?}",
+            iter.iter_error()
         );
     }
 }
