@@ -13,6 +13,46 @@ from storage_trials import schedule
 
 
 class FourHostChecks(unittest.TestCase):
+    def test_shared_view_metrics_must_agree_with_original_child_output(self):
+        raw = "wal puts=10000 put_p99_ns=150 puts_us=5000 fence_us=2\nverified rows=10000\n"
+        row = dict(work_id="unique", arguments=["wal", "sync", "42"], raw=raw,
+                   wal=dict(puts=10000, put_p99_ns=150, puts_us=5000, fence_us=2),
+                   verified={"rows":10000}, volume="reference")
+        self.assertNotIn("volume", analyze.measured_payload(row))
+        row["wal"]["put_p99_ns"] *= 1000
+        with self.assertRaisesRegex(ValueError, "parsed counters differ"):
+            analyze.measured_payload(row)
+
+    def test_loss_of_evidence_does_not_require_an_opposite_median(self):
+        def example(aa):
+            records = {}
+            for i in range(1, 6):
+                for arm, latency in (("A1",100), ("A2",aa), ("AB1",100), ("B",75)):
+                    analyze.add(records, dict(round=i, arm=arm), {"read_p99_ns":latency})
+            return analyze.paired("host", "read", records)
+        with tempfile.TemporaryDirectory() as where:
+            directory = Path(where)
+            analyze.write_csv(directory / "paired.csv", analyze.PAIRED_FIELDS, example(101))
+            changed, = list(analyze.compare_to_baseline(example(150), directory))
+            self.assertEqual(changed[5], 0.0)
+            self.assertEqual(changed[-2:], ("inside-control-spread", "decision-changed"))
+
+    def test_terminal_clock_includes_both_foreground_and_explicit_compaction(self):
+        prefix = ("run seconds=8 compaction_output_bytes=100\n"
+                  "class op=SmallPut sampled=10000 bytes=1048576 service_p99_us=2 issue_delay_p99_us=3\n")
+        def measured(end):
+            return {"raw":prefix + f"drain micros=1000000 terminal_us={end} "
+                    "output_bytes=20 total_compaction_bytes=120 final_l0=0 final_immutables=0 sst_bytes=500\n"}
+        with self.assertRaisesRegex(ValueError, "post-window compact state"):
+            analyze.drain_metrics(measured(8500000), {})
+        short = measured(9000000)
+        short["raw"] = short["raw"].replace("total_compaction_bytes=120", "total_compaction_bytes=100")
+        with self.assertRaisesRegex(ValueError, "post-window compact state"):
+            analyze.drain_metrics(short, {})
+        metrics = {}
+        analyze.drain_metrics(measured(9000000), metrics)
+        self.assertAlmostEqual(metrics["through_compact_MiB_s"], 1 / 9)
+
     def test_checkpoint_retries_the_whole_failed_block_and_rejects_drift(self):
         with tempfile.TemporaryDirectory() as where:
             folder = Path(where)

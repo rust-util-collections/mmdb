@@ -97,9 +97,9 @@ def drain_metrics(row, values):
     terminal = counters(next(line for line in lines if line.startswith("drain ")))
     classes = [counters(line) for line in lines if line.startswith("class ")]
     logical = sum(c["bytes"] for c in classes)
-    require(terminal["terminal_us"] >= run["seconds"] * 1e6 - 1
+    require(terminal["terminal_us"] + 2 >= run["seconds"] * 1e6 + terminal["micros"]
             and 0 < terminal["micros"] <= terminal["terminal_us"]
-            and terminal["total_compaction_bytes"] >= run["compaction_output_bytes"]
+            and terminal["total_compaction_bytes"] >= run["compaction_output_bytes"] + terminal["output_bytes"]
             and terminal["final_l0"] == terminal["final_immutables"] == 0
             and terminal["sst_bytes"] > 0, "invalid post-window compact state")
     values.update(drain_ms=terminal["micros"] / 1000,
@@ -196,7 +196,16 @@ def read_results(location, path, kind, revision=REVISION):
         add(group, dict(round=round_no, arm=arm), metrics, has_cache_evidence(row))
         if kind == "device":
             coverage.append(100 * int(row["device_requests"]) / samples)
-    name = "arc-prewarmed" if location == "9950x-zfs" and kind == "page" else kind
+    name = kind
+    if location == "9950x-zfs" and kind == "page":
+        if revision == REVISION:
+            name = "arc-prewarmed"
+        else:
+            proof = json.loads((path.parent / "page-qualification.json").read_text())
+            require(len(proof["arc_demand_hits"]) == len(proof["arc_demand_misses"]) == len(rows),
+                    f"{path}: incomplete ARC attribution")
+            name = ("arc-prewarmed" if all(h > 0 for h in proof["arc_demand_hits"])
+                    and not any(proof["arc_demand_misses"]) else "prewarmed-mixed")
     return (paired(location, "grouped-" + name, group),
             [single(location, "grouped-device", "io_qualified_pct", coverage)] if coverage else [])
 
@@ -290,18 +299,44 @@ def volume_results(location, path, revision=REVISION):
     return [row for case,g in sorted(groups.items()) for row in paired(location, "volume-" + case, g)]
 
 
-def version_results(location, folder, freeze):
+def version_results(location, folder, freeze, *, confirmation=None, cpus=None):
     result = []
-    for workload, filename in (("memory", "version-memory.jsonl.gz"), ("storage", "version-bridge.jsonl.gz")):
-        header, rows = packet(folder / filename)
+    workloads = [("storage", "version-bridge.jsonl.gz")]
+    if confirmation is None:
+        workloads.insert(0, ("memory", "version-memory.jsonl.gz"))
+    for workload, filename in workloads:
+        header, rows = packet((confirmation or folder) / filename)
         if workload == "memory":
             old, new = header["old_revision"], header["engine_revision"]
             old_binary, new_binary = header["old_binary_sha256"], header["binary_sha256"]["control"]
+            reference, _ = packet(folder / "memory.jsonl.gz")
+            expected_binary = reference["binary_sha256"]["control"]
         else:
             old, new = header["old_engine_revision"], header["new_engine_revision"]
             old_binary, new_binary = header["old_binary_sha256"], header["new_binary_sha256"]
+            reference, _ = packet(folder / "storage.jsonl.gz")
+            expected_binary = reference["binary_sha256"]
+        seed_base = 20261126 if confirmation is None else 20261226
+        if confirmation is not None:
+            original, originals = packet(folder / "version-bridge.jsonl.gz")
+            _, mapping = packet(confirmation / "version-work-map.jsonl.gz")
+            ids = {r["work_id"]:r for r in rows}
+            require(header["cpus"] == cpus and header["seed_base"] == seed_base,
+                    f"{confirmation}: wrong confirmation mask or seed")
+            require(len(ids) == len(mapping) == 20 and
+                    {m["work_id"] for m in mapping} == ids.keys()
+                    and ids.keys().isdisjoint(r["work_id"] for r in originals)
+                    and old_binary == original["old_binary_sha256"] and
+                    new_binary == original["new_binary_sha256"], f"{confirmation}: wrong physical trials")
+            for m in mapping:
+                row = ids[m["work_id"]]
+                require(m["revision"] == row["measurement_revision"]
+                        and m["binary_sha256"] == (new_binary if row["arm"] == "B" else old_binary)
+                        and m["views"] == {"version-bridge.jsonl.gz":[row["case"],row["arm"]]},
+                        f"{confirmation}: wrong confirmatory view")
         require((old, new) == (freeze["baseline_engine"], freeze["engine"]) and
-                old_binary != new_binary and len(rows) == 20, f"{folder}: invalid version comparison")
+                old_binary != new_binary and new_binary == expected_binary and len(rows) == 20,
+                f"{folder}: invalid version comparison")
         groups = defaultdict(dict)
         for r in rows:
             candidate = r["arm"] == "B"
@@ -314,8 +349,9 @@ def version_results(location, folder, freeze):
                 drain_metrics(r, values)
                 add(groups["hot-saturation"], r, values, bool(kept))
             else:
+                measured_payload(r)
                 require(r["measurement_revision"] == (new if candidate else old)
-                        and r["arguments"] == ["sst","none","entropy",str(20261126+r["round"])]
+                        and r["arguments"] == ["sst","none","entropy",str(seed_base+r["round"])]
                         and r["sst"]["rows"] == 262144 and r["sst"]["lookups"] == 40000,
                         f"{folder}: mismatched version SST work")
                 s = r["sst"]
@@ -324,7 +360,8 @@ def version_results(location, folder, freeze):
                 add(groups["sorted-ingest"], r, {"ingest_us":s["ingest_us"], "sst_bytes":s["sst_bytes"]})
                 add(groups["prewarmed-reads"], r, {"scan_us":s["scan_us"], "read_p99_ns":s["read_p99_ns"]}, ok)
         for case, group in sorted(groups.items()):
-            result.extend(paired(location, "version-" + case, group, higher=("logical_MiB_s","through_compact_MiB_s")))
+            prefix = "version-" if confirmation is None else f"confirm-{confirmation.name}-"
+            result.extend(paired(location, prefix + case, group, higher=("logical_MiB_s","through_compact_MiB_s")))
     return result
 
 
@@ -387,12 +424,121 @@ def write_csv(path, header, rows):
         writer.writerows(rows)
 
 
+def measured_payload(row):
+    from retest_storage import reopen_observation, storage_observation
+    if row["arguments"][0] == "reopen":
+        parsed = reopen_observation(row["raw"], row["settings"])
+    else:
+        parsed = storage_observation(row["raw"], row["arguments"][0])
+    require(all(row[key] == value for key, value in parsed.items()),
+            f"parsed counters differ from child output for {row['work_id']}")
+    return {k:v for k,v in row.items() if k not in ("case", "arm", "volume")}
+
+
+def verify_shared_observations(root, primary, locations, disk_file, freeze):
+    """Verify that different views reuse real processes and retain independent pairs."""
+    from retest_storage import blocks
+    old, new = freeze["baseline_engine"], freeze["engine"]
+    local = root / primary
+    latest, _ = packet(local / "storage.jsonl.gz")
+    order = latest["stack_order"]
+    primary_alias = latest["stack"]
+    translated = {}
+    for location in locations:
+        for filename in ("storage.jsonl.gz", "reopen.jsonl.gz"):
+            p = root / location / filename
+            h, _ = packet(p)
+            translated[h["stack"] + "/" + filename] = p
+    view_names = set(translated)
+    if disk_file:
+        translated["volume-pairs.jsonl.gz"] = disk_file
+        view_names.add("volume-pairs.jsonl.gz")
+    translated["version-bridge.jsonl.gz"] = local / "version-bridge.jsonl.gz"
+    summary = {}
+    seen = set()
+    periods = []
+    for suite, names in (("standard", view_names), ("version", {"version-bridge.jsonl.gz"})):
+        h, mappings = packet(local / (suite + "-work-map.jsonl.gz"))
+        require(h["engine_revision"] == new and h["stack_order"] == order, "wrong work-map source")
+        schedule = [(f"{suite}-r{i}-{key}", pos, trial)
+                    for i, key, jobs in blocks(order, primary_alias, suite)
+                    for pos, trial in enumerate(jobs, 1)]
+        require(len(schedule) == len(mappings), "incomplete physical schedule")
+        by_view = {}
+        view_headers = {}
+        view_count = 0
+        for name in names:
+            view_headers[name], rs = packet(translated[name])
+            indexed = {r["work_id"]:r for r in rs}
+            require(len(indexed) == len(rs), "an observation appears twice in a view")
+            by_view[name] = indexed
+            view_count += len(rs)
+        for (block, pos, trial), work in zip(schedule, mappings):
+            ident = work["work_id"]
+            require(ident not in seen and work["block"] == block and work["position"] == pos
+                    and work["stack"] == trial["stack"] and work["views"] == trial["views"],
+                    f"incorrect physical observation {ident}")
+            seen.add(ident)
+            expected = old if trial["binary"] == "old-storage" else new
+            require(work["revision"] == expected, f"wrong binary revision for {ident}")
+            payloads = []
+            for name, (case, arm) in work["views"].items():
+                r = by_view[name].pop(ident)
+                meta = view_headers[name]
+                binary = (meta["old_binary_sha256"] if expected == old
+                          else meta["binary_sha256"])
+                require((r["case"], r["arm"], r["measurement_revision"], r["stack"]) ==
+                        (case, arm, expected, work["stack"]), f"wrong view for {ident}")
+                require(work["binary_sha256"] == binary and r["arguments"] == trial["argv"],
+                        f"incorrect actual binary or arguments for {ident}")
+                payloads.append(measured_payload(r))
+            require(all(data == payloads[0] for data in payloads), "shared measurements differ between views")
+            start = payloads[0]["sample_started_ns"]
+            end = payloads[0]["sample_ended_ns"]
+            # A resumed block may run later than subsequent retained blocks.
+            # Check chronological non-overlap separately from schedule order.
+            require(end >= start > 0, "invalid child clock")
+            periods.append((start, end, ident))
+        require(not any(by_view.values()), "unmapped observations in output views")
+        summary[suite] = dict(physical=len(mappings), views=view_count, shared=view_count-len(mappings))
+    previous_end = 0
+    for start, end, _ in sorted(periods):
+        require(start >= previous_end, "simultaneous test children on one host")
+        previous_end = end
+    return summary
+
+
+def compare_to_baseline(rows, directory):
+    with (directory / "paired.csv").open() as f:
+        old = {(r["location"], r["case"], r["metric"]):r for r in csv.DictReader(f)}
+    for row in rows:
+        r = dict(zip(PAIRED_FIELDS, row))
+        key = tuple(r[k] for k in ("location", "case", "metric"))
+        if key not in old or not old[key]["gain_pct"] or r["gain_pct"] == "":
+            continue
+        before = old[key]
+        delta = r["gain_pct"] - float(before["gain_pct"])
+        spread = max(float(before["max_aa_pct"]), r["max_aa_pct"])
+        previous, now = before["evidence"], r["evidence"]
+        change = "same-screen"
+        if min(int(before["eligible_pairs"]), r["eligible_pairs"]) != 5:
+            change = "qualification-limited"
+        elif previous != now and ("clears-benefit-screen" in (previous, now)
+                                  or "repeatable-loss-over-5pct" in (previous, now)):
+            change = "decision-changed"
+        elif abs(delta) >= 10 and abs(delta) > spread:
+            change = "magnitude-shift"
+        yield (*key, before["gain_pct"], r["gain_pct"], round(delta, 4),
+               round(spread, 4), previous, now, change)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--locations", nargs="+", choices=LOCATIONS, default=LOCATIONS)
     parser.add_argument("--retest-freeze", type=Path, help="optimized campaign manifest; omit for the original study")
+    parser.add_argument("--compare", type=Path, help="directory of regenerated historical summary CSVs")
     args = parser.parse_args()
     freeze = json.loads(args.retest_freeze.read_text()) if args.retest_freeze else {}
     revision = freeze["engine"] if freeze else REVISION
@@ -426,6 +572,16 @@ def main():
             descriptive.extend(d)
         if freeze and location in freeze["primary_locations"]:
             pairs.extend(version_results(location, folder, freeze))
+            confirmation = args.results / "confirmation"
+            if location == "5900x-raid" and confirmation.exists():
+                confirmation_ids = set()
+                for name, mask in (("same-affinity","4-7"), ("cpu4","4")):
+                    _, repeated = packet(confirmation / name / "version-bridge.jsonl.gz")
+                    ids = {r["work_id"] for r in repeated}
+                    require(confirmation_ids.isdisjoint(ids), "same process in both affinity panels")
+                    confirmation_ids.update(ids)
+                    pairs.extend(version_results(location, folder, freeze,
+                                                 confirmation=confirmation / name, cpus=mask))
     for label, ref, cand in (("5900x-single-to-raid", "5900x-single","5900x-raid"),
                              ("9474f-single-to-raid", "9474f-single","9474f-raid"),
                              ("9950x-ext4-to-zfs", "9950x-ext4","9950x-zfs")):
@@ -448,6 +604,21 @@ def main():
     (args.output / "capacity.json").write_text(json.dumps(capacity, indent=2) + "\n")
     (args.output / "inputs.json").write_text(json.dumps(receipts, indent=2) + "\n")
     (args.output / "shard-screens.json").write_text(json.dumps(shard_screens, indent=2) + "\n")
+    if freeze:
+        proof = {}
+        hosts = [("m5-apfs", ["m5-apfs"], None),
+                 ("5900x-raid", ["5900x-single","5900x-raid"], "5900x-single-to-raid"),
+                 ("9474f-raid", ["9474f-single","9474f-raid"], "9474f-single-to-raid"),
+                 ("9950x-zfs", ["9950x-ext4","9950x-zfs"], "9950x-ext4-to-zfs")]
+        for primary, locs, bridge in hosts:
+            if set(locs).issubset(args.locations):
+                proof[primary] = verify_shared_observations(args.results, primary, locs,
+                    args.results / (bridge + ".jsonl.gz") if bridge else None, freeze)
+        (args.output / "executions.json").write_text(json.dumps(proof, indent=2) + "\n")
+    if args.compare:
+        write_csv(args.output / "changes.csv", ("location","case","metric","old_gain_pct","new_gain_pct",
+                  "delta_pp","max_control_pct","old_screen","new_screen","change"),
+                  compare_to_baseline(pairs, args.compare))
 
 
 if __name__ == "__main__":

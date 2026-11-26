@@ -4,6 +4,8 @@ Use the SHA and dependency digests in [freeze.json](freeze.json).
 Create an independent checkout for each host. Keep all fixtures, Cargo
 targets and results in that experiment's own paths on the intended device.
 Verify the mount of `$scratch`, rather than relying on the path name.
+Commit `608fef67569c463a2a1eff64a88c15f099d583d4` retains the exact
+external measurement tools for the `828e47a` campaign.
 
 ```sh
 git clone "$source" "$work/clone"
@@ -109,3 +111,69 @@ are reported independently. The tarball also contains a SHA-256 manifest
 of the canonical observation files. Host receipts retain CPU/volume
 details and executable hashes; private account names and scratch paths
 may be replaced by their benchmark roles in the public copies.
+
+## Optimized 5.0.1 retest
+
+Use the [retest freeze](retest-5.0.1.json) and [selection rules](retest.md).
+The workflow commit is `31d495f`; `07aa56b` fixes the Linux affinity
+query used before memory trials. Use the engine clone at `b18532d` and a
+separate `828e47a` clone for the old control. Copy the same frozen
+`benches/engine_profile/concurrent.rs` into **both** benchmark checkouts
+before compiling. Its optional post-window compact measurement changes
+the harness. All production source files must match the respective engine
+revision. Build the same storage driver twice with the new and historical
+locks. The 5.0.1 locks are generated on demand:
+
+```sh
+python3 -B "$campaign/derive_locks.py" "$locks" --manifest "$new_clone/Cargo.toml"
+python3 -B "$campaign/derive_locks.py" "$locks" --manifest "$new_clone/Cargo.toml" --check
+```
+
+On Linux the first volume below is the single-drive reference and the
+second is the RAID or ZFS candidate. `$cpus` is the four-core set in the
+protocol. Set the host lease for the whole session and choose an empty,
+private output directory. The commands below illustrate the 5900X.
+
+```sh
+export MMDB_TRIAL_HOST_LOCK="$work/.host-measurement.lock"
+taskset -c 4-7 python3 -c 'import os; assert os.sched_getaffinity(0) == {4, 5, 6, 7}'
+revision=b18532df32ee89af88734577e23be6e87041b0c1
+old=828e47a1d019e3fd0854a3d9a0d98b72e873350c
+python3 -B "$campaign/retest_storage.py" "$out" --revision "$revision" \
+  --storage "$storage" --engine "$engine" --old-storage "$old_storage" --old-revision "$old" \
+  --volume 5900x-single "$single" nvme1n1 --volume 5900x-raid "$raid" nvme2n1,nvme3n1 \
+  --primary 5900x-raid --cpus 4-7
+python3 -B "$campaign/retest_reads.py" "$probe" "$single/fixtures" "$out/5900x-single/grouped" \
+  --stack 5900x-single --revision "$revision" --devices nvme1n1
+python3 -B "$campaign/retest_reads.py" "$probe" "$raid/fixtures" "$out/5900x-raid/grouped" \
+  --stack 5900x-raid --revision "$revision" --devices nvme2n1,nvme3n1
+python3 -B "$campaign/retest_memory.py" "$out" --revision "$revision" \
+  --engine "$engine" --old-engine "$old_engine" --old-revision "$old" \
+  --volume 5900x-single "$single" --volume 5900x-raid "$raid" --primary 5900x-raid --cpus 4-7
+```
+
+On macOS pass one `m5-apfs` volume, `--cpus native`, and `-` for
+the storage runner's disk list. Reuse the same command, path and binaries
+after an interruption. Checkpoint identity includes the measured binary
+and runner fingerprints; new identities need new output directories.
+The capacity driver's `--checkpoint-dir`, `--engine-dir` and `--lockfile`
+select its resumable mode.
+
+To compare the published packets, extract each archive into its own
+directory, preserving its `raw/` layout. Keep the generated tables in a
+working directory. The comparison validates the work-ID mapping, including
+distinct controls within each analysis and identical raw payloads in
+shared views. A change of evidence status is reported even if both
+campaigns estimated the same direction.
+
+```sh
+python3 -B "$campaign/analyze.py" "$previous/raw" "$previous/summary"
+python3 -B "$campaign/analyze.py" "$current/raw" "$current/summary" \
+  --retest-freeze "$campaign/retest-5.0.1.json" --compare "$previous/summary"
+```
+
+`changes.csv` compares the configuration gains across campaigns;
+the `version-*` rows in the new `paired.csv` compare binaries inside
+one campaign. `executions.json` reconciles physical storage processes
+with their analysis views. `through_compact_MiB_s` uses the clock from
+the common start through the explicit terminal maintenance pass.
