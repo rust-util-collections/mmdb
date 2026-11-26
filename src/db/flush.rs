@@ -941,6 +941,109 @@ mod tests {
         db.flush().unwrap();
         assert_eq!(db.get(b"recursive").unwrap(), None);
     }
+
+    #[test]
+    fn flush_collector_releasing_final_db_handle_exits_and_releases_lock() {
+        use crate::BlockPropertyCollector;
+        use std::sync::Weak;
+
+        struct HoldWeakRead {
+            store: Arc<Mutex<Weak<DB>>>,
+            upgraded_tx: Mutex<Option<mpsc::Sender<()>>>,
+            release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+            lock_held_during_flush: Arc<AtomicBool>,
+            storage_path: PathBuf,
+        }
+        impl BlockPropertyCollector for HoldWeakRead {
+            fn add(&mut self, key: &[u8]) {
+                if let Some(rx) = self.release_rx.lock().take() {
+                    let db = self.store.lock().upgrade().expect("live DB handle");
+                    assert!(db.get(key).unwrap().is_some());
+                    self.upgraded_tx.lock().take().unwrap().send(()).unwrap();
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    drop(db);
+                    // Even after `DB::drop` ran on `mmdb-flush`, `LOCK` must stay
+                    // held while the worker finishes writing and installing the SST.
+                    #[cfg(unix)]
+                    {
+                        let probe = DB::open(options(), &self.storage_path);
+                        self.lock_held_during_flush
+                            .store(probe.is_err(), Ordering::Release);
+                    }
+                    #[cfg(not(unix))]
+                    self.lock_held_during_flush.store(true, Ordering::Release);
+                }
+            }
+            fn finish_block(&mut self) -> Vec<u8> {
+                Vec::new()
+            }
+            fn name(&self) -> &str {
+                "final-drop-collector"
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Weak::new()));
+        let (upgraded_tx, upgraded_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let lock_held = Arc::new(AtomicBool::new(false));
+        let path_for_collector = dir.path().to_path_buf();
+        let store_for_collector = Arc::clone(&store);
+        let lock_held_for_collector = Arc::clone(&lock_held);
+        let upgraded_slot = Arc::new(Mutex::new(Some(upgraded_tx)));
+        let release_slot = Arc::new(Mutex::new(Some(release_rx)));
+        let db = Arc::new(
+            DB::open(
+                options()
+                    .with_max_immutable_memtables(1)
+                    .with_block_property_collectors(vec![Arc::new(move || {
+                        Box::new(HoldWeakRead {
+                            store: Arc::clone(&store_for_collector),
+                            upgraded_tx: Mutex::new(upgraded_slot.lock().take()),
+                            release_rx: Mutex::new(release_slot.lock().take()),
+                            lock_held_during_flush: Arc::clone(&lock_held_for_collector),
+                            storage_path: path_for_collector.clone(),
+                        })
+                    })]),
+                dir.path(),
+            )
+            .unwrap(),
+        );
+        *store.lock() = Arc::downgrade(&db);
+        let lifecycle = Arc::clone(&db.worker_lifecycle);
+
+        let payload = vec![7u8; (8 << 10) + 1];
+        db.put(b"k", &payload).unwrap();
+        upgraded_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("flush collector never ran");
+
+        // Drop the caller's last external handle while the callback still holds its
+        // upgraded Arc<DB>, then release the callback so `DB::drop` runs on `mmdb-flush`.
+        drop(db);
+        release_tx.send(()).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            lifecycle.wait_until_stopped();
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("flush worker did not terminate cleanly");
+        waiter.join().unwrap();
+        assert!(
+            lock_held.load(Ordering::Acquire),
+            "LOCK must remain held until worker teardown completes"
+        );
+
+        let reopened = DB::open(options(), dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"k").unwrap().as_deref(),
+            Some(payload.as_slice())
+        );
+        reopened.close().unwrap();
+    }
     #[test]
     fn directory_sync_failure_leaves_manifest_boundary_and_old_wal_intact() {
         use crate::manifest::version_set::FAIL_NEXT_SST_DIR_SYNC;

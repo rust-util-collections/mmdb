@@ -567,6 +567,107 @@ impl Drop for DirLock {
     }
 }
 
+struct DeferredTeardown {
+    flush_queue: Arc<FlushQueue>,
+    storage_path: PathBuf,
+    block_cache: Arc<BlockCache>,
+    table_cache: Arc<TableCache>,
+    inner: Arc<Mutex<DBInner>>,
+    super_version: Arc<ArcSwap<SuperVersion>>,
+    dir_sync: Arc<Mutex<Option<fs::File>>>,
+    lock_file: Option<DirLock>,
+}
+
+impl DeferredTeardown {
+    fn run(self) {
+        self.block_cache.detach();
+        self.flush_queue.cleanup_standby_wal(&self.storage_path);
+        let mut inner = self.inner.lock();
+        inner.wal_writer.take();
+        inner.versions.release_files();
+        inner.active_memtable = Arc::new(MemTable::new());
+        inner.immutable_memtables.clear();
+        refresh_super_version(&self.super_version, &inner);
+        drop(inner);
+        self.dir_sync.lock().take();
+        self.table_cache.close();
+        drop(self.lock_file);
+    }
+}
+
+#[derive(Default)]
+struct WorkerLifecycleState {
+    live_workers: usize,
+    teardown_in_progress: bool,
+    deferred: Option<DeferredTeardown>,
+}
+
+/// Tracks live background workers so dropping the final `Arc<DB>` from inside
+/// a worker or scoped subcompaction callback can hand final resource/LOCK
+/// teardown to the last exiting worker without self-joining or deadlocking.
+#[derive(Default)]
+pub(super) struct WorkerLifecycle {
+    state: Mutex<WorkerLifecycleState>,
+    all_exited: Condvar,
+}
+
+struct WorkerExitGuard(Arc<WorkerLifecycle>);
+
+impl WorkerLifecycle {
+    fn enter(this: &Arc<Self>) -> WorkerExitGuard {
+        this.state.lock().live_workers += 1;
+        WorkerExitGuard(Arc::clone(this))
+    }
+
+    fn defer_teardown(&self, deferred: DeferredTeardown) {
+        let run_now = {
+            let mut state = self.state.lock();
+            if state.live_workers == 0 {
+                Some(deferred)
+            } else {
+                state.deferred = Some(deferred);
+                None
+            }
+        };
+        if let Some(deferred) = run_now {
+            deferred.run();
+        }
+    }
+
+    pub(super) fn wait_until_stopped(&self) {
+        let mut state = self.state.lock();
+        while state.live_workers != 0 || state.teardown_in_progress {
+            self.all_exited.wait(&mut state);
+        }
+    }
+}
+
+impl Drop for WorkerExitGuard {
+    fn drop(&mut self) {
+        let deferred = {
+            let mut state = self.0.state.lock();
+            state.live_workers -= 1;
+            if state.live_workers == 0 {
+                let d = state.deferred.take();
+                if d.is_some() {
+                    state.teardown_in_progress = true;
+                } else {
+                    self.0.all_exited.notify_all();
+                }
+                d
+            } else {
+                None
+            }
+        };
+        if let Some(deferred) = deferred {
+            deferred.run();
+            let mut state = self.0.state.lock();
+            state.teardown_in_progress = false;
+            self.0.all_exited.notify_all();
+        }
+    }
+}
+
 /// File numbers claimed by in-flight compaction picks, paired with a condvar
 /// so the explicit full-compaction path can wait for in-flight picks to
 /// install or discard instead of silently skipping their input files.
@@ -678,6 +779,7 @@ pub struct DB {
     compaction_shutdown: Arc<AtomicBool>,
     /// Background compaction thread handles.
     compaction_handles: Mutex<Vec<JoinHandle<()>>>,
+    worker_lifecycle: Arc<WorkerLifecycle>,
     /// File numbers currently claimed by an in-progress compaction pick
     /// (between `pick_compaction` and `install_compaction`/discard). Lets
     /// concurrent background compaction threads (multiple
@@ -1372,6 +1474,7 @@ impl DB {
         let read_compaction_hints = Arc::new(Mutex::new(Vec::<CompactionHint>::new()));
         let snapshot_list = Arc::new(SnapshotList::new());
         let flush_queue = Arc::new(FlushQueue::default());
+        let worker_lifecycle = Arc::new(WorkerLifecycle::default());
         for i in 0..num_compaction_threads {
             let bg_flush_queue = flush_queue.clone();
             let bg_inner = Arc::clone(&inner);
@@ -1394,299 +1497,308 @@ impl DB {
             let bg_dead_key_sweep = dead_key_sweep.clone();
             let bg_manifest_poisoned = manifest_poisoned.clone();
             let bg_dir_sync = dir_sync.clone();
+            let worker_exit = WorkerLifecycle::enter(&worker_lifecycle);
 
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
                 .spawn(move || {
-                    // Helper: set background error and log it.
-                    let set_error = |msg: String| {
-                        tracing::error!("{}", msg);
-                        *bg_error_msg.lock() = Some(msg.clone());
-                        bg_has_error.store(true, Ordering::Release);
-                        bg_flush_queue.fail(Error::background(msg));
-                    };
+                    let _worker_exit = worker_exit;
+                    (move || {
+                        // Helper: set background error and log it.
+                        let set_error = |msg: String| {
+                            tracing::error!("{}", msg);
+                            *bg_error_msg.lock() = Some(msg.clone());
+                            bg_has_error.store(true, Ordering::Release);
+                            bg_flush_queue.fail(Error::background(msg));
+                        };
 
-                    let mut retry_l0 = false;
-                    loop {
-                        // Wait for notification
-                        {
-                            let (lock, cvar) = &*notify;
-                            let mut has_work = lock.lock();
-                            while !*has_work && !shutdown.load(Ordering::Acquire) {
-                                cvar.wait(&mut has_work);
+                        let mut retry_l0 = false;
+                        loop {
+                            // Wait for notification
+                            {
+                                let (lock, cvar) = &*notify;
+                                let mut has_work = lock.lock();
+                                while !*has_work && !shutdown.load(Ordering::Acquire) {
+                                    cvar.wait(&mut has_work);
+                                }
+                                *has_work = false; // consumed
                             }
-                            *has_work = false; // consumed
-                        }
-                        if shutdown.load(Ordering::Acquire) {
-                            break;
-                        }
+                            if shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
 
-                        // Wrap compaction work in catch_unwind to prevent
-                        // thread death from panics in corrupt data paths.
-                        let result = catch_unwind(AssertUnwindSafe(
-                            || -> std::result::Result<(), String> {
-                                // Run pending organic compactions first (L0 and byte-budget
-                                // levels take strict precedence over optional read hints),
-                                // and re-check organic budgets whenever a hint installs an
-                                // edit that may push its target level over budget.
-                                loop {
+                            // Wrap compaction work in catch_unwind to prevent
+                            // thread death from panics in corrupt data paths.
+                            let result = catch_unwind(AssertUnwindSafe(
+                                || -> std::result::Result<(), String> {
+                                    // Run pending organic compactions first (L0 and byte-budget
+                                    // levels take strict precedence over optional read hints),
+                                    // and re-check organic budgets whenever a hint installs an
+                                    // edit that may push its target level over budget.
                                     loop {
-                                        if shutdown.load(Ordering::Acquire) {
-                                            return Ok(());
-                                        }
-                                        // Phase 1: pick and claim (short lock)
-                                        let pick = {
-                                            let inner = bg_inner.lock();
-                                            let version = inner.versions.current();
-                                            let mut claimed = bg_compacting_files.lock();
-                                            match LeveledCompaction::pick_compaction(
-                                                &version,
-                                                &bg_options,
-                                                &claimed,
-                                            ) {
-                                                Some(task) => {
-                                                    let l0_inputs: Vec<u64> = if task.level == 0 {
-                                                        task.input_files_level
-                                                            .iter()
-                                                            .map(|f| f.meta.number)
-                                                            .collect()
-                                                    } else {
-                                                        Vec::new()
-                                                    };
-                                                    let file_numbers =
-                                                        inner.versions.file_numbers.clone();
-                                                    let all_inputs: Vec<_> = task
-                                                        .input_files_level
-                                                        .iter()
-                                                        .chain(task.input_files_next.iter())
-                                                        .cloned()
-                                                        .collect();
-                                                    let is_bottom =
-                                                        LeveledCompaction::is_bottommost_level(
-                                                            &version,
-                                                            task.level,
-                                                            bg_options.num_levels,
-                                                            &all_inputs,
-                                                        );
-                                                    let claimed_numbers: Vec<u64> = all_inputs
-                                                        .iter()
-                                                        .map(|f| f.meta.number)
-                                                        .collect();
-                                                    claimed.extend(claimed_numbers.iter().copied());
-                                                    let active_snaps =
-                                                        bg_snapshot_list.as_sorted_vec();
-                                                    Some((
-                                                        task,
-                                                        file_numbers,
-                                                        l0_inputs,
-                                                        is_bottom,
-                                                        active_snaps,
-                                                        claimed_numbers,
-                                                    ))
-                                                }
-                                                None => None,
-                                            }
-                                        };
-
-                                        let Some((
-                                            task,
-                                            file_numbers,
-                                            l0_inputs,
-                                            is_bottom,
-                                            active_snaps,
-                                            claimed_numbers,
-                                        )) = pick
-                                        else {
-                                            break;
-                                        };
-                                        let _claim = CompactionClaim {
-                                            claims: Arc::clone(&bg_compacting_files),
-                                            numbers: claimed_numbers,
-                                        };
-
-                                        // Phase 2: I/O (no lock held)
-                                        let ctx = CompactionContext {
-                                            db_path: &bg_path,
-                                            dir_sync: &bg_dir_sync,
-                                            manifest_poisoned: &bg_manifest_poisoned,
-                                            options: &bg_options,
-                                            builds: &bg_builds,
-                                            rate_limiter: Some(&bg_rate_limiter),
-                                            stats: Some(&bg_stats),
-                                            active_snapshots: &active_snaps,
-                                        };
-                                        let output = LeveledCompaction::execute_compaction_io(
-                                            &ctx,
-                                            &task,
-                                            &file_numbers,
-                                            is_bottom,
-                                        )
-                                        .map_err(|e| format!("compaction error: {}", e))?;
-
-                                        bg_table_cache.prewarm(
-                                            output
-                                                .edit
-                                                .new_files
-                                                .iter()
-                                                .map(|(_, meta)| meta.number),
-                                        );
-
-                                        // Phase 3: validate and install the directory-synced outputs.
-                                        let cleanup = {
-                                            let mut inner = bg_inner.lock();
-                                            let cleanup = LeveledCompaction::install_compaction(
-                                                output,
-                                                &mut inner.versions,
-                                                Some(&bg_table_cache),
-                                                Some(&bg_block_cache),
-                                                &bg_path,
-                                                Some(&bg_stats),
-                                                !bg_snapshot_list.is_empty(),
-                                            )
-                                            .map_err(|e| {
-                                                format!("compaction install error: {}", e)
-                                            })?;
-                                            if !l0_inputs.is_empty() {
-                                                let current = inner.versions.current();
-                                                for num in &l0_inputs {
-                                                    if !current
-                                                        .level_files(0)
-                                                        .iter()
-                                                        .any(|tf| tf.meta.number == *num)
-                                                    {
-                                                        bg_block_cache.unpin_file(*num);
-                                                    }
-                                                }
-                                            }
-                                            bg_l0_count.store(
-                                                inner.versions.current().l0_file_count(),
-                                                Ordering::Relaxed,
-                                            );
-                                            refresh_super_version(&bg_sv, &inner);
-                                            cleanup
-                                        };
-                                        // Phase 4: sync manifest + delete old SSTs (no lock)
-                                        if let Err(e) = {
-                                            let manifest_handle =
-                                                bg_inner.lock().versions.manifest_sync_handle();
-                                            confirm_manifest_durable(
-                                                &manifest_handle,
-                                                &bg_manifest_poisoned,
-                                            )
-                                        } {
-                                            return Err(format!("manifest sync error: {}", e));
-                                        }
-                                        LeveledCompaction::run_post_compaction_cleanup(
-                                            &cleanup, &bg_path,
-                                        );
-                                    }
-
-                                    // Drain read-compaction hints only after organic backlog clears.
-                                    let mut hint_installed = false;
-                                    let hints: Vec<CompactionHint> =
-                                        mem::take(&mut *bg_hints.lock());
-                                    if !hints.is_empty() {
-                                        for hint in &hints {
+                                        loop {
                                             if shutdown.load(Ordering::Acquire) {
                                                 return Ok(());
                                             }
-                                            // Evaluate user filter `is_noop()` outside `DB::inner`,
-                                            // covered by the SST callback re-entrancy guard.
-                                            let allow_trivial_move = {
-                                                let _build = bg_builds.enter();
-                                                bg_options
-                                                    .compaction_filter
-                                                    .as_ref()
-                                                    .is_none_or(|f| f.is_noop())
-                                            };
+                                            // Phase 1: pick and claim (short lock)
                                             let pick = {
                                                 let inner = bg_inner.lock();
                                                 let version = inner.versions.current();
                                                 let mut claimed = bg_compacting_files.lock();
-                                                LeveledCompaction::pick_compaction_for_hint(
+                                                match LeveledCompaction::pick_compaction(
                                                     &version,
                                                     &bg_options,
-                                                    hint,
                                                     &claimed,
-                                                    allow_trivial_move,
-                                                )
-                                                .map(|task| {
-                                                    let file_numbers =
-                                                        inner.versions.file_numbers.clone();
-                                                    let all_inputs: Vec<_> = task
-                                                        .input_files_level
-                                                        .iter()
-                                                        .chain(task.input_files_next.iter())
-                                                        .cloned()
-                                                        .collect();
-                                                    let is_bottom =
-                                                        LeveledCompaction::is_bottommost_level(
-                                                            &version,
-                                                            task.level,
-                                                            bg_options.num_levels,
-                                                            &all_inputs,
+                                                ) {
+                                                    Some(task) => {
+                                                        let l0_inputs: Vec<u64> = if task.level == 0
+                                                        {
+                                                            task.input_files_level
+                                                                .iter()
+                                                                .map(|f| f.meta.number)
+                                                                .collect()
+                                                        } else {
+                                                            Vec::new()
+                                                        };
+                                                        let file_numbers =
+                                                            inner.versions.file_numbers.clone();
+                                                        let all_inputs: Vec<_> = task
+                                                            .input_files_level
+                                                            .iter()
+                                                            .chain(task.input_files_next.iter())
+                                                            .cloned()
+                                                            .collect();
+                                                        let is_bottom =
+                                                            LeveledCompaction::is_bottommost_level(
+                                                                &version,
+                                                                task.level,
+                                                                bg_options.num_levels,
+                                                                &all_inputs,
+                                                            );
+                                                        let claimed_numbers: Vec<u64> = all_inputs
+                                                            .iter()
+                                                            .map(|f| f.meta.number)
+                                                            .collect();
+                                                        claimed.extend(
+                                                            claimed_numbers.iter().copied(),
                                                         );
-                                                    let claimed_numbers: Vec<u64> = all_inputs
-                                                        .iter()
-                                                        .map(|f| f.meta.number)
-                                                        .collect();
-                                                    claimed.extend(claimed_numbers.iter().copied());
-                                                    let active_snaps =
-                                                        bg_snapshot_list.as_sorted_vec();
-                                                    (
-                                                        task,
-                                                        file_numbers,
-                                                        is_bottom,
-                                                        active_snaps,
-                                                        claimed_numbers,
-                                                    )
-                                                })
+                                                        let active_snaps =
+                                                            bg_snapshot_list.as_sorted_vec();
+                                                        Some((
+                                                            task,
+                                                            file_numbers,
+                                                            l0_inputs,
+                                                            is_bottom,
+                                                            active_snaps,
+                                                            claimed_numbers,
+                                                        ))
+                                                    }
+                                                    None => None,
+                                                }
                                             };
 
-                                            if let Some((
+                                            let Some((
                                                 task,
                                                 file_numbers,
+                                                l0_inputs,
                                                 is_bottom,
                                                 active_snaps,
                                                 claimed_numbers,
                                             )) = pick
-                                            {
-                                                let _claim = CompactionClaim {
-                                                    claims: Arc::clone(&bg_compacting_files),
-                                                    numbers: claimed_numbers,
-                                                };
-                                                let ctx = CompactionContext {
-                                                    db_path: &bg_path,
-                                                    dir_sync: &bg_dir_sync,
-                                                    manifest_poisoned: &bg_manifest_poisoned,
-                                                    options: &bg_options,
-                                                    builds: &bg_builds,
-                                                    rate_limiter: Some(&bg_rate_limiter),
-                                                    stats: Some(&bg_stats),
-                                                    active_snapshots: &active_snaps,
-                                                };
-                                                let output =
-                                                    LeveledCompaction::execute_compaction_io(
-                                                        &ctx,
-                                                        &task,
-                                                        &file_numbers,
-                                                        is_bottom,
+                                            else {
+                                                break;
+                                            };
+                                            let _claim = CompactionClaim {
+                                                claims: Arc::clone(&bg_compacting_files),
+                                                numbers: claimed_numbers,
+                                            };
+
+                                            // Phase 2: I/O (no lock held)
+                                            let ctx = CompactionContext {
+                                                db_path: &bg_path,
+                                                dir_sync: &bg_dir_sync,
+                                                manifest_poisoned: &bg_manifest_poisoned,
+                                                options: &bg_options,
+                                                builds: &bg_builds,
+                                                rate_limiter: Some(&bg_rate_limiter),
+                                                stats: Some(&bg_stats),
+                                                active_snapshots: &active_snaps,
+                                            };
+                                            let output = LeveledCompaction::execute_compaction_io(
+                                                &ctx,
+                                                &task,
+                                                &file_numbers,
+                                                is_bottom,
+                                            )
+                                            .map_err(|e| format!("compaction error: {}", e))?;
+
+                                            bg_table_cache.prewarm(
+                                                output
+                                                    .edit
+                                                    .new_files
+                                                    .iter()
+                                                    .map(|(_, meta)| meta.number),
+                                            );
+
+                                            // Phase 3: validate and install the directory-synced outputs.
+                                            let cleanup = {
+                                                let mut inner = bg_inner.lock();
+                                                let cleanup =
+                                                    LeveledCompaction::install_compaction(
+                                                        output,
+                                                        &mut inner.versions,
+                                                        Some(&bg_table_cache),
+                                                        Some(&bg_block_cache),
+                                                        &bg_path,
+                                                        Some(&bg_stats),
+                                                        !bg_snapshot_list.is_empty(),
                                                     )
                                                     .map_err(|e| {
-                                                        format!("hint compaction error: {}", e)
+                                                        format!("compaction install error: {}", e)
                                                     })?;
-
-                                                bg_table_cache.prewarm(
-                                                    output
-                                                        .edit
-                                                        .new_files
-                                                        .iter()
-                                                        .map(|(_, meta)| meta.number),
+                                                if !l0_inputs.is_empty() {
+                                                    let current = inner.versions.current();
+                                                    for num in &l0_inputs {
+                                                        if !current
+                                                            .level_files(0)
+                                                            .iter()
+                                                            .any(|tf| tf.meta.number == *num)
+                                                        {
+                                                            bg_block_cache.unpin_file(*num);
+                                                        }
+                                                    }
+                                                }
+                                                bg_l0_count.store(
+                                                    inner.versions.current().l0_file_count(),
+                                                    Ordering::Relaxed,
                                                 );
+                                                refresh_super_version(&bg_sv, &inner);
+                                                cleanup
+                                            };
+                                            // Phase 4: sync manifest + delete old SSTs (no lock)
+                                            if let Err(e) = {
+                                                let manifest_handle =
+                                                    bg_inner.lock().versions.manifest_sync_handle();
+                                                confirm_manifest_durable(
+                                                    &manifest_handle,
+                                                    &bg_manifest_poisoned,
+                                                )
+                                            } {
+                                                return Err(format!("manifest sync error: {}", e));
+                                            }
+                                            LeveledCompaction::run_post_compaction_cleanup(
+                                                &cleanup, &bg_path,
+                                            );
+                                        }
 
-                                                let cleanup = {
-                                                    let mut inner = bg_inner.lock();
-                                                    let cleanup =
+                                        // Drain read-compaction hints only after organic backlog clears.
+                                        let mut hint_installed = false;
+                                        let hints: Vec<CompactionHint> =
+                                            mem::take(&mut *bg_hints.lock());
+                                        if !hints.is_empty() {
+                                            for hint in &hints {
+                                                if shutdown.load(Ordering::Acquire) {
+                                                    return Ok(());
+                                                }
+                                                // Evaluate user filter `is_noop()` outside `DB::inner`,
+                                                // covered by the SST callback re-entrancy guard.
+                                                let allow_trivial_move = {
+                                                    let _build = bg_builds.enter();
+                                                    bg_options
+                                                        .compaction_filter
+                                                        .as_ref()
+                                                        .is_none_or(|f| f.is_noop())
+                                                };
+                                                let pick = {
+                                                    let inner = bg_inner.lock();
+                                                    let version = inner.versions.current();
+                                                    let mut claimed = bg_compacting_files.lock();
+                                                    LeveledCompaction::pick_compaction_for_hint(
+                                                        &version,
+                                                        &bg_options,
+                                                        hint,
+                                                        &claimed,
+                                                        allow_trivial_move,
+                                                    )
+                                                    .map(|task| {
+                                                        let file_numbers =
+                                                            inner.versions.file_numbers.clone();
+                                                        let all_inputs: Vec<_> = task
+                                                            .input_files_level
+                                                            .iter()
+                                                            .chain(task.input_files_next.iter())
+                                                            .cloned()
+                                                            .collect();
+                                                        let is_bottom =
+                                                            LeveledCompaction::is_bottommost_level(
+                                                                &version,
+                                                                task.level,
+                                                                bg_options.num_levels,
+                                                                &all_inputs,
+                                                            );
+                                                        let claimed_numbers: Vec<u64> = all_inputs
+                                                            .iter()
+                                                            .map(|f| f.meta.number)
+                                                            .collect();
+                                                        claimed.extend(
+                                                            claimed_numbers.iter().copied(),
+                                                        );
+                                                        let active_snaps =
+                                                            bg_snapshot_list.as_sorted_vec();
+                                                        (
+                                                            task,
+                                                            file_numbers,
+                                                            is_bottom,
+                                                            active_snaps,
+                                                            claimed_numbers,
+                                                        )
+                                                    })
+                                                };
+
+                                                if let Some((
+                                                    task,
+                                                    file_numbers,
+                                                    is_bottom,
+                                                    active_snaps,
+                                                    claimed_numbers,
+                                                )) = pick
+                                                {
+                                                    let _claim = CompactionClaim {
+                                                        claims: Arc::clone(&bg_compacting_files),
+                                                        numbers: claimed_numbers,
+                                                    };
+                                                    let ctx = CompactionContext {
+                                                        db_path: &bg_path,
+                                                        dir_sync: &bg_dir_sync,
+                                                        manifest_poisoned: &bg_manifest_poisoned,
+                                                        options: &bg_options,
+                                                        builds: &bg_builds,
+                                                        rate_limiter: Some(&bg_rate_limiter),
+                                                        stats: Some(&bg_stats),
+                                                        active_snapshots: &active_snaps,
+                                                    };
+                                                    let output =
+                                                        LeveledCompaction::execute_compaction_io(
+                                                            &ctx,
+                                                            &task,
+                                                            &file_numbers,
+                                                            is_bottom,
+                                                        )
+                                                        .map_err(|e| {
+                                                            format!("hint compaction error: {}", e)
+                                                        })?;
+
+                                                    bg_table_cache.prewarm(
+                                                        output
+                                                            .edit
+                                                            .new_files
+                                                            .iter()
+                                                            .map(|(_, meta)| meta.number),
+                                                    );
+
+                                                    let cleanup = {
+                                                        let mut inner = bg_inner.lock();
+                                                        let cleanup =
                                                         LeveledCompaction::install_compaction(
                                                             output,
                                                             &mut inner.versions,
@@ -1702,140 +1814,150 @@ impl DB {
                                                                 e
                                                             )
                                                         })?;
-                                                    bg_l0_count.store(
-                                                        inner.versions.current().l0_file_count(),
-                                                        Ordering::Relaxed,
+                                                        bg_l0_count.store(
+                                                            inner
+                                                                .versions
+                                                                .current()
+                                                                .l0_file_count(),
+                                                            Ordering::Relaxed,
+                                                        );
+                                                        refresh_super_version(&bg_sv, &inner);
+                                                        cleanup
+                                                    };
+                                                    if let Err(e) = {
+                                                        let manifest_handle = bg_inner
+                                                            .lock()
+                                                            .versions
+                                                            .manifest_sync_handle();
+                                                        confirm_manifest_durable(
+                                                            &manifest_handle,
+                                                            &bg_manifest_poisoned,
+                                                        )
+                                                    } {
+                                                        return Err(format!(
+                                                            "manifest sync error: {}",
+                                                            e
+                                                        ));
+                                                    }
+                                                    hint_installed |= cleanup.installed;
+                                                    LeveledCompaction::run_post_compaction_cleanup(
+                                                        &cleanup, &bg_path,
                                                     );
-                                                    refresh_super_version(&bg_sv, &inner);
-                                                    cleanup
-                                                };
-                                                if let Err(e) = {
-                                                    let manifest_handle = bg_inner
-                                                        .lock()
-                                                        .versions
-                                                        .manifest_sync_handle();
-                                                    confirm_manifest_durable(
-                                                        &manifest_handle,
-                                                        &bg_manifest_poisoned,
-                                                    )
-                                                } {
-                                                    return Err(format!(
-                                                        "manifest sync error: {}",
-                                                        e
-                                                    ));
                                                 }
-                                                hint_installed |= cleanup.installed;
-                                                LeveledCompaction::run_post_compaction_cleanup(
-                                                    &cleanup, &bg_path,
-                                                );
                                             }
                                         }
-                                    }
-                                    if !hint_installed {
-                                        break;
-                                    }
-                                }
-
-                                // A pending sweep stays queued while snapshots
-                                // are active. Once runnable, process deeper
-                                // levels first so removing older copies can make
-                                // shallower copies eligible in the same pass.
-                                loop {
-                                    if shutdown.load(Ordering::Acquire)
-                                        || !bg_dead_key_sweep.is_pending()
-                                        || !bg_snapshot_list.is_empty()
-                                        || !bg_dead_key_sweep.try_start()
-                                    {
-                                        break;
+                                        if !hint_installed {
+                                            break;
+                                        }
                                     }
 
-                                    let mut blocked_by_snapshot = false;
-                                    let mut deferred_l0 = false;
-                                    for level in (0..bg_options.num_levels).rev() {
-                                        if shutdown.load(Ordering::Acquire) {
-                                            bg_dead_key_sweep.finish(true);
-                                            return Ok(());
+                                    // A pending sweep stays queued while snapshots
+                                    // are active. Once runnable, process deeper
+                                    // levels first so removing older copies can make
+                                    // shallower copies eligible in the same pass.
+                                    loop {
+                                        if shutdown.load(Ordering::Acquire)
+                                            || !bg_dead_key_sweep.is_pending()
+                                            || !bg_snapshot_list.is_empty()
+                                            || !bg_dead_key_sweep.try_start()
+                                        {
+                                            break;
                                         }
-                                        blocked_by_snapshot |= !bg_snapshot_list.is_empty();
-                                        let ctx = CompactionContext {
-                                            db_path: &bg_path,
-                                            dir_sync: &bg_dir_sync,
-                                            manifest_poisoned: &bg_manifest_poisoned,
-                                            options: &bg_options,
-                                            builds: &bg_builds,
-                                            rate_limiter: Some(&bg_rate_limiter),
-                                            stats: Some(&bg_stats),
-                                            active_snapshots: &[],
-                                        };
-                                        let rewrite = LevelRewrite {
-                                            inner: &bg_inner,
-                                            snapshots: &bg_snapshot_list,
-                                            claims: &bg_compacting_files,
-                                            table_cache: &bg_table_cache,
-                                            block_cache: &bg_block_cache,
-                                            super_version: &bg_sv,
-                                            l0_count: &bg_l0_count,
-                                        };
-                                        let swept = rewrite
-                                            .run(level, &ctx, level == 0 && retry_l0)
-                                            .map_err(|e| {
-                                                format!("dead-key sweep error at L{level}: {e}")
-                                            })?;
-                                        if level == 0 {
-                                            deferred_l0 = !swept;
-                                            retry_l0 = !swept && !retry_l0;
+
+                                        let mut blocked_by_snapshot = false;
+                                        let mut deferred_l0 = false;
+                                        for level in (0..bg_options.num_levels).rev() {
+                                            if shutdown.load(Ordering::Acquire) {
+                                                bg_dead_key_sweep.finish(true);
+                                                return Ok(());
+                                            }
+                                            blocked_by_snapshot |= !bg_snapshot_list.is_empty();
+                                            let ctx = CompactionContext {
+                                                db_path: &bg_path,
+                                                dir_sync: &bg_dir_sync,
+                                                manifest_poisoned: &bg_manifest_poisoned,
+                                                options: &bg_options,
+                                                builds: &bg_builds,
+                                                rate_limiter: Some(&bg_rate_limiter),
+                                                stats: Some(&bg_stats),
+                                                active_snapshots: &[],
+                                            };
+                                            let rewrite = LevelRewrite {
+                                                inner: &bg_inner,
+                                                snapshots: &bg_snapshot_list,
+                                                claims: &bg_compacting_files,
+                                                table_cache: &bg_table_cache,
+                                                block_cache: &bg_block_cache,
+                                                super_version: &bg_sv,
+                                                l0_count: &bg_l0_count,
+                                            };
+                                            let swept = rewrite
+                                                .run(level, &ctx, level == 0 && retry_l0)
+                                                .map_err(|e| {
+                                                    format!("dead-key sweep error at L{level}: {e}")
+                                                })?;
+                                            if level == 0 {
+                                                deferred_l0 = !swept;
+                                                retry_l0 = !swept && !retry_l0;
+                                            }
+                                            blocked_by_snapshot |= !bg_snapshot_list.is_empty();
                                         }
-                                        blocked_by_snapshot |= !bg_snapshot_list.is_empty();
+                                        #[cfg(test)]
+                                        if deferred_l0 {
+                                            let hook = bg_dead_key_sweep
+                                                .before_deferred_finish
+                                                .lock()
+                                                .take();
+                                            if let Some(hook) = hook {
+                                                hook();
+                                            }
+                                        }
+                                        bg_dead_key_sweep
+                                            .finish(blocked_by_snapshot || deferred_l0);
+                                        // Publish Pending before checking whether the
+                                        // flush is still in flight. Another worker may
+                                        // have consumed its notification while this
+                                        // sweep was Running. If it already installed,
+                                        // retry here; otherwise its install follows
+                                        // this locked check and sends a new wake.
+                                        if deferred_l0
+                                            && !bg_inner.lock().immutable_memtables.is_empty()
+                                        {
+                                            break;
+                                        }
                                     }
+                                    Ok(())
+                                },
+                            ));
+
+                            match result {
+                                Ok(Ok(())) => {
                                     #[cfg(test)]
-                                    if deferred_l0 {
-                                        let hook =
-                                            bg_dead_key_sweep.before_deferred_finish.lock().take();
-                                        if let Some(hook) = hook {
-                                            hook();
-                                        }
-                                    }
-                                    bg_dead_key_sweep.finish(blocked_by_snapshot || deferred_l0);
-                                    // Publish Pending before checking whether the
-                                    // flush is still in flight. Another worker may
-                                    // have consumed its notification while this
-                                    // sweep was Running. If it already installed,
-                                    // retry here; otherwise its install follows
-                                    // this locked check and sends a new wake.
-                                    if deferred_l0
-                                        && !bg_inner.lock().immutable_memtables.is_empty()
-                                    {
-                                        break;
-                                    }
+                                    bg_dead_key_sweep
+                                        .completed_passes
+                                        .fetch_add(1, Ordering::Release);
                                 }
-                                Ok(())
-                            },
-                        ));
-
-                        match result {
-                            Ok(Ok(())) => {
-                                #[cfg(test)]
-                                bg_dead_key_sweep
-                                    .completed_passes
-                                    .fetch_add(1, Ordering::Release);
-                            }
-                            Ok(Err(msg)) => {
-                                set_error(msg);
-                                break;
-                            }
-                            Err(panic_payload) => {
-                                let msg = if let Some(s) = panic_payload.downcast_ref::<String>() {
-                                    format!("compaction thread panicked: {}", s)
-                                } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                                    format!("compaction thread panicked: {}", s)
-                                } else {
-                                    "compaction thread panicked with unknown payload".to_string()
-                                };
-                                set_error(msg);
-                                break;
+                                Ok(Err(msg)) => {
+                                    set_error(msg);
+                                    break;
+                                }
+                                Err(panic_payload) => {
+                                    let msg = if let Some(s) =
+                                        panic_payload.downcast_ref::<String>()
+                                    {
+                                        format!("compaction thread panicked: {}", s)
+                                    } else if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                                        format!("compaction thread panicked: {}", s)
+                                    } else {
+                                        "compaction thread panicked with unknown payload"
+                                            .to_string()
+                                    };
+                                    set_error(msg);
+                                    break;
+                                }
                             }
                         }
-                    }
+                    })();
                 });
             // Test-only: force this iteration to be reported as a failed
             // spawn. Any real handle just created above is dropped
@@ -1916,6 +2038,7 @@ impl DB {
             rate_limiter,
             compaction_shutdown,
             compaction_handles: Mutex::new(compaction_handles),
+            worker_lifecycle: Arc::clone(&worker_lifecycle),
             compacting_files,
             l0_file_count,
 
@@ -1929,10 +2052,17 @@ impl DB {
 
         if !read_only {
             let ctx = db.flush_context();
+            let worker_exit = WorkerLifecycle::enter(&worker_lifecycle);
             *db.flush_worker.lock() = Some(
                 thread::Builder::new()
                     .name("mmdb-flush".into())
-                    .spawn(move || flush_queue.run(&ctx))
+                    .spawn(move || {
+                        let _worker_exit = worker_exit;
+                        {
+                            let (flush_queue, ctx) = (flush_queue, ctx);
+                            flush_queue.run(&ctx);
+                        }
+                    })
                     .ctx()?,
             );
         }
@@ -4244,14 +4374,53 @@ impl Drop for DB {
                 let _ = wal.sync();
             }
         }
+        let current_id = thread::current().id();
+        let on_worker_or_callback = self.builds.contains_current_thread()
+            || self
+                .flush_worker
+                .lock()
+                .as_ref()
+                .is_some_and(|h| h.thread().id() == current_id)
+            || self
+                .compaction_handles
+                .lock()
+                .iter()
+                .any(|h| h.thread().id() == current_id);
+        if on_worker_or_callback {
+            self.flush_queue.stop();
+            {
+                let (lock, cvar) = &*self.read.compaction_notify;
+                let _guard = lock.lock();
+                self.compaction_shutdown.store(true, Ordering::Release);
+                cvar.notify_all();
+            }
+            drop(self.flush_worker.lock().take());
+            drop(mem::take(&mut *self.compaction_handles.lock()));
+            self.worker_lifecycle.defer_teardown(DeferredTeardown {
+                flush_queue: Arc::clone(&self.flush_queue),
+                storage_path: self.storage_path.clone(),
+                block_cache: Arc::clone(&self.block_cache),
+                table_cache: Arc::clone(&self.table_cache),
+                inner: Arc::clone(&self.inner),
+                super_version: Arc::clone(&self.read.super_version),
+                dir_sync: Arc::clone(&self.dir_sync),
+                lock_file: self.lock_file.lock().take(),
+            });
+            return;
+        }
         self.stop_background_and_detach_cache();
-        self.flush_queue.cleanup_standby_wal(&self.storage_path);
-        let mut inner = self.inner.lock();
-        inner.wal_writer.take();
-        inner.versions.manifest_sync_handle().lock().take();
-        self.dir_sync.lock().take();
-        drop(inner);
-        self.lock_file.lock().take();
+        self.worker_lifecycle.wait_until_stopped();
+        DeferredTeardown {
+            flush_queue: Arc::clone(&self.flush_queue),
+            storage_path: self.storage_path.clone(),
+            block_cache: Arc::clone(&self.block_cache),
+            table_cache: Arc::clone(&self.table_cache),
+            inner: Arc::clone(&self.inner),
+            super_version: Arc::clone(&self.read.super_version),
+            dir_sync: Arc::clone(&self.dir_sync),
+            lock_file: self.lock_file.lock().take(),
+        }
+        .run();
     }
 }
 
@@ -7686,5 +7855,98 @@ mod tests {
             .expect("read-hint worker never invoked CompactionFilter::is_noop");
         assert_eq!(db.get(b"recursive").unwrap(), None);
         db.close().unwrap();
+    }
+
+    #[test]
+    fn parallel_subcompaction_callback_releasing_final_db_handle_avoids_deadlock() {
+        use std::sync::{Weak, mpsc};
+
+        struct SubcompactionDropFilter {
+            store: Arc<Mutex<Weak<DB>>>,
+            upgraded_tx: Mutex<Option<mpsc::Sender<()>>>,
+            release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+        }
+        impl CompactionFilter for SubcompactionDropFilter {
+            fn filter(
+                &self,
+                target_level: usize,
+                key: &[u8],
+                _: &[u8],
+            ) -> CompactionFilterDecision {
+                if target_level == 2
+                    && let Some(rx) = self.release_rx.lock().take()
+                {
+                    let db = self.store.lock().upgrade().expect("live DB handle");
+                    assert!(db.get(key).unwrap().is_some());
+                    self.upgraded_tx.lock().take().unwrap().send(()).unwrap();
+                    rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    // Dropping `db` here runs `DB::drop` on a scoped subcompaction
+                    // worker while the parent compaction worker waits in `thread::scope`.
+                    drop(db);
+                }
+                CompactionFilterDecision::Keep
+            }
+            fn is_noop(&self) -> bool {
+                false
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Weak::new()));
+        let (upgraded_tx, upgraded_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let opts = DbOptions::default()
+            .with_num_levels(3)
+            .with_l0_compaction_trigger(1)
+            .with_max_subcompactions(2)
+            .with_max_bytes_for_level_base(128)
+            .with_compaction_filter(Some(Arc::new(SubcompactionDropFilter {
+                store: Arc::clone(&store),
+                upgraded_tx: Mutex::new(Some(upgraded_tx)),
+                release_rx: Mutex::new(Some(release_rx)),
+            })));
+        let db = Arc::new(DB::open(opts, dir.path()).unwrap());
+        *store.lock() = Arc::downgrade(&db);
+        let lifecycle = Arc::clone(&db.worker_lifecycle);
+
+        // Two disjoint L2 files give `compute_split_points` an interior split,
+        // forcing `execute_compaction_io` onto the `thread::scope` parallel path
+        // once an overlapping L1 file pushes L1 over its 128-byte budget.
+        assert_eq!(db.ingest_sorted([(b"a0", b"1"), (b"m0", b"2")]).unwrap(), 2);
+        let reopen_opts = DbOptions::default()
+            .with_num_levels(3)
+            .with_max_subcompactions(2)
+            .with_max_bytes_for_level_base(128);
+        assert_eq!(db.ingest_sorted([(b"n0", b"3"), (b"z0", b"4")]).unwrap(), 2);
+        db.put(b"b0", &[b'x'; 256]).unwrap();
+        db.put(b"y0", &[b'y'; 256]).unwrap();
+        db.flush().unwrap();
+
+        upgraded_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("parallel subcompaction never entered filter callback");
+        drop(db);
+        release_tx.send(()).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            lifecycle.wait_until_stopped();
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("workers deadlocked after subcompaction callback dropped final Arc<DB>");
+        waiter.join().unwrap();
+
+        let reopened = DB::open(reopen_opts, dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"b0").unwrap().as_deref(),
+            Some(&[b'x'; 256][..])
+        );
+        assert_eq!(
+            reopened.get(b"y0").unwrap().as_deref(),
+            Some(&[b'y'; 256][..])
+        );
+        reopened.close().unwrap();
     }
 }
