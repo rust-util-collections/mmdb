@@ -695,25 +695,38 @@ impl VersionSet {
         // recovered file set must still satisfy the read-path invariant.
         Self::validate_level_disjointness(&version).ctx()?;
 
-        if enforce_db_wal_floor && log_number == 0 {
-            if !live_files.is_empty() || last_sequence != 0 {
-                return Err(Error::corruption(
-                    "MANIFEST has zero log_number alongside persisted DB state",
-                ));
+        if enforce_db_wal_floor {
+            for (_, meta) in live_files.values() {
+                let (_, s_seq, _) = decode_internal_key(&meta.smallest_key)?;
+                let (_, l_seq, _) = decode_internal_key(&meta.largest_key)?;
+                if s_seq > last_sequence || l_seq > last_sequence {
+                    return Err(Error::corruption(format!(
+                        "MANIFEST last_sequence {} precedes live SST {} key sequence ({}, {})",
+                        last_sequence, meta.number, s_seq, l_seq
+                    )));
+                }
             }
-            for entry in fs::read_dir(db_path).with_ctx(|| "reading DB directory")? {
-                let entry = entry.with_ctx(|| "reading DB directory entry")?;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.ends_with(".sst") {
+            if log_number == 0 {
+                if !live_files.is_empty() || last_sequence != 0 {
                     return Err(Error::corruption(
-                        "MANIFEST has zero log_number alongside existing SST files",
+                        "MANIFEST has zero log_number alongside persisted DB state",
                     ));
                 }
-                if name.ends_with(".wal") && entry.metadata().with_ctx(|| "stat WAL")?.len() > 0 {
-                    return Err(Error::corruption(
-                        "MANIFEST has zero log_number alongside non-empty WAL",
-                    ));
+                for entry in fs::read_dir(db_path).with_ctx(|| "reading DB directory")? {
+                    let entry = entry.with_ctx(|| "reading DB directory entry")?;
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.ends_with(".sst") {
+                        return Err(Error::corruption(
+                            "MANIFEST has zero log_number alongside existing SST files",
+                        ));
+                    }
+                    if name.ends_with(".wal") && entry.metadata().with_ctx(|| "stat WAL")?.len() > 0
+                    {
+                        return Err(Error::corruption(
+                            "MANIFEST has zero log_number alongside non-empty WAL",
+                        ));
+                    }
                 }
             }
         }
@@ -2383,5 +2396,69 @@ mod tests {
                 "fallback MANIFEST-000001 must remain on disk when poison_manifest_writer={poison_manifest_writer}"
             );
         }
+    }
+
+    #[test]
+    fn db_recovery_rejects_manifest_last_sequence_below_live_sst_sequences() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+        use crate::{DB, DbOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let sst_meta = {
+            let mut b =
+                TableBuilder::new(&path.join("000003.sst"), TableBuildOptions::default()).unwrap();
+            let ik = InternalKey::new(b"k", 5, ValueType::Value);
+            b.add(ik.as_bytes(), b"v5").unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 3,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+        drop(WalWriter::new(&path.join("000002.wal")).unwrap());
+
+        let manifest_path = path.join("MANIFEST-000001");
+        let mut writer = WalWriter::new(&manifest_path).unwrap();
+        writer
+            .add_record(&DBHeader::new(7, 0).unwrap().encode())
+            .unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_log_number(2);
+        edit.set_last_sequence(1);
+        edit.set_next_file_number(4);
+        edit.add_file(1, sst_meta);
+        writer.add_record(&edit.encode()).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        // Append a zero-padded torn tail so a premature writable repair would
+        // observably truncate `MANIFEST-000001`.
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&manifest_path)
+                .unwrap();
+            file.write_all(&[0, 0]).unwrap();
+        }
+        let expected_manifest = fs::read(&manifest_path).unwrap();
+        fs::write(path.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+
+        assert_eq!(
+            DB::open_read_only(path).err().unwrap().kind(),
+            ErrorKind::Corruption
+        );
+        assert_eq!(
+            DB::open(DbOptions::default(), path).err().unwrap().kind(),
+            ErrorKind::Corruption
+        );
+        assert_eq!(
+            fs::read(&manifest_path).unwrap(),
+            expected_manifest,
+            "failed DB open must not truncate MANIFEST before sequence validation"
+        );
     }
 }
