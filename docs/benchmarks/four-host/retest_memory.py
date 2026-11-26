@@ -55,8 +55,8 @@ def main():
         parser.error("expected distinct volumes and a valid primary label")
     launcher = [] if args.cpus == "native" else ["taskset", "-c", args.cpus]
     if launcher:
-        affinity = subprocess.check_output([*launcher, "taskset", "-pc", "0"], text=True).strip()
-        affinity = affinity.rsplit(":", 1)[-1].strip()
+        query = "import os; print(','.join(str(n) for n in sorted(os.sched_getaffinity(0))))"
+        affinity = subprocess.check_output([*launcher, sys.executable, "-c", query], text=True).strip()
     else:
         affinity = "native"
     common = dict(engine_revision=args.revision, binary_sha256={"control": digest(executable)},

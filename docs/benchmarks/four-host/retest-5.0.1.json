@@ -13,7 +13,7 @@
   "frozen_sha256": {
     "retest.md": "bfc994046a9606254c113fc2ef304edddfaad38ed6e83c91415fee55dddd6942",
     "retest_run.py": "ddaf4566602ec03bc19a8fbba76a54a7914423ac8286608dd9807b5d429e74a1",
-    "retest_memory.py": "986d1c250fe28be919c079ef112367396f0368b806030210ff379eb28496bf43",
+    "retest_memory.py": "56f423987e6bf4943e31d42ac5f4b6eabd3493da46c0cb558886bcf42e14f2a0",
     "retest_reads.py": "00c53c8b0a1bd4fef05fb9a26b3584973ef8e283751323d2d33bf40fda42d7f7",
     "retest_storage.py": "968c86f71483538070722b3a6768da067a4250578853fa9fa13eb42e5f206571",
     "derive_locks.py": "017c4d75054057542016531f747eda70a5aaec69500352007dc53784f84935a5",
@@ -24,5 +24,10 @@
   "root_lock_sha256": "bed1eecdc350363d63b0c02ddc83c1cc0a705a88a51632be770b6c11f559d130",
   "storage_lock_sha256": "fd2caca444aa1cdb0d32d8b3af41b1783b20b49fbf4b73dd7c7a7f5a1a0be9a8",
   "capacity_lock_sha256": "0b533e8761248ad930f0543ef4fa9b714a3e2ea7503cf84d0efb8da005081b2b",
-  "exporter_lock_sha256": "c73f04767e9db8dc43a98224e7fd5e688f49ced5f923bf0fa63a8165e0dfbbaa"
+  "exporter_lock_sha256": "c73f04767e9db8dc43a98224e7fd5e688f49ced5f923bf0fa63a8165e0dfbbaa",
+  "affinity_preflight_erratum": {
+    "original_retest_memory_sha256": "986d1c250fe28be919c079ef112367396f0368b806030210ff379eb28496bf43",
+    "replacement_sha256": "56f423987e6bf4943e31d42ac5f4b6eabd3493da46c0cb558886bcf42e14f2a0",
+    "change": "Linux only: query the taskset child with os.sched_getaffinity(0); the timed child command, schedule and analysis are unchanged. Original Darwin version sentinel is equivalent."
+  }
 }
