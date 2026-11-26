@@ -1032,12 +1032,12 @@ mod tests {
     fn bg_error_is_published_before_waking_flush_queue_waiters() {
         // 1. Foreground DB::set_bg_error path.
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(DB::open(options(), dir.path()).unwrap());
+        let db = DB::open(options(), dir.path()).unwrap();
         db.put(b"k", b"v").unwrap();
-        let db_check = db.clone();
+        let snapshot = db.arc_snapshot();
         let (tx, rx) = mpsc::channel();
         db.flush_queue.on_next_fail(move || {
-            let _ = tx.send(db_check.get(b"k").map_err(|e| e.kind()));
+            let _ = tx.send(snapshot.get(b"k").map_err(|e| e.kind()));
         });
         db.set_bg_error("simulated foreground error".to_string());
         assert_eq!(rx.recv().unwrap(), Err(ErrorKind::Background));
@@ -1048,21 +1048,22 @@ mod tests {
             .with_write_buffer_size(8 << 10)
             .with_l0_compaction_trigger(2)
             .with_pin_l0_first_block_and_warm_index(false);
-        let db2 = Arc::new(DB::open(opts2, dir2.path()).unwrap());
+        let db2 = DB::open(opts2, dir2.path()).unwrap();
         db2.put(b"a", b"1").unwrap();
         db2.flush().unwrap();
         let sst_num = db2.inner.lock().versions.current().level_files(0)[0]
             .meta
             .number;
         fs::write(dir2.path().join(format!("{sst_num:06}.sst")), b"corrupt").unwrap();
-        let db2_check = db2.clone();
+        // The hook reads on the compaction worker. Keep DB teardown on this thread.
+        let snapshot = db2.arc_snapshot();
         let (tx2, rx2) = mpsc::channel();
         db2.flush_queue.on_next_fail(move || {
-            let _ = tx2.send(db2_check.get(b"a").map_err(|e| e.kind()));
+            let _ = tx2.send(snapshot.get(b"a").map_err(|e| e.kind()));
         });
+        // This write triggers the second L0 flush, which wakes compaction before
+        // updating flush progress. The error hook can run during that interval.
         db2.put(b"b", &[2u8; (8 << 10) + 64]).unwrap();
-        db2.flush_queue.wait(db2.flush_queue.target()).unwrap();
-        db2.read.signal_compaction();
         assert_eq!(
             rx2.recv_timeout(Duration::from_secs(3)).unwrap(),
             Err(ErrorKind::Background)
