@@ -29,6 +29,12 @@ None.
 - **What**: The test releases the background compaction gate after a fixed delay instead of after `compact_range` has observed the in-flight claim. An unlucky schedule can let `compact_range` start after the release, so the wait path is not exercised; the final assertion can still pass.
 - **Reason**: The final assertion catches the primary regression whenever the early-return path is taken, and the scheduler state machine has deterministic unit coverage in `src/db.rs`. Observing the wait predicate from the test needs a hook inside the production path under test, which is disproportionate for this timing-only gap. Retained as an accepted test limitation; the snapshot-deferral test no longer depends on timing.
 
+### [LOW] sst: Linux `advise_willneed` converts `posix_fadvise` arguments to `i64` instead of `libc::off_t`
+
+- **Where**: `src/sst/table_reader/mod.rs:1810-1829` (`TableReader::advise_willneed`).
+- **What**: `advise_willneed` converts `offset` and `len` with `i64::try_from` and passes them directly to `libc::posix_fadvise`. On 32-bit GNU, uClibc, and Android Linux targets (`libc` `b32`), `libc::off_t` is `i32`, so compiling for those targets fails with `E0308` mismatched types.
+- **Reason**: Confirmed against `libc-0.2.191` target definitions (`off_t = i32` on 32-bit Linux ABIs vs `off_t = i64` on 64-bit Linux ABIs). Both supported architectures (`x86_64` and `aarch64` with 64-bit ABIs) define `libc::off_t` as `i64`, so 32-bit targets are outside the [supported architecture guarantee](../README.md#supported-architectures).
+
 ---
 
 ## Rejected
