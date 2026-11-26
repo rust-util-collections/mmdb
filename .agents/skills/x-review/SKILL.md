@@ -25,8 +25,6 @@ and starting `HEAD` for `workflow-policy.md` §1 and the invocation ledger.
 
 Read first:
 [workflow-policy.md](../../../docs/ai/workflow-policy.md),
-[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
-[technical-patterns.md](../../../docs/ai/technical-patterns.md),
 [review-core.md](../../../docs/ai/review-core.md),
 [false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 Design-shaped or multi-subsystem → also

@@ -1,7 +1,7 @@
 # Reliability Review and Atomic Commit Policy
 
 Shared workflow rules for `$x-review`, `$x-commit`, `$x-fix`, and `$x-overhaul`.
-Skills must not weaken these rules. See also `pragmatic-engineering.md`.
+Skills must not weaken these rules.
 
 **Hard rules:** user-invoked only · never push or open a PR · no history
 rewrite · one independent issue per commit · at most one eligible patch bump
@@ -48,10 +48,8 @@ the full repository; full repository requires `all`.
 
 ## Supported architectures
 
-MMDB guarantees correct behavior on 64-bit ARM (AArch64, `aarch64`) and
-64-bit x86 (`x86_64`), using a 64-bit ABI. Other architectures are outside
-the project’s tested correctness guarantee.
-Apply this boundary to all four workflows, including `all` reviews and
+Apply the [supported architecture and ABI guarantee](../../README.md#supported-architectures)
+to all four workflows, including full-repository reviews and
 release validation. Record a confirmed defect confined to an unsupported
 architecture under `Won't Fix` with its affected target and reason. If a
 supported target is also affected, use normal triage. For example, an
@@ -65,29 +63,11 @@ operating solely on caller-owned local database files (`CURRENT`, `MANIFEST-*`,
 endpoint, and defines no cross-user privilege boundary. Cargo dependency
 downloads and Git commands are separate developer-tooling operations.
 
-Describe every candidate, finding, test, progress update, and commit message in
-concrete storage-engineering terms:
-
-1. **Operation and input** — public API call sequence, `WriteBatch` /
-   `DurabilityMode` (`WalAsync`, `WalSync`, `DisableWal`) / `sync_wal()` calls,
-   `Snapshot` / `ArcSnapshot` (`SnapshotRef`), `PinnedSlice`, iterator
-   `[lower, upper)` bounds/direction (`step_next`/`step_prev` vs `Iterator::next`),
-   `DB::simulate_crash()`, or deterministic file truncation / block-byte edit in
-   an isolated `tempfile::TempDir`.
-2. **State and invariant** — MVCC sequence cutoff, `SuperVersion`-before-sequence
-   read barrier, internal-key ordering, SST v2 partitioned index/`rangedel`
-   directory-to-leaf bounds, 64B blocked Bloom (`filter.format = 2`), WAL or
-   MANIFEST `DBHeader` framing, `DirSynced` / `PendingSsts`, or lock acquisition
-   and fail-stop publication order.
-3. **Expected vs observed behavior** — expected `Result` (`Ok(...)` or typed
-   `Err(ErrorKind::Corruption)` / `ErrorKind::Busy` / `ErrorKind::Background` /
-   `ErrorKind::ReadOnly` / `ErrorKind::DbClosed` / `ErrorKind::Io`) and
-   persisted state versus the actual returned value, panic, retained allocation,
-   or quantified hot-path cost.
-4. **Existing checks and regression test** — why current guards do or do not
-   cover the path, and the smallest deterministic test that fails before the fix.
-   For documentation drift, identify the claimed behavior and verify it against
-   the implementing symbol, an existing test, or the documented example.
+For each candidate, finding, test, progress update, and commit message,
+name the local operation and input, the invariant, and the expected and
+observed results. Use deterministic records and isolated `tempfile::TempDir`
+directories for storage tests. The [evidence standard](review-core.md#3-evidence)
+covers existing guards, regression tests, and documentation discrepancies.
 
 Keep exact Rust and MMDB identifiers (`unsafe`, `ErrorKind::Corruption`,
 `VersionSet::poisoned`, `ReadState::has_bg_error`, `DirSynced`, `PinnedSlice`,
@@ -104,17 +84,8 @@ Review small, single-commit, `staged`, `worktree`, or single-subsystem scopes
 directly in the current session. Spawn read-only subagents only when splitting
 large context materially helps (`all` or multi-subsystem ranges).
 
-Give each delegated subagent a fresh, narrow prompt using the template in
-`review-core.md`: include the embedded local-library context, repository path,
-frozen `HEAD`/baseline, disjoint assigned files (or disjoint line ranges for
-large files such as `src/db.rs`, `src/compaction/leveled.rs`,
-`src/sst/table_reader/{mod.rs,iterator.rs}`, `src/sst/table_builder.rs`,
-`src/iterator/db_iter.rs`, and `src/manifest/version_set.rs`), mapped pattern
-guides, and a concrete storage-invariant question (for example, key ordering,
-MVCC visibility, SST v2 directory-leaf bounds, WAL/MANIFEST replay, or lock
-ordering) — never an open-ended request to hunt vulnerabilities. Retain the full
-coverage ledger in the coordinating session; smaller handoffs do not narrow the
-user's requested scope.
+Use the [scoped handoff](review-core.md#agent-handoff-and-response) for each
+assignment. Keep the full coverage ledger in the coordinating session.
 
 Derive scope and status from the current checkout and `docs/audit.md`, not from
 prior session claims. If a subagent run stops early or returns incomplete
@@ -130,9 +101,8 @@ Before mutating files or creating commits:
 3. Stop on an unfinished merge/rebase/cherry-pick or detached `HEAD` unless the
    user resolves it.
 4. Define this invocation's owned files/hunks; baseline changes stay untouched.
-   In `worktree` mode, leave untracked design drafts or scratch notes (such as
-   `docs/proposals/*`) outside the owned set unless the user asked to commit
-   them.
+   In `worktree` mode, leave untracked design drafts or scratch notes outside the
+   owned set unless the user asked to commit them.
 5. **Commit workflows:** freeze owned paths and planned units before editing.
    Stage only the frozen set plus this invocation's in-unit fix/rustfmt paths —
    never paths created later by concurrent work.

@@ -30,8 +30,6 @@ Read first:
 [workflow-policy.md](../../../docs/ai/workflow-policy.md),
 [commit-protocol.md](../../../docs/ai/commit-protocol.md),
 [review-core.md](../../../docs/ai/review-core.md),
-[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
-[technical-patterns.md](../../../docs/ai/technical-patterns.md),
 [false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 Multi-subsystem or design-shaped scope → also
 [design-patterns.md](../../../docs/ai/design-patterns.md).
@@ -57,7 +55,7 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
    editing if any staged file also has unstaged changes that affect validation.
 3. `worktree`: owns tracked staged/unstaged changes and only user-intended
    untracked source/test files and explicitly requested untracked documentation.
-   Leave untracked design drafts or scratch notes (such as `docs/proposals/*`)
+   Leave untracked design drafts or scratch notes
    untouched unless the user asked to include them.
 4. Committed scopes (`empty`, `N`, `<rev>`, `<rev1>..<rev2>`, `all`): leave all
    baseline worktree changes uncommitted and untouched; stop and report if an
@@ -98,7 +96,7 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
 |-------------|-------|-----------------------|
 | any | Subject/body claim matches the diff; public behavior agrees with item rustdoc, the relevant reader guide, and tests | Contract drift (LOW) or the behavior defect itself |
 | `fix(...)` | The diff removes the root cause, not one symptom; a focused check fails when the behavior-changing hunks are reverted (revert probe below) | Incomplete fix (severity of the original defect); missing regression test (LOW) |
-| `perf(...)` | Verify the measured path, control and feature flags against the [performance priorities](../../../docs/ai/pragmatic-engineering.md#performance-priorities). Check hot/warm scope (FP-9) and observable results at boundaries: empty/single-entry block, first/last restart, `[lower, upper)` bounds, reverse direction, snapshot cutoff, range tombstones, latched errors | Any changed result or dropped check is a correctness finding, not a perf note |
+| `perf(...)` | Verify the measured path, control and feature flags against the [performance priorities](../../../docs/ai/review-core.md#performance-priorities). Check hot/warm scope (FP-9) and observable results at boundaries: empty/single-entry block, first/last restart, `[lower, upper)` bounds, reverse direction, snapshot cutoff, range tombstones, latched errors | Any changed result or dropped check is a correctness finding, not a perf note |
 | `refactor(...)` | No behavior change: same `ErrorKind`, same order of fsync / dir-sync / MANIFEST append / `CURRENT` rename / unlink, same lock scope | Behavior defect at its own severity |
 
 **Revert probe** (each `fix(...)` commit in the frozen range): identify the

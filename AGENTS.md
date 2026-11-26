@@ -84,12 +84,10 @@ identifiers and finding severities.
 Supporting docs (`docs/ai/`):
 
 - [workflow-policy.md](docs/ai/workflow-policy.md) — scope resolution, embedded-storage specification, scoped handoffs, worktree ownership, atomic commits
-- [pragmatic-engineering.md](docs/ai/pragmatic-engineering.md) — engineering and [performance priorities](docs/ai/pragmatic-engineering.md#performance-priorities) for core operations, cleanup, and migration
-- [technical-patterns.md](docs/ai/technical-patterns.md) / [design-patterns.md](docs/ai/design-patterns.md) — LSM bugs + D-\* design lens
-- [review-core.md](docs/ai/review-core.md) — evidence/report templates + Subsystem Map
+- [review-core.md](docs/ai/review-core.md) — [subsystem checklists](docs/ai/review-core.md#subsystem-map), finding evidence, handoffs and [performance priorities](docs/ai/review-core.md#performance-priorities)
+- [design-patterns.md](docs/ai/design-patterns.md) — cross-subsystem design checks
 - [false-positive-guide.md](docs/ai/false-positive-guide.md) — check existing guarantees before recording findings
 - [commit-protocol.md](docs/ai/commit-protocol.md) — validate → commit → version bump → local version tag
-- `patterns/*` — per-subsystem checklists
 
 The [audit registry](docs/audit.md) is maintained by `$x-review`, `$x-fix`, and `$x-overhaul`. Open is actionable; Won't Fix is an accepted defect; Rejected is a disproven claim.
 

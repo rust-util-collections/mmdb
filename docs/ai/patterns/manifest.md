@@ -18,6 +18,14 @@
 
 **MAN6 `CURRENT` creation & rotation** — before first publication, `db/directory.rs` syncs the links for newly created store directories. `create_with_cache` writes `DBHeader` + initial `VersionEdit` and `sync_manifest()`s *before* publishing `CURRENT`. `maybe_compact_manifest` writes `DBHeader` + snapshot `VersionEdit` to `MANIFEST-{new}`, syncs both new and old MANIFESTs, writes+syncs `CURRENT.tmp.{new}`, renames `CURRENT`, installs the writer, and syncs `db_path` (keeping the old MANIFEST and latching `poisoned` if post-rename directory sync fails).
 
+**MAN7 Sorted ingestion** — Verify strict input order. Under `DB::inner`,
+recheck the full user-key span against active and immutable memtables, SST
+point bounds and range-tombstone extents. All rows in one nonempty ingest share
+a single fresh sequence. Before the MANIFEST install, failure
+discards only this job's staged SSTs. If durability confirmation fails after
+install, retain the referenced SSTs and fail-stop. On success, cap old views
+before publishing the new view and sequence. [Ingestion and race tests](../../../src/db/ingest.rs)
+
 ## Checklist
 
 - [ ] `DBHeader` validated before MANIFEST tail repair or WAL recovery; preserved on every MANIFEST rotation

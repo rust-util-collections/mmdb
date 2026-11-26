@@ -26,8 +26,6 @@ Read first:
 [workflow-policy.md](../../../docs/ai/workflow-policy.md),
 [commit-protocol.md](../../../docs/ai/commit-protocol.md),
 [review-core.md](../../../docs/ai/review-core.md),
-[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
-[technical-patterns.md](../../../docs/ai/technical-patterns.md),
 [false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 
 Preflight and freeze owned paths before editing. Empty `Open` → report

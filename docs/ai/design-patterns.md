@@ -1,7 +1,9 @@
 # MMDB Design Anti-Patterns
 
-Design lens for reviews. Language/protocol behavior checks: `technical-patterns.md`, `patterns/*`.
-Report only with a concrete failure; apply `false-positive-guide.md` first.
+Use these checks for changes that span subsystems or alter a design. For
+individual operations, use the [subsystem map](review-core.md#subsystem-map).
+Check a concrete failure against the [false-positive guide](false-positive-guide.md)
+before recording a finding.
 
 | Prefix | Question |
 |--------|----------|

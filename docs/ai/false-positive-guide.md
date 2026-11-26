@@ -61,7 +61,7 @@ core paths. Flush and compaction affect them when writers wait for capacity
 or readers contend for resources. Quantify allocations, lock time, I/O or
 throughput at the affected API. For occasional cleanup jobs or a one-time
 export, assess the cost within that task. A bounded local cost can be an
-acceptable trade for correctness or simplicity. [Performance priorities](pragmatic-engineering.md#performance-priorities)
+acceptable trade for correctness or simplicity. [Performance priorities](review-core.md#performance-priorities)
 
 ## FP-10: Incomplete lock analysis
 

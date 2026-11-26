@@ -1,10 +1,10 @@
 # MMDB Review Core
 
-Evidence standard, subsystem map, and subagent handoff rules. Apply
-`pragmatic-engineering.md`: keep only findings and steps that eliminate a
-concrete storage failure mode. Specify the exact local API/file operation,
-invariant, and expected vs observed result on MMDB's embedded data structures
-and local files.
+Use the subsystem map to select the invariants for a change. For a storage
+finding, name the API or file operation, the expected result and the
+observed failure. For documentation or workflow changes, identify the
+ambiguity or failure the edit removes and cite the contract or check that
+establishes the intended behavior.
 
 Use the [architecture support policy](workflow-policy.md#supported-architectures)
 when checking platform-specific claims. Name the affected target and distinguish
@@ -15,10 +15,11 @@ to unsupported architectures under `Won't Fix`.
 
 1. Read the full diff and surrounding functions, callers, error paths, and tests.
 2. Map each Rust file via the Subsystem Map and load the corresponding guides.
-3. Multi-subsystem or design-shaped diffs → also load `design-patterns.md`.
+3. For multi-subsystem or design-shaped diffs, apply the [design checks](design-patterns.md).
 4. For an `all` review, derive the tracked-file ledger from `git ls-files`.
-   Include reader guides, design records, project skills and their UI metadata,
-   alongside the source, tests, examples, benchmarks, and build configuration.
+   Include reader guides, benchmark reports, review guides, project skills and
+   their UI metadata, alongside the source, tests, examples, benchmarks, and
+   build configuration.
 
 ### Documentation map
 
@@ -27,8 +28,7 @@ to unsupported architectures under `Won't Fix`.
 | Public operations, errors, defaults | [Usage guide](../usage.md), public rustdoc on the items re-exported by `src/lib.rs`, and the corresponding API tests |
 | Read, write, recovery, format, or resource behavior | [Storage architecture](../architecture.md), the subsystem implementation and its tests |
 | Store and caller migration | [Migration guide](../migration.md), `tools/v4-export/src/main.rs` and its golden-store tests |
-| Engine performance and diagnostic changes | [Engine workloads](../benchmarks/engine-profile/), [L0 trial and disposition](../benchmarks/l0-profile/), [grouped read trials](../benchmarks/grouped-reads/), and [performance priorities](pragmatic-engineering.md#performance-priorities). Match revision, feature flags, load and counter scope. |
-| Historical measurements or proposed designs | [Engine comparison and release decisions](../proposals/mmdb-v5-vsdb-v18-improvements.md) and the measured revisions in the benchmark reports |
+| Engine performance, diagnostics, or historical comparisons | [Benchmark reports](../benchmarks/README.md) and [performance priorities](#performance-priorities). Match the revision, feature flags, workload and counter scope to the claim. |
 | Skill scope, outputs, and validation | [Project guide](../../AGENTS.md#skills), the four skill entry points and their `agents/openai.yaml`, [workflow policy](workflow-policy.md) and [commit protocol](commit-protocol.md) |
 
 The [README](../../README.md#documentation) is the reader index. Update the
@@ -47,20 +47,20 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 
 | Subsystem | Files | Guides |
 |-----------|-------|--------|
-| write / flush / lifecycle | `src/db.rs`, `src/db/directory.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/wal.md`, `patterns/manifest.md`, `patterns/unsafe-audit.md` (`db.rs`) |
-| memory and diagnostics | `src/db/memory.rs`, `src/profile.rs`, `src/stats.rs`; L0 job counters belong to the compaction row | `patterns/cache.md`, `patterns/concurrency.md`, `pragmatic-engineering.md` |
-| sorted ingest | `src/db/ingest.rs` (ascending disjoint span, one sequence, bottommost install) | `patterns/manifest.md`, `patterns/concurrency.md` |
-| read / snapshots / pins | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | `patterns/concurrency.md`, `patterns/iterator.md`, `patterns/sst.md` (grouped block reuse), `patterns/memtable.md` (arena-backed pins) |
-| memtable | `src/memtable/**` and `tests/arena_miri.rs` (concurrent arena pins) | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
-| WAL | `src/wal/**` | `patterns/wal.md` |
-| SST v2 | `src/sst/**` | `patterns/sst.md`, `patterns/unsafe-audit.md` (`table_reader/mod.rs`) |
-| iterator | `src/iterator/**` | `patterns/iterator.md` |
-| compaction | `src/compaction/**` | `patterns/compaction.md`, `patterns/concurrency.md` |
-| manifest | `src/manifest/**` | `patterns/manifest.md`, `patterns/concurrency.md` |
-| cache | `src/cache/**` | `patterns/cache.md`, `patterns/concurrency.md` |
-| types / API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` |
-| v4 migration tool | `tools/v4-export/**` and `tests/fixtures/v4.3.15/**` | `patterns/manifest.md`, `patterns/iterator.md` |
-| test allocator | `src/test_alloc.rs` (test-only thread-local allocation counters) | `patterns/unsafe-audit.md` |
+| write / flush / lifecycle | `src/db.rs`, `src/db/directory.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs` | [concurrency](patterns/concurrency.md), [WAL](patterns/wal.md), [MANIFEST](patterns/manifest.md), [unsafe code](patterns/unsafe-audit.md) (`db.rs`) |
+| memory and diagnostics | `src/db/memory.rs`, `src/profile.rs`, `src/stats.rs`; L0 job counters belong to the compaction row | [cache](patterns/cache.md), [concurrency](patterns/concurrency.md), [performance priorities](#performance-priorities) |
+| sorted ingest | `src/db/ingest.rs` (ascending disjoint span, one sequence, bottommost install) | [MANIFEST](patterns/manifest.md), [concurrency](patterns/concurrency.md) |
+| read / snapshots / pins | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | [concurrency](patterns/concurrency.md), [iterator](patterns/iterator.md), [SST](patterns/sst.md) (grouped block reuse), [memtable](patterns/memtable.md) (arena-backed pins) |
+| memtable | `src/memtable/**` and `tests/arena_miri.rs` (concurrent arena pins) | [memtable](patterns/memtable.md), [unsafe code](patterns/unsafe-audit.md) |
+| WAL | `src/wal/**` | [WAL](patterns/wal.md) |
+| SST v2 | `src/sst/**` | [SST](patterns/sst.md), [unsafe code](patterns/unsafe-audit.md) (`table_reader/mod.rs`) |
+| iterator | `src/iterator/**` | [iterator](patterns/iterator.md) |
+| compaction | `src/compaction/**` | [compaction](patterns/compaction.md), [concurrency](patterns/concurrency.md) |
+| manifest | `src/manifest/**` | [MANIFEST](patterns/manifest.md), [concurrency](patterns/concurrency.md) |
+| cache | `src/cache/**` | [cache](patterns/cache.md), [concurrency](patterns/concurrency.md) |
+| types / API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | [Public contracts](../usage.md), [v5 contract checks](#v5-contract-checks), [WAL](patterns/wal.md) (batch encoding), [memtable](patterns/memtable.md) (admission budgets), [compaction](patterns/compaction.md) & [concurrency](patterns/concurrency.md) (`rate_limiter.rs`) |
+| v4 migration tool | `tools/v4-export/**` and `tests/fixtures/v4.3.15/**` | [MANIFEST](patterns/manifest.md), [iterator](patterns/iterator.md) |
+| test allocator | `src/test_alloc.rs` (test-only thread-local allocation counters) | [unsafe code](patterns/unsafe-audit.md) |
 
 Guides live under `docs/ai/patterns/`. Map `tests/**` (`crash_recovery`,
 `integration`, `e2e_scenarios`, `proptest_db`, `bidi_debug`, `lazy_delete`,
@@ -132,11 +132,7 @@ waiter wake, loop-rechecked wait predicates, and clean worker shutdown.
 
 **Durability:** check state transitions across SST sync, `DirSynced`, MANIFEST
 append, `confirm_manifest_durable`, `CURRENT` rename, WAL rotation, and
-obsolete-file unlink (`patterns/manifest.md`, `patterns/wal.md`).
-
-**Performance:** report hot/warm-path regressions only with path class and
-concrete allocation, lock, or I/O cost. Assess maintenance overhead by its
-effect on normal reads and writes. [Performance priorities](pragmatic-engineering.md#performance-priorities)
+obsolete-file unlink ([MANIFEST](patterns/manifest.md), [WAL](patterns/wal.md)).
 
 **Design:** walk applicable `D-*` checks in `design-patterns.md` for locks,
 resource lifecycles, bounded queues/memory, multi-step state transitions, error
@@ -151,6 +147,35 @@ the public methods on its exposed types. Check the applicable feature set for
 the default library, optional `bench-metrics` counters, or `test-utils`
 helpers. Keep defaults, typed errors, item rustdoc, reader documentation
 and tests aligned.
+
+### Performance priorities
+
+Compare the same read, scan, or write workload before and after a change.
+Keep MVCC visibility, ordering and durability fixed. Record the control,
+operation class, offered load, CPU and memory budgets, and actual worker or
+shard scope. Compare paired changes against control-to-control variation.
+A candidate remains provisional while a protected latency, throughput, or
+resource budget is unresolved. Keep raw runs and deferred prototypes with
+their [benchmark report](../benchmarks/README.md).
+
+- **Writers.** Measure arrival-to-ack and service latency separately. Use
+  ordinary builds for the latency comparison and separate `bench-metrics`
+  runs for per-thread timings. Report paced foreground p99, successful puts/s
+  and bulk batches/s at saturation. Include background flush or compaction
+  when it limits admission. Compare memory, L0 files and pending immutable
+  tables at the end of each arm.
+- **Bounded reads.** Compare scalar and grouped requests on the same trace and
+  snapshot with matching pin lifetimes. Report full-request p99 and qualify
+  device traffic separately. Claims about a caller require measuring the
+  complete operation on the same graph or collection. The 32-key engine
+  workload and the VSDB VecDex query gave different results.
+  [Grouped reads](../benchmarks/grouped-reads/README.md) · [VSDB application results](../benchmarks/README.md#vsdb-application-results)
+- **Cleanup and migration.** An occasional cleanup or one-time conversion
+  can take longer for correctness or simplicity. Keep tool-specific
+  optimizations in the tool. Before adding state, locking or branches to
+  the engine, establish a measurable benefit to normal operations. For
+  cleanup under a writer lock or with a growing queue, measure the cost to
+  foreground reads and writes.
 
 ## 4. Deterministic checks vs review findings
 

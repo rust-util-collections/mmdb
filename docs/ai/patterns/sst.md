@@ -16,6 +16,10 @@
 
 **S5 Pre-fragmented `rangedel` & stripe budget** — `write_range_del_block` sweeps `RangeFragment`s (`begin < end`) into disjoint elementary intervals `[prev, end)` with strictly ascending snapshot-pruned stripes (`<= MAX_SEQUENCE_NUMBER`), partitioned into ~64 KiB leaves. `admit_range_stripes` (`MAX_RANGE_STRIPES = 6,290,928`) bounds worst-case single-interval size below `META_BLOCK_HARD_LIMIT`. Point lookups (`covering_sequence`) binary-search `range_partitions` (`end <= user_key`) and read **at most one** `rangedel` leaf; scans (`read_tombstones`) read only partitions overlapping `[lower, upper)`. `FileMetaData` folds extreme `RangeFragment` `begin` keys into `smallest_key`/`largest_key` and sets `has_range_deletions == !range_partitions.is_empty()`.
 
+For point reads, account for covering tombstones in every file marked
+`has_range_deletions` at the level before pruning by SST point bounds. A
+tombstone can end beyond the file's `largest_key`. [Point lookup](../../../src/db/read.rs)
+
 **S6 64B Blocked Bloom & `BlockPropertyCollector`** — `#[repr(align(64))] Line([u8; 64])` backs safe 64B-aligned filters (`filter.format = 2` required iff key/prefix filter exists; non-64B-multiple payloads rejected as `Corruption`). The whole-key filter hashes each distinct point user key with seed-zero XXH3-64. The high 32 bits select a 64-byte line, and two `mix64` outputs supply eight 9-bit positions within it. Verify the level-dependent whole-key budget separately from the fixed prefix-filter budget. For every point entry, including multiple versions and point deletions, `TableBuilder` passes the user key to each `BlockPropertyCollector::add`.
 
 **S7 Compression & `fill_cache`** — verify `crc32(payload || [compression_byte])` before decompression and cap decoded LZ4/Zstd sizes at `64 MiB` before allocation. Thread `fill_cache` through `index_leaf_block`, `find_data_block`, `covering_sequence`, `visit_ranges`, and `TableIterator`.

@@ -26,8 +26,6 @@ Read first:
 [workflow-policy.md](../../../docs/ai/workflow-policy.md),
 [commit-protocol.md](../../../docs/ai/commit-protocol.md),
 [review-core.md](../../../docs/ai/review-core.md) (evidence rules),
-[pragmatic-engineering.md](../../../docs/ai/pragmatic-engineering.md),
-[technical-patterns.md](../../../docs/ai/technical-patterns.md),
 [false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
 Design-shaped → also [design-patterns.md](../../../docs/ai/design-patterns.md).
 
@@ -39,7 +37,7 @@ Preflight, then freeze owned paths before editing.
 
 1. Inspect `git status --short`, full diffs, and user-intended untracked
    source/test files and explicitly requested untracked documentation (`git diff HEAD` misses untracked files). Leave untracked
-   design drafts or scratch notes (such as `docs/proposals/*`) untouched unless
+   design drafts or scratch notes untouched unless
    the user asked to commit them.
 2. Nothing intended → report "nothing to commit" and stop.
 3. Freeze owned paths before edits. Stage only that set plus this invocation's

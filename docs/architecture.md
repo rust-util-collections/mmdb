@@ -7,17 +7,15 @@ opens no network sockets, runs no external daemon, and enforces no multi-tenant
 privilege boundary. Correctness is guaranteed on 64-bit x86 (`x86_64`) and
 64-bit ARM (`aarch64`).
 
-This document consolidates the global component topology, core execution flows,
-on-disk formats, MVCC visibility rules, memory accounting, and synchronization
-invariants of MMDB v5. For caller configuration, API contracts, and v4 store
-conversion, see [Using MMDB v5](usage.md), [Migrating to v5](migration.md), and
-[v5 storage decisions and measured results](proposals/mmdb-v5-vsdb-v18-improvements.md).
+For caller-facing operations, see [Using MMDB v5](usage.md). For format
+conversion, see [Migrating to v5](migration.md). Measured workloads and
+release decisions are in the [benchmark reports](benchmarks/README.md).
 
 ## Global system overview
 
 A writable `DB` handle coordinates foreground writers, lock-free readers, one
 FIFO flush worker (`mmdb-flush`), and one or more leveled compaction workers
-(`mmdb-compaction`). Readers acquire a point-in-time `SuperVersion` through
+(`mmdb-compaction-{i}`). Readers acquire a point-in-time `SuperVersion` through
 `ArcSwap` without taking the writer mutex, while mutations serialize state
 transitions through `WriteQueueState`, `DB::inner`, and `VersionSet`.
 
@@ -45,7 +43,7 @@ flowchart TD
 
     subgraph BgWorkers["Background & Maintenance Pipelines"]
         FQ["FlushQueue + mmdb-flush (FIFO L0 builder + standby WAL)"]
-        COMP["LeveledCompaction + mmdb-compaction (CompactionClaims + RateLimiter)"]
+        COMP["LeveledCompaction + mmdb-compaction-{i} (CompactionClaims + RateLimiter)"]
         SWEEP["DeadKeySweepScheduler + LazyDeleteFilter"]
     end
 
@@ -287,7 +285,7 @@ strictly disjoint user-key ranges.
 
 ```mermaid
 flowchart TD
-    C1["Trigger: mmdb-compaction wake, inline L0 stop drain, read hint, or compact / compact_range"] --> C2["Lock DB::inner + CompactionClaims"]
+    C1["Trigger: mmdb-compaction-{i} wake, inline L0 stop drain, read hint, or compact / compact_range"] --> C2["Lock DB::inner + CompactionClaims"]
     C2 --> C3["Pick L0->L1 full-set task or L(n)->L(n+1) highest-score / range task"]
     C3 --> C4["Zero-I/O extent closure (include range_partition_extents); snapshot SnapshotList; claim file IDs"]
     C4 --> C5{"Single input, target != source, zero target overlap, & filter is_noop()?"}
@@ -344,8 +342,8 @@ flowchart TD
 
 ## Reading a point and scanning a range
 
-Every read path obeys the **view-before-sequence** barrier: the reader pins an
-`Arc<SuperVersion>` via `ArcSwap::load_full` *before* resolving its visibility
+Every read path obeys the **view-before-sequence** barrier: the reader pins a
+`Guard<Arc<SuperVersion>>` via `ArcSwap::load` *before* resolving its visibility
 sequence. Latest reads load `min(committed_sequence, sv.ingest_ceiling)` with
 `Acquire` ordering, pairing with the writer's `Release` store after memtable
 insertion. Explicit snapshot reads validate that the supplied `Snapshot` or
@@ -357,7 +355,7 @@ evictions never invalidate an in-flight read.
 
 ```mermaid
 flowchart TD
-    R0["Read entry: get* / contains_key / get_many_pinned / iter*"] --> R1["Pin Arc<SuperVersion> via ArcSwap (lock-free)"]
+    R0["Read entry: get* / contains_key / get_many_pinned / iter*"] --> R1["Pin Guard<Arc<SuperVersion>> via ArcSwap::load (lock-free)"]
     R1 --> R2["Check ReadState::check_usable (DbClosed before fail-stop Background)"]
     R2 --> R3["Resolve sequence: registered SnapshotRef OR min(committed_sequence, sv.ingest_ceiling)"]
     R3 --> KIND{"Operation class"}
@@ -429,10 +427,10 @@ flowchart TD
 
     O9 -- "Yes" --> RO["Retain replayed entries in active MemTable; leave directory untouched; publish SuperVersion"]
     O9 -- "No (Writable)" --> WR1["Spill mid-WAL (>= write_buffer_size) & per-WAL buffers to staged L0 PendingSsts"]
-    WR1 --> WR2["Allocate fresh active WAL; sync new SSTs & parent directory (DirSynced)"]
+    WR1 --> WR2["Allocate fresh active WAL; if SSTs spilled, sync new SSTs & parent directory (DirSynced)"]
     WR2 --> WR3["Append single atomic VersionEdit (recovered L0 SSTs + new log_number + last_sequence) & sync MANIFEST"]
     WR3 --> WR4["Unlink obsolete WALs (< new log_number) & orphan SSTs"]
-    WR4 --> WR5["Publish SuperVersion; spawn mmdb-flush & mmdb-compaction workers; kick initial compaction check"]
+    WR4 --> WR5["Publish SuperVersion; spawn mmdb-compaction-{i} & mmdb-flush workers; kick initial compaction check"]
 ```
 
 Notice two critical recovery invariants:
@@ -618,7 +616,7 @@ flowchart LR
   `lock_file`, atomically marks `closed = true`, drains active `MaintenanceState`
   operations (`flush`, `compact*`, `ingest_sorted`), waits for any active
   group-commit leader to finish, flushes the final active memtable if healthy
-  and writable, joins `mmdb-flush` and all `mmdb-compaction` threads, detaches
+  and writable, joins `mmdb-flush` and all `mmdb-compaction-{i}` threads, detaches
   the member `BlockCache`, snapshots final level/size metrics into
   `ClosedProperties`, closes `TableCache`, releases `DirLock`, and surfaces any
   flush, sync, or background error. Implicit `Drop` performs best-effort WAL

@@ -6,7 +6,7 @@
 
 ## Invariants
 
-**W1 Sequence & group order** — each admitted nonempty WAL-enabled batch appends one logical record. WAL order follows request order, with sequence gaps allowed for `DisableWal` batches. Prefix methods encode the complete physical key. `delete_range_prefixed` prefixes both endpoints. A wipe followed by replacement rows in one batch retains that ordering across two eight-byte prefixes on the same DB. Verify snapshot visibility and recovery from a complete or torn WAL record. [Encoding](../../../src/types.rs) · [Cross-prefix recovery test](../../../tests/crash_recovery.rs)
+**W1 Sequence & group order** — each admitted batch reserves one sequence per operation. A nonempty WAL-enabled batch appends one logical record. WAL order follows request order, with sequence gaps allowed for `DisableWal` batches. Prefix methods encode the complete physical key. `delete_range_prefixed` prefixes both endpoints. A wipe followed by replacement rows in one batch retains that ordering across two eight-byte prefixes on the same DB. Verify snapshot visibility and recovery from a complete or torn WAL record. [Encoding](../../../src/types.rs) · [Cross-prefix recovery test](../../../tests/crash_recovery.rs)
 
 **W2 CRC & vectored framing** — `PartsCursor` skips empty interior slices, zero-pads `< 7B` block trailers, emits a 0-length `First` fragment when `remaining == 7` with non-empty data, and computes streaming `crc32([record_type as u8] || fragment_bytes)` identical to `WalReader`. A failed batch append latches the DB background error. A failed MANIFEST append poisons the VersionSet.
 
