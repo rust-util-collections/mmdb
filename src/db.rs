@@ -1565,11 +1565,13 @@ impl DB {
                                 || -> std::result::Result<(), String> {
                                     // Run pending organic compactions first (L0 and byte-budget
                                     // levels take strict precedence over optional read hints),
-                                    // and re-check organic budgets whenever a hint installs an
-                                    // edit that may push its target level over budget.
+                                    // and re-check organic budgets whenever a hint or dead-key
+                                    // sweep installs an edit that pushes a level over budget.
+                                    let mut hold_deferred_sweep = false;
                                     loop {
                                         loop {
-                                            if shutdown.load(Ordering::Acquire) {
+                                            loop {
+                                                if shutdown.load(Ordering::Acquire) {
                                                 return Ok(());
                                             }
                                             // Phase 1: pick and claim (short lock)
@@ -1887,7 +1889,7 @@ impl DB {
                                     // are active. Once runnable, process deeper
                                     // levels first so removing older copies can make
                                     // shallower copies eligible in the same pass.
-                                    loop {
+                                    while !hold_deferred_sweep {
                                         if shutdown.load(Ordering::Acquire)
                                             || !bg_dead_key_sweep.is_pending()
                                             || !bg_snapshot_list.is_empty()
@@ -1956,8 +1958,25 @@ impl DB {
                                         if deferred_l0
                                             && !bg_inner.lock().immutable_memtables.is_empty()
                                         {
+                                            hold_deferred_sweep = true;
                                             break;
                                         }
+                                    }
+                                    let more_organic_work =
+                                        !shutdown.load(Ordering::Acquire) && {
+                                            let inner = bg_inner.lock();
+                                            let version = inner.versions.current();
+                                            let claimed = bg_compacting_files.lock();
+                                            LeveledCompaction::pick_compaction(
+                                                &version,
+                                                &bg_options,
+                                                &claimed,
+                                            )
+                                            .is_some()
+                                        };
+                                    if !more_organic_work {
+                                        break;
+                                    }
                                     }
                                     Ok(())
                                 },
@@ -2700,6 +2719,7 @@ impl DB {
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.storage_path);
         }
 
+        self.signal_compaction_if_pending();
         // A range-scoped pass can only newly settle registrations inside
         // [begin, end): only those are probed. Out-of-range settled keys are
         // harvested by later capped flush passes or a full compact().
@@ -4097,7 +4117,18 @@ impl DB {
                 .run(level, &ctx, false)
                 .inspect_err(|e| self.fail_stop_if_manifest_poisoned("compact", e))?;
         }
+        self.signal_compaction_if_pending();
         Ok(())
+    }
+
+    fn signal_compaction_if_pending(&self) {
+        let pending = {
+            let inner = self.inner.lock();
+            LeveledCompaction::is_pending(&inner.versions.current(), &self.options)
+        };
+        if pending {
+            self.read.signal_compaction();
+        }
     }
 
     /// Remove files in the DB directory that recovery has proven dead:
@@ -8262,5 +8293,129 @@ mod tests {
         }
         assert_eq!(db.get(b"z_gate").unwrap().as_deref(), Some(b"g".as_slice()));
         db.close().unwrap();
+    }
+
+    #[test]
+    fn compact_and_sweep_signal_pending_organic_compaction_on_over_budget_levels() {
+        let wait_until_settled = |db: &DB, label: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_millis(400);
+            while db.get_property("compaction-pending").as_deref() != Some("0") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{label}: over-budget level left compaction-pending=1 with idle workers"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        // 1. `compact_range` splitting an L0 SST leaves an out-of-range output
+        //    in L1 that exceeds `max_bytes_for_level_base`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open(
+                DbOptions::default()
+                    .with_num_levels(3)
+                    .with_block_size(256)
+                    .with_l0_compaction_trigger(8)
+                    .with_target_file_size_base(512)
+                    .with_max_bytes_for_level_base(512)
+                    .with_compression(crate::CompressionType::None),
+                dir.path(),
+            )
+            .unwrap();
+            let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
+                assert!(std::time::Instant::now() < startup_deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+            db.put(b"a", &[b'1'; 1024]).unwrap();
+            db.put(b"z", &[b'2'; 1024]).unwrap();
+            db.flush().unwrap();
+            db.put(b"a", &[b'3'; 1024]).unwrap();
+            db.flush().unwrap();
+            assert_eq!(db.get_property("compaction-pending").as_deref(), Some("0"));
+
+            db.compact_range(Some(b"a"), Some(b"b")).unwrap();
+            wait_until_settled(&db, "compact_range");
+            db.close().unwrap();
+        }
+
+        // 2. `compact()` (`force_compact_all`) draining L0 into L1 leaves L1
+        //    above `max_bytes_for_level_base`.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open(
+                DbOptions::default()
+                    .with_num_levels(3)
+                    .with_block_size(256)
+                    .with_l0_compaction_trigger(8)
+                    .with_target_file_size_base(512)
+                    .with_max_bytes_for_level_base(512)
+                    .with_compression(crate::CompressionType::None),
+                dir.path(),
+            )
+            .unwrap();
+            let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
+                assert!(std::time::Instant::now() < startup_deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+            db.put(b"a", &[b'1'; 1024]).unwrap();
+            db.flush().unwrap();
+            db.put(b"z", &[b'2'; 1024]).unwrap();
+            db.flush().unwrap();
+            assert_eq!(db.get_property("compaction-pending").as_deref(), Some("0"));
+
+            db.compact().unwrap();
+            wait_until_settled(&db, "compact");
+            db.close().unwrap();
+        }
+
+        // 3. Background dead-key sweep falling back to `move_l0` pushes L1 over
+        //    `max_bytes_for_level_base` without an organic wakeup.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DB::open(
+                DbOptions {
+                    num_levels: 3,
+                    max_background_compactions: 1,
+                    l0_compaction_trigger: 8,
+                    target_file_size_base: 512,
+                    max_bytes_for_level_base: 512,
+                    compression: crate::CompressionType::None,
+                    lazy_delete_compaction_threshold: 1,
+                    ..Default::default()
+                },
+                dir.path(),
+            )
+            .unwrap();
+            let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
+                assert!(std::time::Instant::now() < startup_deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+            db.put(b"d_dead", &[b'd'; 256]).unwrap();
+            db.flush().unwrap();
+            db.put(b"k_keep", &[b'k'; 1024]).unwrap();
+            db.flush().unwrap();
+            db.put(b"inflight", b"v").unwrap();
+            let frozen = db.freeze_memtable().unwrap();
+
+            db.lazy_delete(b"d_dead");
+            let defer_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 2 {
+                assert!(std::time::Instant::now() < defer_deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+            db.flush_context().flush(&frozen).unwrap();
+
+            let finish_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.get(b"d_dead").unwrap().is_some() {
+                assert!(std::time::Instant::now() < finish_deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+            wait_until_settled(&db, "dead_key_sweep move_l0");
+            db.close().unwrap();
+        }
     }
 }
