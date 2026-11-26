@@ -4527,6 +4527,7 @@ impl Drop for DB {
 mod tests {
     use super::*;
     use crate::error::ErrorKind;
+    use std::time::Instant;
 
     #[test]
     fn lazy_delete_batch_sizes_the_registry_by_distinct_keys() {
@@ -5568,7 +5569,6 @@ mod tests {
     #[test]
     fn close_stops_background_compaction_after_the_current_job() {
         use std::sync::mpsc;
-        use std::time::Instant;
 
         use crate::options::{CompactionFilter, CompactionFilterDecision};
 
@@ -5928,7 +5928,6 @@ mod tests {
     #[test]
     fn deferred_sweep_rechecks_flush_after_another_worker_consumes_its_wakeup() {
         use std::sync::mpsc;
-        use std::time::Instant;
 
         for flush_before_finish in [true, false] {
             let dir = tempfile::tempdir().unwrap();
@@ -6158,14 +6157,14 @@ mod tests {
         // returns; worker 2's real (detached) thread only needs to notice
         // the same shutdown signal and exit, which the poll below allows a
         // short bounded time for.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let count = Arc::strong_count(&shutdown_flag);
             if count == 1 {
                 break;
             }
             assert!(
-                std::time::Instant::now() <= deadline,
+                Instant::now() <= deadline,
                 "compaction workers spawned before the injected failure were \
                  not joined/exited (Arc::strong_count = {count})"
             );
@@ -6427,10 +6426,10 @@ mod tests {
                 }
             }));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while db.get_property("stats.flushes_completed").as_deref() == Some("0") {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "writers never triggered an auto-flush before close"
             );
             thread::sleep(Duration::from_millis(2));
@@ -6589,10 +6588,10 @@ mod tests {
                 }
             }));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !progressed.load(Ordering::Acquire) {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "workers never completed a compact_range iteration before close"
             );
             thread::sleep(Duration::from_millis(2));
@@ -6816,12 +6815,12 @@ mod tests {
                 }
             }));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while db.get_property("stats.compactions_completed").as_deref() == Some("0")
             && db.l0_file_count.load(Ordering::Relaxed) < 3
         {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "writers never reached L0 stop-trigger drain before close"
             );
             thread::sleep(Duration::from_millis(2));
@@ -6880,10 +6879,10 @@ mod tests {
                 }
             }));
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while written.lock().is_empty() {
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "disable_wal writers never landed a key before flush loop"
             );
             thread::sleep(Duration::from_millis(2));
@@ -7692,8 +7691,8 @@ mod tests {
             .push(CompactionHint { level: 2 });
         db.read.signal_compaction();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             if db.get_property("compaction-pending").as_deref() == Some("0")
                 && db.get_property("num-files-at-level4").as_deref() != Some("0")
             {
@@ -7726,9 +7725,9 @@ mod tests {
             dir2.path(),
         )
         .unwrap();
-        let startup2 = std::time::Instant::now() + Duration::from_secs(5);
+        let startup2 = Instant::now() + Duration::from_secs(5);
         while db2.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
-            assert!(std::time::Instant::now() < startup2);
+            assert!(Instant::now() < startup2);
             thread::sleep(Duration::from_millis(2));
         }
         {
@@ -7751,10 +7750,10 @@ mod tests {
             .lock()
             .push(CompactionHint { level: 2 });
         db2.read.signal_compaction();
-        let hint_deadline2 = std::time::Instant::now() + Duration::from_secs(5);
+        let hint_deadline2 = Instant::now() + Duration::from_secs(5);
         while db2.dead_key_sweep.completed_passes.load(Ordering::Acquire) <= passes_before2 {
             assert!(
-                std::time::Instant::now() < hint_deadline2,
+                Instant::now() < hint_deadline2,
                 "compaction worker never processed db2 read hint"
             );
             thread::sleep(Duration::from_millis(2));
@@ -7783,9 +7782,9 @@ mod tests {
             dir3.path(),
         )
         .unwrap();
-        let startup3 = std::time::Instant::now() + Duration::from_secs(5);
+        let startup3 = Instant::now() + Duration::from_secs(5);
         while db3.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
-            assert!(std::time::Instant::now() < startup3);
+            assert!(Instant::now() < startup3);
             thread::sleep(Duration::from_millis(2));
         }
         {
@@ -7830,10 +7829,10 @@ mod tests {
             .lock()
             .push(CompactionHint { level: 2 });
         db3.read.signal_compaction();
-        let hint_deadline3 = std::time::Instant::now() + Duration::from_secs(5);
+        let hint_deadline3 = Instant::now() + Duration::from_secs(5);
         while db3.dead_key_sweep.completed_passes.load(Ordering::Acquire) <= passes_before3 {
             assert!(
-                std::time::Instant::now() < hint_deadline3,
+                Instant::now() < hint_deadline3,
                 "compaction worker never processed db3 read hint"
             );
             thread::sleep(Duration::from_millis(2));
@@ -7853,8 +7852,6 @@ mod tests {
     #[cfg(feature = "bench-metrics")]
     #[test]
     fn write_profile_counts_actual_parks_not_spin_completions() {
-        use std::time::Instant;
-
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(open_test_db(dir.path()));
 
@@ -8225,10 +8222,10 @@ mod tests {
         db.put(b"k", &[b'b'; 32 * 1024]).unwrap();
         db.flush().unwrap();
 
-        let enter_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let enter_deadline = Instant::now() + Duration::from_secs(5);
         while !db.rate_limiter.has_inflight_debt() {
             assert!(
-                std::time::Instant::now() < enter_deadline,
+                Instant::now() < enter_deadline,
                 "background compaction never entered rate-limiter sleep"
             );
             thread::sleep(Duration::from_millis(5));
@@ -8252,7 +8249,7 @@ mod tests {
         type GateStep = (mpsc::Sender<()>, mpsc::Receiver<()>);
 
         struct TwoStepCollector {
-            steps: Arc<Mutex<std::collections::VecDeque<GateStep>>>,
+            steps: Arc<Mutex<VecDeque<GateStep>>>,
         }
         impl BlockPropertyCollector for TwoStepCollector {
             fn add(&mut self, key: &[u8]) {
@@ -8272,8 +8269,7 @@ mod tests {
         }
 
         let dir = tempfile::tempdir().unwrap();
-        let steps: Arc<Mutex<std::collections::VecDeque<GateStep>>> =
-            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let steps: Arc<Mutex<VecDeque<GateStep>>> = Arc::new(Mutex::new(VecDeque::new()));
         let steps_factory = Arc::clone(&steps);
         let opts = DbOptions {
             num_levels: 2,
@@ -8293,10 +8289,10 @@ mod tests {
         assert_eq!(db.ingest_sorted([(b"a_dead", b"v")]).unwrap(), 1);
         assert_eq!(db.ingest_sorted([(b"z_gate", b"g")]).unwrap(), 1);
 
-        let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
         while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
             assert!(
-                std::time::Instant::now() < startup_deadline,
+                Instant::now() < startup_deadline,
                 "startup compaction pass did not complete"
             );
             thread::sleep(Duration::from_millis(2));
@@ -8333,22 +8329,19 @@ mod tests {
         db.snapshot_list.release(seq);
         go2_tx.send(()).unwrap();
 
-        let pass_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let pass_deadline = Instant::now() + Duration::from_secs(5);
         while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 2 {
-            assert!(
-                std::time::Instant::now() < pass_deadline,
-                "sweep pass did not finish"
-            );
+            assert!(Instant::now() < pass_deadline, "sweep pass did not finish");
             thread::sleep(Duration::from_millis(2));
         }
         if db.dead_key_sweep.retry_after_snapshot_release() {
             db.read.signal_compaction();
         }
 
-        let sweep_deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let sweep_deadline = Instant::now() + Duration::from_millis(500);
         while db.get(b"a_dead").unwrap().is_some() {
             assert!(
-                std::time::Instant::now() < sweep_deadline,
+                Instant::now() < sweep_deadline,
                 "dead key remained in L1 after snapshot release because sweep state dropped to Idle"
             );
             thread::sleep(Duration::from_millis(5));
@@ -8360,10 +8353,10 @@ mod tests {
     #[test]
     fn compact_and_sweep_signal_pending_organic_compaction_on_over_budget_levels() {
         let wait_until_settled = |db: &DB, label: &str| {
-            let deadline = std::time::Instant::now() + Duration::from_millis(400);
+            let deadline = Instant::now() + Duration::from_millis(400);
             while db.get_property("compaction-pending").as_deref() != Some("0") {
                 assert!(
-                    std::time::Instant::now() < deadline,
+                    Instant::now() < deadline,
                     "{label}: over-budget level left compaction-pending=1 with idle workers"
                 );
                 thread::sleep(Duration::from_millis(5));
@@ -8385,9 +8378,9 @@ mod tests {
                 dir.path(),
             )
             .unwrap();
-            let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let startup_deadline = Instant::now() + Duration::from_secs(5);
             while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
-                assert!(std::time::Instant::now() < startup_deadline);
+                assert!(Instant::now() < startup_deadline);
                 thread::sleep(Duration::from_millis(2));
             }
             db.put(b"a", &[b'1'; 1024]).unwrap();
@@ -8417,9 +8410,9 @@ mod tests {
                 dir.path(),
             )
             .unwrap();
-            let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let startup_deadline = Instant::now() + Duration::from_secs(5);
             while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
-                assert!(std::time::Instant::now() < startup_deadline);
+                assert!(Instant::now() < startup_deadline);
                 thread::sleep(Duration::from_millis(2));
             }
             db.put(b"a", &[b'1'; 1024]).unwrap();
@@ -8451,9 +8444,9 @@ mod tests {
                 dir.path(),
             )
             .unwrap();
-            let startup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let startup_deadline = Instant::now() + Duration::from_secs(5);
             while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
-                assert!(std::time::Instant::now() < startup_deadline);
+                assert!(Instant::now() < startup_deadline);
                 thread::sleep(Duration::from_millis(2));
             }
             db.put(b"d_dead", &[b'd'; 256]).unwrap();
@@ -8464,16 +8457,16 @@ mod tests {
             let frozen = db.freeze_memtable().unwrap();
 
             db.lazy_delete(b"d_dead");
-            let defer_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let defer_deadline = Instant::now() + Duration::from_secs(5);
             while db.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 2 {
-                assert!(std::time::Instant::now() < defer_deadline);
+                assert!(Instant::now() < defer_deadline);
                 thread::sleep(Duration::from_millis(2));
             }
             db.flush_context().flush(&frozen).unwrap();
 
-            let finish_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let finish_deadline = Instant::now() + Duration::from_secs(5);
             while db.get(b"d_dead").unwrap().is_some() {
-                assert!(std::time::Instant::now() < finish_deadline);
+                assert!(Instant::now() < finish_deadline);
                 thread::sleep(Duration::from_millis(2));
             }
             wait_until_settled(&db, "dead_key_sweep move_l0");
