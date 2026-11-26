@@ -5099,25 +5099,43 @@ mod tests {
     #[test]
     fn disabled_cache_skips_first_block_pin_io() {
         use crate::sst::table_reader::PREPARE_FIRST_BLOCK_PIN_HOOK;
-        for pool in [None, Some(Arc::new(crate::BlockCachePool::new(0)))] {
+        let probe_flush_pin_io = |options: DbOptions| -> bool {
             let dir = tempfile::tempdir().unwrap();
-            let db = DB::open(
-                DbOptions {
+            let db = DB::open(options, dir.path()).unwrap();
+            db.put(b"key", b"value").unwrap();
+            let armed_on_worker = Arc::new(AtomicBool::new(false));
+            let pin_io_ran = Arc::new(AtomicBool::new(false));
+            let armed_clone = Arc::clone(&armed_on_worker);
+            let pin_io_clone = Arc::clone(&pin_io_ran);
+            db.flush_queue.on_next_build(move || {
+                armed_clone.store(true, Ordering::SeqCst);
+                PREPARE_FIRST_BLOCK_PIN_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        pin_io_clone.store(true, Ordering::SeqCst);
+                    }));
+                });
+            });
+            db.flush().unwrap();
+            assert!(
+                armed_on_worker.load(Ordering::SeqCst),
+                "flush hook must run on mmdb-flush worker"
+            );
+            pin_io_ran.load(Ordering::SeqCst)
+        };
+
+        assert!(
+            probe_flush_pin_io(DbOptions::default()),
+            "enabled cache control must exercise PREPARE_FIRST_BLOCK_PIN_HOOK on mmdb-flush"
+        );
+        for pool in [None, Some(Arc::new(crate::BlockCachePool::new(0)))] {
+            assert!(
+                !probe_flush_pin_io(DbOptions {
                     block_cache_capacity: 0,
                     block_cache: pool,
                     ..Default::default()
-                },
-                dir.path(),
-            )
-            .unwrap();
-            db.put(b"key", b"value").unwrap();
-            PREPARE_FIRST_BLOCK_PIN_HOOK.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(|| {
-                    panic!("disabled cache read a block for pinning")
-                }));
-            });
-            db.flush().unwrap();
-            PREPARE_FIRST_BLOCK_PIN_HOOK.with(|hook| assert!(hook.borrow_mut().take().is_some()));
+                }),
+                "disabled cache read a block for pinning"
+            );
         }
     }
 
