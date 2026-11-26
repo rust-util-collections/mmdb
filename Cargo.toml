@@ -62,4 +62,3 @@ required-features = ["bench-metrics"]
 [[bench]]
 name = "grouped_reads"
 harness = false
-required-features = ["test-utils"]
