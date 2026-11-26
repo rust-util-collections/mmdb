@@ -139,6 +139,11 @@ impl FlushQueue {
         self.standby_wal.lock().is_some()
     }
 
+    #[cfg(test)]
+    pub(super) fn notify_waiter_for_test(&self) -> bool {
+        self.changed.notify_one()
+    }
+
     pub(super) fn request_standby(&self) {
         let mut p = self.progress.lock();
         if !p.shutdown && p.error.is_none() && !p.prepare_standby {

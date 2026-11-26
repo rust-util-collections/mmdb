@@ -2582,6 +2582,7 @@ impl DB {
             };
             let output =
                 LeveledCompaction::execute_compaction_io(&ctx, &task, &file_numbers, is_bottom)
+                    .inspect_err(|e| self.fail_stop_if_manifest_poisoned("compact_range", e))
                     .ctx()?;
 
             // Pre-warm the table cache for the new output files while
@@ -2605,7 +2606,7 @@ impl DB {
 
             let cleanup = {
                 let mut inner = self.inner.lock();
-                let cleanup = LeveledCompaction::install_compaction(
+                let cleanup = match LeveledCompaction::install_compaction(
                     output,
                     &mut inner.versions,
                     Some(&self.table_cache),
@@ -2613,8 +2614,14 @@ impl DB {
                     &self.storage_path,
                     Some(&self.read.stats),
                     !self.snapshot_list.is_empty(),
-                )
-                .ctx()?;
+                ) {
+                    Ok(cleanup) => cleanup,
+                    Err(e) => {
+                        drop(inner);
+                        self.fail_stop_if_manifest_poisoned("compact_range", &e);
+                        return Err(e).ctx();
+                    }
+                };
                 if cleanup.installed {
                     settled_bottom.extend(rewritten_bottom_outputs);
                 }
@@ -3114,6 +3121,12 @@ impl DB {
         *self.read.bg_error.lock() = Some(msg.clone());
         self.read.has_bg_error.store(true, Ordering::Release);
         self.flush_queue.fail(Error::background(msg));
+    }
+
+    pub(super) fn fail_stop_if_manifest_poisoned(&self, op: &str, err: &Error) {
+        if self.read.manifest_poisoned.load(Ordering::Acquire) {
+            self.set_bg_error(format!("{op} failed: {err}"));
+        }
     }
 
     fn check_writable(&self) -> Result<()> {
@@ -3946,6 +3959,7 @@ impl DB {
             };
             let output =
                 LeveledCompaction::execute_compaction_io(&ctx, &task, &file_numbers, is_bottom)
+                    .inspect_err(|e| self.fail_stop_if_manifest_poisoned("drain_l0", e))
                     .ctx()?;
 
             // Pre-warm the table cache for the new output files while
@@ -3956,7 +3970,7 @@ impl DB {
             // Phase 3: install (short lock)
             let cleanup = {
                 let mut inner = self.inner.lock();
-                let cleanup = LeveledCompaction::install_compaction(
+                let cleanup = match LeveledCompaction::install_compaction(
                     output,
                     &mut inner.versions,
                     Some(&self.table_cache),
@@ -3964,8 +3978,14 @@ impl DB {
                     &self.storage_path,
                     Some(&self.read.stats),
                     !self.snapshot_list.is_empty(),
-                )
-                .ctx()?;
+                ) {
+                    Ok(cleanup) => cleanup,
+                    Err(e) => {
+                        drop(inner);
+                        self.fail_stop_if_manifest_poisoned("drain_l0", &e);
+                        return Err(e).ctx();
+                    }
+                };
                 // Unpin L0 inputs that actually left L0. Covers both a
                 // normal install (input consumed and scheduled for deletion)
                 // and a trivial move (same physical file relabeled to L1, so
@@ -4044,7 +4064,9 @@ impl DB {
             active_snapshots: &[],
         };
         for level in (1..self.options.num_levels).rev() {
-            self.level_rewrite().run(level, &ctx, false)?;
+            self.level_rewrite()
+                .run(level, &ctx, false)
+                .inspect_err(|e| self.fail_stop_if_manifest_poisoned("compact", e))?;
         }
         Ok(())
     }

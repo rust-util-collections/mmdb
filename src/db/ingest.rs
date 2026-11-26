@@ -233,7 +233,8 @@ impl DB {
             ));
         }
 
-        let synced = sync_new_sst_parent_dir(&self.dir_sync, &self.read.manifest_poisoned)?;
+        let synced = sync_new_sst_parent_dir(&self.dir_sync, &self.read.manifest_poisoned)
+            .inspect_err(|e| self.fail_stop_if_manifest_poisoned("ingest_sorted", e))?;
         self.table_cache.prewarm(outputs.iter().map(|m| m.number));
 
         let (manifest_handle, claim) = {
@@ -259,9 +260,11 @@ impl DB {
                 edit.add_file(target_level as u32, meta.clone());
             }
             if let Err(e) = inner.versions.log_and_apply_synced(edit, synced) {
+                drop(inner);
                 for m in &outputs {
                     self.table_cache.evict(m.number);
                 }
+                self.fail_stop_if_manifest_poisoned("ingest_sorted", &e);
                 return Err(e).ctx();
             }
             pending.keep();
@@ -591,5 +594,66 @@ mod tests {
                 (b"c".to_vec(), b"2".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn ingest_sorted_dir_sync_poison_immediately_wakes_flush_queue_waiters() {
+        use std::{sync::mpsc, thread, time::Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            DB::open(
+                DbOptions::default()
+                    .with_num_levels(2)
+                    .with_write_buffer_size(8 << 10)
+                    .with_max_immutable_memtables(1)
+                    .with_l0_compaction_trigger(usize::MAX),
+                dir.path(),
+            )
+            .unwrap(),
+        );
+
+        let (flush_started_tx, flush_started_rx) = mpsc::channel();
+        let (flush_release_tx, flush_release_rx) = mpsc::channel();
+        db.flush_queue.on_next_build(move || {
+            flush_started_tx.send(()).unwrap();
+            let _ = flush_release_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        db.put(b"a_gen1", &[b'x'; 9000]).unwrap();
+        flush_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let db_writer = Arc::clone(&db);
+        let writer = thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            let _ = done_tx.send(db_writer.put(b"b_blocked", b"v"));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !db.flush_queue.notify_waiter_for_test() {
+            assert!(
+                Instant::now() < deadline,
+                "writer did not park on FlushQueue"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        crate::manifest::version_set::FAIL_NEXT_SST_DIR_SYNC.with(|f| f.set(true));
+        assert_eq!(
+            db.ingest_sorted([(b"z_ingest", b"v")]).unwrap_err().kind(),
+            ErrorKind::Io
+        );
+
+        let blocked_res = done_rx
+            .recv_timeout(Duration::from_millis(400))
+            .expect("FlushQueue waiter stayed blocked after ingest_sorted poisoned MANIFEST");
+        assert_eq!(blocked_res.unwrap_err().kind(), ErrorKind::Background);
+
+        let _ = flush_release_tx.send(());
+        writer.join().unwrap();
     }
 }
