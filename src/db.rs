@@ -613,6 +613,13 @@ pub(super) struct WorkerLifecycle {
 
 struct WorkerExitGuard(Arc<WorkerLifecycle>);
 
+impl WorkerExitGuard {
+    fn run(self, work: impl FnOnce()) {
+        work();
+        drop(self);
+    }
+}
+
 impl WorkerLifecycle {
     fn enter(this: &Arc<Self>) -> WorkerExitGuard {
         this.state.lock().live_workers += 1;
@@ -1502,8 +1509,7 @@ impl DB {
             let handle = thread::Builder::new()
                 .name(format!("mmdb-compaction-{}", i))
                 .spawn(move || {
-                    let _worker_exit = worker_exit;
-                    (move || {
+                    worker_exit.run(move || {
                         // Helper: set background error and log it.
                         let set_error = |msg: String| {
                             tracing::error!("{}", msg);
@@ -1957,7 +1963,7 @@ impl DB {
                                 }
                             }
                         }
-                    })();
+                    });
                 });
             // Test-only: force this iteration to be reported as a failed
             // spawn. Any real handle just created above is dropped
@@ -2056,13 +2062,7 @@ impl DB {
             *db.flush_worker.lock() = Some(
                 thread::Builder::new()
                     .name("mmdb-flush".into())
-                    .spawn(move || {
-                        let _worker_exit = worker_exit;
-                        {
-                            let (flush_queue, ctx) = (flush_queue, ctx);
-                            flush_queue.run(&ctx);
-                        }
-                    })
+                    .spawn(move || worker_exit.run(move || flush_queue.run(&ctx)))
                     .ctx()?,
             );
         }
