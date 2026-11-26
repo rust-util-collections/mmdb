@@ -13,6 +13,11 @@ copy-on-write mutations, and compaction-driven garbage collection. Each
 database is a local directory. The caller reads and writes byte strings through
 the Rust API. Optimization work targets the vsdb workload. A writable handle runs flush and compaction workers in-process.
 
+MMDB 6 opens v5 databases in place. To upgrade a v4 database, first
+convert it with MMDB 5, then open the resulting directory with MMDB 6.
+The converter and all 5.x releases are maintained on the
+[v5 branch](https://github.com/rust-util-collections/mmdb/tree/v5).
+
 ## Supported architectures
 
 MMDB guarantees correct behavior on 64-bit ARM (AArch64, `aarch64`) and
