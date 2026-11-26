@@ -31,7 +31,12 @@ def observation(row):
     settings = row["settings"]
     if row["mode"] in ("gap", "native", "sentinel"):
         data = counters(row["raw"])
-        if not (data["write_ops"] == data["read_ops"] == settings["OPS"]
+        if not (data.get("mode", "").lower() == row["mode"]
+                and data.get("seed") == settings["SEED"]
+                and data.get("rate") == settings["RATE"]
+                and data.get("subs") == settings["SUBS"]
+                and (data.get("trace_cold") == "true") == (settings.get("COLD_ROWS", 0) > 0)
+                and data["write_ops"] == data["read_ops"] == settings["OPS"]
                 and data["l1_start"] == 24 and data["multi_target_jobs"] > 0
                 and 1 <= data["peak_ranges"] <= settings["SUBS"]
                 and (data["parallel_jobs"] > 0) == (data["peak_ranges"] > 1) == (settings["SUBS"] > 1)):
@@ -48,7 +53,21 @@ def observation(row):
         return result, None
 
     lines = row["raw"].splitlines()
+    cfg = counters(next(line for line in lines if line.startswith("config ")))
     run = counters(next(line for line in lines if line.startswith("run ")))
+    if not (cfg.get("mode") == row["mode"]
+            and cfg.get("ops") == settings["OPS"]
+            and cfg.get("rate") == settings.get("RATE", 0)
+            and cfg.get("seconds") == settings.get("SECONDS", 0)
+            and cfg.get("buffer_mib") == settings.get("BUFFER_MIB", 16)
+            and cfg.get("depth") == settings.get("IMMUTABLES", 4)
+            and cfg.get("pool_mib") == settings.get("POOL_MIB", 64)
+            and cfg.get("seed") == settings["SEED"]
+            and str(cfg.get("entropy")) == str(settings.get("ENTROPY", "true"))
+            and str(cfg.get("sync")) == str(settings.get("SYNC", "false"))
+            and run.get("placement") == settings.get("PLACEMENT")
+            and str(run.get("instrumented")) == "false"):
+        raise ValueError(f"child config disagrees with settings in {row['case']}")
     classes = {}
     for line in lines:
         if line.startswith("class "):
@@ -96,10 +115,48 @@ def observation(row):
     return result, load_kept({**row, "classes": classes})
 
 
+def validate_pair_group(case, round_num, seed_base, group):
+    if set(group) != {"A1", "A2", "AB1", "B"}:
+        raise ValueError(f"incomplete arms in {case} round {round_num}")
+    rows = {arm: entry[0] for arm, entry in group.items()}
+    expected_seed = seed_base + round_num if seed_base is not None else rows["A1"]["settings"]["SEED"]
+    if any(r["settings"]["SEED"] != expected_seed for r in rows.values()):
+        raise ValueError(f"seed mismatch in {case} round {round_num}")
+    control_sig = {(rows[arm]["mode"], rows[arm].get("binary"),
+                    tuple(sorted(rows[arm]["settings"].items()))) for arm in ("A1", "A2", "AB1")}
+    if len(control_sig) != 1:
+        raise ValueError(f"inconsistent control arms in {case} round {round_num}")
+    a, b = rows["AB1"], rows["B"]
+    sa, sb = a["settings"], b["settings"]
+    if case == "fence":
+        ok = a["mode"] == "sentinel" and b["mode"] == "native" and a.get("binary") == b.get("binary") == "l0" and sa == sb
+    elif case == "parallel":
+        ok = (a["mode"] == b["mode"] == "gap" and a.get("binary") == "l0" and b.get("binary") == "two-range"
+              and sa.get("SUBS") == 1 and sb.get("SUBS") == 2
+              and {k: v for k, v in sa.items() if k != "SUBS"} == {k: v for k, v in sb.items() if k != "SUBS"})
+    elif case.startswith("handoff-"):
+        ok = a["mode"] == b["mode"] == "mixed" and a.get("binary") == "control" and b.get("binary") == "handoff" and sa == sb
+    elif case.startswith("mixed-"):
+        ok = (a["mode"] == b["mode"] == "mixed" and a.get("binary") == b.get("binary") == "control"
+              and sa.get("PLACEMENT") == "hot" and sb.get("PLACEMENT") == "split"
+              and {k: v for k, v in sa.items() if k != "PLACEMENT"} == {k: v for k, v in sb.items() if k != "PLACEMENT"})
+    elif a["mode"] == "memory":
+        varying = {"IMMUTABLES", "BUFFER_MIB"}
+        ok = (b["mode"] == "memory" and a.get("binary") == b.get("binary") == "control"
+              and (sa.get("IMMUTABLES"), sa.get("BUFFER_MIB")) == (4, 6)
+              and (sb.get("IMMUTABLES"), sb.get("BUFFER_MIB")) == (2, 10)
+              and {k: v for k, v in sa.items() if k not in varying} == {k: v for k, v in sb.items() if k not in varying})
+    else:
+        ok = False
+    if not ok:
+        raise ValueError(f"mislabeled or mismatched candidate/control arms in {case} round {round_num}")
+
+
 def summarize(packet, output):
     cases = defaultdict(lambda: defaultdict(dict))
     with gzip.open(packet, "rt") as source:
-        json.loads(next(source))["metadata"]
+        meta = json.loads(next(source))["metadata"]
+        seed_base = meta.get("seed_base")
         for line in source:
             row = json.loads(line)
             arm = row["arm"]
@@ -108,17 +165,16 @@ def summarize(packet, output):
             group = cases[row["case"]][row["round"]]
             if arm in group:
                 raise ValueError(f"duplicate {arm} in {row['case']} round {row['round']}")
-            group[arm] = (row["settings"]["SEED"], *observation(row))
+            group[arm] = (row, *observation(row))
     if not cases:
         raise ValueError("no paired trials in packet")
     output.writerow(("case", "metric", "n_pairs", "ab_reference", "candidate", "gain_pct",
                      "max_AA_pct", "pairs_favoring_candidate", "kept_pairs", "min_value", "max_value"))
     for case, rounds in sorted(cases.items()):
-        if len(rounds) != 5:
-            raise ValueError(f"expected five rounds for {case}")
-        for group in rounds.values():
-            if set(group) != {"A1", "A2", "AB1", "B"} or len({v[0] for v in group.values()}) != 1:
-                raise ValueError(f"incomplete or mismatched pairs in {case}")
+        if set(rounds) != {1, 2, 3, 4, 5}:
+            raise ValueError(f"expected rounds 1..5 for {case}, got {sorted(rounds)}")
+        for round_num, group in sorted(rounds.items()):
+            validate_pair_group(case, round_num, seed_base, group)
         for metric in next(iter(rounds.values()))["B"][1]:
             values = [{arm: trial[1][metric] for arm, trial in group.items()} for group in rounds.values()]
             if any(None in v.values() for v in values):

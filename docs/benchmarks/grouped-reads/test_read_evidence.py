@@ -46,3 +46,65 @@ class DecisionMetricTests(unittest.TestCase):
             verify_block_reuse(control, candidate)
         candidate.update(blocks=4)
         verify_block_reuse(control, candidate)
+
+
+class SummarizeCsvTests(unittest.TestCase):
+    def test_summarize_rejects_empty_rogue_or_mismatched_schedule(self):
+        import csv
+        import json
+        from pathlib import Path
+        import shutil
+        import tempfile
+        from summarize import summarize_file
+
+        src_csv = Path(__file__).resolve().parent / "results/final/primary.csv"
+        src_meta = src_csv.with_suffix(".metadata.json")
+        self.assertEqual(len(summarize_file(src_csv)), 1)
+
+        def mutate_and_run(mutate_rows=None, mutate_meta=None):
+            with tempfile.TemporaryDirectory() as d:
+                dst_csv = Path(d) / "primary.csv"
+                dst_meta = dst_csv.with_suffix(".metadata.json")
+                shutil.copyfile(src_csv, dst_csv)
+                shutil.copyfile(src_meta, dst_meta)
+                if mutate_meta is not None:
+                    meta = json.loads(dst_meta.read_text())
+                    mutate_meta(meta)
+                    dst_meta.write_text(json.dumps(meta))
+                if mutate_rows is not None:
+                    with dst_csv.open() as f:
+                        reader = csv.DictReader(f)
+                        fieldnames = reader.fieldnames
+                        rows = list(reader)
+                    rows = mutate_rows(rows)
+                    with dst_csv.open("w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                return summarize_file(dst_csv)
+
+        # Empty CSV must fail instead of succeeding with zero output.
+        with self.assertRaises(ValueError):
+            mutate_and_run(mutate_rows=lambda rows: [])
+
+        # Extra unrequested arm or round must fail instead of being silently ignored.
+        with self.assertRaises(ValueError):
+            mutate_and_run(mutate_rows=lambda rows: rows + [{**rows[0], "arm": "rogue"}])
+        with self.assertRaises(ValueError):
+            mutate_and_run(mutate_rows=lambda rows: rows + [{**rows[0], "round": "6"}])
+
+        # Samples differing from metadata samples_per_run must fail.
+        with self.assertRaises(ValueError):
+            mutate_and_run(mutate_meta=lambda m: m.update(samples_per_run=500_000))
+
+        # Swapped/wrong method must raise ValueError, not AssertionError.
+        def bad_method(rows):
+            target = next(r for r in rows if r["pair"] == "AB" and r["round"] == "1" and r["arm"] == "comparison")
+            target["method"] = "scalar"
+            target["tables"] = next(
+                r["tables"] for r in rows if r["pair"] == "AB" and r["round"] == "1" and r["arm"] == "baseline"
+            )
+            return rows
+
+        with self.assertRaises(ValueError):
+            mutate_and_run(mutate_rows=bad_method)

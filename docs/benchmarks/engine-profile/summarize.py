@@ -81,11 +81,48 @@ def validate_record(record):
                 and 0 < sample_count(record, c) <= c["completed"], f"incomplete {record['case']} {op}")
 
 
+def validate_emitted_config(record, meta):
+    settings = record["settings"]
+    if meta.get("seed") and record.get("round"):
+        require(settings.get("SEED") == meta["seed"] + record["round"],
+                f"unexpected round seed in {record['case']} round {record['round']}")
+    config = record.get("config")
+    if config is not None:
+        expected_pool = settings.get("POOL_MIB", 64)
+        require(config.get("mode") == record["mode"]
+                and config.get("ops") == settings["OPS"]
+                and config.get("seed") == settings["SEED"]
+                and config.get("rate") == settings.get("RATE", 0)
+                and config.get("seconds") == settings.get("SECONDS", 0)
+                and config.get("buffer_mib") == settings.get("BUFFER_MIB", 16)
+                and config.get("depth") == settings.get("IMMUTABLES", 4)
+                and config.get("pool_mib") == expected_pool
+                and str(config.get("entropy")) == str(settings.get("ENTROPY", "true"))
+                and str(config.get("sync")) == str(settings.get("SYNC", "false")),
+                f"emitted child config disagrees with settings in {record['case']}")
+    run = record.get("run")
+    if run is not None:
+        if "placement" in run and "PLACEMENT" in settings:
+            require(run["placement"] == settings["PLACEMENT"],
+                    f"emitted placement disagrees with settings in {record['case']}")
+        if "instrumented" in run:
+            expected_inst = "true" if record["arm"] == "stage-timing" else "false"
+            require(str(run["instrumented"]) == expected_inst,
+                    f"unexpected instrumentation state in {record['case']} {record['arm']}")
+
+
 def check_pair(control, other):
     case = control["case"]
+    if "binary" in control or "binary" in other:
+        expected_other_bin = "candidate" if other["arm"] == "B" else "control"
+        require(control.get("binary") == "control" and other.get("binary") == expected_other_bin,
+                f"mislabeled binary in {case} round {control['round']}")
     varying = set()
     if other["arm"] == "split":
         varying.add("PLACEMENT")
+        require(control["settings"].get("PLACEMENT") == "hot"
+                and other["settings"].get("PLACEMENT") == "split",
+                f"mislabeled placement in {case} round {control['round']}")
     if case.startswith(("buffer-", "envelope-")):
         varying.update(("IMMUTABLES", "BUFFER_MIB"))
         expected_control = MEMORY_ARMS[case.split("-", 1)[0]][0]
@@ -133,13 +170,14 @@ def guard(suite, case, label, values, gains, noise, qualified_load):
     return "guard-met" if gain >= -5 else "guard-regression"
 
 
-def summarize_reopen(records, rounds, writer):
+def summarize_reopen(records, rounds, writer, meta):
     geometries = {g for members in MEMORY_ARMS.values() for g in members}
     expected = {(size, "writable", q, b) for size in (10_000, 100_000) for q, b in geometries}
     expected |= {(size, "read-only", 4, 6) for size in (10_000, 100_000)}
     cells = defaultdict(dict)
     wal_bytes = {}
     for r in records:
+        validate_emitted_config(r, meta)
         settings = r["settings"]
         size = settings["OPS"]
         q, b = settings.get("IMMUTABLES", 4), settings["BUFFER_MIB"]
@@ -179,7 +217,7 @@ def summarize(meta, records, writer):
     suite = meta["suite"]
     rounds = range(1, meta["rounds"] + 1)
     if suite == "reopen":
-        summarize_reopen(records, rounds, writer)
+        summarize_reopen(records, rounds, writer, meta)
         return
     groups = defaultdict(lambda: defaultdict(dict))
     for record in records:
@@ -208,6 +246,8 @@ def summarize(meta, records, writer):
                 require(values["completed"] == count and sample_count(record, values) == count
                         and values["bytes"] == count * bytes_per_call,
                         f"incomplete memory-tail {name} trace")
+        elif record["round"]:
+            validate_emitted_config(record, meta)
         if record["round"]:
             group = groups[record["case"]][record["round"]]
             require(record["arm"] not in group, f"duplicate {record['case']} round {record['round']}")

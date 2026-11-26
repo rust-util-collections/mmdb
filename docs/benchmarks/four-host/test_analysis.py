@@ -175,5 +175,64 @@ class FrozenLockTests(unittest.TestCase):
         self.assertEqual(after, before.replace('version = "5.0.0"', 'version = "5.0.1"'))
 
 
+class AppleM5EngineSummaryTests(unittest.TestCase):
+    def test_rejects_mislabeled_arms_round_drift_and_child_config_mismatch(self):
+        import importlib.util
+        import io
+
+        spec = importlib.util.spec_from_file_location(
+            "summarize_engine",
+            Path(__file__).resolve().parents[1] / "apple-m5/summarize_engine.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        src = Path(__file__).resolve().parents[1] / "apple-m5/engine/handoff-async-1-5.jsonl.gz"
+        with gzip.open(src, "rt") as f:
+            header = json.loads(next(f))
+            base_rows = [json.loads(line) for line in f]
+
+        def run_packet(mutator):
+            rows = json.loads(json.dumps(base_rows))
+            hdr = json.loads(json.dumps(header))
+            mutator(hdr, rows)
+            with tempfile.TemporaryDirectory() as d:
+                pkt = Path(d) / "trial.jsonl.gz"
+                with gzip.open(pkt, "wt") as out:
+                    print(json.dumps(hdr), file=out)
+                    for r in rows:
+                        print(json.dumps(r), file=out)
+                buf = io.StringIO()
+                mod.summarize(pkt, csv.writer(buf, lineterminator="\n"))
+                return buf.getvalue()
+
+        self.assertIn("handoff-false", run_packet(lambda h, rs: None))
+
+        def swap_ab_arms(hdr, rows):
+            for r in rows:
+                if r["round"] == 1 and r["arm"] in ("AB1", "B"):
+                    r["arm"] = "B" if r["arm"] == "AB1" else "AB1"
+
+        with self.assertRaises(ValueError):
+            run_packet(swap_ab_arms)
+
+        def tamper_child_seed(hdr, rows):
+            target = next(r for r in rows if r["round"] == 1 and r["arm"] == "B")
+            target["raw"] = target["raw"].replace("seed=20261127", "seed=99999999")
+
+        with self.assertRaises(ValueError):
+            run_packet(tamper_child_seed)
+
+        def shift_round_index(hdr, rows):
+            for r in rows:
+                if r["round"] == 5:
+                    r["round"] = 6
+                    r["settings"]["SEED"] = hdr["metadata"]["seed_base"] + 6
+                    r["raw"] = r["raw"].replace("seed=20261131", f"seed={hdr['metadata']['seed_base'] + 6}")
+
+        with self.assertRaises(ValueError):
+            run_packet(shift_round_index)
+
+
 if __name__ == "__main__":
     unittest.main()

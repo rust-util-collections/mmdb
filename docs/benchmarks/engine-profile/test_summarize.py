@@ -175,3 +175,66 @@ class SummaryTest(unittest.TestCase):
         records[-1]["reopen"]["wal_bytes"] += 1
         with self.assertRaisesRegex(ValueError, "unequal residual WAL"):
             summary("reopen", records)
+
+    def test_rejects_swapped_arms_and_drifted_child_config(self):
+        records = handoff_trials()
+        for r in records:
+            r["binary"] = "candidate" if r["arm"] == "B" else "control"
+            r["config"] = {
+                "mode": "mixed",
+                "ops": 10_000,
+                "rate": 0,
+                "seconds": 0,
+                "buffer_mib": 16,
+                "depth": 4,
+                "pool_mib": 64,
+                "seed": r["settings"]["SEED"],
+                "entropy": "true",
+                "sync": r["settings"]["SYNC"],
+                "sample": "false",
+            }
+        self.assertTrue(summary("handoff", records))
+
+        # Swapping control and candidate binaries under A1/B must fail.
+        a1 = next(r for r in records if (r["case"], r["round"], r["arm"]) == ("same-db-false", 1, "A1"))
+        b = next(r for r in records if (r["case"], r["round"], r["arm"]) == ("same-db-false", 1, "B"))
+        a1["binary"], b["binary"] = "candidate", "control"
+        with self.assertRaises(ValueError):
+            summary("handoff", records)
+        a1["binary"], b["binary"] = "control", "candidate"
+
+        # Drifted child config field must fail.
+        b["config"]["buffer_mib"] = 6
+        with self.assertRaises(ValueError):
+            summary("handoff", records)
+        b["config"]["buffer_mib"] = 16
+
+        # Swapping hot/split placement labels in mixed suite must fail.
+        mixed = [
+            {"case": "single-stream", "arm": "reader", "round": 0, "mode": "mixed",
+             "settings": {"CONTROL": "reader"}, "run": {"seconds": 1, "peak_kib": 500, "compaction_output_bytes": 0},
+             "classes": {"Read": {"offered": 10000, "completed": 10000, "sampled": 10000, "bytes": 0,
+                                  "rejected": 0, "outstanding_half": 0, "outstanding_end": 0, "arrival_p99_us": 10}}},
+            {"case": "single-stream", "arm": "writer", "round": 0, "mode": "mixed",
+             "settings": {"CONTROL": "writer"}, "run": {"seconds": 1, "peak_kib": 500, "compaction_output_bytes": 100},
+             "classes": {"SmallPut": {"offered": 10000, "completed": 10000, "sampled": 10000, "bytes": 1000,
+                                      "rejected": 0, "outstanding_half": 0, "outstanding_end": 0, "arrival_p99_us": 10}}},
+        ]
+        ops = ["SmallPut", "Batch", "Read", "FreshSnapshot", "HeldSnapshot"]
+        for sync in ("false", "true"):
+            for entropy in ("false", "true"):
+                for i in range(1, 6):
+                    for arm, placement in (("A1", "split"), ("A2", "split"), ("split", "hot")):
+                        classes = {op: {"offered": 10000, "completed": 10000, "sampled": 10000,
+                                        "bytes": 1000 if op in ("SmallPut", "Batch") else 0,
+                                        "rejected": 0, "outstanding_half": 0, "outstanding_end": 0,
+                                        "arrival_p99_us": 50}
+                                   for op in ops}
+                        mixed.append({"mode": "mixed", "case": f"sync-{sync}-entropy-{entropy}",
+                                      "round": i, "arm": arm,
+                                      "settings": {"OPS": 10000, "SEED": i, "SYNC": sync,
+                                                   "ENTROPY": entropy, "PLACEMENT": placement},
+                                      "run": {"seconds": 1, "peak_kib": 500, "compaction_output_bytes": 100},
+                                      "classes": classes})
+        with self.assertRaises(ValueError):
+            summary("mixed", mixed)
