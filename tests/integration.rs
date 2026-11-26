@@ -86,6 +86,56 @@ fn test_overwrite_pattern() {
 }
 
 #[test]
+fn bounded_scans_skip_blocks_ending_at_a_shortened_separator() {
+    for key_len in [3, 70_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions::default()
+            .with_block_size(1)
+            .with_bloom_bits_per_key(0)
+            .with_block_cache_capacity(0);
+        let db = DB::open(options, dir.path()).unwrap();
+        let mut last_key = b"ca1".to_vec();
+        // The longer key puts the second block in a separate index leaf.
+        last_key.resize(key_len, b'x');
+        db.ingest_sorted([(b"aa9".as_slice(), b"1"), (&last_key, b"2")])
+            .unwrap();
+        let misses = || {
+            db.get_property("stats.block_cache_misses")
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        // The first block ends strictly before its shortened separator "b".
+        for lower in [last_key.as_slice(), b"b"] {
+            for reverse in [false, true] {
+                let before = misses();
+                let mut scan = db
+                    .iter_with_range(&ReadOptions::default(), Some(lower), None)
+                    .unwrap();
+                if reverse {
+                    assert_eq!(
+                        scan.step_prev().unwrap(),
+                        Some((last_key.as_slice(), b"2".as_slice()))
+                    );
+                    assert!(scan.step_prev().unwrap().is_none());
+                } else {
+                    assert_eq!(
+                        scan.step_next().unwrap(),
+                        Some((last_key.as_slice(), b"2".as_slice()))
+                    );
+                    assert!(scan.step_next().unwrap().is_none());
+                }
+                assert_eq!(
+                    misses() - before,
+                    2,
+                    "one index leaf and one data block, reverse={reverse}, key_len={key_len}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn test_snapshot_isolation() {
     let dir = tempfile::tempdir().unwrap();
     let db = make_db(dir.path());

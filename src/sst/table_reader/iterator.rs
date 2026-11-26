@@ -14,7 +14,7 @@ use crate::{Error, options::IterConfig};
 
 pub use crate::sst::format::BLOCK_TRAILER_SIZE;
 
-use super::TableReader;
+use super::{TableReader, separator_precedes};
 
 #[inline]
 fn index_entry_at(block: &Block, idx: usize) -> (&[u8], DecodedIndexEntry<'_>) {
@@ -338,14 +338,14 @@ impl TableIterator {
         self.config
             .lower
             .as_ref()
-            .is_some_and(|lb| user_key(sep) < lb.as_slice())
+            .is_some_and(|lb| separator_precedes(user_key(sep).cmp(lb), sep))
     }
 
     fn partition_precedes_lower_bound(&self, part: usize) -> bool {
-        self.config
-            .lower
-            .as_ref()
-            .is_some_and(|lb| self.reader.partitions[part].0.prefix.as_ref() < lb.as_slice())
+        self.config.lower.as_ref().is_some_and(|lb| {
+            let sep = &self.reader.partitions[part].0;
+            separator_precedes(sep.prefix.as_ref().cmp(lb), &sep.trailer)
+        })
     }
 
     /// Materialize the deferred block: load the data block for deferred_index_pos.
@@ -421,7 +421,7 @@ impl TableIterator {
         } else {
             None
         };
-        self.select_partition(self.seek_partition(target));
+        self.select_partition(self.reader.point_partition(target));
         self.reset_positioning_state();
         if self.err.is_some() {
             return;

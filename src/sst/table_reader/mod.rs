@@ -158,6 +158,18 @@ impl PartitionKey {
     }
 }
 
+// A shortened separator lies strictly between two user keys. Its trailer
+// sorts before every point at that user key, so equality also excludes the
+// preceding block when searching for a point or an inclusive lower bound.
+fn separator_precedes(comparison: Ordering, separator: &[u8]) -> bool {
+    comparison.is_lt()
+        || (comparison.is_eq()
+            && separator.ends_with(
+                &(!pack_sequence_and_type(MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion))
+                    .to_be_bytes(),
+            ))
+}
+
 struct RangePartition {
     begin: Vec<u8>,
     end: Vec<u8>,
@@ -610,7 +622,7 @@ impl TableReader {
     }
 
     /// Binary-search a validated `restart_interval = 1` index leaf in place:
-    /// returns the first index `i` where `separator_key >= target`, or `num_restarts`.
+    /// returns the first block that can reach `target`, or `num_restarts`.
     #[inline]
     pub(super) fn partition_point_index_leaf(block: &Block, target: &[u8]) -> u32 {
         let mut left = 0u32;
@@ -620,13 +632,19 @@ impl TableReader {
             let (sep, _, _) = block
                 .decode_restart_entry(mid)
                 .expect("validated index leaf entry");
-            if compare_internal_key(sep, target).is_lt() {
+            if separator_precedes(compare_internal_key(sep, target), sep) {
                 left = mid + 1;
             } else {
                 right = mid;
             }
         }
         left
+    }
+
+    fn point_partition(&self, target: &[u8]) -> usize {
+        self.partitions.partition_point(|(sep, _)| {
+            separator_precedes(sep.compare_internal(target), &sep.trailer)
+        })
     }
 
     #[cfg(test)]
@@ -742,9 +760,7 @@ impl TableReader {
         }
         let user_key = probe.user_key;
         let seek_key = probe.seek_key();
-        let part = self
-            .partitions
-            .partition_point(|(k, _)| k.compare_internal(seek_key).is_lt());
+        let part = self.point_partition(seek_key);
         let Some((sep, leaf_handle)) = self.partitions.get(part) else {
             return Ok(None);
         };
@@ -850,9 +866,7 @@ impl TableReader {
         }
         let user_key = probe.user_key;
         let seek_key = probe.seek_key();
-        let part = self
-            .partitions
-            .partition_point(|(sep, _)| sep.compare_internal(seek_key).is_lt());
+        let part = self.point_partition(seek_key);
         if part == self.partitions.len() {
             return Ok(None);
         }

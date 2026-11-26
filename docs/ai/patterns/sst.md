@@ -11,6 +11,9 @@
 **S2 Footer & paged directories** — decode `TABLE_MAGIC_V2` and reject `metaindex_handle.size == 0` before reading blocks; require the head index directory page to end immediately before `FOOTER_SIZE` (`offset + size + 5 == file_size - 48`). `read_directory` enforces `prev.size > 0` and `prev.offset + prev.size + 5 <= page.offset` (strictly decreasing offsets → loop-free, total bytes ≤ `file_size`), restores ascending order, and verifies strict monotonicity across `partitions` (`p[0].0 < p[1].0`) and `range_partitions` (`p[0].end <= p[1].begin`).
 
 **S3 Shortest separators & final block** — `shorten_separator(lo, hi)` emits `InternalKey::new(&prefix, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion)` (`[0x00..0xFD]`) only when `lo < prefix < hi` strictly as user keys; equal-user-key block boundaries and the final point block (`emit_pending(None, ...)` even when trailing `RangeDeletion`s follow) retain the exact unshortened `last_key`.
+At an inclusive scan lower bound equal to a shortened separator, the preceding
+block or index partition contains only smaller user keys. An exact point-key
+separator remains inclusive.
 
 **S4 Directory↔Leaf consistency** — every leaf `part` in `partitions` must be non-empty, end with `separator_key == partitions[part].0`, and (`part > 0`) start with `first_key > partitions[part - 1].0`; `point_value_with_probe` and `grouped_point_value` must treat `partition_point_index_leaf` reaching `block.num_restarts()` inside a selected partition as `ErrorKind::Corruption` (matching `range_partitions` checks in `covering_sequence` and `visit_ranges`).
 
