@@ -4,7 +4,10 @@ The four-host tuning study runs the same v5 engine on Apple M5/macOS and
 three physical Linux systems, covering APFS, ext4, ZFS and single- and
 dual-device Btrfs. Its independent controls cover grouped reads, shard
 buffer geometries, SST compression, durable WAL writes and application
-cache capacity. [Four-host findings](four-host/README.md) · [Measurement protocol](four-host/protocol.md)
+cache capacity. The 5.0.1 follow-up compares binaries directly and includes
+the cost of bringing the shard sets to a common compaction endpoint.
+[5.0.1 findings and historical baseline](four-host/README.md) ·
+[Retest protocol](four-host/retest.md)
 
 ## Engine workloads
 

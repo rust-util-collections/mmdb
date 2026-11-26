@@ -1,5 +1,137 @@
 # MMDB v5 on four physical hosts
 
+## Follow-up on MMDB 5.0.1
+
+The follow-up freezes production revision `b18532d` and retains
+`828e47a` as the binary control. The [retest protocol](retest.md)
+keeps the work and decision thresholds comparable while sharing physical
+observations between questions. See the [frozen tool and lock
+fingerprints](retest-5.0.1.json).
+
+**Workflow check.** On each dual-volume Linux host, 130 distinct
+standard storage/reopen executions supplied 160 observations across
+the codec, WAL, reopen and disk-comparison views. Those 30 shared
+observations per host were verified against the same child output,
+timestamps, counters, binary and work ID. The four primary-only warm
+cells removed another 60 duplicate warm executions. On M5 a repeat
+invocation loaded 25 completed standard checkpoints (60 physical
+observations) in 0.094 seconds with byte-identical output and zero new
+measurements. A Linux CPU-affinity query was corrected at preflight;
+the already committed 20-process version sample was reused.
+
+**Same-session version comparison.** Each entry is the paired gain of
+5.0.1 over `828e47a` at identical settings / the largest old/old
+control change. Positive values mean less time or greater throughput.
+The storage sentinel uses high-entropy, uncompressed SSTs and disabled
+MMDB cache admission. The writer sentinel uses 4 frozen slots / 6 MiB,
+one hot shard, and the same eight-second saturation window in both arms.
+
+| Primary stack | Sorted ingest | Prewarmed scan | Random read p99 | Saturation throughput | Through final compaction |
+|---|---:|---:|---:|---:|---:|
+| M5 / APFS | −3.15% / 46.63% | −1.37% / 30.25% | −0.85% / 0.84% | +0.13% / 93.43% | −1.43% / 122.01% |
+| 5900X / dual Btrfs | +1.28% / 2.83% | +5.50% / 4.72% | −32.31% / 3.62% | −3.31% / 13.29% | −3.32% / 12.77% |
+| EPYC / dual Btrfs | +0.25% / 4.95% | +1.28% / 18.47% | +3.11% / 5.23% | −0.60% / 2.68% | −0.55% / 5.36% |
+| 9950X / ZFS | −0.49% / 11.37% | −0.72% / 4.55% | −0.30% / 8.29% | −2.59% / 4.10% | −1.42% / 4.33% |
+
+All four within-host throughput changes fall inside their control bands,
+both at the foreground boundary and at the common maintenance endpoint.
+
+The first 5900X revision sentinel produced a 32.31% increase in prewarmed
+random-read p99 (five matched pairs, 3.62% maximum A/A change). This
+triggered an independent confirmation **after** the primary measurement:
+same uncompressed, high-entropy SST, two unchanged binaries, 40,000
+validated lookups per process, five fresh A/A and A/B pairs. The
+confirmation uses seeds 20261227–20261231 on the original four-core
+mask and repeats them on CPU 4 to check scheduling sensitivity. Each
+panel retains its own primary statistic and noise band. A reproducible
+four-core loss must also clear the 5% guard and the independent A/A
+band, with at least four pairs slower, on the same-affinity repeat.
+The single-core panel diagnoses placement sensitivity separately.
+
+The same-affinity confirmation reproduced the loss: median run p99
+was 33.48 µs on the old binary and 44.77 µs on 5.0.1. The within-pair
+increase was 32.73%, with four of five pairs slower and 4.92% A/A
+variation. Restricted to CPU 4, the two medians were 31.99 and 32.03 µs;
+the paired median change was 0.00%, with 0.78% A/A variation. One
+single-core pair still exhibited a large loss. These measurements
+establish a repeatable **four-core-mask** effect on this host and trace.
+They do not identify a particular cache patch, core migration, or a
+general x86 penalty.
+
+**Locality and cache fit.** Warm clustered grouping on the four primary
+stacks lowered 32-key p99 by 25.83% on M5, 28.41% on 5900X, 27.25% on
+EPYC and 40.76% on 9950X. The four physically accepted scattered-device
+cells gained only 2.66–6.83%. ZFS again recorded zero physical reads in
+its device pilots. On EPYC, the fresh 64 GiB working set reproduced the
+application-cache result: 71.68 to 19.21 µs, a paired 73.23% reduction
+versus 73.27% previously. The larger cache still consumed about 60.5 GiB
+of additional process RSS.
+
+The 8 GiB 9950X replication needs a cache-regime qualification on 5.0.1.
+Its primary 512 MiB / 12 GiB comparison had a 76.65% paired p99 gain
+(A/A 18.21%), but two of the 20 processes accounted for disk reads:
+24,784,896 bytes in one A/A control and 4,096 bytes in a large-cache
+A/B arm. It failed the zero-read rule. In a separate confirmation we
+explicitly read all 8,615,640,765 bytes of the same 33 SSTs before any
+timed process, verified 100% file residency, and used independent seeds.
+That run had zero process disk-read bytes throughout the timed probes
+in every arm. Median p99 was 44.76 / 11.03 µs, paired gain 75.36%,
+A/A 10.75%, five pairs favorable. For a cache-fit recommendation,
+verify residency **and** measured disk bytes; configuring a large cache
+or performing a partial warm-up does not establish the intended regime.
+
+**SST compression.** The encoded-space gains remained 82.33% for patterned
+values and 2.16% for high entropy. LZ4 shortened patterned sorted ingest
+by 26.70–44.68% on the six Linux paths; M5 ingest took 35.27% longer.
+The earlier study observed longer patterned-data random-read p99 medians
+on all seven paths. On 5.0.1 the 5900X dual-drive and EPYC single-drive
+p99 comparisons fell inside their control spread. Five stacks showed a repeatable
+penalty with MMDB's block cache disabled. EPYC dual Btrfs newly cleared
+that loss screen (57.54% longer p99 versus 51.80% A/A).
+
+**WAL volume selection.** The 5900X dual-drive p99 remained slower
+than single WD (+77.30% duration, 10.74% A/A). The EPYC result needs a
+qualification change: the dual Intel volume had the lower p99 in every
+pair, but its 65.23% median reduction is inside the 84.47% A/A spread
+of the single-drive control. The historical reduction of 63.58% had
+cleared a 0.86% control band. On the 9950X, ZFS lowered sync-put p99 by
+48.26% relative to ext4 (6.91% A/A), down from 63.52% in the previous
+trial. Both periods used two different drives of the same model. These
+are storage-stack comparisons; a cross-session magnitude change alone
+does not isolate a change of engine version.
+
+The 9950X prewarmed uncompressed scan took 18.40 ms on ext4 and 26.89 ms
+on ZFS (44.90% paired increase, A/A 8.02%, previously 34.36%). The
+random-read p99 also rose by a paired 6.96% on ZFS (A/A 4.47%), crossing
+the 5% loss guard on this fixture. The previous estimate of a 0.40%
+increase was inside its A/A spread.
+
+### Shard settings on 5.0.1
+
+Five matched A/B pairs compare two immutable slots / 10 MiB with four slots / 6 MiB at the same nominal 30 MiB per DB. Positive gains mean higher throughput or lower p99. The latency columns also show the maximum independent A/A variation. The final two columns measure logical bytes over the elapsed time from the original start through forced flush/compaction.
+
+| Stack | Hot saturation gain | All-active saturation gain | Hot put p99 gain / A/A | All-active put p99 gain / A/A | Hot through compact | All-active through compact |
+|---|---:|---:|---:|---:|---:|---:|
+| M5 / APFS | +38.48% | +39.05% | +58.33% / 355.57% | +35.63% / 457.68% | +38.82% | +36.42% |
+| 5900X / dual Btrfs | +44.64% | +15.67% | -5.38% / 7.42% | -13.72% / 17.66% | +41.70% | +14.38% |
+| 5900X / single Btrfs | +40.11% | +13.96% | -6.20% / 1.97% | +24.16% / 42.81% | +39.88% | +13.73% |
+| EPYC / dual Btrfs | +43.53% | +17.03% | -0.22% / 14.24% | +23.79% / 31.30% | +41.61% | +15.84% |
+| EPYC / single Btrfs | +35.65% | +18.64% | +1.77% / 3.78% | +8.15% / 25.74% | +34.46% | +17.82% |
+| 9950X / ext4 | +37.29% | +14.10% | +5.30% / 24.92% | +61.76% / 35.55% | +35.39% | +16.17% |
+| 9950X / ZFS | +35.61% | +10.30% | -318.59% / 41.20% | +9.94% / 20.78% | +33.01% | +11.74% |
+
+All 280 fixed-rate arms passed the workload and backlog checks. All 560 arms reached zero L0 files and zero pending immutables at the explicit terminal sample; peak foreground-window RSS stayed below 1 GiB (maximum 611.60 MiB). All-active saturation now cleared the benefit screen on **seven of seven** stacks, including EPYC single Btrfs, previously inside control variation. The gain after full maintenance was 11.74–36.42% and passed on all seven. Hot-shard saturation cleared the foreground screen on **six of seven**. On M5 the 38.48% gain was inside 41.35% A/A, unlike the previous qualified +42.53%; all five paired gains were positive.
+
+The fixed-work all-active arms still ended the foreground window with median 0 versus 45 L0 files. Compaction output per logical byte was 0.634 versus 0.324 before maintenance, and **0.714 versus 0.404 after both configurations reached the common endpoint** on all seven paths. The output gap persisted after the prescribed drain. This is a finite-trace engine counter, not a measurement of device lifetime write amplification.
+
+The hot-shard p99 loss remained reproducible on 9950X/ZFS: 0.398 to 1.665 ms, a 318.59% paired increase (41.20% A/A). On the same host/ext4 the old 16.79% loss did not reproduce: the new +5.30% gain was inside 24.92% A/A. The 5900X single WD still exceeded the loss guard (6.20% slower, A/A 1.97%); the 5.38% loss on dual Btrfs was inside 7.42% A/A. **Zero of seven stacks passed the combined portability screen.** Use the larger buffers as an explicit throughput choice and retain a separate hot-shard latency control.
+
+### Evidence and verification
+
+The archived retest contains **1,510 formal physical observations**, including 160 independent old/new sentinel processes. Reusing storage controls eliminated 90 duplicated executions, and the warm-read selection omitted 60 redundant secondary-volume processes. The comparable tuning matrix used 1,350 executions versus 1,500 before the added version sentinels. There are separately labelled 40 CPU-mask confirmation processes, 20 explicitly prewarmed capacity confirmations and four rejected ZFS device pilots. All four hosts passed their functional gates, including the revised shared-cache tests. The [raw retest archive](retest-observations.tar.gz) contains 136 canonical files and their SHA-256 manifest (267,904 compressed bytes). Archive SHA-256: `f5e83768a4f6ca0d9ef168b499eea67eb5962203040864b3b729da8e3af6cc82`. [Reproduce both summaries and their differences](reproduce.md#optimized-501-retest).
+
+## Historical campaign at `828e47a`
+
 This campaign builds revision `828e47a` on four physical machines and
 exercises seven storage configurations. The measurement plan specifies the
 build, fixtures, placement, statistical thresholds and resource guards.
@@ -18,7 +150,7 @@ library and integration checks (435 and 74 cases). The M5 also passed
 the full 25-command repository gate. [Raw observations and receipts](observations.tar.gz) ·
 [Coverage and archive digest](freeze.json) · [Regenerate detailed tables and per-stack decisions](reproduce.md#recalculate-the-results)
 
-## Which configuration to use
+### Which configuration to use
 
 | Workload or resource constraint | Starting configuration |
 |---|---|
@@ -51,7 +183,7 @@ to separate local DBs. Run `cargo +stable run --example shard_buffers`
 to exercise both through batch writes, a durability fence and grouped
 reads. [Rust configuration example](../../../examples/shard_buffers.rs)
 
-## Sixteen write-active shards
+### Sixteen write-active shards
 
 Both arms have one active memtable per DB. The reference permits four frozen buffers at 6 MiB each; the candidate has two frozen slots and a 10 MiB buffer. All 16 DBs share one block cache, with 256 MiB allowed in each weighted store. A paced run offers 200 requests/s per stream on the hot placement or 320 per stream with all shards active. A separate eight-second window measures saturation.
 
@@ -99,7 +231,7 @@ when the measured tail tradeoff and remaining L0 files fit the application.
 Use the four-slot reference to protect the hot-shard latency budget and
 compare on the target volume. [Recalculate per-stack guards and paired gains](reproduce.md#recalculate-the-results)
 
-## Single-snapshot reads
+### Single-snapshot reads
 
 These are median per-process p99s for a complete 32-key clustered request
 with one warm SST. The release probe enables `test-utils` for SST/block
@@ -145,7 +277,7 @@ A separate 20-process replication observed zero physical reads and zero
 ARC demand misses in each process. The primary timing remains the
 ARC-prewarmed observation; the replication supplies attribution evidence.
 
-## SST compression
+### SST compression
 
 LZ4 reduced the encoded SST size by **82.33%** on the repeated-pattern
 values and **2.16%** on high-entropy values on all seven paths. Across the
@@ -183,7 +315,7 @@ only 1,024 allocated bytes in these trials. A separately checked,
 long-lived 38,155,840-byte SST reported 38,298,112 allocated bytes. The
 immediate allocation counter cannot establish the physical space saving.
 
-## Durable small writes and storage selection
+### Durable small writes and storage selection
 
 The disk comparison alternated two scratch volumes on the same host. Each
 process issued 10,000 individual 128-byte `WalSync` puts, measured
@@ -230,7 +362,7 @@ pool was 64 MiB, the writable buffer 6 MiB and immutable depth four.
 An initial M5 run used a 256 MiB pool. It is retained as a diagnostic;
 the table and the cross-host validator use the new 64 MiB run.
 
-## Paying for an application-resident working set
+### Paying for an application-resident working set
 
 On EPYC, the residency samples immediately before and after the random
 probes both showed all 64.19 GiB of SST files in the OS page cache.

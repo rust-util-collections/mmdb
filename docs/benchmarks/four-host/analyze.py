@@ -365,7 +365,7 @@ def version_results(location, folder, freeze, *, confirmation=None, cpus=None):
     return result
 
 
-def capacity_result(location, path, revision=REVISION, lock=None):
+def capacity_result(location, path, revision=REVISION, lock=None, *, seed=20261125):
     rows, small, large, min_charge, max_charge = {
         "9474f-raid": (8388608, 4096, 98304, 49152, 5120),
         "9950x-ext4": (1048576, 512, 12288, 6144, 640),
@@ -376,7 +376,7 @@ def capacity_result(location, path, revision=REVISION, lock=None):
         meta = json.loads(next(f))["metadata"]
     if lock is None:
         lock = json.loads((HERE / "freeze.json").read_text())["supplements"]["capacity_external_lock_sha256"]
-    require(build["engine_revision"] == fixture["engine_revision"] == revision
+    require(build["engine_revision"] == fixture["engine_revision"] == revision and meta["seed"] == seed
             and build["binary_sha256"] == meta["binary_sha256"] and build["cargo_lock_sha256"] == lock
             and int(fixture["rows"]) == rows and int(fixture["value_bytes"]) == 8192,
             f"{path}: mismatched capacity build or fixture")
@@ -554,6 +554,20 @@ def main():
         checks = [memory, storage_results(location, folder / "storage.jsonl.gz", revision)]
         if location in ("9950x-ext4", "9474f-raid"):
             capacity[location] = capacity_result(location, folder / "capacity" / "trials.jsonl", revision, capacity_lock)
+            repeat = folder / "capacity-repeat" / "trials.jsonl"
+            if freeze and location == "9950x-ext4" and repeat.exists():
+                warm = json.loads((repeat.parent / "prewarm.json").read_text())
+                primary_fixture = json.loads((folder / "capacity" / "fixture.json").read_text())
+                repeat_fixture = json.loads((repeat.parent / "fixture.json").read_text())
+                primary_build = json.loads((folder / "capacity" / "build.json").read_text())
+                require(warm["all_files_100pct_resident"] and warm["seed_base"] == 20261226
+                        and warm["sequential_bytes_read"] == repeat_fixture["sst_bytes"]
+                        and warm["fixture_state_sha256"] == primary_fixture["fixture_state_sha256"]
+                        == repeat_fixture["fixture_state_sha256"]
+                        and warm["measurement_binary_sha256"] == primary_build["binary_sha256"],
+                        f"{folder}: mismatched warmed fixture or capacity binary")
+                capacity["9950x-ext4-os-prewarm-repeat"] = capacity_result(
+                    location, repeat, revision, capacity_lock, seed=20261226)
         descriptive.extend(reopen_results(location, folder / "reopen.jsonl.gz"))
         for kind in ("warm", "page", "device"):
             if kind == "warm" and not warm_measured:

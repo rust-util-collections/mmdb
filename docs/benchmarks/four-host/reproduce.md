@@ -167,6 +167,9 @@ shared views. A change of evidence status is reported even if both
 campaigns estimated the same direction.
 
 ```sh
+mkdir -p "$previous" "$current"
+tar -xzf "$campaign/observations.tar.gz" -C "$previous"
+tar -xzf "$campaign/retest-observations.tar.gz" -C "$current"
 python3 -B "$campaign/analyze.py" "$previous/raw" "$previous/summary"
 python3 -B "$campaign/analyze.py" "$current/raw" "$current/summary" \
   --retest-freeze "$campaign/retest-5.0.1.json" --compare "$previous/summary"
