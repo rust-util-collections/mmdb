@@ -95,6 +95,9 @@ impl FlushQueue {
             if let Some(e) = &p.error {
                 return Err(e.clone());
             }
+            if p.shutdown {
+                return Err(Error::db_closed());
+            }
             if p.submitted - p.durable < limit as u64 {
                 return Ok(());
             }
@@ -114,6 +117,9 @@ impl FlushQueue {
         while p.durable < target {
             if let Some(e) = &p.error {
                 return Err(e.clone());
+            }
+            if p.shutdown {
+                return Err(Error::db_closed());
             }
             self.changed.wait(&mut p);
         }
@@ -1361,5 +1367,78 @@ mod tests {
             "writable recovery must unlink the unused 0-byte standby WAL"
         );
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn flush_queue_stop_wakes_blocked_capacity_and_target_waiters() {
+        let queue = Arc::new(FlushQueue::default());
+        let target = queue.submit(FrozenMemtable {
+            old_mem: Arc::new(MemTable::new()),
+            file_numbers: Arc::new(FileNumbers::new(2)),
+            old_wal_number: 1,
+            new_wal_number: 2,
+            last_sequence: 1,
+            snapshots: Vec::new(),
+        });
+
+        let (cap_entered_tx, cap_entered_rx) = mpsc::channel();
+        let (cap_done_tx, cap_done_rx) = mpsc::channel();
+        let q_cap = Arc::clone(&queue);
+        let cap_handle = thread::spawn(move || {
+            cap_entered_tx.send(()).unwrap();
+            let res = q_cap.check_capacity(1, false);
+            let _ = cap_done_tx.send(res);
+        });
+
+        let (wait_entered_tx, wait_entered_rx) = mpsc::channel();
+        let (wait_done_tx, wait_done_rx) = mpsc::channel();
+        let q_wait = Arc::clone(&queue);
+        let wait_handle = thread::spawn(move || {
+            wait_entered_tx.send(()).unwrap();
+            let res = q_wait.wait(target);
+            let _ = wait_done_tx.send(res);
+        });
+
+        cap_entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while queue.changed.notify_one() {
+            thread::yield_now();
+        }
+        // Wait until both threads are parked inside `FlushQueue::changed.wait`.
+        loop {
+            let mut woke = 0;
+            if queue.changed.notify_one() {
+                woke += 1;
+            }
+            if queue.changed.notify_one() {
+                woke += 1;
+            }
+            if woke == 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiters did not park on FlushQueue::changed"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+
+        queue.stop();
+
+        let cap_err = cap_done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("check_capacity waiter hung after FlushQueue::stop")
+            .unwrap_err();
+        let wait_err = wait_done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("FlushQueue::wait waiter hung after FlushQueue::stop")
+            .unwrap_err();
+        assert_eq!(cap_err.kind(), ErrorKind::DbClosed);
+        assert_eq!(wait_err.kind(), ErrorKind::DbClosed);
+        cap_handle.join().unwrap();
+        wait_handle.join().unwrap();
     }
 }
