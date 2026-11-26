@@ -336,11 +336,13 @@ pub enum CompactionFilterDecision {
 /// [`filter`](Self::filter) is not invoked for every key-value pair a
 /// compaction touches — only when all of the following hold:
 ///
-/// - The compaction's target level is the bottommost level for the affected
-///   key range. Applying `Remove` or `ChangeValue` above the bottommost level
-///   could otherwise resurrect stale data, since an older, unfiltered version
-///   of the same key may still live in a lower level and would then
-///   incorrectly become visible.
+/// - Either the compaction's target level is bottommost across the job's key
+///   range, or the job captured the deeper disjoint levels for per-key
+///   bottommost verification. In the latter case [`filter`](Self::filter) may
+///   still inspect the newest `Value` entry first, and `Remove` or
+///   `ChangeValue` takes effect only if no deeper level holds that user key
+///   (preventing stale older versions from resurrecting while avoiding
+///   per-key deeper-level SST point lookups for `Keep` entries).
 /// - No explicit snapshots are currently active (handles from
 ///   [`crate::DB::snapshot`]). Removing or changing a value while such a
 ///   snapshot is open could change what that snapshot observes, violating its
