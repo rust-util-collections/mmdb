@@ -33,4 +33,13 @@ engine for maintenance work, establish a measurable benefit to normal
 operations. If cleanup holds a writer lock or retains a growing queue,
 measure that foreground impact as part of the core path.
 
-For bounded point reads, keep the scalar and grouped controls on the same snapshot and charge the same lifetime for returned pins. Compare full-request p99 across the same input trace and qualify device traffic separately. [Grouped-read evidence](../benchmarks/grouped-reads/README.md)
+For bounded point reads, keep scalar and grouped controls on the same
+snapshot with matching pin lifetimes. Compare full-request p99 across
+the same input trace and qualify device traffic separately. When claiming a
+caller benefit, also compare the complete VSDB operation on the same graph
+or collection. The warmed 32-key engine trial and the v18 VecDex query
+had different outcomes. For competing writers, distinguish paced
+foreground p99, successful puts/s and bulk batches/s at saturation.
+Aggregate bytes/s can hide a loss in foreground completions. Compare
+memory and L0/immutable debt at the end of each arm.
+[MMDB grouped reads](../benchmarks/grouped-reads/README.md) · [VSDB query measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-vecdex-v5/README.md) · [VSDB write and memory measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-adapter/README.md)

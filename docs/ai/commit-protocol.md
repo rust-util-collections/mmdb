@@ -25,7 +25,12 @@ by this invocation.
 1. One independent issue, root cause, or behavior change + its focused
    regression test, matching docs, and any resolved `docs/audit.md` hunk.
 2. Formatting check:
-   - Docs/config only: `git diff --check` (skip Rust checks).
+   - Documentation or project skills: run `git diff --check` and verify changed
+     paths, anchors, commands and claims. For a skill, check its frontmatter
+     name against its directory, its listed invocation in [AGENTS.md](../../AGENTS.md#skills),
+     and its `agents/openai.yaml` interface and explicit-only policy.
+   - For changes to CI, Make targets or Cargo settings, compare the affected
+     command, manifest, target and feature set to the Final repository gate.
    - Rust edits in root crate: `cargo +stable fmt --all -- --check` (and when
      `tools/v4-export/**` is owned, also
      `cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check`).
@@ -37,11 +42,14 @@ by this invocation.
      unless the user asked for it.
 3. Smallest proving tests (never `tests/scale_profile.rs`, never `--release`,
    never the full suite per unit):
-   - docs-only → none;
+   - prose-only changes → no Rust tests; apply the documentation checks above.
+     Under `docs/benchmarks/`, executable drivers and validators use the
+     corresponding benchmark README. Run the affected checker against its
+     recorded inputs or focused tests, checking operation counts and controls.
    - single subsystem → targeted `--lib <filter>` plus the integration binary
      covering any public behavior change (`integration`, `read_only`,
-     `shared_cache`, `lazy_delete`, `bidi_debug`, `e2e_scenarios`, or
-     `proptest_db`);
+     `shared_cache`, `grouped_reads`, `lazy_delete`, `bidi_debug`, `e2e_scenarios`, or
+     `proptest_db`). Confirm a named filter ran the intended test;
    - WAL / MANIFEST / flush / interrupted-write recovery →
      `cargo +stable test --test crash_recovery`;
    - `src/memtable/` arena or skiplist `unsafe` → when `cargo +nightly miri` is
@@ -50,14 +58,24 @@ by this invocation.
    - optional diagnostic counters or profiles → exercise the affected test with
      `--features bench-metrics` and check the caller with the feature disabled;
    - `tools/v4-export/**` →
-     `cargo +stable test --manifest-path tools/v4-export/Cargo.toml` (clean
+     `CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml` (clean
      `tools/v4-export/target` if `.gitignore` does not yet ignore nested `target/`).
 4. Fix failures caused by the unit before committing. Report pre-existing
    out-of-scope failures with the command and output rather than looping.
-5. Stage exact paths/hunks (`git add -- <paths>`); never use `git add -A` or
-   `git commit -a`.
-6. Verify `git diff --cached` contains exactly one logical unit, zero baseline
-   or post-freeze paths, and at most that unit's `docs/audit.md` hunk.
+5. Stage only the owned change. Use `git add -- <path>` for a wholly owned
+   file (including a new test or verifier), or stage just the owned hunks
+   when other changes share the file.
+6. Inspect the proposed commit before recording it. When the index contains
+   only this unit, use `git diff --cached` and commit the index. If unrelated
+   files are already staged and the unit owns the **entire working-tree
+   diff** of each selected path, inspect `git diff HEAD -- <unit paths>` and
+   use `git commit --only -F - -- <unit paths>`. This form takes whole files
+   from the working tree, including their unstaged edits. For a partial-file
+   unit with unrelated staged changes, keep both sets in the real index and
+   use a temporary index initialized from `HEAD` to apply, inspect and commit
+   only the reviewed patch. Include only this unit’s owned audit hunks where
+   applicable. Verify the resulting commit and the real staged and unstaged
+   baseline afterward.
 7. Write a concise commit message matching repository style (`fix(<subsystem>):
    <behavior>`, `perf(<subsystem>): <behavior>`, `test(<subsystem>): …`,
    `docs: …`) via a multi-line HEREDOC describing concrete storage operations

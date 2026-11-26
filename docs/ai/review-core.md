@@ -50,8 +50,8 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 | write / flush / lifecycle | `src/db.rs`, `src/db/directory.rs`, `src/db/flush.rs`, `src/options.rs`, `src/error.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/wal.md`, `patterns/manifest.md`, `patterns/unsafe-audit.md` (`db.rs`) |
 | memory and diagnostics | `src/db/memory.rs`, `src/profile.rs`, `src/stats.rs`; L0 job counters belong to the compaction row | `patterns/cache.md`, `patterns/concurrency.md`, `pragmatic-engineering.md` |
 | sorted ingest | `src/db/ingest.rs` (ascending disjoint span, one sequence, bottommost install) | `patterns/manifest.md`, `patterns/concurrency.md` |
-| read / snapshots / pins | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | `technical-patterns.md`, `patterns/concurrency.md`, `patterns/iterator.md`, `patterns/unsafe-audit.md` (`pinned.rs`) |
-| memtable | `src/memtable/**` | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
+| read / snapshots / pins | `src/db/read.rs`, `src/db/snapshot.rs`, `src/pinned.rs` | `patterns/concurrency.md`, `patterns/iterator.md`, `patterns/sst.md` (grouped block reuse), `patterns/memtable.md` (arena-backed pins) |
+| memtable | `src/memtable/**` and `tests/arena_miri.rs` (concurrent arena pins) | `patterns/memtable.md`, `patterns/unsafe-audit.md` |
 | WAL | `src/wal/**` | `patterns/wal.md` |
 | SST v2 | `src/sst/**` | `patterns/sst.md`, `patterns/unsafe-audit.md` (`table_reader/mod.rs`) |
 | iterator | `src/iterator/**` | `patterns/iterator.md` |
@@ -59,14 +59,36 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 | manifest | `src/manifest/**` | `patterns/manifest.md`, `patterns/concurrency.md` |
 | cache | `src/cache/**` | `patterns/cache.md`, `patterns/concurrency.md` |
 | types / API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | `technical-patterns.md` |
-| v4 migration tool | `tools/v4-export/**` | `patterns/manifest.md`, `patterns/iterator.md` |
-| test allocator | `src/test_alloc.rs` (`#[cfg(test)]`), `tests/arena_miri.rs` | `patterns/unsafe-audit.md` |
+| v4 migration tool | `tools/v4-export/**` and `tests/fixtures/v4.3.15/**` | `patterns/manifest.md`, `patterns/iterator.md` |
+| test allocator | `src/test_alloc.rs` (test-only thread-local allocation counters) | `patterns/unsafe-audit.md` |
 
 Guides live under `docs/ai/patterns/`. Map `tests/**` (`crash_recovery`,
 `integration`, `e2e_scenarios`, `proptest_db`, `bidi_debug`, `lazy_delete`,
 `shared_cache`, `grouped_reads`, `read_only`, `arena_miri`), `benches/**`, `examples/**`,
 CI/Makefile/`.gitignore`, public docs, `.agents/**`, and `docs/ai/**` to the
-subsystems they exercise or document and verify contract alignment.
+subsystems they exercise or document. Under `docs/benchmarks/**`, distinguish
+executable drivers and result validators from archived patches and raw data.
+Use the recorded revisions to identify measured code.
+
+### V5 contract checks
+
+Select the row that matches the changed operation. These checks also locate
+sibling callers for a fix and a focused regression test.
+
+| Operation | What to compare | Evidence |
+|---|---|---|
+| Admit a batch or fence its WAL | A nonempty `no_slowdown` request can receive `Busy` at the L0 limit or from the immutable queue. Check the rejected member's sequence, WAL and rows alongside an admitted neighbor. A native `DB::sync_wal()` adds no user record or sequence. Exercise rotation and reopen on the requested durability path. | [Write admission](../../src/db.rs), [queue and fence tests](../../src/db/flush.rs), [recovery tests](../../tests/crash_recovery.rs) |
+| Read a key, group or range | Compare owned, pinned and existence reads at one snapshot. `get_many_pinned_with_options` fixes one view and sequence for up to `MAX_GROUPED_READ_KEYS`, preserves duplicates and input order, and publishes the returned-byte count only after all slots succeed. For scans check lending errors and the owned iterator's terminal status. | [Read path](../../src/db/read.rs), [grouped SST lookup](../../src/sst/table_reader/mod.rs), [grouped-read tests](../../tests/grouped_reads.rs), [iterator contract](../usage.md) |
+| Sample shared memory | `BlockCachePool::usage()` reports segmented and overflow charges once per pool. `DB::memory_usage()` reports each member's current memtables and L0 pin payload. Hold a returned pin through eviction or close and verify its contents independently of these gauges. | [Memory API](../../src/db/memory.rs), [cache](../../src/cache/block_cache.rs), [shared-pool tests](../../tests/shared_cache.rs) |
+| Convert and reopen one store | Trace the v4 read-only iterator, its terminal error, sorted ingest, exclusive publication and parent-directory sync. Reopen writable with the intended level count and prefix length. Read-only v5 open adopts the recorded geometry. Check SST-only rows, residual WAL updates, empty values and deletions. | [Standalone exporter](../../tools/v4-export/src/main.rs), [golden tests](../../tools/v4-export/tests/golden.rs), [migration guide](../migration.md) |
+
+When a claim concerns VSDB v18, check the MMDB revision in that checkout's
+`Cargo.toml`. The adapter in `core/src/common/engine/mmdb.rs` opens one MMDB handle
+per namespace shard. Its `migration/src/universe/staging.rs`
+publishes a complete universe, including external namespaces. The MMDB exporter
+operates on one store. Use the actual adapter operation and its own workload
+for collection latency, pin lifetime or namespace-wide memory claims.
+[VSDB v18 implementation record](https://github.com/rust-util-collections/vsdb/blob/master/docs/proposals/v18-mmdb-v5-execution.md)
 
 ## 2. Review priority (effort allocation, not automatic severity)
 
@@ -124,8 +146,11 @@ visibility, and public exports.
 `todo!`, `unimplemented!`, stand-in `unreachable!`, stub returns, or unfinished
 `TODO`/`FIXME` on active code paths. Search callers before labeling code dead.
 
-**Public API:** only items re-exported in `src/lib.rs` are public. Keep code,
-defaults, typed errors, item rustdoc, [reader documentation](#documentation-map), and tests aligned.
+**Public API** — start at [the crate root](../../src/lib.rs) and follow
+the public methods on its exposed types. Check the applicable feature set for
+the default library, optional `bench-metrics` counters, or `test-utils`
+helpers. Keep defaults, typed errors, item rustdoc, reader documentation
+and tests aligned.
 
 ## 4. Deterministic checks vs review findings
 

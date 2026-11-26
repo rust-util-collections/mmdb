@@ -1,6 +1,6 @@
 ---
 name: x-fix
-description: Resolve Open findings in docs/audit.md sequentially, one validated local commit each. Does not bump the version or tag.
+description: Explicitly invoke $x-fix to resolve Open MMDB audit findings sequentially, with one validated local commit per root cause and no version bump.
 ---
 
 # Resolve MMDB Reliability Findings
@@ -55,10 +55,10 @@ Verify each finding against current code and dedupe shared root causes:
    test in a temporary DB. For a documentation defect, correct the owning page
    in the [documentation map](../../../docs/ai/review-core.md#documentation-map)
    and verify its claim against the relevant code or test.
-2. Trace typed `ErrorKind` propagation, post-commit acknowledgement boundaries,
-   interrupted-write recovery, lock/claim/fail-stop publication order, and
-   resource cleanup paths; check sibling twins (`forward`/`reverse`,
-   `partitions`/`range_partitions`, `Snapshot`/`ArcSnapshot`, `WalAsync`/`WalSync`/`DisableWal`).
+2. Select the affected [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks).
+   Trace the failure through the API, the state change and its sibling paths.
+   For example, compare scalar and grouped read errors, or ordinary writers and
+   `no_slowdown` writers during the same flush or compaction pressure.
 3. Remove that finding's `Open` entry in the same commit.
 4. Run per-unit validation in `commit-protocol.md`.
 5. Stage only the unit's owned fix/test/doc/audit paths, inspect

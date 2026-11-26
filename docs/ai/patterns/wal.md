@@ -6,7 +6,7 @@
 
 ## Invariants
 
-**W1 Sequence & group order** — WAL record order equals contiguous sequence assignment order. `DisableWal` batches still reserve sequences and apply to `active_memtable` in group order while omitting WAL records.
+**W1 Sequence & group order** — each admitted nonempty WAL-enabled batch appends one logical record. WAL order follows request order, with sequence gaps allowed for `DisableWal` batches. Prefix methods encode the complete physical key. `delete_range_prefixed` prefixes both endpoints. A wipe followed by replacement rows in one batch retains that ordering across two eight-byte prefixes on the same DB. Verify snapshot visibility and recovery from a complete or torn WAL record. [Encoding](../../../src/types.rs) · [Cross-prefix recovery test](../../../tests/crash_recovery.rs)
 
 **W2 CRC & vectored framing** — `PartsCursor` skips empty interior slices, zero-pads `< 7B` block trailers, emits a 0-length `First` fragment when `remaining == 7` with non-empty data, and computes streaming `crc32([record_type as u8] || fragment_bytes)` identical to `WalReader`. A failed batch append latches the DB background error. A failed MANIFEST append poisons the VersionSet.
 
@@ -19,7 +19,7 @@
 ## Checklist
 
 - [ ] `PartsCursor` handles empty slices, 0-byte records, and 32 KiB block-tail boundaries identically to `WalReader`
-- [ ] A fence already covered by `synced_wal_seq` succeeds immediately. An outstanding target requires `sync_data()` even for a fence-only group
+- [ ] On a usable writable DB, an empty `WalSync` batch leaves earlier asynchronous writes unfenced. `DB::sync_wal()` captures the committed sequence and succeeds immediately when the WAL watermark already covers it. An outstanding target requires `sync_data()` even in a fence-only group. The fence adds zero WAL records and consumes zero sequences. Check rotation and loss of an unfenced suffix. [Write and fence paths](../../../src/db.rs) · [Power-loss tests](../../../src/db/flush.rs)
 - [ ] Post-commit `append_error` / `submit_active` failures preserve `Ok(())` for already-committed requests while latching fail-stop
 - [ ] `old_wal` unlinked only after `FlushContext::flush` confirms MANIFEST durability; `mmdb-flush` exits on failure so newer WALs never leapfrog a failed generation
 - [ ] Rotation consumes a ready zero-length standby WAL or creates a replacement. Empty higher WALs do not change the eligible torn-tail file

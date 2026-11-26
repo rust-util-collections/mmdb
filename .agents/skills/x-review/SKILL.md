@@ -1,6 +1,6 @@
 ---
 name: x-review
-description: Review correctness, recovery, and resource behavior in an MMDB scope and update docs/audit.md. Default is the latest commit.
+description: Explicitly invoke $x-review to inspect an MMDB scope and update docs/audit.md with verified findings. Default scope is the latest commit.
 ---
 
 # MMDB Storage-Engine Reliability Review
@@ -45,7 +45,10 @@ anything else, including `--fix`.
 2. Changed files, full diff, callers, tests. `worktree` includes intended
    untracked source/test files and explicitly requested untracked documentation (`git status --short`). For `all`,
    use `git ls-files` and the [documentation and subsystem maps](../../../docs/ai/review-core.md#documentation-map).
-3. Map via the Subsystem Map. Load concurrency/`unsafe` guides when relevant.
+3. Use the [subsystem map](../../../docs/ai/review-core.md#subsystem-map)
+   and [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks)
+   to locate the current implementation, callers and tests. Load the
+   concurrency or `unsafe` guide when the path crosses those boundaries.
 4. Mark generated, vendored, and out-of-scope rows explicitly in the ledger.
 
 ### 2. Evidence

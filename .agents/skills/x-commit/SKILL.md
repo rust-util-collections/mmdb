@@ -1,6 +1,6 @@
 ---
 name: x-commit
-description: Check MMDB worktree changes for correctness, fix confirmed issues, validate, and create atomic local commits. Does not bump the version or tag.
+description: Explicitly invoke $x-commit to review intended MMDB worktree changes, fix confirmed issues, validate and commit locally without a version bump.
 ---
 
 # Self-Reviewing Commit for MMDB
@@ -53,15 +53,14 @@ Preflight, then freeze owned paths before editing.
 
 ### 2. Review and fix (per unit)
 
-For documentation units, check the affected [reader guide or skill reference](../../../docs/ai/review-core.md#documentation-map) against its implementation, links, and examples.
-For code units, read full functions, callers, error paths, and tests. Check data-structure and
-SST v2 directory-leaf invariants, MVCC/snapshot cutoffs, post-commit and
-interrupted-write durability, concurrency/wake ordering, `unsafe` provenance
-preconditions, quantified hot-path cost, design shape, unfinished placeholders,
-standalone `tools/v4-export` parity, and the public API in `src/lib.rs`. Apply
-`false-positive-guide.md`. Fix confirmed defects in the owned unit completely,
-cover behavior fixes with a focused regression test, and re-check the affected unit. Stop and report on no
-progress or when a fix requires editing an unowned baseline file.
+For documentation and skill changes, use the [documentation map](../../../docs/ai/review-core.md#documentation-map)
+and the [per-unit validation rules](../../../docs/ai/commit-protocol.md#per-unit-validate-and-commit).
+For code, trace the complete changed operation and error or cleanup path.
+Select the relevant [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks)
+and subsystem guide. A change in a benchmark driver or validator needs
+verification against its input, marker for the measured path and output metric.
+Fix confirmed defects in the owned unit and cover behavior changes with a
+focused regression test. Report a baseline overlap before editing unowned lines.
 
 Reads may run in parallel; edits and commits are strictly sequential.
 

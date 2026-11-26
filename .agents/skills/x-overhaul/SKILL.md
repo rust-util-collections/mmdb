@@ -12,10 +12,6 @@ invariants, proves each confirmed defect with a test that fails before the fix,
 fixes it together with its sibling variants as sequential atomic local commits,
 and finalizes at most one eligible patch version bump with a local version tag.
 
-Value comes from executed evidence, not volume: every fix carries a test that
-fails before it and passes after it, and every reviewed fix is checked for its
-siblings and its regression coverage.
-
 Resolve repository paths from the Git root; Markdown links below are relative
 to this file. Read invocation arguments from user prompt text. Never create a
 branch, push, open a PR, publish, or rewrite history.
@@ -101,19 +97,20 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
 | Commit type | Check | Finding when it fails |
 |-------------|-------|-----------------------|
 | any | Subject/body claim matches the diff; public behavior agrees with item rustdoc, the relevant reader guide, and tests | Contract drift (LOW) or the behavior defect itself |
-| `fix(...)` | The diff removes the root cause, not one symptom; a test fails when the commit's `src/` hunks are reverted (revert probe below) | Incomplete fix (severity of the original defect); missing regression test (LOW) |
+| `fix(...)` | The diff removes the root cause, not one symptom; a focused check fails when the behavior-changing hunks are reverted (revert probe below) | Incomplete fix (severity of the original defect); missing regression test (LOW) |
 | `perf(...)` | Verify the measured path, control and feature flags against the [performance priorities](../../../docs/ai/pragmatic-engineering.md#performance-priorities). Check hot/warm scope (FP-9) and observable results at boundaries: empty/single-entry block, first/last restart, `[lower, upper)` bounds, reverse direction, snapshot cutoff, range tombstones, latched errors | Any changed result or dropped check is a correctness finding, not a perf note |
 | `refactor(...)` | No behavior change: same `ErrorKind`, same order of fsync / dir-sync / MANIFEST append / `CURRENT` rename / unlink, same lock scope | Behavior defect at its own severity |
 
-**Revert probe** (each `fix(...)` commit in the frozen range): when the commit's
-`src/` paths have no baseline edits and no owned edits yet, reverse-apply only
-those hunks (`git show <commit> -- <src paths> | git apply -R`), run the
-targeted test filter for the subsystem, then re-apply
-(`git show <commit> -- <src paths> | git apply`) and confirm
-`git diff --quiet -- <src paths>` before any other step. A test that fails under
-the revert is the commit's regression coverage; record its name. No failure →
-coverage gap. If reverse-apply does not apply cleanly (later commits rewrote the
-hunk), skip the probe and trace coverage statically, saying so in the report.
+**Revert probe** (each `fix(...)` commit in the frozen range): identify the
+behavior-changing hunks, including those in the standalone exporter or an
+evidence validator where applicable. Run the relevant check at `HEAD` and
+confirm it actually exercises the case. On eligible clean paths, reverse-apply
+only those implementation hunks, retaining the regression test even when
+it lives in the same Rust file. Run the same check and record whether the
+expected failure occurs. Reapply the identical patch and confirm `git diff --quiet -- <paths>` before
+continuing. If later edits or inseparable hunks prevent a clean probe, trace
+coverage statically and report the limitation. A filter that selected zero
+tests gives no coverage evidence.
 
 **Variant sweep** (each confirmed finding and each `fix(...)` commit in scope):
 
@@ -121,7 +118,8 @@ hunk), skip the probe and trace coverage statically, saying so in the report.
    latched by an iterator stays latched on every later advance", "a partitioned
    SST leaf agrees with its resident directory bounds", "already-committed
    writes still return `Ok(())` when post-commit rotation fails").
-2. Search for every sibling that must hold the same invariant: forward/reverse
+2. Follow the affected [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks)
+   across API, subsystem and caller boundaries. Search sibling paths including forward/reverse
    twins (`seek` vs `seek_for_prev` / `seek_to_last`), lending `step_next` /
    `step_prev` vs `Iterator::next` / `next_back`, `DBIterator` / `BidiIterator` /
    `LevelIterator` / `TableIterator` / `MergingIterator`, point-index

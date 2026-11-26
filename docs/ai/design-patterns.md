@@ -15,7 +15,7 @@ Report only with a concrete failure; apply `false-positive-guide.md` first.
 ## D-LOCK
 
 - **1** Global exclusive lock where ArcSwap/atomics/channels suffice, **or** lock-free snapshot used for a latest-state decision (SuperVersion rules).
-- **2** Lock across disk I/O, fsync, network, or heavy work.
+- **2** Holding `DB::inner` across unnecessary SST construction, table-cache misses or directory sync. For group WAL append/sync, trace the existing serialized write path and measure its effect on competing operations. [Lock scopes](patterns/concurrency.md)
 - **3** Nested locks without documented order (`patterns/concurrency.md`).
 - **4** Check-then-act / lazy init without one continuous guard.
 
@@ -48,7 +48,7 @@ Skip documented single-writer + intentional snapshot reads unless a multi-writer
 ## D-FAIL
 
 - **1** Durability side effect dropped after log/catch while reporting success.
-- **2** Partial success returned as full success, **or** post-commit side-effect failure (rotation/queueing) returning `Err` for writes already visible and durable.
+- **2** A partial grouped read reported as a complete result, or a rotation or queueing failure returning `Err` to an already-committed writer. Check visibility and WAL persistence separately for the writer's requested durability mode.
 - **3** Incorrect success result (checksum or directory-to-leaf bounds not checked; unreadable/truncated leaf returned as empty).
 - **4** Distinct failures collapsed (`Corruption`/`Io` reclassified as `Background` when not fail-stopped) or fail-stop flag published *after* waking waiters.
 - **5** Interrupted multi-step write leaves inconsistent or unrecoverable on-disk state.

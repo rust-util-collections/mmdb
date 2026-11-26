@@ -148,9 +148,10 @@ A dirty worktree is permitted when ownership boundaries remain disjoint.
 - If a required fix overlaps dirty baseline hunks, or if `staged` scope touches
   a file that also has unstaged edits affecting worktree `cargo` validation,
   stop and report before editing.
-- `$x-overhaul` revert probe: may temporarily reverse-apply a reviewed commit's
-  `src/` hunks only on paths with no baseline or owned edits. Re-apply them and
-  confirm `git diff --quiet -- <paths>` before any other step.
+- For the `$x-overhaul` revert probe, temporarily reverse only behavior-changing
+  hunks on paths with no baseline or owned edits. Preserve regression tests in
+  those files, including exporter tests and benchmark evidence checks. Reapply
+  the patch and confirm `git diff --quiet -- <paths>` before any other step.
 - Delegated review agents are strictly read-only. Investigation and read-only
   checks may run in parallel; edits and commits on one checkout are sequential.
 

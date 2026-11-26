@@ -40,6 +40,7 @@ cargo test --test integration   # integration tests only
 cargo test --test crash_recovery
 cargo test --test e2e_scenarios
 cargo test --test proptest_db
+cargo test --test grouped_reads    # bounded pinned reads and snapshot visibility
 cargo test --lib --features bench-metrics  # include opt-in diagnostic counters
 ```
 
@@ -56,7 +57,9 @@ jobs, or older-compiler compatibility shims.
 
 Follow a write, read, compaction, or reopen in the [v5 storage architecture](docs/architecture.md).
 The [subsystem map](docs/ai/review-core.md#subsystem-map) pairs each source area
-with its review checklist. For public behavior and format conversion, see
+with its review checklist. The [v5 contract checks](docs/ai/review-core.md#v5-contract-checks)
+connect admission, WAL fences, grouped reads, memory accounting and export
+to their implementing paths and tests. For public behavior and format conversion, see
 [Using MMDB v5](docs/usage.md) and [Migrating to v5](docs/migration.md).
 
 ## Skills
@@ -105,5 +108,5 @@ The [audit registry](docs/audit.md) is maintained by `$x-review`, `$x-fix`, and 
 - Feature `bench-metrics` enables per-worker write-stage timing and per-DB L0 statistics. Use the [engine workload profiles](docs/benchmarks/engine-profile/) and [L0 evidence](docs/benchmarks/l0-profile/) for benchmark configurations, controls and counter units. The [grouped read trials](docs/benchmarks/grouped-reads/) record returned-pin ownership, actual storage-read coverage and independent scalar controls.
 - Feature `test-utils` exposes `DB::simulate_crash()` for durability tests and `point_table_probes()` / `PinnedSlice::sst_backing_charge()` for grouped-read attribution. Under Miri it also exposes `concurrent_arena_pins()` for `cargo +nightly miri test --test arena_miri`
 - Unsafe code is confined to the arena skiplist (`src/memtable/`), group-commit/file-lock and advisory WAL writeback paths (`src/db.rs`), advisory SST readahead (`src/sst/table_reader/mod.rs`), and the `#[cfg(test)]` counting allocator (`src/test_alloc.rs`); derive the live inventory via search and follow [unsafe-audit.md](docs/ai/patterns/unsafe-audit.md)
-- Only the curated re-exports in `src/lib.rs` are public API; all modules are private — internal refactors are not breaking changes
+- [The crate root](src/lib.rs) defines the public API, including re-exported types and their public methods. Check feature-gated diagnostics and test helpers in the configuration that exposes them.
 - **No Co-Authored-By in commits** — never add `Co-Authored-By:` or similar trailers to commit messages; project commits are authored only by the human contributor

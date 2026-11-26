@@ -119,9 +119,13 @@ Rejected. Delete an existing entry when a re-check shows it was never a defect.
 **Skip:** `DurabilityMode::DisableWal` omitting WAL records (losing un-flushed
 batches on crash is its contract), or `wal_bytes_per_sync` (`sync_file_range`)
 not guaranteeing crash durability (it is an advisory writeback hint).
-**Keep:** `WalSync` or `sync_wal()` (`WalFence`) returning `Ok(())` without
-`sync_data()` covering prior WAL-enabled batches, or `synced_wal_seq` advancing
-past unsynced `WalAsync` records.
+A writable empty `WalSync` batch completes after validation and has no
+fence effect. A native `DB::sync_wal()` may reuse a target already synced
+by a previous group or WAL rotation. Check the seal and current watermark
+before treating the absence of a new sync syscall as a defect.
+**Keep:** a successful fence whose target includes a WAL-enabled batch
+that still disappears after loss of unsynced bytes, or a watermark that
+advances past an unsynced `WalAsync` record. [Fence and rotation tests](../../src/db/flush.rs)
 
 ## FP-19: `Iterator::next` vs fallible `step_next` / `step_prev` lookahead
 

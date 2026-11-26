@@ -7,15 +7,15 @@ Describe findings with the registry fields in `review-core.md`.
 
 ### 1.1 View-before-sequence & SuperVersion usage
 **Pattern:** Reading `committed_sequence` before pinning `SuperVersion` (GC race), or using a point-in-time `SuperVersion` for latest-state mutation/compaction picks without revalidating under `DB::inner`.
-**Where:** `db/read.rs` (`point_lookup`, `scan`), `db.rs` (`super_version.load()`).
+**Where:** [Read view and visibility](../../src/db/read.rs) (`point_lookup`, `grouped_point_lookup`, `scan`, `resolve_read_sequence`) and [sorted ingestion](../../src/db/ingest.rs).
 **Impact:** Snapshot/point read misses compacted versions, or compaction acts on superseded files.
-**Check:** Readers pin `SuperVersion` *before* `committed_sequence.load(Acquire)`. Latest-state mutations revalidate inputs, `l0_install_epoch`, and active snapshots under `DB::inner`.
+**Check:** After pinning the view, latest reads take the minimum of the committed sequence and that view's `ingest_ceiling`. Explicit snapshots supply a DB-checked sequence. A grouped lookup uses the same pair for every slot. A reader paused after pinning an old view must still observe the pre-ingest state after sorted ingestion and a subsequent write. Latest-state mutations revalidate their own inputs under `DB::inner`.
 
 ### 1.2 Group-commit ordering & post-commit boundary
 **Pattern:** WAL vs MemTable phase reorder, `committed_sequence` stored before all MemTable inserts finish, or post-commit auto-freeze (`submit_active`) / partial-group `append_error` overwriting already-committed callers' results with `Err`.
 **Where:** `db.rs` (`enqueue_write`, `write_batch_group`, `submit_active`).
 **Impact:** Linearizability break, or callers told a durable/visible write failed.
-**Check:** Required order: `admit_range_stripes` + `admit_same_key_runs` → contiguous seq reserve → vectored WAL loop (`DisableWal` skipped; a fence syncs an outstanding target) → `sync_data()`/`flush()` → MemTable loop in group order → `committed_sequence.store(Release)` → `synced_wal_seq`. Any error *after* `committed_sequence` publication must preserve `Ok(())` for committed requests while latching fail-stop.
+**Check:** Validate the batch before pressure checks. A full immutable queue or L0 at the slowdown or stop threshold can return `Busy` to a nonempty `no_slowdown` write. The leader rechecks immutable capacity for each queued nonblocking member before range-stripe and same-key admission. Trace admitted sequences through WAL append and flush/sync, ordered memtable insertion and `committed_sequence.store(Release)`. Advance the WAL watermark on a successful sync. When a later append or post-commit auto-freeze fails, preserve each already-committed caller's success. [Group and WAL oracles](../../src/db/flush.rs)
 
 ### 1.3 Async `FlushQueue`, claims, & fail-stop wake ordering
 **Pattern:** Popping `immutable_memtables` before `confirm_manifest_durable`; signaling `compaction_notify` while still holding `CompactionClaim` on new L0 SSTs; or waking `FlushQueue` waiters (`flush_queue.fail`) before storing `bg_error` + `has_bg_error` (`Release`).
@@ -36,6 +36,14 @@ Describe findings with the registry fields in `review-core.md`.
 **Where:** `db.rs`, `manifest/version_set.rs`, `types.rs`.
 **Impact:** Snapshot anomalies, or corrupting/truncating a store on format/geometry mismatch.
 **Check:** A write batch reserves one sequence per operation. Sorted ingestion assigns one fresh sequence to all rows in a nonempty input. On reopen, `DBHeader::read` + geometry check run before `VersionEdit` replay, `open_append_truncated`, or WAL recovery. Writable locking can create `LOCK` before header validation. Read-only open adopts stored geometry.
+
+For `ingest_sorted`, check strict input order and revalidate the complete
+user-key interval against active/immutable memtables, SST point bounds
+and range-tombstone extents at installation. Before MANIFEST installation,
+failure discards this job's staged SSTs. After installation, a failed
+durability confirmation must retain the referenced files and fail-stop.
+A successful ingest caps the old views before publishing the new view and
+sequence. [Ingestion and its race tests](../../src/db/ingest.rs)
 
 ### 2.2 `InternalKey`, `FileMetaData`, & directory↔leaf bounds
 **Pattern:** Unvalidated `< 8`-byte or inverted `FileMetaData` bounds in `VersionSet`, or SST v2 partitioned index/`rangedel` leaves whose start/end keys disagree with `TableReader::partitions` / `range_partitions`.

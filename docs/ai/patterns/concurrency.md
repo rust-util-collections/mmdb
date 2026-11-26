@@ -28,7 +28,8 @@ possible MANIFEST rotation, runs under `inner`.
 
 **CC1 View-before-sequence read barrier** — `ReadState::point_lookup`,
 `grouped_point_lookup` and `scan` pin the `SuperVersion` before resolving
-visibility. A latest read loads `committed_sequence` with `Acquire`. An
+visibility. A latest read takes the minimum of `committed_sequence` and
+that view's `ingest_ceiling`, loading both with `Acquire`. An
 explicit snapshot supplies its checked sequence. The grouped lookup uses
 one view and sequence for every slot, including duplicates. Writers publish
 the sequence with `Release` after all memtable inserts. The pinned view
@@ -39,7 +40,9 @@ keeps the reader's sources alive through concurrent compaction.
 **CC3 Unlocked WAL rotation & FIFO `FlushQueue`** — only the active `write_queue` leader (or `close()` after draining writers and `maintenance`) enters `freeze_memtable`, so taking `wal_writer = None` across unlocked seal/create cannot race another writer; on seal/create error, restore `old_wal` and fail-stop. `immutable_memtables` pushes newest-first (`push_front`), `SuperVersion` reads front-to-back, and `mmdb-flush` pops oldest (`pop_back`) only *after* `confirm_manifest_durable` succeeds. A valid nonempty `no_slowdown` batch receives `ErrorKind::Busy` from a full
 immutable queue or when L0 reaches its slowdown threshold (including stop
 pressure). Reject before assigning that request a sequence or appending its
-WAL record. A group can still publish an admitted neighbor. Waiters release
+WAL record. On L0 refusal, signal compaction when the observed count also
+meets `l0_compaction_trigger`, so an earlier overlapping claim cannot strand
+eligible work. A group can still publish an admitted neighbor. Waiters release
 their stack-backed requests only after leader completion.
 
 **CC4 Unlocked compaction, claims, & `l0_install_epoch`** — release `CompactionClaim` *before* signaling `compaction_notify` so woken workers never see newly flushed L0 SSTs still in `in_flight` and go back to sleep. Full-level `LevelRewrite` records `l0_install_epoch` (incremented on every freeze and flush completion); if `0 -> 0` races a freeze/flush, discard created outputs and switch to `L0 -> L1`. `SstBuilds` tracks threads inside flush/compaction SST builds so filter/collector callbacks calling mutating DB methods or `close()` fail fast with `ErrorKind::InvalidArgument` instead of deadlocking.

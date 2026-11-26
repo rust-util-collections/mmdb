@@ -21,7 +21,8 @@
 ## Checklist
 
 - [ ] `DBHeader` validated before MANIFEST tail repair or WAL recovery; preserved on every MANIFEST rotation
-- [ ] For exporter changes, compare the ordered visible source and destination rows and final iterator statuses. Verify a writable reopen with the exported geometry, a new write and another reopen; the read-only opener adopts the stored geometry.
+- [ ] For the single-store exporter, cover an SST plus residual WAL, deletions, an empty value and two eight-byte prefixes. Check the full visible stream and terminal iterator status on each side. An incorrect writable level count or prefix length must fail. With the matching geometry, write, close, reopen and compare the entire updated stream. [Exporter golden tests](../../../tools/v4-export/tests/golden.rs)
+- [ ] Check source-file preservation, cleanup after a late source scan error and exclusive publication to an absent destination. If the parent directory sync fails after rename, a visible destination can remain. VSDB owns namespace inventory, allocator floors and the whole-generation switch for its own converter. [MMDB exporter](../../../tools/v4-export/src/main.rs) · [VSDB migration](https://github.com/rust-util-collections/vsdb/tree/master/migration)
 - [ ] Writable reopen rejects `(num_levels, prefix_len)` mismatch with `InvalidArgument`; read-only adopts stored geometry
 - [ ] `open_table` validates `decode_internal_key` + `smallest_key <= largest_key` + `has_range_deletions`; `validate_level_disjointness` never skips empty bounds
 - [ ] `DirSynced` + `confirm_manifest_durable` precede WAL/SST unlinks; `PendingSsts` cleans failed builds without touching sibling jobs

@@ -16,7 +16,7 @@ policy. `TableCache` coalesces opens through `try_get_with`.
 **CA1 Member isolation** — same `file_number`/`offset` across DBs never share bytes.
 Keys always carry `member_id`; IDs are monotonic and never reused after `detach()`.
 
-**CA2 Pin lifecycle & unlocked L0 warm** — `prepare_first_block_pin` reads L0 index leaf 0 + data block 0 outside `DB::inner`; `publish_prepared_pin` uses `insert_validated_block` when the leaf needs warming and `insert_pinned_validated_block` for the prepared data block. Every L0 exit path (compaction, trivial move, `drain_l0`, `LevelRewrite`, `detach`) calls `unpin_file`/`invalidate_file` only after MANIFEST install succeeds. Replacement pins adjust `pinned.bytes` by exact delta.
+**CA2 Pin lifecycle & unlocked L0 warm** — `prepare_first_block_pin` prepares the first index leaf and data block of an eligible L0 SST outside `DB::inner`. `publish_prepared_pin` warms the index leaf when needed and publishes the data pin. Trace `unpin_file` or `invalidate_file` after an installed compaction, trivial move, L0 drain or level rewrite. Closing a member detaches its cache independently of a MANIFEST edit. Replacement pins adjust `pinned.bytes` by the exact payload delta.
 
 **CA3 Pin snapshots** — `get()` loads immutable pins through `ArcSwap` without `pin_updates`. Insert, unpin, and detach serialize on `pin_updates`, load the latest snapshot under the lock, and publish `entries` + `bytes` atomically. In-flight readers finish via retained `Arc<Vec<u8>>`s (including `PinnedSlice` `LazyValue::BlockRef`).
 
@@ -26,7 +26,7 @@ Keys always carry `member_id`; IDs are monotonic and never reused after `detach(
 
 **CA6 TableReader & TableCache life** — eviction or `TableCache::close()` (`inner.store(None)` → `ErrorKind::DbClosed` on new misses) must not invalidate `Version` or iterator `Arc<TableReader>`s. `prewarm` runs unlocked before `log_and_apply_synced`; authoritative open errors happen inside `VersionSet::open_table`.
 
-**CA7 Memory gauges** — count `BlockCachePool::usage()` once per pool. Each store charges `capacity().max(1)` per admitted buffer. Test stable weighted charges after quiescent cache maintenance. `DB::memory_usage()` reports the member's L0 pin-map payload lengths and the active/immutable memtables in one published view. Caller-held blocks and retired views can outlive cache invalidation and DB close.
+**CA7 Memory gauges** — count `BlockCachePool::usage()` once per shared pool, keeping both stores' capacities and weighted charges separate. Each store charges `capacity().max(1)` per admitted buffer. Test weighted charges after quiescent maintenance. `DB::memory_usage()` samples active and immutable memtables from one published view and the member's L0 pin-map payload independently. The string property `block-cache-usage` reports an entry count. After close the DB gauges reach zero even when a caller still owns an old pin. [Gauge implementation](../../../src/db/memory.rs) · [Shared-pool tests](../../../tests/shared_cache.rs)
 
 ## Accepted races
 

@@ -1,5 +1,5 @@
 interface:
   display_name: "MMDB Overhaul"
-  short_description: "Review scoped changes, prove fixes, and create local patch tags"
+  short_description: "Review a scope, prove fixes and tag eligible local versions"
 policy:
   allow_implicit_invocation: false

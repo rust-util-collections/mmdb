@@ -24,8 +24,12 @@
 
 ### Grouped point reads
 
-A grouped request keeps one published view and one read sequence, coalesces
-equal keys and restores the original order of its result slots. Each of the
+A grouped request accepts up to `MAX_GROUPED_READ_KEYS` input slots (32),
+including duplicates. Check empty and singleton inputs with a foreign
+snapshot, the 33-slot error, and a nonempty pin held after close. The limit
+bounds slots. Distinct returned values can retain whole SST blocks or
+memtable arenas. A group keeps one published view and one read sequence,
+coalesces equal keys and restores the original slot order. Each of the
 two request-local file cursors owns an index leaf. Each leaf belongs
 to a file number and partition. The cached data slot belongs to that same
 leaf. Replacing a file cursor or changing its partition drops the cached data
@@ -35,6 +39,7 @@ keys outside SST point bounds, duplicates, misses and a malformed later
 block. A failed request drops its earlier pins and leaves the returned-byte
 counter unchanged. Compare the real block acquisitions when two SSTs
 alternate, including a third table with only a post-snapshot record.
+[Grouped-read regression tests](../../../tests/grouped_reads.rs)
 
 ## Checklist
 
