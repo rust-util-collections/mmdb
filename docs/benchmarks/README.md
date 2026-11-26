@@ -21,9 +21,9 @@ the cost of bringing the shard sets to a common compaction endpoint.
 | [L0 compaction and WAL fences](l0-profile/README.md) | Two-range compaction cut foreground stalls, but the experiment could not establish whether read p99 stayed within budget. An extra prefix cut increased cold-row rewrites. MMDB retains serial L0 compaction and the ordinary flush layout. |
 | [MMDB, RocksDB, and Pebble](point-ops/README.md) | MMDB had lower eight-writer put throughput than RocksDB and higher single-reader warm-hit throughput in both fill layouts. The report gives WAL acknowledgement policies for each engine. |
 
-At revision `90b220e`, all 25 engine validation commands passed on native
-x86_64 Linux and in an AArch64 Linux full-system virtual machine. Each
-target passed 585 default runtime cases and two doctests, plus 429
+At revision `90b220e`, the 21 engine checks in the validation excerpt passed
+on native x86_64 Linux and in an AArch64 Linux full-system virtual machine.
+Each target passed 579 default engine runtime cases and two doctests, plus 429
 overlapping feature-enabled library tests. The arena pin test also passed
 under Miri.
 [Validation receipt](engine-profile/validation.json)
@@ -46,27 +46,20 @@ One VSDB namespace owns a pool and one or more MMDB shards. VSDB v18
 uses seven levels and eight-byte prefixes. Its ordinary VecDex search uses
 scalar pinned decoding. DagMap publishes parent and
 child records in a single checked, co-located batch. VerMap dependent
-edits publish one changed working root. Upgrading an existing universe
-requires a complete offline generation, including any externally placed
-namespaces. [VSDB v18](https://github.com/rust-util-collections/vsdb/blob/master/docs/v18.md) · [VSDB storage](https://github.com/rust-util-collections/vsdb/blob/master/docs/storage.md) · [VSDB migration](https://github.com/rust-util-collections/vsdb/blob/master/migration/README.md)
+edits publish one changed working root. [VSDB v18](https://github.com/rust-util-collections/vsdb/blob/master/docs/v18.md) · [VSDB storage](https://github.com/rust-util-collections/vsdb/blob/master/docs/storage.md)
 
-The stock v18/v4 versus v18/v5 comparisons measure complete caller
-operations on x86_64 Linux:
+The VSDB v18 experiments measured complete caller operations on MMDB v5
+on x86_64 Linux.
 
-- Creating a child in a default 16-shard DagMap reduced p99 by 33.38%. On
-  the v5 adapter alone, atomic registration reduced engine writes per child
+- On the v5 adapter, atomic registration reduced engine writes per DagMap child
   from two to one. [Publication trials](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-publication/README.md)
-- Hot-shard write saturation rose 59.53%. With all 16 shards active, gross
-  saturated byte throughput stayed within the control spread, but foreground
-  small-put completions/s fell 31.63%. The selected 2 GiB namespace profile
+- The selected 2 GiB namespace profile
   uses four immutable slots, a 16 MiB per-shard buffer and 256 MiB for
   each of the two evictable stores. The measured RSS applies to the stated
   workloads. [Adapter and resource trials](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-adapter/README.md)
-- The same warm 8,192-node VecDex graph produced identical ordered query
-  results. Median run p99 was 184.57 µs on v4 and 253.38 µs on v5, a
-  paired regression of 37.48%. Grouping vectors did not meet the full-query
-  adoption criterion. On the final stock B+ tree fixture, hit and miss p99
-  rose by 12.03% and 11.83%. [VecDex queries](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-vecdex-v5/README.md) · [B+ tree measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-tree-v5/stock/README.md)
+- On a warm 8,192-node VecDex graph, median query p99 was 253.38 µs.
+  Grouping vectors did not meet the full-query adoption criterion.
+  [VecDex queries](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-vecdex-v5/README.md) · [B+ tree measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-tree-v5/stock/README.md)
 
 ## Performance criteria
 

@@ -44,7 +44,7 @@ anything else, including `--fix`.
    untracked source/test files and explicitly requested untracked documentation (`git status --short`). For `all`,
    use `git ls-files` and the [documentation and subsystem maps](../../../docs/ai/review-core.md#documentation-map).
 3. Use the [subsystem map](../../../docs/ai/review-core.md#subsystem-map)
-   and [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks)
+   and [storage contract checks](../../../docs/ai/review-core.md#storage-contract-checks)
    to locate the current implementation, callers and tests. Load the
    concurrency or `unsafe` guide when the path crosses those boundaries.
 4. Mark generated, vendored, and out-of-scope rows explicitly in the ledger.

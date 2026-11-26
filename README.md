@@ -50,12 +50,12 @@ with prefix scans, bounded iteration, and typed errors. [Example source](example
 
 | Task | Start here |
 |------|------------|
-| Choose durability, configure a store, read a snapshot, or scan a range | [Using MMDB v5](docs/usage.md) |
+| Choose durability, configure a store, read a snapshot, or scan a range | [Using MMDB v6](docs/usage.md) |
 | Inspect a stable copy without writing to it | [Read-only databases](docs/usage.md#read-only-databases) |
-| Convert a v4 store and update Rust call sites | [Migrating to v5](docs/migration.md), [changelog](CHANGELOG.md) |
+| Upgrade a database to v6 | [Upgrade path and reopening a v5 store](docs/migration.md), [changelog](CHANGELOG.md) |
 | Trace a write through the WAL, flush, recovery, and compaction, or follow a point lookup | [Storage architecture](docs/architecture.md) |
 | Find public methods, options, defaults, and error types | [Crate API](https://docs.rs/mmdb), [exports in this checkout](src/lib.rs) |
-| Compare engines, assess the v5 upgrade, or reproduce a benchmark | [Benchmark reports and workloads](docs/benchmarks/README.md), [VSDB v18 application results](docs/benchmarks/README.md#vsdb-application-results) |
+| Compare engines or reproduce a benchmark | [Benchmark reports and workloads](docs/benchmarks/README.md), [VSDB v18 application results](docs/benchmarks/README.md#vsdb-application-results) |
 | Contribute or run the project's review and fix workflows | [Contributor and skill guide](AGENTS.md), [audit registry](docs/audit.md) |
 
 ## Build and test

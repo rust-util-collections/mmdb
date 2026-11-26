@@ -1,4 +1,4 @@
-# Using MMDB v5
+# Using MMDB v6
 
 ## Open and configure a store
 
@@ -11,6 +11,8 @@ their containing directories before publishing the store. A caller supplying
 an existing directory under a search-only parent is responsible for the
 durability of that existing directory entry. At creation MMDB records `num_levels` and `prefix_len` in the MANIFEST.
 Supply the same values on every writable reopen.
+An existing v5 database can be opened directly with those options.
+[Upgrading to v6](migration.md)
 
 | Option | Default | What it controls |
 |--------|---------|------------------|

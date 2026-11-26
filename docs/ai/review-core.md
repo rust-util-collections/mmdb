@@ -27,7 +27,6 @@ to unsupported architectures under `Won't Fix`.
 |---------------|-----------------|
 | Public operations, errors, defaults | [Usage guide](../usage.md), public rustdoc on the items re-exported by `src/lib.rs`, and the corresponding API tests |
 | Read, write, recovery, format, or resource behavior | [Storage architecture](../architecture.md), the subsystem implementation and its tests |
-| Store and caller migration | [Migration guide](../migration.md), `tools/v4-export/src/main.rs` and its golden-store tests |
 | Engine performance, diagnostics, or historical comparisons | [Benchmark reports](../benchmarks/README.md) and [performance priorities](#performance-priorities). Match the revision, feature flags, workload and counter scope to the claim. |
 | Skill scope, outputs, and validation | [Project guide](../../AGENTS.md#skills), the four skill entry points and their `agents/openai.yaml`, [workflow policy](workflow-policy.md) and [commit protocol](commit-protocol.md) |
 
@@ -58,8 +57,7 @@ sections in the coordinator's ledger so each section has one read-only reviewer.
 | compaction | `src/compaction/**` | [compaction](patterns/compaction.md), [concurrency](patterns/concurrency.md) |
 | manifest | `src/manifest/**` | [MANIFEST](patterns/manifest.md), [concurrency](patterns/concurrency.md) |
 | cache | `src/cache/**` | [cache](patterns/cache.md), [concurrency](patterns/concurrency.md) |
-| types / API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | [Public contracts](../usage.md), [v5 contract checks](#v5-contract-checks), [WAL](patterns/wal.md) (batch encoding), [memtable](patterns/memtable.md) (admission budgets), [compaction](patterns/compaction.md) & [concurrency](patterns/concurrency.md) (`rate_limiter.rs`) |
-| v4 migration tool | `tools/v4-export/**` and `tests/fixtures/v4.3.15/**` | [MANIFEST](patterns/manifest.md), [iterator](patterns/iterator.md) |
+| types / API | `src/types.rs`, `src/lib.rs`, `src/rate_limiter.rs` | [Public contracts](../usage.md), [storage contract checks](#storage-contract-checks), [WAL](patterns/wal.md) (batch encoding), [memtable](patterns/memtable.md) (admission budgets), [compaction](patterns/compaction.md) & [concurrency](patterns/concurrency.md) (`rate_limiter.rs`) |
 | test allocator | `src/test_alloc.rs` (test-only thread-local allocation counters) | [unsafe code](patterns/unsafe-audit.md) |
 
 Guides live under `docs/ai/patterns/`. Map `tests/**` (`crash_recovery`,
@@ -70,7 +68,7 @@ subsystems they exercise or document. Under `docs/benchmarks/**`, distinguish
 executable drivers and result validators from archived patches and raw data.
 Use the recorded revisions to identify measured code.
 
-### V5 contract checks
+### Storage contract checks
 
 Select the row that matches the changed operation. These checks also locate
 sibling callers for a fix and a focused regression test.
@@ -80,15 +78,11 @@ sibling callers for a fix and a focused regression test.
 | Admit a batch or fence its WAL | A nonempty `no_slowdown` request can receive `Busy` at the L0 limit or from the immutable queue. Check the rejected member's sequence, WAL and rows alongside an admitted neighbor. A native `DB::sync_wal()` adds no user record or sequence. Exercise rotation and reopen on the requested durability path. | [Write admission](../../src/db.rs), [queue and fence tests](../../src/db/flush.rs), [recovery tests](../../tests/crash_recovery.rs) |
 | Read a key, group or range | Compare owned, pinned and existence reads at one snapshot. `get_many_pinned_with_options` fixes one view and sequence for up to `MAX_GROUPED_READ_KEYS`, preserves duplicates and input order, and publishes the returned-byte count only after all slots succeed. For scans check lending errors and the owned iterator's terminal status. | [Read path](../../src/db/read.rs), [grouped SST lookup](../../src/sst/table_reader/mod.rs), [grouped-read tests](../../tests/grouped_reads.rs), [iterator contract](../usage.md) |
 | Sample shared memory | `BlockCachePool::usage()` reports segmented and overflow charges once per pool. `DB::memory_usage()` reports each member's current memtables and L0 pin payload. Hold a returned pin through eviction or close and verify its contents independently of these gauges. | [Memory API](../../src/db/memory.rs), [cache](../../src/cache/block_cache.rs), [shared-pool tests](../../tests/shared_cache.rs) |
-| Convert and reopen one store | Trace the v4 read-only iterator, its terminal error, sorted ingest, exclusive publication and parent-directory sync. Reopen writable with the intended level count and prefix length. Read-only v5 open adopts the recorded geometry. Check SST-only rows, residual WAL updates, empty values and deletions. | [Standalone exporter](../../tools/v4-export/src/main.rs), [golden tests](../../tools/v4-export/tests/golden.rs), [migration guide](../migration.md) |
+| Reopen an existing store | Check the v5 MANIFEST header and persisted level count and prefix length. Writable reopen must reject mismatched geometry. Read-only open adopts that geometry and replays eligible residual WAL records into memory. Check visible SST and WAL rows at reopen and verify a subsequent write after another reopen. | [MANIFEST](patterns/manifest.md), [`native_v5_store_recovers_and_accepts_new_writes`](../../tests/integration.rs), [read-only tests](../../tests/read_only.rs), [recovery tests](../../tests/crash_recovery.rs) |
 
-When a claim concerns VSDB v18, check the MMDB revision in that checkout's
-`Cargo.toml`. The adapter in `core/src/common/engine/mmdb.rs` opens one MMDB handle
-per namespace shard. Its `migration/src/universe/staging.rs`
-publishes a complete universe, including external namespaces. The MMDB exporter
-operates on one store. Use the actual adapter operation and its own workload
-for collection latency, pin lifetime or namespace-wide memory claims.
-[VSDB v18 implementation record](https://github.com/rust-util-collections/vsdb/blob/master/docs/v18.md)
+For claims about VSDB collection latency, pin lifetime or namespace-wide memory,
+check the MMDB dependency and adapter in the VSDB revision under test and
+measure the caller's workload.
 
 ## 2. Review priority (effort allocation, not automatic severity)
 
@@ -100,7 +94,7 @@ for collection latency, pin lifetime or namespace-wide memory claims.
 | API / semantics | `src/lib.rs` exports, `DbOptions` builders/defaults, MVCC & `[lower, upper)` bounds, `step_next`/`step_prev` | HIGH |
 | Error handling | fail-stop latches (`VersionSet::poisoned`, `ReadState::has_bg_error`, `FlushQueue::fail`), typed `ErrorKind` (`Busy`, `Background`, `Corruption`, `ReadOnly`, `DbClosed`) | MEDIUM |
 | Performance | quantified hot/warm-path allocations, lock hold across I/O, extra partition leaf reads | context |
-| Tests / docs / build | regression coverage, doc-code alignment, `tools/v4-export` & CI/gate parity | LOW unless broken |
+| Tests / docs / build | regression coverage, doc-code alignment, CI/gate parity | LOW unless broken |
 
 ## 3. Evidence
 
@@ -170,9 +164,8 @@ their [benchmark report](../benchmarks/README.md).
   complete operation on the same graph or collection. The 32-key engine
   workload and the VSDB VecDex query gave different results.
   [Grouped reads](../benchmarks/grouped-reads/README.md) · [VSDB application results](../benchmarks/README.md#vsdb-application-results)
-- **Cleanup and migration.** An occasional cleanup or one-time conversion
-  can take longer for correctness or simplicity. Keep tool-specific
-  optimizations in the tool. Before adding state, locking or branches to
+- **Maintenance.** Occasional cleanup can take longer for correctness or
+  simplicity. Keep tool-specific optimizations in the tool. Before adding state, locking or branches to
   the engine, establish a measurable benefit to normal operations. For
   cleanup under a writer lock or with a growing queue, measure the cost to
   foreground reads and writes.
@@ -188,7 +181,7 @@ Record static-inspection findings only for rules automated tools cannot check:
 - `#[allow(...)]` attributes added to suppress warnings instead of fixing them
 - public behavior, defaults, `ErrorKind`, or docs that disagree with the code
 - missing, vague, or inaccurate `// SAFETY:` preconditions on `unsafe` blocks
-- CI / `Makefile` / `.gitignore` omissions that skip a standalone crate such as `tools/v4-export`
+- CI or `Makefile` omissions that skip an engine test target or feature configuration
 
 ## 5. Findings registry (`docs/audit.md`)
 

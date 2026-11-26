@@ -6,32 +6,27 @@ all: fmt lint test
 
 fmt:
 	cargo fmt
-	cargo fmt --manifest-path tools/v4-export/Cargo.toml
 
 lint:
 	cargo clippy --lib -- -D warnings
 	cargo clippy --lib --features bench-metrics -- -D warnings
 	cargo clippy --all-targets -- -D warnings
 	cargo clippy --all-targets --features bench-metrics -- -D warnings
-	cargo clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 	RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features bench-metrics
 
 check:
 	cargo check --all-targets
 	cargo check --benches --features bench-metrics
-	cargo check --manifest-path tools/v4-export/Cargo.toml --all-targets
 
 test:
 	$(CARGO_TEST)
 	$(CARGO_TEST) --release
 	$(CARGO_TEST) --lib --features bench-metrics
-	$(CARGO_TEST) --manifest-path tools/v4-export/Cargo.toml
 
 # Same gate as .github/workflows/ci.yml. No release suite, no scale_profile.
 ci:
 	cargo fmt --all -- --check
-	cargo fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check
 	$(MAKE) check
 	$(MAKE) lint
 	$(CARGO_TEST) --lib
@@ -46,14 +41,12 @@ ci:
 	$(CARGO_TEST) --test shared_cache
 	$(CARGO_TEST) --test grouped_reads
 	$(CARGO_TEST) --test read_only
-	CI=1 $(CARGO_TEST) --manifest-path tools/v4-export/Cargo.toml
 
 bench:
 	cargo bench
 
 clean:
 	cargo clean
-	cargo clean --manifest-path tools/v4-export/Cargo.toml
 
 update:
 	cargo update

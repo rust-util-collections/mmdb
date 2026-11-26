@@ -73,11 +73,6 @@ Keep exact Rust and MMDB identifiers (`unsafe`, `ErrorKind::Corruption`,
 `VersionSet::poisoned`, `ReadState::has_bg_error`, `DirSynced`, `PinnedSlice`,
 `SequenceNumber`, `ArcSwap`) verbatim, while conversing in the user's language.
 
-The exporter has its own [Cargo manifest](../../tools/v4-export/Cargo.toml)
-and links MMDB 4.3.15 alongside the v5 path dependency. Root Cargo commands
-cover the library package. Run the exporter checks with
-`--manifest-path tools/v4-export/Cargo.toml`.
-
 ### Review-agent handoffs
 
 Review small, single-commit, `staged`, `worktree`, or single-subsystem scopes
@@ -120,7 +115,7 @@ A dirty worktree is permitted when ownership boundaries remain disjoint.
   stop and report before editing.
 - For the `$x-overhaul` revert probe, temporarily reverse only behavior-changing
   hunks on paths with no baseline or owned edits. Preserve regression tests in
-  those files, including exporter tests and benchmark evidence checks. Reapply
+  those files, including benchmark evidence checks. Reapply
   the patch and confirm `git diff --quiet -- <paths>` before any other step.
 - Delegated review agents are strictly read-only. Investigation and read-only
   checks may run in parallel; edits and commits on one checkout are sequential.

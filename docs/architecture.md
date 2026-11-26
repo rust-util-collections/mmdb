@@ -1,14 +1,14 @@
-# MMDB v5 storage architecture
+# MMDB v6 storage architecture
 
-MMDB v5 is an in-process embedded Rust LSM-tree key-value engine built as the
+MMDB v6 is an in-process embedded Rust LSM-tree key-value engine built as the
 local storage backend for [vsdb](https://github.com/rust-util-collections/vsdb).
 Each database is a local directory managed inside the caller's process; MMDB
 opens no network sockets, runs no external daemon, and enforces no multi-tenant
 privilege boundary. Correctness is guaranteed on 64-bit x86 (`x86_64`) and
 64-bit ARM (`aarch64`).
 
-For caller-facing operations, see [Using MMDB v5](usage.md). For format
-conversion, see [Migrating to v5](migration.md). Measured workloads and
+For caller-facing operations, see [Using MMDB v6](usage.md). For existing
+v5 databases, see [Upgrading to v6](migration.md). Measured workloads and
 release decisions are in the [benchmark reports](benchmarks/README.md).
 
 ## Global system overview
@@ -114,7 +114,6 @@ flowchart TD
 | Leveled compaction | [`src/compaction/`](../src/compaction/), [`src/rate_limiter.rs`](../src/rate_limiter.rs) | L0 full-set serial merge, L1+ score/min-overlap/range/hint picks, trivial moves, subcompaction range splits, snapshot-aware tombstone stripe GC, and token-bucket write pacing |
 | MANIFEST and version set | [`src/manifest/`](../src/manifest/) | `DBHeader` geometry validation, `Version` Copy-on-Write level lists, incremental live-file & neighbor-disjointness install checks, `PendingSsts` RAII orphan cleanup, `DirSynced` + `confirm_manifest_durable` barriers, and `CURRENT` rotation |
 | Block and table caches | [`src/cache/`](../src/cache/), [`src/db/memory.rs`](../src/db/memory.rs) | Shared or private `BlockCachePool` (segmented + overflow Moka stores), member-isolated L0 block pins, `TableCache`, and lock-free memory gauges |
-| Offline v4 format converter | [`tools/v4-export/`](../tools/v4-export/) | Read-only v4 scan (including residual WALs), bottommost v5 `ingest_sorted` streaming, and atomic exclusive directory publication |
 
 ## Data model and internal keys
 
@@ -399,7 +398,7 @@ flowchart TD
 
 ## Database files and recovery
 
-| File | Physical format and role in v5 |
+| File | Physical format and role in v6 |
 |------|--------------------------------|
 | `LOCK` | Cooperative Unix `flock` lock file (`DirLock`). Writable handles acquire `LOCK_EX \| LOCK_NB` before reading metadata; read-only handles acquire `LOCK_SH \| LOCK_NB` if `LOCK` exists, or proceed unlocked on immutable snapshots without `LOCK`. Dropping `DirLock` explicitly issues `LOCK_UN` before closing the descriptor |
 | `CURRENT` | ASCII pointer naming the active `MANIFEST-{number}`. Published on creation and MANIFEST rotation via write + `sync_all` on `CURRENT.tmp.{new}`, atomic `rename` to `CURRENT`, and parent directory `sync_all` |
@@ -417,7 +416,7 @@ flowchart TD
     O1["DB::open / DB::open_read_only*"] --> O2["Validate options; create_durable if missing & writable; canonicalize path"]
     O2 --> O3["Acquire DirLock: LOCK_EX (writable) or LOCK_SH / unlocked (read-only)"]
     O3 --> O4["Read CURRENT -> open MANIFEST-* -> validate 16-byte v5 DBHeader"]
-    O4 -- "Missing/v4 header" --> CORR1["Return ErrorKind::Corruption (before tail repair)"]
+    O4 -- "Missing or unsupported header" --> CORR1["Return ErrorKind::Corruption (before tail repair)"]
     O4 -- "Writable (num_levels, prefix_len) mismatch" --> INV["Return ErrorKind::InvalidArgument"]
     O4 -- "Valid (Read-only adopts stored geometry)" --> O5["Replay VersionEdits; open & validate live SSTs and L1+ disjointness"]
 

@@ -8,22 +8,12 @@
       "ignored": null
     },
     {
-      "command": "cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check",
-      "passed": null,
-      "ignored": null
-    },
-    {
       "command": "cargo +stable check --all-targets",
       "passed": null,
       "ignored": null
     },
     {
       "command": "cargo +stable check --benches --features bench-metrics",
-      "passed": null,
-      "ignored": null
-    },
-    {
-      "command": "cargo +stable check --manifest-path tools/v4-export/Cargo.toml --all-targets",
       "passed": null,
       "ignored": null
     },
@@ -44,11 +34,6 @@
     },
     {
       "command": "cargo +stable clippy --all-targets --features bench-metrics -- -D warnings",
-      "passed": null,
-      "ignored": null
-    },
-    {
-      "command": "cargo +stable clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings",
       "passed": null,
       "ignored": null
     },
@@ -121,11 +106,6 @@
       "command": "cargo +stable test --test read_only",
       "passed": 7,
       "ignored": 1
-    },
-    {
-      "command": "CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml",
-      "passed": 6,
-      "ignored": 0
     }
   ],
   "emulated_aarch64_linux": {
@@ -194,33 +174,23 @@
         0
       ],
       [
-        "exporter-mmdb-v4-export",
-        1,
-        0,
-        0
-      ],
-      [
-        "exporter-golden",
-        5,
-        0,
-        0
-      ],
-      [
         "metrics-mmdb",
         429,
         0,
         0
       ]
     ],
-    "passed": 1014,
-    "gate_commands": 25,
     "doc_tests": 2,
-    "vm_log_sha256": "e273c03ed2b653962b8b1804f5cb09208dd23a67c0a51ba14952828cbbb83d65"
+    "vm_log_sha256": "e273c03ed2b653962b8b1804f5cb09208dd23a67c0a51ba14952828cbbb83d65",
+    "listed_gate_commands": 21,
+    "listed_suite_passes": 1008
   },
   "note": "Feature-enabled library tests overlap the default suite. The read-only strace helper is invoked by its parent test.",
   "miri": {
     "target": "x86_64-unknown-linux-gnu",
     "case": "concurrent_arena_pins",
     "passed": 1
-  }
+  },
+  "scope": "Engine checks selected from the original v5 validation receipt.",
+  "original_receipt": "https://github.com/rust-util-collections/mmdb/blob/e0e490dce4eb53f03ed7e56d036779e906dfb3c1/docs/benchmarks/engine-profile/validation.json"
 }

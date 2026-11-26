@@ -53,7 +53,7 @@ Verify each finding against current code and dedupe shared root causes:
    test in a temporary DB. For a documentation defect, correct the owning page
    in the [documentation map](../../../docs/ai/review-core.md#documentation-map)
    and verify its claim against the relevant code or test.
-2. Select the affected [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks).
+2. Select the affected [storage contract checks](../../../docs/ai/review-core.md#storage-contract-checks).
    Trace the failure through the API, the state change and its sibling paths.
    For example, compare scalar and grouped read errors, or ordinary writers and
    `no_slowdown` writers during the same flush or compaction pressure.

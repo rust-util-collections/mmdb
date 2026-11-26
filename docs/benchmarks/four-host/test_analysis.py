@@ -162,20 +162,17 @@ class FourHostChecks(unittest.TestCase):
 
 
 class FrozenLockTests(unittest.TestCase):
-    def test_exporter_keeps_its_registry_mmdb_package(self):
-        original = gzip.decompress((Path(__file__).parent / 'exporter.lock.gz').read_bytes())
+    def test_storage_lock_changes_only_the_local_engine_version(self):
+        original = gzip.decompress((Path(__file__).parent / 'storage.lock.gz').read_bytes())
         derived = locks.derive(original, '5.0.1')
         old_blocks = original.decode().split(locks.PACKAGE)[1:]
         new_blocks = derived.decode().split(locks.PACKAGE)[1:]
-        index = next(i for i, b in enumerate(old_blocks) if locks.package_fields(b).get('version') == '4.3.15'
-                     and locks.package_fields(b)['name'] == 'mmdb')
-        self.assertEqual(old_blocks[index], new_blocks[index])
-        self.assertEqual(derived.count(b' "mmdb 4.3.15",'), 1)
-        self.assertEqual(derived.count(b' "mmdb 5.0.1",'), 1)
-        self.assertNotIn(b' "mmdb 5.0.0",', derived)
-        self.assertEqual(locks.derive(derived, '5.0.0'), original)
-        with self.assertRaisesRegex(ValueError, 'collide'):
-            locks.derive(original, '4.3.15')
+        changed = [(before, after) for before, after in zip(old_blocks, new_blocks) if before != after]
+        self.assertEqual(len(old_blocks), len(new_blocks))
+        self.assertEqual(len(changed), 1)
+        before, after = changed[0]
+        self.assertEqual(locks.package_fields(before), dict(name='mmdb', version='5.0.0'))
+        self.assertEqual(after, before.replace('version = "5.0.0"', 'version = "5.0.1"'))
 
 
 if __name__ == "__main__":
