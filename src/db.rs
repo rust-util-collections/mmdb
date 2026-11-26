@@ -3193,6 +3193,19 @@ impl DB {
         Ok(())
     }
 
+    fn check_no_slowdown_l0(&self, count: usize) -> Result<()> {
+        if count < self.options.l0_slowdown_trigger {
+            return Ok(());
+        }
+        // An earlier wake may have found an overlapping maintenance claim.
+        if count >= self.options.l0_compaction_trigger {
+            self.read.signal_compaction();
+        }
+        Err(Error::busy(
+            "L0 file count reached the write slowdown threshold",
+        ))
+    }
+
     fn write_batch_inner(&self, batch: WriteBatch, write_options: &WriteOptions) -> Result<()> {
         batch.check_valid().ctx()?;
         if batch.is_empty() {
@@ -3204,22 +3217,7 @@ impl DB {
             write_options.no_slowdown,
         )?;
         if write_options.no_slowdown {
-            // A no_slowdown write fails fast whenever a blocking path would
-            // engage. Open-time validation guarantees
-            // l0_slowdown_trigger <= l0_stop_trigger, so the slowdown
-            // trigger is the first threshold at which either blocking path
-            // (the slowdown delay or the stop-trigger drain) can activate.
-            let l0_count = self.l0_file_count.load(Ordering::Relaxed);
-            if l0_count >= self.options.l0_slowdown_trigger {
-                // An earlier wake may have found an overlapping maintenance claim.
-                // Leave eligible L0 work queued even when all writers are no_slowdown.
-                if l0_count >= self.options.l0_compaction_trigger {
-                    self.read.signal_compaction();
-                }
-                return Err(Error::busy(
-                    "L0 file count reached the write slowdown threshold",
-                ));
-            }
+            self.check_no_slowdown_l0(self.l0_file_count.load(Ordering::Relaxed))?;
         } else {
             self.maybe_throttle_writes().ctx()?;
         }
@@ -3514,6 +3512,7 @@ impl DB {
     ) -> Result<bool> {
         self.check_writable()?;
         let mut group = WriteGroup::with_capacity(orig_batch_group.len());
+        let mut has_no_slowdown = false;
         for &ptr in orig_batch_group {
             // SAFETY: the leader exclusively processes the queued request's fields.
             let no_slowdown =
@@ -3526,6 +3525,7 @@ impl DB {
                 // SAFETY: only the active leader writes this field until completion.
                 unsafe { (*ptr).result = Some(Err(e)) };
             } else {
+                has_no_slowdown |= no_slowdown;
                 group.push(ptr);
             }
         }
@@ -3543,6 +3543,22 @@ impl DB {
         });
         let mut inner = self.inner.lock();
 
+        // A flush can install L0 files while a request waits for the leader or
+        // for immutable capacity. The install and sequence reservation share inner.
+        if has_no_slowdown
+            && let Err(error) = self.check_no_slowdown_l0(inner.versions.current().l0_file_count())
+        {
+            group.retain(|&mut ptr| {
+                // SAFETY: the leader owns result until it publishes completion.
+                unsafe {
+                    if (*ptr).no_slowdown {
+                        (*ptr).result = Some(Err(error.clone()));
+                        return false;
+                    }
+                }
+                true
+            });
+        }
         self.admit_range_stripes(&mut group);
         Self::admit_same_key_runs(&inner.active_memtable, &mut group);
         let batch_group = group.as_slice();

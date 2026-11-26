@@ -558,19 +558,57 @@ mod tests {
         );
     }
 
+    fn wait_for(mut predicate: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            thread::yield_now();
+        }
+        true
+    }
+
+    #[test]
+    fn queued_no_slowdown_rechecks_l0_after_flush_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_l0_slowdown_trigger(1)
+            .with_l0_compaction_trigger(usize::MAX);
+        let db = DB::open(opts.clone(), dir.path()).unwrap();
+        db.put(b"seed", b"initial").unwrap();
+        let before = db.read.current_sequence();
+        let no_wait = WriteOptions::default().with_no_slowdown(true);
+        thread::scope(|scope| {
+            db.write_queue.lock().leader_active = true;
+            let refused = scope.spawn(|| db.put_with_options(&no_wait, b"refused", b"value"));
+            let admitted = scope.spawn(|| db.put(b"admitted", b"value"));
+            let queued = wait_for(|| db.write_queue.lock().queue.len() == 2);
+            let generation = db.submit_active();
+            let installed = generation
+                .is_ok_and(|target| wait_for(|| db.flush_queue.progress.lock().durable >= target));
+            db.release_write_leadership();
+            assert!(
+                queued && installed,
+                "both requests must span the L0 install"
+            );
+            assert_eq!(refused.join().unwrap().unwrap_err().kind(), ErrorKind::Busy);
+            admitted.join().unwrap().unwrap();
+        });
+        db.sync_wal().unwrap();
+        assert_eq!(db.read.current_sequence(), before + 1);
+        db.simulate_crash();
+        let reopened = DB::open(opts, dir.path()).unwrap();
+        assert_eq!(reopened.read.current_sequence(), before + 1);
+        assert_eq!(reopened.get(b"refused").unwrap(), None);
+        assert_eq!(
+            reopened.get(b"admitted").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
+    }
+
     #[test]
     fn mixed_group_busy_member_leaves_only_the_accepted_neighbors_wal() {
-        fn wait_for(mut predicate: impl FnMut() -> bool) -> bool {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !predicate() {
-                if std::time::Instant::now() >= deadline {
-                    return false;
-                }
-                thread::yield_now();
-            }
-            true
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let reference_dir = tempfile::tempdir().unwrap();
         let opts = DbOptions::default().with_max_immutable_memtables(1);

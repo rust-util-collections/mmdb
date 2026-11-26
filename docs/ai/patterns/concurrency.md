@@ -44,8 +44,8 @@ mutations revalidate their inputs under `DB::inner`.
 **CC3 Unlocked WAL rotation & FIFO `FlushQueue`** — only the active `write_queue` leader (or `close()` after draining writers and `maintenance`) enters `freeze_memtable`, so taking `wal_writer = None` across unlocked seal/create cannot race another writer; on seal/create error, restore `old_wal` and fail-stop. `immutable_memtables` pushes newest-first (`push_front`), `SuperVersion` reads front-to-back, and `mmdb-flush` pops oldest (`pop_back`) only *after* `confirm_manifest_durable` succeeds. A valid nonempty `no_slowdown` batch receives `ErrorKind::Busy` from a full
 immutable queue or when L0 reaches its slowdown threshold (including stop
 pressure). Validate the batch before checking pressure. The group leader
-rechecks immutable capacity for each queued nonblocking member before
-range-stripe and same-key admission. Reject before assigning that request a sequence or appending its
+rechecks immutable capacity for each queued nonblocking member and checks the
+installed L0 count under `DB::inner` before range-stripe and same-key admission. Reject before assigning that request a sequence or appending its
 WAL record. On L0 refusal, signal compaction when the observed count also
 meets `l0_compaction_trigger`, so an earlier overlapping claim cannot strand
 eligible work. A group can still publish an admitted neighbor. Waiters release

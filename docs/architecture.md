@@ -175,7 +175,7 @@ flowchart TD
 
     LDR -- "Yes (Leader)" --> DRAIN_GRP["Set leader_active = true; drain_group (<= min(buf/2, 16 MiB))"]
     DRAIN_GRP --> LOCK_IN["Recheck queue capacity; lock DB::inner"]
-    LOCK_IN --> ADMIT["Filter group via admit_range_stripes & admit_same_key_runs"]
+    LOCK_IN --> ADMIT["Recheck L0 for no_slowdown members, then apply range-stripe and same-key budgets"]
     ADMIT --> SEQ["Reserve contiguous sequence range [first_seq..=last_seq]"]
     SEQ --> WAL_APP["Append vectored [wal_header, payload] per WAL-enabled batch"]
     WAL_APP --> WAL_IO{"Any WalSync or pending WalFence?"}
@@ -203,7 +203,8 @@ flowchart TD
    A `no_slowdown` request fails fast with `ErrorKind::Busy` before consuming a
    sequence or writing to the WAL. Among queued requests, one leader drains a
    group up to `min(write_buffer_size / 2, 16 MiB)` (always admitting the head
-   batch even if larger). Under `DB::inner`, the leader enforces range-stripe
+   batch even if larger). Under `DB::inner`, the leader rechecks the installed
+   L0 count for queued `no_slowdown` members, enforces range-stripe
    and same-key metadata budgets, reserves a contiguous sequence interval, and
    streams one logical WAL record per WAL-enabled batch via `WalWriter::add_record_parts`
    using `[header, payload]` slices without intermediate concatenation. The group
