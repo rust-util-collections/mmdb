@@ -12,30 +12,45 @@ use std::{ops::Deref, sync::Arc};
 /// to retain just the value.
 pub struct PinnedSlice(LazyValue);
 
-/// Projection at a visible point entry. Existence reads consume only the length
-/// and never construct a pin or increment its backing owner's reference count.
+/// Projection at a visible point entry. Existence and owned-byte reads avoid
+/// constructing a pin or touching its backing owner's reference count.
 pub(crate) trait PointValue: Sized {
-    fn project(len: usize, pin: impl FnOnce() -> PinnedSlice) -> Self;
+    fn project(value: &[u8], pin: impl FnOnce() -> PinnedSlice) -> Self;
     fn byte_len(&self) -> usize;
 }
 
 impl PointValue for usize {
-    fn project(len: usize, _pin: impl FnOnce() -> PinnedSlice) -> Self {
-        len
+    #[inline]
+    fn project(value: &[u8], _pin: impl FnOnce() -> PinnedSlice) -> Self {
+        value.len()
     }
+    #[inline]
     fn byte_len(&self) -> usize {
         *self
     }
 }
 
+impl PointValue for Vec<u8> {
+    #[inline]
+    fn project(value: &[u8], _pin: impl FnOnce() -> PinnedSlice) -> Self {
+        value.to_vec()
+    }
+    #[inline]
+    fn byte_len(&self) -> usize {
+        self.len()
+    }
+}
+
 impl PointValue for PinnedSlice {
-    fn project(len: usize, pin: impl FnOnce() -> Self) -> Self {
-        if len == 0 {
+    #[inline]
+    fn project(value: &[u8], pin: impl FnOnce() -> Self) -> Self {
+        if value.is_empty() {
             Self(LazyValue::empty())
         } else {
             pin()
         }
     }
+    #[inline]
     fn byte_len(&self) -> usize {
         self.len()
     }

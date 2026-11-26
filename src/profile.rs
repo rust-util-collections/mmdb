@@ -45,9 +45,9 @@ mod enabled {
         pub max_group_bytes: u64,
         /// This thread's requests that waited at least once on the write queue.
         pub queue_waits: u64,
-        /// Returns from write-queue condition waits, including repeated wakes.
+        /// Returns from write-queue `thread::park()` waits, including repeated parks.
         pub queue_wakeups: u64,
-        /// Time in those condition waits, including mutex reacquisition.
+        /// Time spent parked in write-queue `thread::park()` waits.
         pub queue_wait_ns: u64,
         /// Time appending WAL records for admitted requests.
         pub wal_append_ns: u64,

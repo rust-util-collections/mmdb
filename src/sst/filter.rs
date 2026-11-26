@@ -25,8 +25,14 @@ impl AlignedBytes {
         ))
     }
 
+    #[inline]
     pub(crate) fn may_match(&self, key: &[u8]) -> bool {
-        let (line, bits) = probes(bloom_hash(key), self.0.len());
+        self.may_match_hash(bloom_hash(key))
+    }
+
+    #[inline]
+    pub(crate) fn may_match_hash(&self, hash: u64) -> bool {
+        let (line, bits) = probes(hash, self.0.len());
         let data = &self.0[line].0;
         bits.into_iter()
             .all(|bit| data[bit / 8] & (1 << (bit % 8)) != 0)

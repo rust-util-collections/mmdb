@@ -49,7 +49,7 @@ impl Drop for Slab {
 unsafe impl Send for Slab {}
 
 #[derive(Default)]
-struct Arena {
+pub(super) struct Arena {
     slabs: Vec<Slab>,
     active: Option<usize>,
     offset: usize,
@@ -127,11 +127,14 @@ unsafe fn tower(node: *mut NodeHeader) -> *mut Link {
     unsafe { node.add(1).cast() }
 }
 
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
 pub struct ConcurrentSkipList {
     head: [Link; MAX_HEIGHT],
     tail: Link,
     height: AtomicUsize,
-    arena: Mutex<Arena>,
+    arena: CachePadded<Mutex<Arena>>,
 }
 
 impl ConcurrentSkipList {
@@ -140,7 +143,7 @@ impl ConcurrentSkipList {
             head: std::array::from_fn(|_| Link::new(ptr::null_mut())),
             tail: Link::new(ptr::null_mut()),
             height: AtomicUsize::new(1),
-            arena: Mutex::new(Arena::default()),
+            arena: CachePadded(Mutex::new(Arena::default())),
         }
     }
 
@@ -199,8 +202,23 @@ impl ConcurrentSkipList {
         (current, successor)
     }
 
+    #[inline]
+    pub(super) fn lock_arena(&self) -> parking_lot::MutexGuard<'_, Arena> {
+        self.arena.0.lock()
+    }
+
     pub fn insert(&self, key: &[u8], trailer: &[u8; 8], value: &[u8]) -> usize {
-        let mut arena = self.arena.lock();
+        let mut arena = self.arena.0.lock();
+        self.insert_locked(&mut arena, key, trailer, value)
+    }
+
+    pub(super) fn insert_locked(
+        &self,
+        arena: &mut Arena,
+        key: &[u8],
+        trailer: &[u8; 8],
+        value: &[u8],
+    ) -> usize {
         let height = arena.random_height();
         let key_len = key.len().checked_add(8).unwrap();
         let header = NodeHeader {
@@ -235,7 +253,11 @@ impl ConcurrentSkipList {
         for (i, &p) in prev[..height].iter().enumerate() {
             self.link(p, i).store(node, Ordering::Release);
         }
-        self.height.fetch_max(height, Ordering::Release);
+        // `arena` serializes all writers, so `height` only increases here;
+        // skipping redundant RMWs avoids dirtying the reader-hot cache line.
+        if height > self.height.load(Ordering::Relaxed) {
+            self.height.store(height, Ordering::Release);
+        }
         if at_end {
             self.tail.store(node, Ordering::Release);
         }

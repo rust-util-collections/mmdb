@@ -6,28 +6,34 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) const MAX_LEVELS: usize = 32;
 
 /// Tracks database statistics for monitoring and diagnostics.
+///
+/// Writer-hot, reader-hot, and background counters are separated by 64-byte
+/// padding so concurrent reads and writes never contend on the same cache line.
+#[repr(C)]
 pub struct DbStats {
     #[cfg(feature = "bench-metrics")]
     pub(crate) l0_profile: parking_lot::Mutex<crate::compaction::profile::L0CompactionProfile>,
     /// Total bytes written by the user.
     pub bytes_written: AtomicU64,
+    _pad_write: [u8; 56],
     /// Key and value bytes returned by point lookups (`get*`); iterator
     /// reads are not counted.
     pub bytes_read: AtomicU64,
+    /// Number of block cache hits.
+    pub block_cache_hits: AtomicU64,
+    /// Number of block cache misses.
+    pub block_cache_misses: AtomicU64,
+    /// Counter for sampling reads (only sample every Nth read).
+    pub read_sample_counter: AtomicU64,
+    _pad_read: [u8; 32],
     /// Number of compactions completed.
     pub compactions_completed: AtomicU64,
     /// Total bytes written during compaction (write amplification numerator).
     pub compaction_bytes_written: AtomicU64,
     /// Number of flushes completed.
     pub flushes_completed: AtomicU64,
-    /// Number of block cache hits.
-    pub block_cache_hits: AtomicU64,
-    /// Number of block cache misses.
-    pub block_cache_misses: AtomicU64,
     /// Per-level read sample counters.
     pub read_level_samples: [AtomicU64; MAX_LEVELS],
-    /// Counter for sampling reads (only sample every Nth read).
-    pub read_sample_counter: AtomicU64,
 }
 
 impl DbStats {
@@ -36,14 +42,16 @@ impl DbStats {
             #[cfg(feature = "bench-metrics")]
             l0_profile: Default::default(),
             bytes_written: AtomicU64::new(0),
+            _pad_write: [0; 56],
             bytes_read: AtomicU64::new(0),
+            block_cache_hits: AtomicU64::new(0),
+            block_cache_misses: AtomicU64::new(0),
+            read_sample_counter: AtomicU64::new(0),
+            _pad_read: [0; 32],
             compactions_completed: AtomicU64::new(0),
             compaction_bytes_written: AtomicU64::new(0),
             flushes_completed: AtomicU64::new(0),
-            block_cache_hits: AtomicU64::new(0),
-            block_cache_misses: AtomicU64::new(0),
             read_level_samples: std::array::from_fn(|_| AtomicU64::new(0)),
-            read_sample_counter: AtomicU64::new(0),
         }
     }
 

@@ -190,6 +190,20 @@ impl LevelIterator {
         let idx = self.files.partition_point(|tf| {
             compare_internal_key(&tf.meta.largest_key, target) == Ordering::Less
         });
+        if idx == self.file_index
+            && self.current_iter.is_some()
+            && idx < self.files.len()
+            && matches!(self.check_file_filters(&self.files[idx]), FileFilter::Pass)
+        {
+            let iter = self.current_iter.as_mut().unwrap();
+            iter.seek(target);
+            if let Some(e) = iter.iter_error() {
+                self.error = Some(e.clone());
+                self.file_index = self.files.len();
+                self.current_iter = None;
+            }
+            return;
+        }
         self.file_index = idx;
         self.current_iter = None;
         self.open_file_and_seek(Some(target));

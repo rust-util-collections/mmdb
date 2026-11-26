@@ -12,6 +12,7 @@ use std::{
     },
 };
 
+use crate::cache::block_cache::FastBuildHasher;
 use crate::cache::table_cache::TableCache;
 use crate::error::{Error, Result, ResultExt};
 use crate::manifest::file_numbers::FileNumbers;
@@ -151,6 +152,10 @@ pub struct VersionSet {
 
     /// The current version (immutable snapshot).
     current: Arc<Version>,
+    /// File numbers currently live across all levels of `current`.
+    /// Maintained incrementally in `log_and_apply_synced` after MANIFEST append
+    /// succeeds so duplicate checks are O(|edit|) instead of O(|total live SSTs|).
+    live_file_numbers: HashSet<u64, FastBuildHasher>,
 
     /// Next file number to allocate.
     pub(crate) file_numbers: Arc<FileNumbers>,
@@ -326,6 +331,7 @@ impl VersionSet {
             db_path: db_path.to_path_buf(),
             num_levels,
             current,
+            live_file_numbers: HashSet::with_hasher(FastBuildHasher),
             file_numbers: Arc::new(FileNumbers::new(2)), // 1 is used by MANIFEST
             log_number: 0,
             last_sequence: 0,
@@ -617,11 +623,14 @@ impl VersionSet {
             (Some(writer), Some(dir_file))
         };
 
+        let live_file_numbers: HashSet<u64, FastBuildHasher> = live_files.keys().copied().collect();
+
         Ok(Self {
             header,
             db_path: db_path.to_path_buf(),
             num_levels,
             current: Arc::new(version),
+            live_file_numbers,
             file_numbers: Arc::new(FileNumbers::new(next_file_number)),
             log_number,
             last_sequence,
@@ -694,19 +703,19 @@ impl VersionSet {
         }
 
         // Recovery rejects an addition whose number is already live at any
-        // level, including a duplicate within the same edit. Mirror that
-        // check: installing and fsyncing such an edit would leave a MANIFEST
-        // that the next open refuses to replay.
-        let mut live_numbers: HashSet<u64> = if edit.new_files.is_empty() {
-            HashSet::new()
-        } else {
-            new_version
-                .files
-                .iter()
-                .flat_map(|files| files.iter())
-                .map(|file| file.meta.number)
-                .collect()
-        };
+        // level, including a duplicate within the same edit. Check against the
+        // persistent `live_file_numbers` set (accounting for `deleted_files`
+        // removed earlier in this edit, such as trivial moves, and duplicates
+        // within `edit.new_files`) without scanning untouched levels or
+        // mutating `self.live_file_numbers` before MANIFEST append succeeds.
+        let mut removed_in_edit: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
+        if !edit.new_files.is_empty() && !edit.deleted_files.is_empty() {
+            removed_in_edit.extend(edit.deleted_files.iter().map(|&(_, n)| n));
+            removed_in_edit.sort_unstable();
+        }
+        let mut added_inline: smallvec::SmallVec<[u64; 16]> = smallvec::SmallVec::new();
+        let mut added_overflow: Option<HashSet<u64, FastBuildHasher>> = (edit.new_files.len() > 16)
+            .then(|| HashSet::with_capacity_and_hasher(edit.new_files.len(), FastBuildHasher));
 
         for (level, meta) in &edit.new_files {
             let level = *level as usize;
@@ -725,7 +734,17 @@ impl VersionSet {
                     "VersionEdit SST number overflows allocator",
                 ));
             }
-            if !live_numbers.insert(meta.number) {
+            let still_live = self.live_file_numbers.contains(&meta.number)
+                && removed_in_edit.binary_search(&meta.number).is_err();
+            let dup_in_edit = if let Some(ref mut set) = added_overflow {
+                !set.insert(meta.number)
+            } else if added_inline.contains(&meta.number) {
+                true
+            } else {
+                added_inline.push(meta.number);
+                false
+            };
+            if still_live || dup_in_edit {
                 return Err(Error::corruption(format!(
                     "VersionEdit adds SST {} at level {} but it is already live",
                     meta.number, level
@@ -736,18 +755,36 @@ impl VersionSet {
             let index = if level == 0 {
                 0
             } else {
-                files.partition_point(|other| {
+                let idx = files.partition_point(|other| {
                     compare_internal_key(&other.meta.smallest_key, &meta.smallest_key).is_lt()
-                })
+                });
+                // `self.current` already passed `validate_level_disjointness`,
+                // deletions preserve strict ordering, and `open_table` verified
+                // `meta.smallest_key <= meta.largest_key`. Checking the two
+                // insertion neighbors preserves pairwise disjointness across the
+                // entire level without scanning untouched files or levels.
+                if idx > 0 {
+                    let prev = &files[idx - 1].meta;
+                    if user_key(&prev.largest_key) >= user_key(&meta.smallest_key) {
+                        return Err(Error::corruption(format!(
+                            "SST {} and SST {} have overlapping key ranges at level {}",
+                            prev.number, meta.number, level
+                        )));
+                    }
+                }
+                if idx < files.len() {
+                    let next = &files[idx].meta;
+                    if user_key(&meta.largest_key) >= user_key(&next.smallest_key) {
+                        return Err(Error::corruption(format!(
+                            "SST {} and SST {} have overlapping key ranges at level {}",
+                            meta.number, next.number, level
+                        )));
+                    }
+                }
+                idx
             };
             files.insert(index, file);
         }
-
-        // The fully-applied shape must keep L1+ binary search sound. Reject
-        // the edit wholesale before anything is persisted (same contract as
-        // the level/deletion checks above); recovery enforces the identical
-        // invariant, so a persisted violation would also fail the next open.
-        Self::validate_level_disjointness(&new_version).ctx()?;
 
         // Version built successfully — now persist to MANIFEST (write only, no sync).
         // Callers on hot paths should release the main lock and call
@@ -802,6 +839,13 @@ impl VersionSet {
             self.last_sequence = self.last_sequence.max(s);
         }
 
+        for &(_, file_number) in &edit.deleted_files {
+            self.live_file_numbers.remove(&file_number);
+        }
+        for (_, meta) in &edit.new_files {
+            self.live_file_numbers.insert(meta.number);
+        }
+
         self.current = Arc::new(new_version);
         self.edits_since_snapshot += 1;
 
@@ -839,6 +883,7 @@ impl VersionSet {
     pub fn release_files(&mut self) {
         self.manifest_writer.lock().take();
         self.parent_dir.lock().take();
+        self.live_file_numbers.clear();
         self.current = Arc::new(Version::new(self.num_levels));
     }
 
@@ -2074,5 +2119,107 @@ mod tests {
 
         let reopened = VersionSet::recover(path, 7).unwrap();
         assert_eq!(reopened.current().total_files(), 1);
+    }
+
+    #[test]
+    fn incremental_install_validates_neighbors_and_preserves_live_set_on_rejection() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let build_range = |number: u64, lo: &[u8], hi: &[u8]| {
+            let mut b = TableBuilder::new(
+                &path.join(format!("{number:06}.sst")),
+                TableBuildOptions {
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(lo, 10, ValueType::Value).as_bytes(),
+                b"vlo",
+            )
+            .unwrap();
+            if hi != lo {
+                b.add(
+                    InternalKey::new(hi, 10, ValueType::Value).as_bytes(),
+                    b"vhi",
+                )
+                .unwrap();
+            }
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        let mut seed = VersionEdit::new();
+        for i in 0..32u64 {
+            let k1 = format!("l2_{:04}_a", i * 2);
+            let k2 = format!("l2_{:04}_z", i * 2);
+            seed.add_file(2, build_range(100 + i, k1.as_bytes(), k2.as_bytes()));
+        }
+        seed.add_file(1, build_range(10, b"b0", b"d0"));
+        seed.add_file(1, build_range(11, b"f0", b"h0"));
+        seed.add_file(1, build_range(12, b"j0", b"l0"));
+        vs.log_and_apply(seed).unwrap();
+
+        // 1. Left-neighbor overlap (reaches `d0`) and right-neighbor overlap
+        //    (reaches `f0`) must both be rejected without polluting `live_file_numbers`.
+        let bad_left = build_range(20, b"d0", b"e0");
+        let mut e1 = VersionEdit::new();
+        e1.add_file(1, bad_left);
+        assert_eq!(
+            vs.log_and_apply(e1).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
+
+        // File number 20 must NOT be stuck in `live_file_numbers` after rejection:
+        // rewriting 20 as a valid disjoint gap file `("d1".."e9")` must succeed!
+        let bad_right = build_range(21, b"e1", b"f0");
+        let mut e2 = VersionEdit::new();
+        e2.add_file(1, bad_right);
+        assert_eq!(
+            vs.log_and_apply(e2).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
+
+        // Intra-edit overlap between two newly added L1 files is also rejected cleanly.
+        let intra_a = build_range(22, b"d1", b"e5");
+        let intra_b = build_range(23, b"e5", b"e9");
+        let mut e3 = VersionEdit::new();
+        e3.add_file(1, intra_a);
+        e3.add_file(1, intra_b);
+        assert_eq!(
+            vs.log_and_apply(e3).unwrap_err().kind(),
+            ErrorKind::Corruption
+        );
+
+        // Valid insertion reusing number 22 into the `("d0", "f0")` gap, plus
+        // deleting 11 and inserting 23 into the freed `("e9", "j0")` span:
+        let mut ok = VersionEdit::new();
+        ok.delete_file(1, 11);
+        ok.add_file(1, build_range(22, b"d1", b"e5"));
+        ok.add_file(1, build_range(23, b"e6", b"i9"));
+        vs.log_and_apply(ok).unwrap();
+        vs.sync_manifest().unwrap();
+        drop(vs);
+
+        let recovered = VersionSet::recover(path, 7).unwrap();
+        let l1_nums: Vec<u64> = recovered
+            .current()
+            .level_files(1)
+            .iter()
+            .map(|f| f.meta.number)
+            .collect();
+        assert_eq!(l1_nums, vec![10, 22, 23, 12]);
+        assert_eq!(recovered.current().level_files(2).len(), 32);
     }
 }

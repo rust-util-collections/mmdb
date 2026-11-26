@@ -28,6 +28,24 @@ impl SkipListMemTable {
         self.map.insert(user, &tag, value)
     }
 
+    #[inline]
+    pub(super) fn lock_arena(&self) -> parking_lot::MutexGuard<'_, super::skiplist_impl::Arena> {
+        self.map.lock_arena()
+    }
+
+    #[inline]
+    pub(super) fn insert_entry_locked(
+        &self,
+        arena: &mut super::skiplist_impl::Arena,
+        user: &[u8],
+        sequence: SequenceNumber,
+        kind: ValueType,
+        value: &[u8],
+    ) -> usize {
+        let tag = (!pack_sequence_and_type(sequence, kind)).to_be_bytes();
+        self.map.insert_locked(arena, user, &tag, value)
+    }
+
     pub(super) fn same_key_metadata(&self, key: &[u8]) -> usize {
         self.map
             .versions_of(key)

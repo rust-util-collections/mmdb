@@ -56,7 +56,7 @@ rather than `unsafe`.
   - `MemTablePin` and `MemTableCursorIter` own `Arc<MemTable>`; empty values (`len == 0`) use `LazyValue::Inline(Vec::new())` without pinning slabs/blocks.
   - `cargo +nightly miri test --test arena_miri` exercises concurrent insertion, traversal, and `MemTablePin` reads under Miri.
 - **Group commit, file lock, & WAL writeback (`db.rs`)**:
-  - Each `*mut WriteRequest` points to a writer thread's stack frame parked on `write_cv` under `write_queue` until `done == true`; `done` is accessed only under `write_queue`, and the leader never touches `req_ptr` after setting `done = true` and releasing `write_queue`.
+  - Each `*mut WriteRequest` points to a writer thread's live stack frame inside `enqueue_write` until the leader publishes `STATE_DONE` via `(*rp).state.swap(STATE_DONE, Ordering::AcqRel)` (after writing `result` and taking `waiter`). Neither follower nor leader forms `&WriteRequest` or `&mut WriteRequest` while queued; `write_queue` serializes `wake_queue_head` (which clones `waiter` and sets `STATE_WAKE` before `drain_group`) against `drain_group` (which sets `STATE_IN_GROUP`), and no thread dereferences `req_ptr` once `STATE_DONE` is swapped.
   - `flock` and `sync_file_range` borrow live descriptors owned by `DirLock` / `WalWriter` (`i64::try_from` checked offsets).
 - **SST readahead (`sst/table_reader/mod.rs`)**:
   - `posix_fadvise` passes `self.file.as_raw_fd()` with checked `i64::try_from` offsets while `TableReader` owns the open `SstFile`; cached data blocks are safe `Arc<Vec<u8>>` buffers.

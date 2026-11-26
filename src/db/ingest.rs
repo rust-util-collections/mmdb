@@ -12,8 +12,7 @@ struct WriteLeaderGuard<'a>(&'a DB);
 
 impl Drop for WriteLeaderGuard<'_> {
     fn drop(&mut self) {
-        self.0.write_queue.lock().leader_active = false;
-        self.0.write_cv.notify_all();
+        self.0.release_write_leadership();
     }
 }
 
@@ -132,10 +131,9 @@ impl DB {
         self.check_writable().ctx()?;
         let _maintenance = self.begin_maintenance()?;
         let _leader = {
-            let mut wq = self.write_queue.lock();
-            self.wait_for_write_leader_idle(&mut wq);
+            let mut barrier = self.acquire_write_barrier();
             self.check_writable().ctx()?;
-            wq.leader_active = true;
+            barrier.claim_leadership();
             WriteLeaderGuard(self)
         };
 

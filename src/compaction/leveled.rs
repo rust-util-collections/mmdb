@@ -276,6 +276,155 @@ fn overlapping_files_for_inputs(files: &[TableFile], inputs: &[TableFile]) -> Ve
         .collect()
 }
 
+/// Transitive point + range-tombstone extent closure over a sorted,
+/// pairwise point-disjoint `L1+` slice (`files`). `range_indices` lists the
+/// indices in `files` where `meta.has_range_deletions` is true.
+fn overlapping_files_in_disjoint_level(
+    files: &[TableFile],
+    range_indices: &[usize],
+    inputs: &[TableFile],
+) -> Vec<TableFile> {
+    if files.is_empty() || inputs.is_empty() {
+        return Vec::new();
+    }
+
+    let inputs_have_ranges = inputs.iter().any(|tf| tf.meta.has_range_deletions);
+
+    if range_indices.is_empty() && !inputs_have_ranges {
+        let mut agg_smallest: Option<&[u8]> = None;
+        let mut agg_largest: Option<&[u8]> = None;
+        for tf in inputs {
+            if tf.meta.smallest_key.is_empty() || tf.meta.largest_key.is_empty() {
+                continue;
+            }
+            let s = user_key(&tf.meta.smallest_key);
+            let l = user_key(&tf.meta.largest_key);
+            if agg_smallest.is_none_or(|cur| s < cur) {
+                agg_smallest = Some(s);
+            }
+            if agg_largest.is_none_or(|cur| l > cur) {
+                agg_largest = Some(l);
+            }
+        }
+        let Some((s, l)) = agg_smallest.zip(agg_largest) else {
+            return Vec::new();
+        };
+        let lo = files.partition_point(|tf| {
+            #[cfg(test)]
+            PICKER_FILE_VISITS.with(|n| n.set(n.get() + 1));
+            user_key(&tf.meta.largest_key) < s
+        });
+        let hi = lo
+            + files[lo..].partition_point(|tf| {
+                #[cfg(test)]
+                PICKER_FILE_VISITS.with(|n| n.set(n.get() + 1));
+                user_key(&tf.meta.smallest_key) <= l
+            });
+        return files[lo..hi].to_vec();
+    }
+
+    let mut pending_extents = Vec::new();
+    for tf in inputs {
+        add_file_extents(tf, &mut pending_extents);
+    }
+    {
+        let mut agg_smallest: Option<&[u8]> = None;
+        let mut agg_largest: Option<&[u8]> = None;
+        for tf in inputs {
+            if tf.meta.smallest_key.is_empty() || tf.meta.largest_key.is_empty() {
+                continue;
+            }
+            let s = user_key(&tf.meta.smallest_key);
+            let l = user_key(&tf.meta.largest_key);
+            if agg_smallest.is_none_or(|cur| s < cur) {
+                agg_smallest = Some(s);
+            }
+            if agg_largest.is_none_or(|cur| l > cur) {
+                agg_largest = Some(l);
+            }
+        }
+        if let (Some(s), Some(l)) = (agg_smallest, agg_largest) {
+            pending_extents.push(UserKeyRange::File {
+                smallest: s.to_vec(),
+                largest: l.to_vec(),
+            });
+        }
+    }
+
+    let mut selected = std::collections::BTreeSet::<usize>::new();
+    let mut remaining_ranges: Vec<usize> = range_indices.to_vec();
+    let mut cursor = 0usize;
+
+    while cursor < pending_extents.len() {
+        let extent = match &pending_extents[cursor] {
+            UserKeyRange::File { smallest, largest } => UserKeyRange::File {
+                smallest: smallest.clone(),
+                largest: largest.clone(),
+            },
+            UserKeyRange::Tombstone { begin, end } => UserKeyRange::Tombstone {
+                begin: begin.clone(),
+                end: end.clone(),
+            },
+        };
+        cursor += 1;
+
+        let (lo_key, inclusive_hi, hi_key): (&[u8], bool, &[u8]) = match &extent {
+            UserKeyRange::File { smallest, largest } => (smallest, true, largest),
+            UserKeyRange::Tombstone { begin, end } => (begin, false, end),
+        };
+        let lo = files.partition_point(|tf| {
+            #[cfg(test)]
+            PICKER_FILE_VISITS.with(|n| n.set(n.get() + 1));
+            tf.meta.largest_key.is_empty() || user_key(&tf.meta.largest_key) < lo_key
+        });
+        let hi = lo
+            + files[lo..].partition_point(|tf| {
+                #[cfg(test)]
+                PICKER_FILE_VISITS.with(|n| n.set(n.get() + 1));
+                if tf.meta.smallest_key.is_empty() {
+                    return true;
+                }
+                let s = user_key(&tf.meta.smallest_key);
+                if inclusive_hi {
+                    s <= hi_key
+                } else {
+                    s < hi_key
+                }
+            });
+
+        let mut newly_added = Vec::new();
+        for (offset, file) in files[lo..hi].iter().enumerate() {
+            let idx = lo + offset;
+            if !file.meta.smallest_key.is_empty()
+                && !file.meta.largest_key.is_empty()
+                && selected.insert(idx)
+            {
+                newly_added.push(idx);
+            }
+        }
+        remaining_ranges.retain(|&idx| {
+            if selected.contains(&idx) {
+                return false;
+            }
+            #[cfg(test)]
+            PICKER_FILE_VISITS.with(|n| n.set(n.get() + 1));
+            if file_overlaps_extent(&files[idx], &extent) {
+                selected.insert(idx);
+                newly_added.push(idx);
+                false
+            } else {
+                true
+            }
+        });
+
+        for idx in newly_added {
+            add_file_extents(&files[idx], &mut pending_extents);
+        }
+    }
+
+    selected.into_iter().map(|idx| files[idx].clone()).collect()
+}
+
 /// A sub-task covering a key range within a compaction.
 struct SubCompactionTask {
     /// Inclusive lower bound (user key). None = start from beginning.
@@ -575,6 +724,8 @@ fn execute_sub_compaction_io(
     let mut last_written_seq: SequenceNumber = 0;
     let mut snapshot_idx: usize = ctx.active_snapshots.len();
     let mut filter_mutated = false;
+    let mut rate_limit_pending = 0usize;
+    const RATE_LIMIT_BATCH_BYTES: usize = 64 * 1024;
     let mut next_point = merger.next_entry();
     loop {
         let mut row = if ranges.peek().is_some_and(|r| {
@@ -779,7 +930,11 @@ fn execute_sub_compaction_io(
         current_size = current_size.saturating_add(entry_bytes);
 
         if let Some(rl) = ctx.rate_limiter {
-            rl.request(entry_bytes);
+            rate_limit_pending = rate_limit_pending.saturating_add(entry_bytes);
+            if rate_limit_pending >= RATE_LIMIT_BATCH_BYTES {
+                rl.request(rate_limit_pending);
+                rate_limit_pending = 0;
+            }
         }
 
         if current_size >= ctx.options.target_file_size_base as usize
@@ -791,6 +946,12 @@ fn execute_sub_compaction_io(
             // well below the reader's hard cap for key-heavy data.
             pending_cut = true;
         }
+    }
+
+    if rate_limit_pending > 0
+        && let Some(rl) = ctx.rate_limiter
+    {
+        rl.request(rate_limit_pending);
     }
 
     // Flush remaining builder
@@ -861,19 +1022,48 @@ impl LeveledCompaction {
         options: &DbOptions,
         in_flight: &HashSet<u64>,
     ) -> Option<CompactionTask> {
-        // Priority 1: L0 → L1 when L0 has too many files
-        if version.l0_file_count() >= options.l0_compaction_trigger
-            && let Some(task) = Self::pick_l0_compaction(version, in_flight)
+        // Prioritize L0 → L1 whenever L0 reaches `l0_compaction_trigger` so
+        // overlapping flushes coalesce into L1 before deeper levels rewrite.
+        // If L0 is already claimed by another concurrent worker, fall through
+        // to deeper levels ordered by byte-budget score.
+        let l0_count = version.l0_file_count();
+        if l0_count > 0
+            && l0_count >= options.l0_compaction_trigger
+            && let Some(picked) = Self::pick_l0_compaction(version, in_flight)
         {
-            return Some(task);
+            return Some(picked);
         }
 
-        // Priority 2: Check each level for size overflow
-        for level in 1..version.num_levels - 1 {
-            if Self::level_over_budget(version, options, level)
-                && let Some(task) = Self::pick_level_compaction(version, level, in_flight)
-            {
-                return Some(task);
+        let mut candidates: smallvec::SmallVec<[(f64, usize); 8]> = smallvec::SmallVec::new();
+        for level in 1..version.num_levels.saturating_sub(1) {
+            let files = version.level_files(level);
+            if files.is_empty() {
+                continue;
+            }
+            let size: u64 = files
+                .iter()
+                .map(|file| file.meta.file_size)
+                .fold(0, u64::saturating_add);
+            if size == 0 {
+                continue;
+            }
+            let max_bytes = Self::max_bytes_for_level(options, level);
+            if size > max_bytes {
+                let score = if max_bytes == 0 {
+                    f64::INFINITY
+                } else {
+                    size as f64 / max_bytes as f64
+                };
+                candidates.push((score, level));
+            }
+        }
+
+        // Highest byte-budget score wins; ties prefer shallower levels.
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        for (_, level) in candidates {
+            if let Some(picked) = Self::pick_level_compaction(version, level, in_flight) {
+                return Some(picked);
             }
         }
 
@@ -909,7 +1099,13 @@ impl LeveledCompaction {
         // outside the L0 span; install then discards the output and this same
         // pick repeats. Close L1 over point and tombstone extents, matching
         // `pick_level_compaction` and `pick_compaction_for_range`.
-        let input_l1 = overlapping_files_for_inputs(version.level_files(1), &input_l0);
+        let l1_files = version.level_files(1);
+        let l1_range_indices: Vec<usize> = l1_files
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tf)| tf.meta.has_range_deletions.then_some(i))
+            .collect();
+        let input_l1 = overlapping_files_in_disjoint_level(l1_files, &l1_range_indices, &input_l0);
         if input_l1
             .iter()
             .any(|tf| in_flight.contains(&tf.meta.number))
@@ -926,9 +1122,10 @@ impl LeveledCompaction {
         })
     }
 
-    /// Pick Ln → Ln+1 compaction. Returns `None` (deferring to another
-    /// priority/level) if any range-overlapping source or target file is
-    /// already claimed by another in-flight compaction.
+    /// Pick Ln → Ln+1 compaction by minimum next-level overlap ratio
+    /// (`kMinOverlappingRatio`, tie-breaking toward single-source trivial-move
+    /// eligibility and larger source files), skipping candidates whose
+    /// transitive extent closure touches `in_flight`.
     fn pick_level_compaction(
         version: &Version,
         level: usize,
@@ -939,41 +1136,116 @@ impl LeveledCompaction {
             return None;
         }
 
-        // Pick the largest file in this level that isn't already claimed.
-        let target = files
-            .iter()
-            .filter(|f| !in_flight.contains(&f.meta.number))
-            .max_by_key(|f| f.meta.file_size)?;
-        // A range tombstone's end key is not represented by the file's
-        // smallest/largest metadata. Close the source inputs transitively over
-        // real point and tombstone extents so no covering sibling remains
-        // behind while a selected value is moved deeper and sequence-zeroed.
-        let input_level = overlapping_files_for_inputs(files, std::slice::from_ref(target));
-        if input_level
-            .iter()
-            .any(|tf| in_flight.contains(&tf.meta.number))
-        {
-            return None;
+        struct LevelCandidate {
+            next_bytes: u128,
+            src_bytes: u128,
+            single_source: bool,
+            target_size: u64,
+            input_files_level: Vec<TableFile>,
+            input_files_next: Vec<TableFile>,
         }
 
         let next_level = level + 1;
-        let input_next = if next_level < version.num_levels {
-            overlapping_files_for_inputs(version.level_files(next_level), &input_level)
+        let next_files: &[TableFile] = if next_level < version.num_levels {
+            version.level_files(next_level)
         } else {
-            Vec::new()
+            &[]
         };
-        if input_next
+        let src_range_indices: Vec<usize> = files
             .iter()
-            .any(|tf| in_flight.contains(&tf.meta.number))
-        {
-            return None;
+            .enumerate()
+            .filter_map(|(i, tf)| tf.meta.has_range_deletions.then_some(i))
+            .collect();
+        let next_range_indices: Vec<usize> = next_files
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tf)| tf.meta.has_range_deletions.then_some(i))
+            .collect();
+        let mut evaluated_multi: HashSet<u64> = HashSet::new();
+        let mut best: Option<LevelCandidate> = None;
+
+        for target in files {
+            #[cfg(test)]
+            PICKER_FILE_VISITS.with(|n| n.set(n.get() + 1));
+            if in_flight.contains(&target.meta.number)
+                || evaluated_multi.contains(&target.meta.number)
+            {
+                continue;
+            }
+            let input_level = if src_range_indices.is_empty() && !target.meta.has_range_deletions {
+                vec![target.clone()]
+            } else {
+                overlapping_files_in_disjoint_level(
+                    files,
+                    &src_range_indices,
+                    std::slice::from_ref(target),
+                )
+            };
+            if input_level.len() > 1 {
+                evaluated_multi.extend(input_level.iter().map(|tf| tf.meta.number));
+            }
+            if input_level
+                .iter()
+                .any(|tf| in_flight.contains(&tf.meta.number))
+            {
+                continue;
+            }
+
+            let input_next = if !next_files.is_empty() {
+                overlapping_files_in_disjoint_level(next_files, &next_range_indices, &input_level)
+            } else {
+                Vec::new()
+            };
+            if input_next
+                .iter()
+                .any(|tf| in_flight.contains(&tf.meta.number))
+            {
+                continue;
+            }
+
+            let src_bytes: u128 = input_level
+                .iter()
+                .map(|tf| tf.meta.file_size as u128)
+                .sum::<u128>()
+                .max(1);
+            let next_bytes: u128 = input_next.iter().map(|tf| tf.meta.file_size as u128).sum();
+            let single_source = input_level.len() == 1;
+            let target_size = input_level
+                .iter()
+                .map(|tf| tf.meta.file_size)
+                .max()
+                .unwrap_or(target.meta.file_size);
+
+            let better = match &best {
+                None => true,
+                Some(cur) => {
+                    match (next_bytes * cur.src_bytes).cmp(&(cur.next_bytes * src_bytes)) {
+                        CmpOrdering::Less => true,
+                        CmpOrdering::Equal => {
+                            (single_source, target_size) > (cur.single_source, cur.target_size)
+                        }
+                        CmpOrdering::Greater => false,
+                    }
+                }
+            };
+            if better {
+                best = Some(LevelCandidate {
+                    next_bytes,
+                    src_bytes,
+                    single_source,
+                    target_size,
+                    input_files_level: input_level,
+                    input_files_next: input_next,
+                });
+            }
         }
 
+        let picked = best?;
         Some(CompactionTask {
             level,
             target_level: next_level,
-            input_files_level: input_level,
-            input_files_next: input_next,
+            input_files_level: picked.input_files_level,
+            input_files_next: picked.input_files_next,
             deeper_disjoint_levels: Some(
                 version.files[(next_level + 1).min(version.num_levels)..].to_vec(),
             ),
@@ -1509,14 +1781,20 @@ impl LeveledCompaction {
         })
     }
 
-    /// Pick a compaction based on a read-triggered hint. If the hinted level
-    /// has more than one file, pick the largest file for compaction into the
-    /// next level.
+    /// Pick a compaction based on a read-triggered hint when no organic L0 or
+    /// byte-budget compaction is pending and the hinted level is over budget
+    /// (or has a true metadata-only trivial move available when `allow_trivial_move`
+    /// is true). Caller evaluates `allow_trivial_move` outside `DB::inner`.
     pub fn pick_compaction_for_hint(
         version: &Version,
+        options: &DbOptions,
         hint: &CompactionHint,
         in_flight: &HashSet<u64>,
+        allow_trivial_move: bool,
     ) -> Option<CompactionTask> {
+        if Self::is_pending(version, options) {
+            return None;
+        }
         let level = hint.level;
         if level == 0 || level >= version.num_levels.saturating_sub(1) {
             return None;
@@ -1525,8 +1803,19 @@ impl LeveledCompaction {
         if files.len() <= 1 {
             return None;
         }
-        // Pick the largest file at the hinted level.
-        Self::pick_level_compaction(version, level, in_flight)
+        let over_budget = Self::level_over_budget(version, options, level);
+        if !over_budget && !allow_trivial_move {
+            return None;
+        }
+        let task = Self::pick_level_compaction(version, level, in_flight)?;
+        let is_trivial_move = allow_trivial_move
+            && task.input_files_level.len() == 1
+            && task.input_files_next.is_empty();
+        if over_budget || is_trivial_move {
+            Some(task)
+        } else {
+            None
+        }
     }
 
     /// Maximum bytes for a given level.
@@ -3405,9 +3694,143 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::Corruption);
         }
     }
+
+    #[test]
+    fn pick_compaction_prioritizes_l0_then_highest_score_and_min_overlap_file() {
+        use super::{HashSet, VersionEdit, VersionSet};
+        use crate::manifest::version_edit::FileMetaData;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let make_meta = |num: u64, lo: &[u8], hi: &[u8], pad_bytes: usize| -> FileMetaData {
+            let path = dir.path().join(format!("{num:06}.sst"));
+            let mut b = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    compression: crate::CompressionType::None,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let val = vec![b'x'; pad_bytes];
+            b.add(InternalKey::new(lo, 10, ValueType::Value).as_bytes(), &val)
+                .unwrap();
+            if hi != lo {
+                b.add(InternalKey::new(hi, 10, ValueType::Value).as_bytes(), &val)
+                    .unwrap();
+            }
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: num,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+
+        let opts = DbOptions::default()
+            .with_num_levels(4)
+            .with_l0_compaction_trigger(2)
+            .with_max_bytes_for_level_base(10_000)
+            .with_max_bytes_for_level_multiplier(2.0); // L1 budget = 10 KB, L2 budget = 20 KB
+
+        let mut vs = VersionSet::create(dir.path(), 4).unwrap();
+        let mut edit = VersionEdit::new();
+        // L0 has 2 files (at trigger)
+        edit.add_file(0, make_meta(10, b"a", b"z", 1024));
+        edit.add_file(0, make_meta(11, b"a", b"z", 1024));
+        // L1 has ~12 KB (score ~1.2)
+        edit.add_file(1, make_meta(12, b"a", b"m", 6_000));
+        // L2 has ~60 KB across two files (score ~3.0 > L1 score ~1.2):
+        // - file 20 (`["a", "f"]`) overlaps 50 KB in L3
+        // - file 21 (`["n", "z"]`) has ZERO overlap in L3 (trivial-move candidate!)
+        edit.add_file(2, make_meta(20, b"a", b"f", 15_000));
+        edit.add_file(2, make_meta(21, b"n", b"z", 15_000));
+        edit.add_file(3, make_meta(30, b"a", b"g", 25_000));
+        vs.log_and_apply(edit).unwrap();
+        let version = vs.current();
+
+        // 1. When L0 >= trigger and unclaimed, L0 -> L1 wins first.
+        let t0 = super::LeveledCompaction::pick_compaction(&version, &opts, &HashSet::new())
+            .expect("must pick L0");
+        assert_eq!(t0.level, 0);
+
+        // 2. When L0 is already claimed in-flight, L2 (score ~3.0) beats L1 (score ~1.2),
+        //    and within L2 file 21 (0 overlap in L3) beats file 20 (heavy overlap in L3).
+        let in_flight: HashSet<u64> = [10u64].into_iter().collect();
+        let t2 = super::LeveledCompaction::pick_compaction(&version, &opts, &in_flight)
+            .expect("must pick L2");
+        assert_eq!(t2.level, 2);
+        assert_eq!(t2.input_files_level.len(), 1);
+        assert_eq!(t2.input_files_level[0].meta.number, 21);
+        assert!(t2.input_files_next.is_empty());
+    }
+
+    #[test]
+    fn pick_level_compaction_scales_linearly_on_many_disjoint_files() {
+        use super::{HashSet, PICKER_FILE_VISITS, VersionEdit, VersionSet};
+        use crate::manifest::version_edit::FileMetaData;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let mut vs = VersionSet::create(path, 3).unwrap();
+        let mut edit = VersionEdit::new();
+        for i in 0..250u64 {
+            let num = 10 + i;
+            let sst_path = path.join(format!("{num:06}.sst"));
+            let mut b = TableBuilder::new(
+                &sst_path,
+                TableBuildOptions {
+                    compression: crate::CompressionType::None,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let k = format!("k_{i:05}");
+            b.add(
+                InternalKey::new(k.as_bytes(), 1, ValueType::Value).as_bytes(),
+                b"v",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            edit.add_file(
+                1,
+                FileMetaData {
+                    number: num,
+                    file_size: res.file_size,
+                    smallest_key: res.smallest_key.unwrap(),
+                    largest_key: res.largest_key.unwrap(),
+                    has_range_deletions: false,
+                },
+            );
+        }
+        vs.log_and_apply(edit).unwrap();
+        let version = vs.current();
+        let opts = DbOptions::default()
+            .with_num_levels(3)
+            .with_max_bytes_for_level_base(1);
+
+        PICKER_FILE_VISITS.with(|n| n.set(0));
+        let task = super::LeveledCompaction::pick_compaction(&version, &opts, &HashSet::new())
+            .expect("must pick L1");
+        let visits = PICKER_FILE_VISITS.with(|n| n.get());
+        assert_eq!(task.level, 1);
+        assert_eq!(task.input_files_level.len(), 1);
+        assert!(
+            visits <= 500,
+            "expected linear O(F) file visits for 250 disjoint files, got {visits}"
+        );
+    }
 }
 
 #[cfg(test)]
 thread_local! {
     static LEVEL_BUDGET_MULS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PICKER_FILE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

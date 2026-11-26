@@ -1,19 +1,16 @@
 //! DBIterator: a user-facing iterator that merges all sources, resolves
 //! sequence numbers, and skips tombstones.
 
-use std::{cmp::Ordering, sync::Arc};
+use std::sync::Arc;
 
 use crate::iterator::{
-    merge::{IterSource, MergingIterator},
+    merge::{InternalKeyComparator, IterSource, MergingIterator},
     range_del::FragmentedRangeTombstoneList,
 };
 use crate::types::{
-    LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
-    decode_internal_key,
+    LazyValue, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, decode_internal_key,
 };
 use crate::{Error, options::IterConfig};
-
-type IKeyCompareFn = fn(&[u8], &[u8]) -> Ordering;
 
 /// A database-level iterator that presents a clean view of key-value pairs.
 ///
@@ -21,7 +18,7 @@ type IKeyCompareFn = fn(&[u8], &[u8]) -> Ordering;
 /// without collecting the entire dataset into memory.
 pub struct DBIterator {
     /// Underlying merging iterator producing (internal_key, value) pairs in order.
-    merger: MergingIterator<IKeyCompareFn>,
+    merger: MergingIterator<InternalKeyComparator>,
     /// Snapshot sequence number for visibility filtering.
     sequence: SequenceNumber,
     /// Source zero contains the uncommitted batch when an overlay is present.
@@ -68,10 +65,9 @@ pub struct DBIterator {
     /// successor (all `0xFF`, or `prefix_len == 0`). Keeps later `advance()`
     /// and `next_prefix()` calls exhausted until an explicit seek repositions.
     prefix_exhausted: bool,
-}
-
-fn ikey_compare(a: &[u8], b: &[u8]) -> Ordering {
-    compare_internal_key(a, b)
+    /// Deferred lower-bound seek so `iter_with_prefix` / `iter_with_range`
+    /// followed immediately by `seek*` or `step_prev` avoids an eager throwaway seek.
+    needs_lower_prime: bool,
 }
 
 impl DBIterator {
@@ -83,7 +79,7 @@ impl DBIterator {
 
     /// Build a DB iterator from pre-built IterSource objects (supports streaming).
     pub(crate) fn from_sources(sources: Vec<IterSource>, sequence: SequenceNumber) -> Self {
-        let merger = MergingIterator::new(sources, ikey_compare as fn(&[u8], &[u8]) -> Ordering);
+        let merger = MergingIterator::with_comparator(sources, InternalKeyComparator);
 
         Self {
             merger,
@@ -104,6 +100,7 @@ impl DBIterator {
             clean_read: true,
             key_decode_error: None,
             prefix_exhausted: false,
+            needs_lower_prime: false,
         }
     }
 
@@ -202,6 +199,7 @@ impl DBIterator {
         }
         self.recycle_current();
         self.needs_advance = true;
+        self.needs_lower_prime = false;
         self.prev_overshoot = None;
         self.prefix_exhausted = false;
     }
@@ -226,6 +224,7 @@ impl DBIterator {
     pub(super) fn halt_on_error(&mut self) {
         self.recycle_current();
         self.needs_advance = false;
+        self.needs_lower_prime = false;
         self.prev_overshoot = None;
         self.backward_positioned = false;
     }
@@ -559,6 +558,11 @@ impl DBIterator {
         if !self.needs_advance {
             return self.current.is_some();
         }
+        if self.needs_lower_prime {
+            self.needs_lower_prime = false;
+            self.seek_to_first();
+            self.last_seek_key = None;
+        }
         if self.has_failed() {
             self.halt_on_error();
             return false;
@@ -616,6 +620,7 @@ impl DBIterator {
             } else if self.last_seek_key.is_some() {
                 self.ensure_current();
             } else {
+                self.needs_lower_prime = false;
                 self.seek_to_last();
             }
         }
@@ -637,12 +642,15 @@ impl DBIterator {
     }
 
     pub fn advance(&mut self) {
-        self.next_lazy();
+        if self.ensure_current() {
+            self.needs_advance = true;
+        }
     }
 
     /// Seek to the first key >= target.
     pub fn seek(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
+        self.needs_lower_prime = false;
         if self.has_failed() {
             self.halt_on_error();
             return;
@@ -666,16 +674,16 @@ impl DBIterator {
         self.backward_positioned = false;
     }
 
-    /// Position sources for their first forward read without making a public
-    /// seek. An initial reverse step may still choose the end of the window.
+    /// Position sources lazily for their first forward read without making a public
+    /// seek. An initial reverse step or explicit `seek*` skips the throwaway seek.
     pub(crate) fn prime_lower_bound(&mut self) {
         if self.config.lower.is_some() {
-            self.seek_to_first();
-            self.last_seek_key = None;
+            self.needs_lower_prime = true;
         }
     }
 
     pub fn seek_to_first(&mut self) {
+        self.needs_lower_prime = false;
         if self.has_failed() {
             self.halt_on_error();
             return;
@@ -699,6 +707,7 @@ impl DBIterator {
     /// Uses a single backward seek + inline resolution. No redundant forward seek.
     pub fn seek_for_prev(&mut self, target: &[u8]) {
         use crate::types::InternalKey;
+        self.needs_lower_prime = false;
         if self.has_failed() {
             self.halt_on_error();
             return;
@@ -934,6 +943,7 @@ impl DBIterator {
     /// then resolves visibility inline (no forward re-seek).
     pub fn seek_to_last(&mut self) {
         use crate::types::InternalKey;
+        self.needs_lower_prime = false;
         if self.has_failed() {
             self.halt_on_error();
             return;
@@ -2275,5 +2285,37 @@ mod tests {
             merged_alloc, 0,
             "steady-state merged SST+MemTable step_next allocated {merged_alloc} heap bytes"
         );
+
+        // 3. Cursor API (`valid()` / `key()` / `value()` / `advance()`) must also
+        //    recycle `current_key` / `current_value` with 0 heap allocations, and
+        //    lazy `iter_with_prefix` + `seek` must return exact rows.
+        let mut cursor_iter = db.iter().unwrap();
+        for _ in 0..4 {
+            assert!(cursor_iter.valid());
+            cursor_iter.advance();
+        }
+        let (cursor_rows, cursor_alloc) = crate::test_alloc::count_allocated(|| {
+            let mut n = 0usize;
+            while cursor_iter.valid() {
+                assert_eq!(cursor_iter.key().unwrap().len(), 10);
+                assert!(!cursor_iter.value().unwrap().is_empty());
+                cursor_iter.advance();
+                n += 1;
+            }
+            n
+        });
+        assert_eq!(cursor_rows, merged_rows);
+        assert_eq!(
+            cursor_alloc, 0,
+            "steady-state cursor advance() allocated {cursor_alloc} heap bytes"
+        );
+
+        let mut pfx_iter = db
+            .iter_with_prefix(b"key_0001", &crate::ReadOptions::default())
+            .unwrap();
+        pfx_iter.seek(b"key_000150");
+        let (k, _) = pfx_iter.step_next().unwrap().unwrap();
+        assert!(k.starts_with(b"key_0001"));
+        assert!(k >= b"key_000150".as_slice());
     }
 }

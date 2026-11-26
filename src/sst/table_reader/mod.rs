@@ -2,13 +2,7 @@
 mod iterator;
 pub use iterator::TableIterator;
 
-use std::{
-    cmp::Ordering,
-    fs::File,
-    io,
-    path::Path,
-    sync::{Arc, atomic::Ordering as AtomicOrdering},
-};
+use std::{cmp::Ordering, fs::File, io, path::Path, sync::Arc};
 
 #[cfg(not(unix))]
 use parking_lot::Mutex;
@@ -89,6 +83,9 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Readahead hints issued on this thread.
     pub(crate) static WILLNEED_HINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `(offset, len)` byte spans passed to `advise_willneed` on this thread.
+    pub(crate) static WILLNEED_RANGES: std::cell::RefCell<Vec<(u64, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// An open, immutable SST file. On unix, block reads are positional
@@ -209,6 +206,45 @@ pub struct TableReader {
 #[cfg(feature = "test-utils")]
 thread_local! {
     pub(crate) static POINT_TABLE_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Reusable state for one user-key lookup across multiple SST files/levels:
+/// computes the XXH3-64 Bloom hash and encoded internal seek key at most once.
+pub(crate) struct PointProbe<'a> {
+    pub(crate) user_key: &'a [u8],
+    sequence: SequenceNumber,
+    bloom_hash: Option<u64>,
+    seek_key: SmallVec<[u8; 128]>,
+}
+
+impl<'a> PointProbe<'a> {
+    #[inline]
+    pub(crate) fn new(user_key: &'a [u8], sequence: SequenceNumber) -> Self {
+        Self {
+            user_key,
+            sequence,
+            bloom_hash: None,
+            seek_key: SmallVec::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn bloom_hash(&mut self) -> u64 {
+        *self
+            .bloom_hash
+            .get_or_insert_with(|| crate::sst::filter::bloom_hash(self.user_key))
+    }
+
+    #[inline]
+    pub(crate) fn seek_key(&mut self) -> &[u8] {
+        if self.seek_key.is_empty() {
+            self.seek_key.extend_from_slice(self.user_key);
+            self.seek_key.extend_from_slice(
+                &(!pack_sequence_and_type(self.sequence, ValueType::RangeDeletion)).to_be_bytes(),
+            );
+        }
+        &self.seek_key
+    }
 }
 
 /// Retain a pair of cursors so alternating hits in an overlapping L0 and
@@ -524,21 +560,21 @@ impl TableReader {
             return Ok(None);
         };
         if let Some(ref cache) = self.block_cache
-            && let Some((raw, cached_size, validated)) =
-                cache.get_cached_block(self.file_number, handle.offset)
+            && let Some(entry) = cache.get_cached_entry(self.file_number, handle.offset)
         {
+            let cached_size = entry.compressed_size();
             if cached_size != u64::MAX && cached_size != handle.size {
                 return Err(Error::corruption("SST index leaf block size mismatch"));
             }
             if let Some(ref s) = self.stats {
                 s.record_cache_hit();
             }
-            let block = match validated {
-                Some((block, ValidatedKind::Index, _)) => {
-                    return Ok(Some(block));
+            let block = match entry.validated_ref() {
+                Some((block, ValidatedKind::Index)) => {
+                    return Ok(Some(block.clone()));
                 }
-                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
-                None => Block::new(raw)?,
+                Some((_, _)) => return Err(Error::corruption("SST block role mismatch")),
+                None => Block::new(entry.raw_arc().clone())?,
             };
             self.validate_index_leaf(part, sep, &block)?;
             if fill_cache {
@@ -687,30 +723,136 @@ impl TableReader {
         sequence: SequenceNumber,
         fill_cache: bool,
     ) -> Result<Option<(Option<V>, SequenceNumber)>> {
-        let Some(seek_key) = self.point_seek_key(user_key, sequence) else {
+        let mut probe = PointProbe::new(user_key, sequence);
+        self.point_value_with_probe(&mut probe, 0, fill_cache)
+    }
+
+    pub(crate) fn point_value_with_probe<V: PointValue>(
+        &self,
+        probe: &mut PointProbe<'_>,
+        covering_tombstone_seq: SequenceNumber,
+        fill_cache: bool,
+    ) -> Result<Option<(Option<V>, SequenceNumber)>> {
+        #[cfg(feature = "test-utils")]
+        POINT_TABLE_PROBES.with(|count| count.set(count.get() + 1));
+        if let Some(ref filter) = self.filter_data
+            && !filter.may_match_hash(probe.bloom_hash())
+        {
+            return Ok(None);
+        }
+        let user_key = probe.user_key;
+        let seek_key = probe.seek_key();
+        let part = self
+            .partitions
+            .partition_point(|(k, _)| k.compare_internal(seek_key).is_lt());
+        let Some((sep, leaf_handle)) = self.partitions.get(part) else {
             return Ok(None);
         };
-        let Some((index_block, idx)) = self.find_data_block(&seek_key, fill_cache).ctx()? else {
+
+        // Fast path on warm index leaf: borrow `&Block` from `Arc<CachedBlock>`
+        // without touching the inner `Arc<Vec<u8>>` reference count.
+        if let Some(ref cache) = self.block_cache
+            && let Some(leaf_entry) = cache.get_cached_entry(self.file_number, leaf_handle.offset)
+        {
+            let cached_size = leaf_entry.compressed_size();
+            if cached_size != u64::MAX && cached_size != leaf_handle.size {
+                return Err(Error::corruption("SST index leaf block size mismatch")).ctx();
+            }
+            if let Some((leaf, ValidatedKind::Index)) = leaf_entry.validated_ref() {
+                if let Some(ref s) = self.stats {
+                    s.record_cache_hit();
+                }
+                let idx = Self::partition_point_index_leaf(leaf, seek_key);
+                if idx >= leaf.num_restarts() {
+                    return Err(Error::corruption("index leaf ends before its separator")).ctx();
+                }
+                let (separator, raw, _) = leaf.decode_restart_entry(idx)?;
+                let entry = decode_index_entry(raw).ctx()?;
+                return self.point_in_data_block(
+                    (entry.handle, entry.first_key),
+                    separator,
+                    (user_key, seek_key, covering_tombstone_seq),
+                    fill_cache,
+                );
+            }
+        }
+
+        let Some(index_block) = self.index_leaf_block(part, fill_cache).ctx()? else {
             return Ok(None);
         };
-        let block = self.indexed_point_block(&index_block, idx, fill_cache)?;
-        Self::point_in_block(&block, user_key, &seek_key)
+        let idx = Self::partition_point_index_leaf(&index_block, seek_key);
+        if idx >= index_block.num_restarts() {
+            let _ = sep;
+            return Err(Error::corruption("index leaf ends before its separator")).ctx();
+        }
+        let (separator, raw, _) = index_block.decode_restart_entry(idx)?;
+        let entry = decode_index_entry(raw).ctx()?;
+        self.point_in_data_block(
+            (entry.handle, entry.first_key),
+            separator,
+            (user_key, seek_key, covering_tombstone_seq),
+            fill_cache,
+        )
+    }
+
+    #[inline]
+    fn point_in_data_block<V: PointValue>(
+        &self,
+        indexed: (BlockHandle, &[u8]),
+        sep: &[u8],
+        probe: (&[u8], &[u8], SequenceNumber),
+        fill_cache: bool,
+    ) -> Result<Option<(Option<V>, SequenceNumber)>> {
+        let (ref handle, first_key) = indexed;
+        let (user_key, seek_key, covering_tombstone_seq) = probe;
+        if let Some(ref cache) = self.block_cache
+            && let Some(data_entry) = cache.get_cached_entry(self.file_number, handle.offset)
+        {
+            let cached_size = data_entry.compressed_size();
+            if cached_size != u64::MAX && cached_size != handle.size {
+                return Err(Error::corruption("SST data block size mismatch")).ctx();
+            }
+            if let Some((block, ValidatedKind::DataOrdered)) = data_entry.validated_ref() {
+                if let Some(ref s) = self.stats {
+                    s.record_cache_hit();
+                }
+                let (k0, _, _) = block.decode_restart_entry(0).ctx()?;
+                let (kl, _, _) = block.decode_restart_entry(block.num_restarts() - 1).ctx()?;
+                if k0 != first_key || compare_internal_key(kl, sep).is_gt() {
+                    return Err(Error::corruption(
+                        "SST data block disagrees with index bounds",
+                    ))
+                    .ctx();
+                }
+                return Self::point_in_block(block, user_key, seek_key, covering_tombstone_seq);
+            }
+        }
+        let block = self
+            .read_data_block_ordered(handle, first_key, sep, fill_cache)
+            .ctx()?;
+        Self::point_in_block(&block, user_key, seek_key, covering_tombstone_seq)
     }
 
     pub(crate) fn grouped_point_value(
         &self,
         file_number: u64,
-        user_key: &[u8],
-        sequence: SequenceNumber,
+        probe: &mut PointProbe<'_>,
+        covering_tombstone_seq: SequenceNumber,
         fill_cache: bool,
         blocks: &mut GroupedPointBlocks,
     ) -> Result<Option<(Option<PinnedSlice>, SequenceNumber)>> {
-        let Some(seek_key) = self.point_seek_key(user_key, sequence) else {
+        #[cfg(feature = "test-utils")]
+        POINT_TABLE_PROBES.with(|count| count.set(count.get() + 1));
+        if let Some(ref filter) = self.filter_data
+            && !filter.may_match_hash(probe.bloom_hash())
+        {
             return Ok(None);
-        };
+        }
+        let user_key = probe.user_key;
+        let seek_key = probe.seek_key();
         let part = self
             .partitions
-            .partition_point(|(sep, _)| sep.compare_internal(&seek_key).is_lt());
+            .partition_point(|(sep, _)| sep.compare_internal(seek_key).is_lt());
         if part == self.partitions.len() {
             return Ok(None);
         }
@@ -723,7 +865,7 @@ impl TableReader {
             blocks.data = None;
         }
         let leaf = &blocks.leaf.as_ref().expect("index leaf set above").1;
-        let idx = Self::partition_point_index_leaf(leaf, &seek_key);
+        let idx = Self::partition_point_index_leaf(leaf, seek_key);
         if idx >= leaf.num_restarts() {
             return Err(Error::corruption("index leaf ends before its separator"));
         }
@@ -732,29 +874,7 @@ impl TableReader {
             blocks.data = Some((idx, block));
         }
         let block = &blocks.data.as_ref().expect("data block set above").1;
-        Self::point_in_block(block, user_key, &seek_key)
-    }
-
-    #[inline]
-    fn point_seek_key(
-        &self,
-        user_key: &[u8],
-        sequence: SequenceNumber,
-    ) -> Option<SmallVec<[u8; 128]>> {
-        #[cfg(feature = "test-utils")]
-        POINT_TABLE_PROBES.with(|count| count.set(count.get() + 1));
-        if self
-            .filter_data
-            .as_ref()
-            .is_some_and(|filter| !filter.may_match(user_key))
-        {
-            return None;
-        }
-        let mut seek_key = SmallVec::from_slice(user_key);
-        seek_key.extend_from_slice(
-            &(!pack_sequence_and_type(sequence, ValueType::RangeDeletion)).to_be_bytes(),
-        );
-        Some(seek_key)
+        Self::point_in_block(block, user_key, seek_key, covering_tombstone_seq)
     }
 
     #[inline]
@@ -769,6 +889,7 @@ impl TableReader {
         block: &Block,
         user_key: &[u8],
         seek_key: &[u8],
+        covering_tombstone_seq: SequenceNumber,
     ) -> Result<Option<(Option<V>, SequenceNumber)>> {
         let mut encoded_ikey = SmallVec::<[u8; 128]>::new();
         match block
@@ -780,14 +901,21 @@ impl TableReader {
                 if uk == user_key {
                     return Ok(Some((
                         match vt {
-                            ValueType::Value => Some(V::project(value.len(), || {
-                                PinnedSlice::from_block(
-                                    block.data_arc().clone(),
-                                    (value.as_ptr() as usize - block.data().as_ptr() as usize)
-                                        as u32,
-                                    value.len() as u32,
-                                )
-                            })),
+                            ValueType::Value => {
+                                if covering_tombstone_seq > entry_seq {
+                                    None
+                                } else {
+                                    Some(V::project(value, || {
+                                        PinnedSlice::from_block(
+                                            block.data_arc().clone(),
+                                            (value.as_ptr() as usize
+                                                - block.data().as_ptr() as usize)
+                                                as u32,
+                                            value.len() as u32,
+                                        )
+                                    }))
+                                }
+                            }
                             ValueType::Deletion => None,
                             ValueType::RangeDeletion => {
                                 return Err(Error::corruption(
@@ -880,19 +1008,19 @@ impl TableReader {
 
     fn range_leaf_block(&self, part: &RangePartition, fill_cache: bool) -> Result<Block> {
         if let Some(ref cache) = self.block_cache
-            && let Some((raw, cached_size, validated)) =
-                cache.get_cached_block(self.file_number, part.handle.offset)
+            && let Some(entry) = cache.get_cached_entry(self.file_number, part.handle.offset)
         {
+            let cached_size = entry.compressed_size();
             if cached_size != u64::MAX && cached_size != part.handle.size {
                 return Err(Error::corruption("SST range leaf block size mismatch"));
             }
             if let Some(ref s) = self.stats {
                 s.record_cache_hit();
             }
-            let block = match validated {
-                Some((block, ValidatedKind::RangeDel, _)) => return Ok(block),
-                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
-                None => Block::new(raw)?,
+            let block = match entry.validated_ref() {
+                Some((block, ValidatedKind::RangeDel)) => return Ok(block.clone()),
+                Some((_, _)) => return Err(Error::corruption("SST block role mismatch")),
+                None => Block::new(entry.raw_arc().clone())?,
             };
             Self::validate_range_leaf(part, &block)?;
             if fill_cache {
@@ -1109,22 +1237,6 @@ impl TableReader {
         Ok(result)
     }
 
-    /// Find the index leaf and entry index that might contain `key`.
-    #[inline]
-    fn find_data_block(&self, key: &[u8], fill_cache: bool) -> Result<Option<(Block, u32)>> {
-        let part = self
-            .partitions
-            .partition_point(|(k, _)| k.compare_internal(key).is_lt());
-        let Some(block) = self.index_leaf_block(part, fill_cache)? else {
-            return Ok(None);
-        };
-        let idx = Self::partition_point_index_leaf(&block, key);
-        if idx >= block.num_restarts() {
-            return Err(Error::corruption("index leaf ends before its separator"));
-        }
-        Ok(Some((block, idx)))
-    }
-
     fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
         const MAX_COMPRESSED_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
         let file_size = file.size;
@@ -1328,29 +1440,31 @@ impl TableReader {
     }
 
     /// Read and validate a `Block`, skipping `Block::new` restart scanning on cache hits.
-    /// Returns `(block, is_data_ordered)`.
-    pub(super) fn read_block_cached_block(
+    /// Returns `(block, is_data_ordered, was_cache_hit)`.
+    pub(super) fn read_block_cached_block_with_hit(
         &self,
         handle: &BlockHandle,
         bounds: Option<(&[u8], &[u8])>,
         fill_cache: bool,
-    ) -> Result<(Block, bool)> {
+    ) -> Result<(Block, bool, bool)> {
         if let Some(ref cache) = self.block_cache
-            && let Some((raw, cached_size, validated)) =
-                cache.get_cached_block(self.file_number, handle.offset)
+            && let Some(entry) = cache.get_cached_entry(self.file_number, handle.offset)
         {
+            let cached_size = entry.compressed_size();
             if cached_size != u64::MAX && cached_size != handle.size {
                 return Err(Error::corruption("SST data block size mismatch"));
             }
             if let Some(ref s) = self.stats {
                 s.record_cache_hit();
             }
-            match validated {
-                Some((block, ValidatedKind::DataOrdered, _)) => return Ok((block, true)),
-                Some((block, ValidatedKind::Data, _)) => return Ok((block, false)),
-                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
+            match entry.validated_ref() {
+                Some((block, ValidatedKind::DataOrdered)) => {
+                    return Ok((block.clone(), true, true));
+                }
+                Some((block, ValidatedKind::Data)) => return Ok((block.clone(), false, true)),
+                Some((_, _)) => return Err(Error::corruption("SST block role mismatch")),
                 None => {
-                    let block = Block::new(raw)?;
+                    let block = Block::new(entry.raw_arc().clone())?;
                     if fill_cache && cache.is_enabled() {
                         if let Some((first_key, sep)) = bounds {
                             block.validate_point_block_ordered(first_key, sep)?;
@@ -1361,7 +1475,7 @@ impl TableReader {
                                 &block,
                                 ValidatedKind::DataOrdered,
                             );
-                            return Ok((block, true));
+                            return Ok((block, true, true));
                         }
                         cache.insert_validated_block(
                             self.file_number,
@@ -1371,7 +1485,7 @@ impl TableReader {
                             ValidatedKind::Data,
                         );
                     }
-                    return Ok((block, false));
+                    return Ok((block, false, true));
                 }
             }
         }
@@ -1398,7 +1512,7 @@ impl TableReader {
                     &block,
                     ValidatedKind::DataOrdered,
                 );
-                return Ok((block, true));
+                return Ok((block, true, false));
             }
             cache.insert_validated_block(
                 self.file_number,
@@ -1409,7 +1523,17 @@ impl TableReader {
             );
         }
 
-        Ok((block, false))
+        Ok((block, false, false))
+    }
+
+    pub(super) fn read_block_cached_block(
+        &self,
+        handle: &BlockHandle,
+        bounds: Option<(&[u8], &[u8])>,
+        fill_cache: bool,
+    ) -> Result<(Block, bool)> {
+        self.read_block_cached_block_with_hit(handle, bounds, fill_cache)
+            .map(|(block, ordered, _)| (block, ordered))
     }
 
     /// Read a point data block and ensure its entries are strictly ordered within `[first_key, sep]`.
@@ -1422,17 +1546,17 @@ impl TableReader {
         fill_cache: bool,
     ) -> Result<Block> {
         if let Some(ref cache) = self.block_cache
-            && let Some((raw, cached_size, validated)) =
-                cache.get_cached_block(self.file_number, handle.offset)
+            && let Some(entry) = cache.get_cached_entry(self.file_number, handle.offset)
         {
+            let cached_size = entry.compressed_size();
             if cached_size != u64::MAX && cached_size != handle.size {
                 return Err(Error::corruption("SST data block size mismatch"));
             }
             if let Some(ref s) = self.stats {
                 s.record_cache_hit();
             }
-            match validated {
-                Some((block, ValidatedKind::DataOrdered, _)) => {
+            match entry.validated_ref() {
+                Some((block, ValidatedKind::DataOrdered)) => {
                     let (k0, _, _) = block.decode_restart_entry(0)?;
                     let (kl, _, _) = block.decode_restart_entry(block.num_restarts() - 1)?;
                     if k0 != first_key || compare_internal_key(kl, sep).is_gt() {
@@ -1440,16 +1564,16 @@ impl TableReader {
                             "SST data block disagrees with index bounds",
                         ));
                     }
-                    return Ok(block);
+                    return Ok(block.clone());
                 }
-                Some((block, ValidatedKind::Data, ordered_flag)) => {
+                Some((block, ValidatedKind::Data)) => {
                     block.validate_point_block_ordered(first_key, sep)?;
-                    ordered_flag.store(true, AtomicOrdering::Release);
-                    return Ok(block);
+                    entry.mark_data_ordered();
+                    return Ok(block.clone());
                 }
-                Some((_, _, _)) => return Err(Error::corruption("SST block role mismatch")),
+                Some((_, _)) => return Err(Error::corruption("SST block role mismatch")),
                 None => {
-                    let block = Block::new(raw)?;
+                    let block = Block::new(entry.raw_arc().clone())?;
                     block.validate_point_block_ordered(first_key, sep)?;
                     if fill_cache {
                         cache.insert_validated_block(
@@ -1514,24 +1638,27 @@ impl TableReader {
             return None;
         }
         let (sep, leaf) = self.partitions.first()?;
-        let cached = cache.get_cached_block(self.file_number, leaf.offset);
+        let cached = cache.get_cached_entry(self.file_number, leaf.offset);
         let mut warm = false;
         let leaf_block = match cached {
-            Some((_, cached_size, _)) if cached_size != u64::MAX && cached_size != leaf.size => {
+            Some(ref entry)
+                if entry.compressed_size() != u64::MAX && entry.compressed_size() != leaf.size =>
+            {
                 return None;
             }
-            Some((_, _, Some((block, ValidatedKind::Index, _)))) => {
-                self.check_index_leaf_partition_bounds(0, sep, &block)
-                    .ok()?;
-                block
-            }
-            Some((_, _, Some((_, _, _)))) => return None,
-            Some((raw, _, None)) => {
-                warm = true;
-                let block = Block::new(raw).ok()?;
-                self.validate_index_leaf(0, sep, &block).ok()?;
-                block
-            }
+            Some(entry) => match entry.validated_ref() {
+                Some((block, ValidatedKind::Index)) => {
+                    self.check_index_leaf_partition_bounds(0, sep, block).ok()?;
+                    block.clone()
+                }
+                Some((_, _)) => return None,
+                None => {
+                    warm = true;
+                    let block = Block::new(entry.raw_arc().clone()).ok()?;
+                    self.validate_index_leaf(0, sep, &block).ok()?;
+                    block
+                }
+            },
             None => {
                 warm = true;
                 let bytes = Self::read_block_data(&self.file, leaf).ok()?;
@@ -1601,7 +1728,10 @@ impl TableReader {
     /// Uses `posix_fadvise` on Linux; no-op on other platforms.
     fn advise_willneed(&self, offset: u64, len: u64) {
         #[cfg(test)]
-        WILLNEED_HINTS.with(|hints| hints.set(hints.get() + 1));
+        {
+            WILLNEED_HINTS.with(|hints| hints.set(hints.get() + 1));
+            WILLNEED_RANGES.with(|ranges| ranges.borrow_mut().push((offset, len)));
+        }
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
@@ -1880,9 +2010,10 @@ mod tests {
                         reader.get_internal_with_seq(user_key, seq, false).unwrap(),
                         expected
                     );
+                    let mut probe = super::PointProbe::new(user_key, seq);
                     assert_eq!(
                         reader
-                            .grouped_point_value(1, user_key, seq, false, &mut grouped)
+                            .grouped_point_value(1, &mut probe, 0, false, &mut grouped)
                             .unwrap()
                             .map(|(v, seq)| (v.map(crate::PinnedSlice::into_vec), seq)),
                         expected

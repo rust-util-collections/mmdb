@@ -59,6 +59,10 @@ pub struct WalWriter {
     last_writeback: u64,
 }
 
+/// Buffer 2 full 32 KiB WAL blocks before issuing a syscall so multi-fragment
+/// records and large write groups coalesce instead of bypassing an 8 KiB buffer.
+const WAL_BUF_CAPACITY: usize = 2 * BLOCK_SIZE;
+
 impl WalWriter {
     /// Release the file without letting BufWriter flush during a simulated crash.
     #[cfg(any(test, feature = "test-utils"))]
@@ -78,7 +82,7 @@ impl WalWriter {
             .ctx()?;
         Self::sync_parent_dir(path).ctx()?;
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(WAL_BUF_CAPACITY, file),
             block_offset: 0,
             end_offset: 0,
             last_writeback: 0,
@@ -97,7 +101,7 @@ impl WalWriter {
         file.seek(SeekFrom::End(0)).ctx()?;
         let block_offset = valid_len as usize % BLOCK_SIZE;
         let mut writer = Self {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(WAL_BUF_CAPACITY, file),
             block_offset,
             end_offset: valid_len,
             last_writeback: valid_len,

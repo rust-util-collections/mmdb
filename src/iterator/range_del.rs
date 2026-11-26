@@ -3,7 +3,7 @@
 //! Compaction visits user keys in order at a fixed snapshot cutoff. A max-heap
 //! keeps the newest covering tombstone available between interval boundaries.
 
-use std::collections::BinaryHeap;
+use std::{collections::BinaryHeap, sync::Arc};
 
 use crate::types::SequenceNumber;
 
@@ -141,7 +141,9 @@ impl RangeTombstoneTracker {
 /// Derived from every raw begin/end key, sorted and deduplicated. Some
 /// intervals may have zero covering tombstones (gaps between tombstones);
 /// queries landing there correctly see no coverage.
-type Bounds = Vec<Vec<u8>>;
+type Bounds = Vec<Arc<[u8]>>;
+pub(crate) type SharedRangeTombstone = (Arc<[u8]>, Arc<[u8]>, SequenceNumber);
+type SharedLevelTombstone = (Arc<[u8]>, Arc<[u8]>, SequenceNumber, usize);
 
 /// Segment tree over the elementary intervals in `Bounds`. Node `i`'s
 /// children are `2*i` and `2*i+1` (1-indexed, root at `1`); node `1` spans
@@ -276,22 +278,43 @@ impl FragmentedRangeTombstoneList {
 
     /// Build from raw tombstones: `(begin, end, seq)` triples.
     /// All tombstones are assigned level 0 (no cross-level pruning).
+    #[cfg(test)]
     pub fn new(raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)>) -> Self {
-        let with_levels: Vec<_> = raw.into_iter().map(|(b, e, s)| (b, e, s, 0usize)).collect();
-        Self::new_with_levels(with_levels)
+        let with_levels: Vec<_> = raw
+            .into_iter()
+            .map(|(b, e, s)| (Arc::<[u8]>::from(b), Arc::<[u8]>::from(e), s, 0usize))
+            .collect();
+        Self::from_arc_with_levels(&with_levels)
+    }
+
+    /// Build from shared `(begin, end, seq)` triples without copying endpoint bytes.
+    pub(crate) fn from_shared(raw: &[SharedRangeTombstone]) -> Self {
+        let with_levels: Vec<_> = raw
+            .iter()
+            .map(|(b, e, s)| (Arc::clone(b), Arc::clone(e), *s, 0usize))
+            .collect();
+        Self::from_arc_with_levels(&with_levels)
     }
 
     /// Build from raw tombstones with level info: `(begin, end, seq, level)`.
     pub fn new_with_levels(raw: Vec<(Vec<u8>, Vec<u8>, SequenceNumber, usize)>) -> Self {
+        let with_levels: Vec<_> = raw
+            .into_iter()
+            .map(|(b, e, s, lvl)| (Arc::<[u8]>::from(b), Arc::<[u8]>::from(e), s, lvl))
+            .collect();
+        Self::from_arc_with_levels(&with_levels)
+    }
+
+    fn from_arc_with_levels(raw: &[SharedLevelTombstone]) -> Self {
         if raw.is_empty() {
             return Self::empty();
         }
 
         // Elementary-interval boundaries: every distinct begin/end key.
         let mut bounds: Bounds = Vec::with_capacity(raw.len() * 2);
-        for (begin, end, _, _) in &raw {
-            bounds.push(begin.clone());
-            bounds.push(end.clone());
+        for (begin, end, _, _) in raw {
+            bounds.push(Arc::clone(begin));
+            bounds.push(Arc::clone(end));
         }
         bounds.sort();
         bounds.dedup();
@@ -299,7 +322,7 @@ impl FragmentedRangeTombstoneList {
         let num_intervals = bounds.len() - 1;
         let mut tree: Tree = vec![Vec::new(); tree_node_capacity(num_intervals)];
 
-        for (begin, end, seq, level) in &raw {
+        for (begin, end, seq, level) in raw {
             if begin >= end {
                 continue; // empty/invalid range contributes no coverage
             }
@@ -323,6 +346,25 @@ impl FragmentedRangeTombstoneList {
         }
 
         Self { bounds, tree }
+    }
+
+    /// Approximate structural heap bytes owned by this index (excluding shared
+    /// `Arc<[u8]>` endpoint payloads already accounted in `MemRangeTombstone`).
+    pub(crate) fn approximate_heap_bytes(&self) -> usize {
+        let bounds_bytes = self.bounds.capacity() * size_of::<Arc<[u8]>>();
+        let tree_bytes = self.tree.capacity() * size_of::<Vec<(usize, Vec<SequenceNumber>)>>()
+            + self
+                .tree
+                .iter()
+                .map(|groups| {
+                    groups.capacity() * size_of::<(usize, Vec<SequenceNumber>)>()
+                        + groups
+                            .iter()
+                            .map(|(_, seqs)| seqs.capacity() * size_of::<SequenceNumber>())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        bounds_bytes + tree_bytes
     }
 
     /// Find the highest-seq tombstone covering `user_key` visible at `snapshot`.
@@ -360,14 +402,14 @@ impl FragmentedRangeTombstoneList {
         };
 
         // Binary search: find the last interval whose begin <= user_key.
-        let idx = self.bounds[..num_intervals].partition_point(|b| b.as_slice() <= user_key);
+        let idx = self.bounds[..num_intervals].partition_point(|b| b.as_ref() <= user_key);
         if idx == 0 {
             return 0;
         }
         let leaf = idx - 1;
 
         // Check user_key is within [begin, end).
-        if user_key >= self.bounds[leaf + 1].as_slice() {
+        if user_key >= self.bounds[leaf + 1].as_ref() {
             return 0;
         }
 

@@ -2,7 +2,9 @@
 //! Snapshot registrations retain only a weak reference to this state.
 use super::*;
 use crate::{
-    manifest::version::TableFile, pinned::PointValue, sst::table_reader::GroupedPointBlocks,
+    manifest::version::TableFile,
+    pinned::PointValue,
+    sst::table_reader::{GroupedPointBlocks, PointProbe},
     types::MAX_GROUPED_READ_KEYS,
 };
 use smallvec::SmallVec;
@@ -48,9 +50,12 @@ impl ReadState {
         let sv = self.get_super_version();
         self.check_usable().ctx()?;
         let sequence = self.resolve_read_sequence(&sv, options.snapshot)?;
-        let value: Option<V> = self.point_lookup_in_view(&sv, options, key, sequence, |file| {
-            file.reader.point_value(key, sequence, options.fill_cache)
-        })?;
+        let mut probe = PointProbe::new(key, sequence);
+        let value: Option<V> =
+            self.point_lookup_in_view(&sv, options, key, sequence, |file, tomb_seq| {
+                file.reader
+                    .point_value_with_probe(&mut probe, tomb_seq, options.fill_cache)
+            })?;
         if let Some(v) = &value {
             self.stats.record_read((key.len() + v.byte_len()) as u64);
         }
@@ -81,15 +86,17 @@ impl ReadState {
         for run in slots.chunk_by(|&a, &b| keys[a] == keys[b]) {
             let (&first, duplicates) = run.split_first().expect("nonempty key run");
             let key = keys[first];
-            let value = self.point_lookup_in_view(&view, options, key, sequence, |file| {
-                file.reader.grouped_point_value(
-                    file.meta.number,
-                    key,
-                    sequence,
-                    options.fill_cache,
-                    &mut blocks,
-                )
-            })?;
+            let mut probe = PointProbe::new(key, sequence);
+            let value =
+                self.point_lookup_in_view(&view, options, key, sequence, |file, tomb_seq| {
+                    file.reader.grouped_point_value(
+                        file.meta.number,
+                        &mut probe,
+                        tomb_seq,
+                        options.fill_cache,
+                        &mut blocks,
+                    )
+                })?;
             if let Some(pin) = &value {
                 returned_bytes += ((key.len() + pin.len()) * run.len()) as u64;
                 for &slot in duplicates {
@@ -110,7 +117,7 @@ impl ReadState {
         options: &ReadOptions<'_>,
         key: &[u8],
         sequence: SequenceNumber,
-        mut probe: impl FnMut(&TableFile) -> Result<Option<(Option<V>, SequenceNumber)>>,
+        mut probe: impl FnMut(&TableFile, SequenceNumber) -> Result<Option<(Option<V>, SequenceNumber)>>,
     ) -> Result<Option<V>> {
         let mut tomb_seq = self.max_covering_tombstone_seq(
             key,
@@ -119,16 +126,9 @@ impl ReadState {
             &sv.immutable_memtables,
         );
 
-        let visible = |value, entry_seq, covering_seq| {
-            if covering_seq > entry_seq {
-                None
-            } else {
-                value
-            }
-        };
         for mem in std::iter::once(&sv.active_memtable).chain(&sv.immutable_memtables) {
-            if let Some((value, seq)) = mem.point_value(key, sequence) {
-                return Ok(visible(value, seq, tomb_seq));
+            if let Some((value, _seq)) = mem.point_value(key, sequence, tomb_seq) {
+                return Ok(value);
             }
         }
         if tomb_seq > 0 {
@@ -168,12 +168,12 @@ impl ReadState {
                 {
                     continue;
                 }
-                if let Some((value, seq)) = probe(file).ctx()? {
+                if let Some((value, _seq)) = probe(file, tomb_seq).ctx()? {
                     if level >= 2 {
                         self.stats.maybe_sample_read_level(level);
                         self.maybe_check_read_compaction();
                     }
-                    return Ok(visible(value, seq, tomb_seq));
+                    return Ok(value);
                 }
             }
         }
@@ -227,7 +227,7 @@ impl ReadState {
                             rt.seq <= sequence
                                 && tombstone_overlaps_bounds(&rt.begin, &rt.end, lower, upper)
                         })
-                        .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq, 0)),
+                        .map(|rt| (rt.begin.to_vec(), rt.end.to_vec(), rt.seq, 0)),
                 );
             });
         }
@@ -597,5 +597,41 @@ mod tests {
             );
             assert_eq!(pin.len(), 1 << 20);
         }
+    }
+
+    #[test]
+    fn owned_get_does_not_copy_value_hidden_by_range_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions::default().with_block_cache_capacity(16 << 20),
+            dir.path(),
+        )
+        .unwrap();
+        let payload = vec![0x3cu8; 1 << 20];
+        db.put(b"k", &payload).unwrap();
+        let snap = db.snapshot();
+        db.delete_range(b"a", b"z").unwrap();
+
+        // 1. Active MemTable: `db.get(b"k")` resolves `tomb_seq > entry_seq` before copying.
+        let (got_mem, mem_bytes) = crate::test_alloc::count_allocated(|| db.get(b"k").unwrap());
+        assert!(got_mem.is_none());
+        assert!(
+            mem_bytes < 4096,
+            "memtable range-deleted owned get allocated {mem_bytes} bytes"
+        );
+        assert_eq!(snap.get(b"k").unwrap().as_deref(), Some(payload.as_slice()));
+
+        // 2. Flushed SST (kept intact by `snap`): warm cache via `snap.get_pinned`,
+        //    then verify `db.get(b"k")` does not copy the 1 MiB value either.
+        db.flush().unwrap();
+        assert_eq!(snap.get_pinned(b"k").unwrap().unwrap().len(), 1 << 20);
+        let _ = db.get_pinned(b"k").unwrap(); // warm rangedel leaf too
+        let (got_sst, sst_bytes) = crate::test_alloc::count_allocated(|| db.get(b"k").unwrap());
+        assert!(got_sst.is_none());
+        assert!(
+            sst_bytes < 4096,
+            "SST range-deleted owned get allocated {sst_bytes} bytes"
+        );
+        assert_eq!(snap.get(b"k").unwrap().as_deref(), Some(payload.as_slice()));
     }
 }

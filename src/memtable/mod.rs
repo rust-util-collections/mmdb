@@ -13,6 +13,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use arc_swap::ArcSwapOption;
 use parking_lot::RwLock;
 
 use crate::iterator::range_del::FragmentedRangeTombstoneList;
@@ -21,11 +22,220 @@ use crate::iterator::range_del::FragmentedRangeTombstoneList;
 use crate::types::InternalKey;
 use crate::types::{SequenceNumber, ValueType};
 
+const TOMBSTONE_TAIL_CAP: usize = 8;
+
 /// A cached range tombstone from a memtable.
 pub struct MemRangeTombstone {
-    pub begin: Vec<u8>,
-    pub end: Vec<u8>,
+    pub begin: Arc<[u8]>,
+    pub end: Arc<[u8]>,
     pub seq: SequenceNumber,
+}
+
+type RawTombstone = (Arc<[u8]>, Arc<[u8]>, SequenceNumber);
+
+#[derive(Clone)]
+struct TombstoneTier {
+    count: usize,
+    min_begin: Arc<[u8]>,
+    max_end: Arc<[u8]>,
+    max_seq: SequenceNumber,
+    retained_bytes: usize,
+    raw: Arc<Vec<RawTombstone>>,
+    index: Arc<FragmentedRangeTombstoneList>,
+}
+
+/// Lock-free logarithmic Bentley-Saxe index of active-memtable range tombstones.
+/// Point lookups skip disjoint ranges in O(1) via summary bounds and query
+/// powers-of-two `FragmentedRangeTombstoneList` tiers in O(log³ T) worst-case
+/// without taking `range_tombstones`'s `RwLock`. Endpoint bytes are shared via
+/// `Arc<[u8]>` across `MemRangeTombstone`, summary bounds, tail, and tiers so
+/// inserting a small range after a large-endpoint range copies zero payload bytes.
+#[derive(Clone)]
+struct ActiveTombstoneIndex {
+    min_begin: Arc<[u8]>,
+    max_end: Arc<[u8]>,
+    max_seq: SequenceNumber,
+    tiers: Vec<TombstoneTier>,
+    tail: Vec<RawTombstone>,
+    tail_min_begin: Arc<[u8]>,
+    tail_max_end: Arc<[u8]>,
+    tail_max_seq: SequenceNumber,
+}
+
+impl Default for ActiveTombstoneIndex {
+    fn default() -> Self {
+        let empty: Arc<[u8]> = Arc::from(&[][..]);
+        Self {
+            min_begin: Arc::clone(&empty),
+            max_end: Arc::clone(&empty),
+            max_seq: 0,
+            tiers: Vec::new(),
+            tail: Vec::new(),
+            tail_min_begin: Arc::clone(&empty),
+            tail_max_end: empty,
+            tail_max_seq: 0,
+        }
+    }
+}
+
+impl ActiveTombstoneIndex {
+    /// Structural heap bytes owned by this index (excluding shared `Arc<[u8]>`
+    /// endpoint payloads already charged once in `approximate_size`).
+    fn retained_bytes(&self) -> usize {
+        self.tiers.capacity() * size_of::<TombstoneTier>()
+            + self.tail.capacity() * size_of::<RawTombstone>()
+            + self
+                .tiers
+                .iter()
+                .map(|t| t.retained_bytes)
+                .fold(0usize, usize::saturating_add)
+    }
+
+    fn append(&mut self, begin: Arc<[u8]>, end: Arc<[u8]>, seq: SequenceNumber) {
+        if self.tiers.is_empty() && self.tail.is_empty() {
+            self.min_begin = Arc::clone(&begin);
+            self.max_end = Arc::clone(&end);
+            self.max_seq = seq;
+        } else {
+            if begin.as_ref() < self.min_begin.as_ref() {
+                self.min_begin = Arc::clone(&begin);
+            }
+            if end.as_ref() > self.max_end.as_ref() {
+                self.max_end = Arc::clone(&end);
+            }
+            if seq > self.max_seq {
+                self.max_seq = seq;
+            }
+        }
+
+        if self.tail.is_empty() {
+            self.tail_min_begin = Arc::clone(&begin);
+            self.tail_max_end = Arc::clone(&end);
+            self.tail_max_seq = seq;
+        } else {
+            if begin.as_ref() < self.tail_min_begin.as_ref() {
+                self.tail_min_begin = Arc::clone(&begin);
+            }
+            if end.as_ref() > self.tail_max_end.as_ref() {
+                self.tail_max_end = Arc::clone(&end);
+            }
+            if seq > self.tail_max_seq {
+                self.tail_max_seq = seq;
+            }
+        }
+        self.tail.push((begin, end, seq));
+
+        if self.tail.len() >= TOMBSTONE_TAIL_CAP {
+            let empty: Arc<[u8]> = Arc::from(&[][..]);
+            let mut min_begin = std::mem::replace(&mut self.tail_min_begin, Arc::clone(&empty));
+            let mut max_end = std::mem::replace(&mut self.tail_max_end, empty);
+            let mut max_seq = self.tail_max_seq;
+            self.tail_max_seq = 0;
+            let mut merged = std::mem::take(&mut self.tail);
+            while self.tiers.last().is_some_and(|t| t.count == merged.len()) {
+                let prev = self.tiers.pop().unwrap();
+                if prev.min_begin.as_ref() < min_begin.as_ref() {
+                    min_begin = prev.min_begin;
+                }
+                if prev.max_end.as_ref() > max_end.as_ref() {
+                    max_end = prev.max_end;
+                }
+                if prev.max_seq > max_seq {
+                    max_seq = prev.max_seq;
+                }
+                let mut combined = Vec::with_capacity(prev.raw.len() + merged.len());
+                combined.extend(prev.raw.iter().cloned());
+                combined.append(&mut merged);
+                merged = combined;
+            }
+            let count = merged.len();
+            let index = Arc::new(FragmentedRangeTombstoneList::from_shared(&merged));
+            let retained_bytes =
+                merged.capacity() * size_of::<RawTombstone>() + index.approximate_heap_bytes();
+            self.tiers.push(TombstoneTier {
+                count,
+                min_begin,
+                max_end,
+                max_seq,
+                retained_bytes,
+                raw: Arc::new(merged),
+                index,
+            });
+        }
+    }
+
+    fn max_covering_tombstone_seq(
+        &self,
+        user_key: &[u8],
+        read_seq: SequenceNumber,
+    ) -> SequenceNumber {
+        if (self.tiers.is_empty() && self.tail.is_empty())
+            || user_key < self.min_begin.as_ref()
+            || user_key >= self.max_end.as_ref()
+        {
+            return 0;
+        }
+        let mut best: SequenceNumber = 0;
+        if !self.tail.is_empty()
+            && self.tail_max_seq > best
+            && user_key >= self.tail_min_begin.as_ref()
+            && user_key < self.tail_max_end.as_ref()
+        {
+            for (begin, end, seq) in &self.tail {
+                if *seq <= read_seq
+                    && *seq > best
+                    && user_key >= begin.as_ref()
+                    && user_key < end.as_ref()
+                {
+                    best = *seq;
+                }
+            }
+        }
+        for tier in self.tiers.iter().rev() {
+            if tier.max_seq <= best
+                || user_key < tier.min_begin.as_ref()
+                || user_key >= tier.max_end.as_ref()
+            {
+                continue;
+            }
+            let seq = tier.index.max_covering_tombstone_seq(user_key, read_seq);
+            if seq > best {
+                best = seq;
+            }
+        }
+        best
+    }
+
+    fn overlaps_user_key_range(&self, min_key: &[u8], max_key: &[u8]) -> bool {
+        if (self.tiers.is_empty() && self.tail.is_empty())
+            || self.min_begin.as_ref() > max_key
+            || self.max_end.as_ref() <= min_key
+        {
+            return false;
+        }
+        if !self.tail.is_empty()
+            && self.tail_min_begin.as_ref() <= max_key
+            && self.tail_max_end.as_ref() > min_key
+            && self
+                .tail
+                .iter()
+                .any(|(b, e, _)| b.as_ref() <= max_key && e.as_ref() > min_key)
+        {
+            return true;
+        }
+        for tier in &self.tiers {
+            if tier.min_begin.as_ref() <= max_key
+                && tier.max_end.as_ref() > min_key
+                && tier
+                    .raw
+                    .iter()
+                    .any(|(b, e, _)| b.as_ref() <= max_key && e.as_ref() > min_key)
+            {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// A MemTable stores recent writes in memory before they are flushed to SST.
@@ -38,15 +248,18 @@ pub struct MemTable {
     // skiplist run lookup. No per-key heap index is needed by the memtable.
     metadata_buckets: [AtomicUsize; 64],
     max_metadata_bucket: AtomicUsize,
-    /// Approximate memory usage in bytes.
+    /// Approximate memory usage in bytes (arena slabs + raw range-tombstone payloads).
     approximate_size: AtomicUsize,
+    /// Net structural heap bytes owned by the active or frozen range-tombstone index.
+    tombstone_index_bytes: AtomicUsize,
     /// Whether this memtable contains any RangeDeletion entries.
-    /// Used to skip the expensive O(N) range tombstone scan in get().
+    /// Used to skip range tombstone checks when false.
     has_range_deletions: AtomicBool,
-    /// Dedicated collection of range tombstones for O(T) coverage checks
-    /// instead of O(N) full memtable scan. Readers share the lock; the single
-    /// writer (group commit model) appends.
+    /// Raw collection of range tombstones retained for flush and scan construction.
     range_tombstones: RwLock<Vec<MemRangeTombstone>>,
+    /// Lock-free tiered interval index for active-memtable point lookups.
+    /// Empty (`None`) until the first valid `RangeDeletion` is inserted.
+    active_tombstones: ArcSwapOption<ActiveTombstoneIndex>,
     /// Set when the memtable is frozen for flush; no puts follow.
     immutable: AtomicBool,
     /// Fragmented index of `range_tombstones`, built on the first coverage
@@ -105,8 +318,10 @@ impl MemTable {
             metadata_buckets: std::array::from_fn(|_| AtomicUsize::new(0)),
             max_metadata_bucket: AtomicUsize::new(0),
             approximate_size: AtomicUsize::new(0),
+            tombstone_index_bytes: AtomicUsize::new(0),
             has_range_deletions: AtomicBool::new(false),
             range_tombstones: RwLock::new(Vec::new()),
+            active_tombstones: ArcSwapOption::const_empty(),
             immutable: AtomicBool::new(false),
             frozen_tombstones: OnceLock::new(),
         }
@@ -131,11 +346,24 @@ impl MemTable {
         if value_type == ValueType::RangeDeletion {
             let mut ranges = self.range_tombstones.write();
             let old_cap = ranges.capacity();
+            let begin: Arc<[u8]> = Arc::from(key);
+            let end: Arc<[u8]> = Arc::from(value);
             ranges.push(MemRangeTombstone {
-                begin: key.to_vec(),
-                end: value.to_vec(),
+                begin: Arc::clone(&begin),
+                end: Arc::clone(&end),
                 seq: sequence,
             });
+            let mut next_idx = self
+                .active_tombstones
+                .load()
+                .as_deref()
+                .cloned()
+                .unwrap_or_default();
+            next_idx.append(begin, end, sequence);
+            let idx_bytes = next_idx.retained_bytes();
+            self.active_tombstones.store(Some(Arc::new(next_idx)));
+            self.tombstone_index_bytes
+                .store(idx_bytes, Ordering::Relaxed);
             allocated += (ranges.capacity() - old_cap) * size_of::<MemRangeTombstone>()
                 + key.len()
                 + value.len();
@@ -153,23 +381,129 @@ impl MemTable {
         }
         .metadata_charge();
         let bucket = &self.metadata_buckets[Self::metadata_bucket(key)];
-        let old = bucket.fetch_add(charge, Ordering::Relaxed);
-        self.max_metadata_bucket
-            .fetch_max(old + charge, Ordering::Relaxed);
+        let new_bucket = bucket.fetch_add(charge, Ordering::Relaxed) + charge;
+        if new_bucket > self.max_metadata_bucket.load(Ordering::Relaxed) {
+            self.max_metadata_bucket
+                .fetch_max(new_bucket, Ordering::Relaxed);
+        }
         allocated += self.inner.insert_entry(key, sequence, value_type, value);
         self.approximate_size
             .fetch_add(allocated, Ordering::Relaxed);
     }
 
+    /// Insert an entire validated `WriteBatch` starting at `first_seq`, holding
+    /// the skiplist arena guard across contiguous point entries and publishing
+    /// `approximate_size` once per batch. Returns total user key+value bytes.
+    pub(crate) fn put_batch(
+        &self,
+        batch: &crate::types::WriteBatch,
+        first_seq: SequenceNumber,
+    ) -> u64 {
+        let mut total_bytes = 0u64;
+        let mut total_allocated = 0usize;
+        let mut max_bucket_seen = self.max_metadata_bucket.load(Ordering::Relaxed);
+        let mut arena_guard = Some(self.inner.lock_arena());
+
+        for (i, entry) in batch.entries().enumerate() {
+            let seq = first_seq + i as u64;
+            let key = entry.key;
+            let raw_value = entry.value;
+            let value_type = entry.value_type;
+            total_bytes += key.len() as u64 + raw_value.len() as u64;
+
+            if value_type == ValueType::RangeDeletion {
+                if key >= raw_value {
+                    continue;
+                }
+                // Release `arena` before taking `range_tombstones` so the two
+                // internal locks never nest.
+                drop(arena_guard.take());
+                {
+                    let mut ranges = self.range_tombstones.write();
+                    let old_cap = ranges.capacity();
+                    let begin: Arc<[u8]> = Arc::from(key);
+                    let end: Arc<[u8]> = Arc::from(raw_value);
+                    ranges.push(MemRangeTombstone {
+                        begin: Arc::clone(&begin),
+                        end: Arc::clone(&end),
+                        seq,
+                    });
+                    let mut next_idx = self
+                        .active_tombstones
+                        .load()
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or_default();
+                    next_idx.append(begin, end, seq);
+                    let idx_bytes = next_idx.retained_bytes();
+                    self.active_tombstones.store(Some(Arc::new(next_idx)));
+                    self.tombstone_index_bytes
+                        .store(idx_bytes, Ordering::Relaxed);
+                    total_allocated += (ranges.capacity() - old_cap)
+                        * size_of::<MemRangeTombstone>()
+                        + key.len()
+                        + raw_value.len();
+                    self.has_range_deletions.store(true, Ordering::Release);
+                }
+                arena_guard = Some(self.inner.lock_arena());
+            }
+
+            let value = if value_type == ValueType::Deletion {
+                &[]
+            } else {
+                raw_value
+            };
+            let charge = crate::types::BatchEntry {
+                key,
+                value,
+                value_type,
+            }
+            .metadata_charge();
+            let bucket = &self.metadata_buckets[Self::metadata_bucket(key)];
+            let new_bucket = bucket.fetch_add(charge, Ordering::Relaxed) + charge;
+            if new_bucket > max_bucket_seen {
+                max_bucket_seen = new_bucket;
+            }
+            total_allocated += self.inner.insert_entry_locked(
+                arena_guard.as_mut().unwrap(),
+                key,
+                seq,
+                value_type,
+                value,
+            );
+        }
+        drop(arena_guard);
+
+        if max_bucket_seen > self.max_metadata_bucket.load(Ordering::Relaxed) {
+            self.max_metadata_bucket
+                .fetch_max(max_bucket_seen, Ordering::Relaxed);
+        }
+        if total_allocated != 0 {
+            self.approximate_size
+                .fetch_add(total_allocated, Ordering::Relaxed);
+        }
+        total_bytes
+    }
+
+    #[inline]
     fn metadata_bucket(key: &[u8]) -> usize {
-        // Hashing a bounded sample keeps metadata accounting independent of
-        // large key lengths. Exact verification below resolves collisions.
-        use std::hash::{DefaultHasher, Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        key.len().hash(&mut h);
-        h.write(&key[..key.len().min(8)]);
-        h.write(&key[key.len().saturating_sub(8)..]);
-        h.finish() as usize & 63
+        // Fast bounded-sample 64-bit mix (no SipHash state setup). Collisions
+        // are resolved exactly by `same_key_metadata`.
+        let len = key.len();
+        let mut head = 0u64;
+        let mut tail = 0u64;
+        if len >= 8 {
+            head = u64::from_le_bytes(key[..8].try_into().unwrap());
+            tail = u64::from_le_bytes(key[len - 8..].try_into().unwrap());
+        } else {
+            for (i, &b) in key.iter().enumerate() {
+                head |= (b as u64) << (i * 8);
+            }
+        }
+        let mut h = (len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        h = (h ^ head).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ tail.rotate_left(31)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((h >> 58) ^ h) as usize & 63
     }
 
     pub(crate) fn max_metadata_charge(&self) -> usize {
@@ -188,19 +522,22 @@ impl MemTable {
         self: &Arc<Self>,
         key: &[u8],
         sequence: SequenceNumber,
+        covering_tombstone_seq: SequenceNumber,
     ) -> Option<(Option<V>, SequenceNumber)> {
         let (value, seq) = self.inner.get_ref_with_seq(key, sequence)?;
-        Some((
+        let projected = if covering_tombstone_seq > seq {
+            None
+        } else {
             value.map(|value| {
-                V::project(value.len(), || {
+                V::project(value, || {
                     crate::PinnedSlice::from_memtable(MemTablePin {
                         _owner: self.clone(),
                         bytes: NonNull::from(value),
                     })
                 })
-            }),
-            seq,
-        ))
+            })
+        };
+        Some((projected, seq))
     }
 
     /// Look up a user key at or below the given sequence number.
@@ -225,7 +562,9 @@ impl MemTable {
 
     /// Approximate memory usage in bytes.
     pub fn approximate_size(&self) -> usize {
-        self.approximate_size.load(Ordering::Relaxed)
+        self.approximate_size
+            .load(Ordering::Relaxed)
+            .saturating_add(self.tombstone_index_bytes.load(Ordering::Relaxed))
     }
 
     /// Return an iterator over all entries in order.
@@ -248,10 +587,22 @@ impl MemTable {
         self.has_range_deletions.load(Ordering::Acquire)
     }
 
+    fn init_frozen_tombstones(&self) -> &FragmentedRangeTombstoneList {
+        self.frozen_tombstones.get_or_init(|| {
+            let shared: Vec<RawTombstone> = self.with_range_tombstones(|ranges| {
+                ranges
+                    .iter()
+                    .map(|rt| (Arc::clone(&rt.begin), Arc::clone(&rt.end), rt.seq))
+                    .collect()
+            });
+            FragmentedRangeTombstoneList::from_shared(&shared)
+        })
+    }
+
     /// Find the highest-seq range tombstone covering `user_key` with seq <= `read_seq`.
     /// Returns 0 if no covering tombstone exists.
-    /// O(T) where T = number of range tombstones while active; O(log T) and
-    /// lock-free once frozen.
+    /// Lock-free while active (via tiered interval index) and once frozen
+    /// (via `FragmentedRangeTombstoneList`).
     pub fn max_covering_tombstone_seq(
         &self,
         user_key: &[u8],
@@ -261,22 +612,23 @@ impl MemTable {
             return 0;
         }
         if self.immutable.load(Ordering::Acquire) {
+            let frozen = self.init_frozen_tombstones();
+            if self.active_tombstones.load().is_some() {
+                self.active_tombstones.store(None);
+                self.tombstone_index_bytes
+                    .store(frozen.approximate_heap_bytes(), Ordering::Relaxed);
+            }
+            return frozen.max_covering_tombstone_seq(user_key, read_seq);
+        }
+        if let Some(idx) = self.active_tombstones.load().as_ref() {
+            return idx.max_covering_tombstone_seq(user_key, read_seq);
+        }
+        if self.immutable.load(Ordering::Acquire) {
             return self
-                .frozen_tombstones
-                .get_or_init(|| FragmentedRangeTombstoneList::new(self.get_range_tombstones()))
+                .init_frozen_tombstones()
                 .max_covering_tombstone_seq(user_key, read_seq);
         }
-        let tombstones = self.range_tombstones.read();
-        let mut max_seq: SequenceNumber = 0;
-        for rt in tombstones.iter() {
-            if rt.seq > read_seq {
-                continue;
-            }
-            if user_key >= rt.begin.as_slice() && user_key < rt.end.as_slice() && rt.seq > max_seq {
-                max_seq = rt.seq;
-            }
-        }
-        max_seq
+        0
     }
 
     /// Borrow the list for the duration of a read, so callers can select endpoints before copying them.
@@ -291,11 +643,12 @@ impl MemTable {
     }
 
     /// Return all range tombstones as (begin, end, seq) triples.
+    #[cfg(test)]
     pub fn get_range_tombstones(&self) -> Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> {
         self.with_range_tombstones(|ranges| {
             ranges
                 .iter()
-                .map(|rt| (rt.begin.clone(), rt.end.clone(), rt.seq))
+                .map(|rt| (rt.begin.to_vec(), rt.end.to_vec(), rt.seq))
                 .collect()
         })
     }
@@ -322,10 +675,13 @@ impl MemTable {
             return true;
         }
         if self.has_range_deletions() {
+            if let Some(idx) = self.active_tombstones.load().as_ref() {
+                return idx.overlaps_user_key_range(min_key, max_key);
+            }
             let tombstones = self.range_tombstones.read();
             if tombstones
                 .iter()
-                .any(|rt| rt.begin.as_slice() <= max_key && rt.end.as_slice() > min_key)
+                .any(|rt| rt.begin.as_ref() <= max_key && rt.end.as_ref() > min_key)
             {
                 return true;
             }
@@ -638,5 +994,140 @@ mod tests {
         );
         assert_eq!(mt.get_with_seq(b"k", 10), Some((None, 10)));
         assert_eq!(mt.get_with_seq(b"k", 11), Some((None, 10)));
+    }
+
+    #[test]
+    fn active_tiered_tombstone_index_matches_linear_scan_across_tiers_and_freeze() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        let key = |n: u64| format!("rk_{n:04}").into_bytes();
+
+        let mem = MemTable::new();
+        let mut truth: Vec<(Vec<u8>, Vec<u8>, SequenceNumber)> = Vec::new();
+        let mut seq = 1u64;
+
+        // Mix single `put` and multi-entry `put_batch` across > 150 range deletions
+        // (spanning multiple Bentley-Saxe tiers + non-empty tail, plus ignored empty ranges).
+        for round in 0..40u64 {
+            if round % 3 == 0 {
+                let batch_first = seq;
+                let mut batch = crate::types::WriteBatch::new();
+                for _ in 0..4 {
+                    let b = next(120);
+                    let e = if next(10) == 0 {
+                        b.saturating_sub(1) // empty/inverted range -> ignored by WriteBatch
+                    } else {
+                        b + 1 + next(35)
+                    };
+                    let bk = key(b);
+                    let ek = key(e);
+                    let before_len = batch.len();
+                    batch.delete_range(&bk, &ek);
+                    if batch.len() > before_len {
+                        truth.push((bk, ek, seq));
+                        seq += 1;
+                    }
+                }
+                mem.put_batch(&batch, batch_first);
+            } else {
+                let b = next(120);
+                let e = if next(12) == 0 {
+                    b.saturating_sub(1) // empty/inverted range -> ignored by MemTable::put
+                } else {
+                    b + 1 + next(35)
+                };
+                let bk = key(b);
+                let ek = key(e);
+                mem.put(&bk, &ek, seq, ValueType::RangeDeletion);
+                if bk < ek {
+                    truth.push((bk, ek, seq));
+                    seq += 1;
+                }
+            }
+        }
+        assert!(truth.len() >= 70);
+
+        let linear_max = |uk: &[u8], read_seq: SequenceNumber| -> SequenceNumber {
+            truth
+                .iter()
+                .filter(|(b, e, s)| *s <= read_seq && uk >= b.as_slice() && uk < e.as_slice())
+                .map(|(_, _, s)| *s)
+                .max()
+                .unwrap_or(0)
+        };
+
+        // 1. Active tiered index parity + range-overlap parity
+        for _ in 0..3_000 {
+            let uk = key(next(170));
+            let snap = next(seq + 20);
+            assert_eq!(
+                mem.max_covering_tombstone_seq(&uk, snap),
+                linear_max(&uk, snap),
+                "active mismatch for {:?} at snap {snap}",
+                String::from_utf8_lossy(&uk)
+            );
+        }
+        for _ in 0..500 {
+            let a = next(170);
+            let b = a + next(20);
+            let (lo, hi) = (key(a), key(b));
+            let expected = truth
+                .iter()
+                .any(|(rb, re, _)| rb.as_slice() <= hi.as_slice() && re.as_slice() > lo.as_slice());
+            assert_eq!(mem.overlaps_user_key_range(&lo, &hi), expected);
+        }
+
+        // 2. Freeze transition parity & active index release
+        mem.mark_immutable();
+        for _ in 0..1_000 {
+            let uk = key(next(170));
+            let snap = next(seq + 20);
+            assert_eq!(
+                mem.max_covering_tombstone_seq(&uk, snap),
+                linear_max(&uk, snap)
+            );
+        }
+        assert!(mem.active_tombstones.load().is_none());
+    }
+
+    #[test]
+    fn nested_small_range_deletion_shares_large_endpoints_and_accounts_index_bytes() {
+        let mem = MemTable::new();
+        let big_begin = vec![b'a'; 1 << 20];
+        let big_end = vec![b'z'; 1 << 20];
+        mem.put(&big_begin, &big_end, 1, ValueType::RangeDeletion);
+        let after_first = mem.approximate_size();
+        // Arena dedicated slab (~2 MiB) + shared endpoint Arcs (~2 MiB) + index overhead
+        assert!((4 << 20..5 << 20).contains(&after_first));
+
+        // Inserting a tiny nested `[m, n)` range must NOT clone the 1 MiB endpoints!
+        let ((), second_alloc) = crate::test_alloc::count_allocated(|| {
+            mem.put(b"m", b"n", 2, ValueType::RangeDeletion);
+        });
+        assert!(
+            second_alloc < 8 * 1024,
+            "tiny nested range deletion allocated {second_alloc} bytes"
+        );
+        assert_eq!(mem.max_covering_tombstone_seq(b"b", 1), 1);
+        assert_eq!(mem.max_covering_tombstone_seq(b"m0", 1), 1);
+        assert_eq!(mem.max_covering_tombstone_seq(b"m0", 2), 2);
+
+        // Even across a tier merge (8 range deletions), endpoint bytes remain shared!
+        let ((), merge_alloc) = crate::test_alloc::count_allocated(|| {
+            for seq in 3..=8 {
+                mem.put(b"m1", b"m9", seq, ValueType::RangeDeletion);
+            }
+        });
+        assert!(
+            merge_alloc < 32 * 1024,
+            "tier merge copied large endpoints: {merge_alloc} bytes"
+        );
+        assert!(mem.tombstone_index_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(mem.get_range_tombstones().len(), 8);
     }
 }

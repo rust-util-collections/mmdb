@@ -107,12 +107,12 @@ flowchart TD
 | FIFO flush pipeline | [`src/db/flush.rs`](../src/db/flush.rs) | Bounded `FlushQueue`, standby WAL pre-allocation, FIFO L0 SST construction, MANIFEST durability confirmation, and old-WAL retirement |
 | Sorted bulk ingestion | [`src/db/ingest.rs`](../src/db/ingest.rs) | Disjoint ascending stream directly into bottommost SSTs at one sequence with `ingest_ceiling` isolation for concurrent views |
 | Point reads, grouped reads, and snapshots | [`src/db/read.rs`](../src/db/read.rs), [`src/db/snapshot.rs`](../src/db/snapshot.rs), [`src/pinned.rs`](../src/pinned.rs) | Lock-free `SuperVersion` acquisition, scalar and <= 32-key grouped lookups, borrowed `Snapshot` and cloneable `ArcSnapshot` leases, and zero-copy `PinnedSlice` retention |
-| Memtable and arena skiplist | [`src/memtable/`](../src/memtable/) | Slab-arena `ConcurrentSkipList`, lock-free Acquire/Release reads, separate range-tombstone tracking, and per-key metadata budget accounting |
+| Memtable and arena skiplist | [`src/memtable/`](../src/memtable/) | Slab-arena `ConcurrentSkipList`, lock-free Acquire/Release reads, lock-free tiered active range-tombstone index, and per-key metadata budget accounting |
 | WAL framing | [`src/wal/`](../src/wal/) | 32 KiB block framing, 7-byte CRC32 fragment headers, vectored `[header, payload]` streaming, advisory Linux writeback, and bounded multi-WAL replay |
 | SST v2 tables and Bloom filters | [`src/sst/`](../src/sst/) | Prefix-compressed data blocks, ~64 KiB partitioned index and `rangedel` leaves, backward-linked resident directories, 64B-aligned XXH3-64 blocked Bloom filters, and `TABLE_MAGIC_V2` |
 | Merge and bidirectional iterators | [`src/iterator/`](../src/iterator/) | Binary-heap `MergingIterator`, `LevelIterator`, `FragmentedRangeTombstoneList`, MVCC visibility resolution, post-MVCC block-property filtering, and `BidiIterator` |
-| Leveled compaction | [`src/compaction/`](../src/compaction/), [`src/rate_limiter.rs`](../src/rate_limiter.rs) | L0 full-set serial merge, L1+ score/range/hint picks, trivial moves, subcompaction range splits, snapshot-aware tombstone stripe GC, and token-bucket write pacing |
-| MANIFEST and version set | [`src/manifest/`](../src/manifest/) | `DBHeader` geometry validation, `Version` Copy-on-Write level lists, `PendingSsts` RAII orphan cleanup, `DirSynced` + `confirm_manifest_durable` barriers, and `CURRENT` rotation |
+| Leveled compaction | [`src/compaction/`](../src/compaction/), [`src/rate_limiter.rs`](../src/rate_limiter.rs) | L0 full-set serial merge, L1+ score/min-overlap/range/hint picks, trivial moves, subcompaction range splits, snapshot-aware tombstone stripe GC, and token-bucket write pacing |
+| MANIFEST and version set | [`src/manifest/`](../src/manifest/) | `DBHeader` geometry validation, `Version` Copy-on-Write level lists, incremental live-file & neighbor-disjointness install checks, `PendingSsts` RAII orphan cleanup, `DirSynced` + `confirm_manifest_durable` barriers, and `CURRENT` rotation |
 | Block and table caches | [`src/cache/`](../src/cache/), [`src/db/memory.rs`](../src/db/memory.rs) | Shared or private `BlockCachePool` (segmented + overflow Moka stores), member-isolated L0 block pins, `TableCache`, and lock-free memory gauges |
 | Offline v4 format converter | [`tools/v4-export/`](../tools/v4-export/) | Read-only v4 scan (including residual WALs), bottommost v5 `ingest_sorted` streaming, and atomic exclusive directory publication |
 
@@ -169,11 +169,12 @@ flowchart TD
     SLEEP --> ENQ
     C -- "Admitted" --> ENQ["Push WriteRequest* to WriteQueueState"]
 
-    ENQ --> LDR{"leader_active or waiting_barriers > 0?"}
-    LDR -- "Yes (Follower)" --> FWAIT["Wait on write_cv until req.done"]
-    FWAIT --> RET["Return req.result"]
+    ENQ --> LDR{"!leader_active & waiting_barriers == 0 & can_drain_with?"}
+    LDR -- "No (Follower)" --> FWAIT["Spin then park on WriteRequest::state"]
+    FWAIT -- "STATE_WAKE & queue head" --> DRAIN_GRP
+    FWAIT -- "STATE_DONE" --> RET["Return req.result"]
 
-    LDR -- "No (Leader)" --> DRAIN_GRP["Set leader_active = true; drain_group (<= min(buf/2, 16 MiB))"]
+    LDR -- "Yes (Leader)" --> DRAIN_GRP["Set leader_active = true; drain_group (<= min(buf/2, 16 MiB))"]
     DRAIN_GRP --> LOCK_IN["Recheck queue capacity; lock DB::inner"]
     LOCK_IN --> ADMIT["Filter group via admit_range_stripes & admit_same_key_runs"]
     ADMIT --> SEQ["Reserve contiguous sequence range [first_seq..=last_seq]"]
@@ -188,13 +189,14 @@ flowchart TD
     PUB --> CHK_BUF{"Active MemTable >= write_buffer_size?"}
     CHK_BUF -- "No (>= 50%)" --> STANDBY["Arm background standby WAL preparation; unlock DB::inner"]
     CHK_BUF -- "No (< 50%)" --> UNLOCK["Unlock DB::inner"]
-    CHK_BUF -- "Yes (Post-commit)" --> FREEZE["Unlock DB::inner; seal old WAL with sync_data(); swap standby/new WAL"]
+    CHK_BUF -- "Yes (Post-commit)" --> FREEZE["Unlock DB::inner; complete group followers once; seal old WAL with sync_data(); swap standby/new WAL"]
     FREEZE --> PUSH_IMM["Lock DB::inner: swap active MemTable, push_front immutable, refresh SuperVersion"]
     PUSH_IMM --> SUB_FQ["Submit FrozenMemtable to FlushQueue (auto-freeze error latches bg_error, keeps Ok)"]
-    STANDBY --> WAKE
-    UNLOCK --> WAKE
-    SUB_FQ --> WAKE["Lock write_queue: fill follower results, set done = true, notify write_cv"]
-    WAKE --> RET
+    STANDBY --> COMPLETE["Complete group followers (swap STATE_DONE, unpark parked waiters)"]
+    UNLOCK --> COMPLETE
+    COMPLETE --> REL["release_write_leadership (wake barriers or notify queue head)"]
+    SUB_FQ --> REL
+    REL --> RET
 ```
 
 1. **Admission and group commit.** Before entering `write_queue`, nonempty

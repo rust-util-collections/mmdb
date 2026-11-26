@@ -9,7 +9,7 @@ pub fn concurrent_arena_pins() {
     let mem = Arc::new(MemTable::new());
     mem.put(b"stable", b"retained", 1, ValueType::Value);
     let pin = mem
-        .point_value::<PinnedSlice>(b"stable", 1)
+        .point_value::<PinnedSlice>(b"stable", 1, 0)
         .unwrap()
         .0
         .unwrap();
@@ -24,7 +24,7 @@ pub fn concurrent_arena_pins() {
         for _ in 0..2 {
             scope.spawn(|| {
                 for _ in 0..24 {
-                    let (value, _) = mem.point_value::<PinnedSlice>(b"stable", 1).unwrap();
+                    let (value, _) = mem.point_value::<PinnedSlice>(b"stable", 1, 0).unwrap();
                     assert_eq!(value.unwrap().as_ref(), b"retained");
                     assert_eq!(pin.as_ref(), b"retained");
                     for (key, value) in mem.iter_ref() {

@@ -65,12 +65,18 @@ pub struct TableIterator {
     block_sep_len: u32,
     /// Reusable key buffer — prefix compression reuses shared prefix in-place.
     block_cursor_key: Vec<u8>,
+    /// Index of `current_block` within `index_block` (`usize::MAX` when none).
+    current_block_index: usize,
+    /// Whether `current_block` passed full `DataOrdered` validation.
+    current_block_ordered: bool,
 
     // --- Readahead ---
     /// Number of consecutive sequential block loads.
     sequential_reads: u32,
     /// Previous block's index position (for detecting sequential access).
     prev_block_index: usize,
+    /// Exclusive upper block index covered by the last `posix_fadvise` window.
+    readahead_until_idx: usize,
 
     // --- Deferred block read (first_key_from_index) ---
     /// True when positioned at first_key from index without loading data block.
@@ -123,8 +129,11 @@ impl TableIterator {
             block_sep_off: 0,
             block_sep_len: 0,
             block_cursor_key: Vec::new(),
+            current_block_index: usize::MAX,
+            current_block_ordered: false,
             sequential_reads: 0,
             prev_block_index: usize::MAX,
+            readahead_until_idx: 0,
             at_first_key_from_index: false,
             deferred_index_pos: 0,
             backward_entries: Vec::new(),
@@ -164,6 +173,9 @@ impl TableIterator {
             self.index_block = None;
             self.index_loaded = false;
             self.prev_block_index = usize::MAX;
+            self.readahead_until_idx = 0;
+            self.current_block_index = usize::MAX;
+            self.current_block_ordered = false;
             self.index_pos = 0;
         }
         self.ensure_index();
@@ -244,6 +256,8 @@ impl TableIterator {
         };
         self.block_cursor_key.clear();
         self.current_block = Some(block);
+        self.current_block_index = block_idx;
+        self.current_block_ordered = ordered;
         // Release reverse positioning after crossing into a new forward block.
         self.backward_block = None;
         self.backward_block_index = usize::MAX;
@@ -273,6 +287,8 @@ impl TableIterator {
 
     fn reset_positioning_state(&mut self) {
         self.current_block = None;
+        self.current_block_index = usize::MAX;
+        self.current_block_ordered = false;
         self.block_cursor_offset = 0;
         self.block_data_end = 0;
         self.block_next_restart = 1;
@@ -378,6 +394,14 @@ impl TableIterator {
             self.exhaust_at_upper_bound();
             return;
         }
+        let prev_partition = self.partition;
+        let saved_forward_block = if self.current_block_ordered {
+            self.current_block
+                .take()
+                .map(|b| (self.current_block_index, b))
+        } else {
+            None
+        };
         self.select_partition(self.seek_partition(target));
         self.reset_positioning_state();
         if self.err.is_some() {
@@ -427,6 +451,13 @@ impl TableIterator {
             }
 
             let block_idx = self.index_pos - 1;
+            if self.partition == prev_partition
+                && let Some((saved_idx, saved_block)) = saved_forward_block
+                && saved_idx == block_idx
+            {
+                self.seek_within_block(saved_block, block_idx, target, compare_internal_key);
+                return;
+            }
             match self.reader.read_data_block_ordered(
                 &entry.handle,
                 first_key,
@@ -1023,24 +1054,38 @@ impl TableIterator {
                 let first_key = entry.first_key;
                 self.index_pos += 1;
 
-                // Detect sequential access and trigger readahead
+                // Detect sequential access and trigger windowed readahead only on cache misses.
                 if block_idx == self.prev_block_index.wrapping_add(1) {
-                    self.sequential_reads += 1;
-                    if self.sequential_reads >= 2 {
-                        self.maybe_readahead(&index_block, block_idx);
-                    }
+                    self.sequential_reads = self.sequential_reads.saturating_add(1);
                 } else {
                     self.sequential_reads = 0;
+                    self.readahead_until_idx = 0;
                 }
                 self.prev_block_index = block_idx;
 
-                match self
-                    .reader
-                    .read_block_cached_block(&handle, Some((first_key, sep)), self.fill_cache)
-                    .and_then(|(block, ordered)| {
-                        self.set_block_for_cursor(block, block_idx, ordered)
-                    }) {
-                    Ok(()) => return true,
+                match self.reader.read_block_cached_block_with_hit(
+                    &handle,
+                    Some((first_key, sep)),
+                    self.fill_cache,
+                ) {
+                    Ok((block, ordered, was_hit)) => {
+                        if !was_hit
+                            && self.sequential_reads >= 2
+                            && block_idx + 1 >= self.readahead_until_idx
+                        {
+                            self.maybe_readahead(&index_block, block_idx);
+                        }
+                        match self.set_block_for_cursor(block, block_idx, ordered) {
+                            Ok(()) => return true,
+                            Err(e) => {
+                                self.reset_positioning_state();
+                                self.err = Some(
+                                    e.context(format!("block read error at index {block_idx}")),
+                                );
+                                return false;
+                            }
+                        }
+                    }
                     Err(e) => {
                         self.reset_positioning_state();
                         self.err =
@@ -1066,15 +1111,31 @@ impl TableIterator {
         }
     }
 
-    /// Issue a readahead hint for upcoming blocks.
-    fn maybe_readahead(&self, index_block: &Block, current_idx: usize) {
-        // Prefetch the next N blocks (adaptive: starts at 2, grows to 8)
-        let prefetch_count = (self.sequential_reads as usize).min(8);
+    /// Issue a windowed readahead hint for upcoming uncached blocks, clipped to
+    /// `self.config.upper` so bounded scans never prefetch excluded data blocks.
+    fn maybe_readahead(&mut self, index_block: &Block, current_idx: usize) {
+        let shift = self.sequential_reads.saturating_sub(2).min(4);
+        let prefetch_count = (4usize << shift).min(64);
         let start = current_idx + 1;
-        let end = (start + prefetch_count).min(index_block.num_restarts() as usize);
+        let mut end = (start + prefetch_count).min(index_block.num_restarts() as usize);
+        if let Some(ref ub) = self.config.upper {
+            let mut lo = start;
+            let mut hi = end;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let (_, entry) = index_entry_at(index_block, mid);
+                if crate::types::user_key(entry.first_key) >= ub.as_ref() {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            end = lo;
+        }
         if start >= end {
             return;
         }
+        self.readahead_until_idx = end;
 
         // Compute the file range covering the upcoming blocks
         let (_, first_entry) = index_entry_at(index_block, start);
@@ -1291,6 +1352,14 @@ impl crate::iterator::merge::SeekableIterator for TableIterator {
             && index.num_restarts() > 0
         {
             let (_, entry) = index_entry_at(index, 0);
+            if self
+                .config
+                .upper
+                .as_ref()
+                .is_some_and(|ub| crate::types::user_key(entry.first_key) >= ub.as_ref())
+            {
+                return;
+            }
             if let Some((offset, len)) = checked_readahead_range(entry.handle, entry.handle) {
                 self.reader.advise_willneed(offset, len);
             }
@@ -2549,6 +2618,83 @@ mod tests {
             iter.iter_error().is_none(),
             "forward scan at upper_bound must not read excluded index partition: {:?}",
             iter.iter_error()
+        );
+    }
+
+    #[test]
+    fn bounded_scan_readahead_stops_before_excluded_upper_bound_block() {
+        use crate::iterator::merge::SeekableIterator;
+        use crate::sst::table_reader::WILLNEED_RANGES;
+        use crate::types::{InternalKey, user_key};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded_readahead.sst");
+        let mut builder = TableBuilder::new(
+            &path,
+            TableBuildOptions {
+                block_size: 128,
+                bloom_bits_per_key: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Build >= 75 single-entry data blocks inside one index leaf.
+        for i in 0..80u32 {
+            let uk = format!("blk_{i:04}");
+            let ik = InternalKey::new(uk.as_bytes(), 10, ValueType::Value);
+            builder.add(ik.as_bytes(), &[b'v'; 140]).unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = Arc::new(TableReader::open(&path).unwrap());
+        let entries = reader.cached_index_entries().unwrap();
+        assert!(
+            entries.len() >= 75,
+            "expected >= 75 blocks, got {}",
+            entries.len()
+        );
+
+        // 1. Exclusive upper bound at `first_key` of block 6: reading blocks 0..=5
+        //    must clip every `WILLNEED` span strictly at or before block 6's offset.
+        let ub_block6 = user_key(&entries[6].first_key).to_vec();
+        let block6_offset = entries[6].handle.offset;
+        WILLNEED_RANGES.with(|r| r.borrow_mut().clear());
+
+        let mut iter = TableIterator::new(Arc::clone(&reader));
+        SeekableIterator::set_bounds(&mut iter, None, Some(&ub_block6));
+        SeekableIterator::seek_to_first(&mut iter);
+        let mut count = 0usize;
+        while iter.next().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 6);
+        let ranges = WILLNEED_RANGES.with(|r| r.borrow().clone());
+        assert!(!ranges.is_empty(), "expected readahead for blocks 3..6");
+        for (off, len) in &ranges {
+            assert!(
+                off + len <= block6_offset,
+                "readahead span [{off}, {}) crossed excluded block 6 offset {block6_offset}",
+                off + len
+            );
+        }
+
+        // 2. Exclusive upper bound at `first_key` of block 2: `sequential_reads`
+        //    reaches 2 when reading block 1 (`prev_block_index` starts at `usize::MAX`),
+        //    so the upcoming clipped window `[2, 2)` is empty -> 0 hints!
+        let ub_block2 = user_key(&entries[2].first_key).to_vec();
+        WILLNEED_RANGES.with(|r| r.borrow_mut().clear());
+        let mut iter2 = TableIterator::new(reader);
+        SeekableIterator::set_bounds(&mut iter2, None, Some(&ub_block2));
+        SeekableIterator::seek_to_first(&mut iter2);
+        let mut count2 = 0usize;
+        while iter2.next().is_some() {
+            count2 += 1;
+        }
+        assert_eq!(count2, 2);
+        let ranges2 = WILLNEED_RANGES.with(|r| r.borrow().clone());
+        assert!(
+            ranges2.is_empty(),
+            "empty clipped readahead window must skip advise_willneed, got {ranges2:?}"
         );
     }
 }

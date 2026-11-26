@@ -180,7 +180,7 @@ impl ArcSnapshot {
 
     /// Copy the visible value at this snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.get_pinned(key)?.map(PinnedSlice::into_vec))
+        self.reader()?.point_lookup(&self.read_options(), key)
     }
 
     /// Pin the visible bytes at this snapshot. See [`PinnedSlice`] for retention costs.

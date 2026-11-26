@@ -4,9 +4,37 @@
 
 use std::{cmp::Ordering, sync::Arc};
 
-use crate::{Error, options::IterConfig, types::LazyValue};
+use crate::{
+    Error,
+    options::IterConfig,
+    types::{LazyValue, compare_internal_key},
+};
 
 pub use crate::iterator::source::{IterSource, SeekableIterator};
+
+/// Monomorphized comparator for [`MergingIterator`] so hot heap comparisons
+/// inline directly without function-pointer indirection.
+pub trait KeyComparator {
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering;
+}
+
+/// Zero-sized internal-key comparator used by [`crate::DBIterator`].
+#[derive(Clone, Copy, Default)]
+pub struct InternalKeyComparator;
+
+impl KeyComparator for InternalKeyComparator {
+    #[inline(always)]
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        compare_internal_key(a, b)
+    }
+}
+
+impl<F: Fn(&[u8], &[u8]) -> Ordering> KeyComparator for F {
+    #[inline(always)]
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        self(a, b)
+    }
+}
 
 /// Direction of iteration for MergingIterator.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -20,9 +48,9 @@ enum Direction {
 /// Supports bidirectional iteration:
 /// - Forward: min-heap (smallest key at top)
 /// - Backward: max-heap (largest key at top)
-pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
+pub struct MergingIterator<C: KeyComparator = InternalKeyComparator> {
     sources: Vec<IterSource>,
-    compare: F,
+    compare: C,
     /// Heap of source indices.
     heap: Vec<usize>,
     /// Number of valid entries in the heap.
@@ -45,6 +73,12 @@ pub struct MergingIterator<F: Fn(&[u8], &[u8]) -> Ordering> {
 
 impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
     pub fn new(sources: Vec<IterSource>, compare: F) -> Self {
+        Self::with_comparator(sources, compare)
+    }
+}
+
+impl<C: KeyComparator> MergingIterator<C> {
+    pub fn with_comparator(sources: Vec<IterSource>, compare: C) -> Self {
         let n = sources.len();
         let single = n == 1;
         Self {
@@ -138,24 +172,20 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
     }
 
-    /// Compare two sources by their peeked key (direction-aware).
+    /// Compare two in-heap sources by their peeked key (direction-aware).
     /// In Forward mode: true if a < b (min-heap).
     /// In Backward mode: true if a > b (max-heap).
-    #[inline]
+    #[inline(always)]
     fn source_less(&self, a: usize, b: usize) -> bool {
         let sa = &self.sources[a];
         let sb = &self.sources[b];
-        match (sa.has_peeked, sb.has_peeked) {
-            (true, true) => {
-                let cmp = (self.compare)(sa.peeked_key.as_slice(), sb.peeked_key.as_slice());
-                match self.direction {
-                    Direction::Forward => cmp == Ordering::Less,
-                    Direction::Backward => cmp == Ordering::Greater,
-                }
-            }
-            (true, false) => true,
-            (false, true) => false,
-            (false, false) => false,
+        debug_assert!(sa.has_peeked && sb.has_peeked);
+        let cmp = self
+            .compare
+            .compare(sa.peeked_key.as_slice(), sb.peeked_key.as_slice());
+        match self.direction {
+            Direction::Forward => cmp == Ordering::Less,
+            Direction::Backward => cmp == Ordering::Greater,
         }
     }
 
@@ -306,7 +336,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             // from the backward (max-heap) direction and are not valid
             // for a forward (min-heap) without re-positioning.
             for source in self.sources.iter_mut() {
-                source.seek_to(&self.current_key, &self.compare);
+                let cmp = |a: &[u8], b: &[u8]| self.compare.compare(a, b);
+                source.seek_to(&self.current_key, &cmp);
             }
             self.init_heap_positioned();
         }
@@ -324,7 +355,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
             // from the forward (min-heap) direction and are not valid
             // for a backward (max-heap) without re-positioning.
             for source in self.sources.iter_mut() {
-                source.seek_for_prev_to(&self.current_key, &self.compare);
+                let cmp = |a: &[u8], b: &[u8]| self.compare.compare(a, b);
+                source.seek_for_prev_to(&self.current_key, &cmp);
             }
         }
         self.initialized = false;
@@ -350,7 +382,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
         self.direction = Direction::Forward;
         for source in self.sources.iter_mut() {
-            source.seek_to(target, &self.compare);
+            let cmp = |a: &[u8], b: &[u8]| self.compare.compare(a, b);
+            source.seek_to(target, &cmp);
         }
         self.current_key.clear();
         if self.single_source {
@@ -378,7 +411,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         if try_next
             && self.direction == Direction::Forward
             && !self.current_key.is_empty()
-            && (self.compare)(self.current_key.as_slice(), target) == Ordering::Less
+            && self.compare.compare(self.current_key.as_slice(), target) == Ordering::Less
         {
             const MAX_STEPS: usize = 4;
 
@@ -389,7 +422,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 let mut reached = false;
                 if self.sources[0]
                     .peek_key_only()
-                    .is_some_and(|k| (self.compare)(k, target) != Ordering::Less)
+                    .is_some_and(|k| self.compare.compare(k, target) != Ordering::Less)
                 {
                     reached = true;
                 } else if self.latch_source_error(0) {
@@ -402,7 +435,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                     self.sources[0].skip_peeked();
                     stepped += 1;
                     if let Some(k) = self.sources[0].peek_key_only() {
-                        if (self.compare)(k, target) != Ordering::Less {
+                        if self.compare.compare(k, target) != Ordering::Less {
                             reached = true;
                             break;
                         }
@@ -418,7 +451,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                     }
                 }
                 if !reached {
-                    self.sources[0].seek_to(target, &self.compare);
+                    let cmp = |a: &[u8], b: &[u8]| self.compare.compare(a, b);
+                    self.sources[0].seek_to(target, &cmp);
                     if !self.sources[0].has_peeked {
                         self.latch_source_error(0);
                     }
@@ -435,7 +469,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 }
                 let key_less = {
                     let k = self.sources[i].peeked_key.as_slice();
-                    (self.compare)(k, target) == Ordering::Less
+                    self.compare.compare(k, target) == Ordering::Less
                 };
                 if !key_less {
                     continue; // already >= target
@@ -447,7 +481,7 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                     self.sources[i].skip_peeked();
                     stepped += 1;
                     if let Some(k) = self.sources[i].peek_key_only() {
-                        if (self.compare)(k, target) != Ordering::Less {
+                        if self.compare.compare(k, target) != Ordering::Less {
                             reached = true;
                             break;
                         }
@@ -463,7 +497,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
                 }
                 if !reached {
                     // Not yet at target — fallback to full seek
-                    self.sources[i].seek_to(target, &self.compare);
+                    let cmp = |a: &[u8], b: &[u8]| self.compare.compare(a, b);
+                    self.sources[i].seek_to(target, &cmp);
                 }
             }
             // Rebuild heap
@@ -484,7 +519,8 @@ impl<F: Fn(&[u8], &[u8]) -> Ordering> MergingIterator<F> {
         }
         self.direction = Direction::Backward;
         for source in self.sources.iter_mut() {
-            source.seek_for_prev_to(target, &self.compare);
+            let cmp = |a: &[u8], b: &[u8]| self.compare.compare(a, b);
+            source.seek_for_prev_to(target, &cmp);
         }
         self.current_key.clear();
         self.initialized = false;

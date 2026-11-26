@@ -59,15 +59,32 @@ impl BlockBuilder {
 
     /// Finalize the block and return the encoded data.
     pub fn finish(mut self) -> Vec<u8> {
+        self.finish_in_place();
+        self.buffer
+    }
+
+    /// Finalize the block in place and borrow its encoded bytes so callers
+    /// building many blocks can write the slice and [`reset`](Self::reset)
+    /// without reallocating buffers.
+    pub(crate) fn finish_in_place(&mut self) -> &[u8] {
+        assert!(!self.finished, "cannot finish twice");
         self.finished = true;
-        // Append restart points
         for rp in &self.restarts {
             self.buffer.extend_from_slice(&rp.to_le_bytes());
         }
-        // Append number of restart points
         self.buffer
             .extend_from_slice(&(self.restarts.len() as u32).to_le_bytes());
-        self.buffer
+        &self.buffer
+    }
+
+    /// Reset this builder for the next block while retaining heap capacities.
+    pub(crate) fn reset(&mut self) {
+        self.buffer.clear();
+        self.restarts.clear();
+        self.restarts.push(0);
+        self.last_key.clear();
+        self.counter = 0;
+        self.finished = false;
     }
 
     pub fn last_key(&self) -> &[u8] {

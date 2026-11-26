@@ -1,7 +1,6 @@
 //! SST table builder: constructs a complete SST file from sorted key-value pairs.
 
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, HashSet},
     fs::File,
     io::{BufWriter, Write},
@@ -292,8 +291,17 @@ pub struct TableBuilder {
     /// Block property collectors for per-block metadata.
     block_property_collectors: Vec<Box<dyn crate::options::BlockPropertyCollector>>,
 
+    /// Reusable destination buffer for LZ4 and Zstd block compression.
+    compress_buf: Vec<u8>,
+    /// Reusable Zstd context initialized lazily on the first Zstd block.
+    zstd_compressor: Option<zstd::bulk::Compressor<'static>>,
+
     finished: bool,
 }
+
+/// Buffer 256 KiB per SST output stream (~32x fewer `write` syscalls than the
+/// 8 KiB stdlib default without inflating subcompaction memory).
+const SST_WRITE_BUF_CAPACITY: usize = 256 * 1024;
 
 impl TableBuilder {
     /// Create a new table builder writing to the given path.
@@ -301,7 +309,7 @@ impl TableBuilder {
         let file = File::create(path).ctx()?;
         let collectors = std::mem::take(&mut options.block_property_collectors);
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer: BufWriter::with_capacity(SST_WRITE_BUF_CAPACITY, file),
             data_block: BlockBuilder::new(options.block_restart_interval),
             options,
             index: Some(IndexWriter::new()),
@@ -321,6 +329,8 @@ impl TableBuilder {
             range_del_projected: 0,
             carried_projection: 0,
             block_property_collectors: collectors,
+            compress_buf: Vec::new(),
+            zstd_compressor: None,
             finished: false,
         })
     }
@@ -579,13 +589,6 @@ impl TableBuilder {
         let last_key = self.data_block.last_key().to_vec();
         let first_key = self.pending_first_key.take().unwrap_or_default();
 
-        // Take out the current block builder and replace with a new one
-        let builder = std::mem::replace(
-            &mut self.data_block,
-            BlockBuilder::new(self.options.block_restart_interval),
-        );
-        let block_data = builder.finish();
-
         // Collect block properties from all collectors, then reset for next block
         let props: Vec<(String, Vec<u8>)> = self
             .block_property_collectors
@@ -613,7 +616,17 @@ impl TableBuilder {
                 projected_index, META_BLOCK_HARD_LIMIT
             )));
         }
-        let handle = self.write_raw_block(&block_data).ctx()?;
+
+        // Finalize `data_block` in place and write without reallocating its Vecs.
+        let mut data_block = std::mem::replace(&mut self.data_block, BlockBuilder::new(1));
+        let handle = {
+            let block_data = data_block.finish_in_place();
+            self.write_raw_block(block_data)
+        };
+        data_block.reset();
+        self.data_block = data_block;
+        let handle = handle.ctx()?;
+
         self.index_block_projected = projected_index;
         let mut index = self.index.take().expect("active index");
         index.emit_pending(Some(first_key.as_slice()), &mut |data| {
@@ -638,35 +651,52 @@ impl TableBuilder {
                 MAX_DECOMPRESSED_BLOCK_SIZE
             )));
         }
-        let (block_data, compression_type) = match self.options.compression {
+        let compression_type = match self.options.compression {
             CompressionType::Lz4 => {
-                let compressed = lz4_flex::compress_prepend_size(data);
-                // Only use compression if it actually saves space
-                if compressed.len() < data.len() {
-                    (Cow::Owned(compressed), CompressionType::Lz4)
-                } else {
-                    (Cow::Borrowed(data), CompressionType::None)
+                let max_out = 4 + lz4_flex::block::get_maximum_output_size(data.len());
+                self.compress_buf.resize(max_out, 0);
+                self.compress_buf[..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                match lz4_flex::block::compress_into(data, &mut self.compress_buf[4..]) {
+                    Ok(written) if 4 + written < data.len() => {
+                        self.compress_buf.truncate(4 + written);
+                        CompressionType::Lz4
+                    }
+                    _ => CompressionType::None,
                 }
             }
             CompressionType::Zstd => {
-                if let Ok(compressed) = zstd::bulk::compress(data, 3)
-                    && compressed.len() < data.len()
+                if self.zstd_compressor.is_none() {
+                    self.zstd_compressor = zstd::bulk::Compressor::new(3).ok();
+                }
+                self.compress_buf.clear();
+                self.compress_buf
+                    .reserve(zstd::zstd_safe::compress_bound(data.len()));
+                if let Some(ref mut comp) = self.zstd_compressor
+                    && comp
+                        .compress_to_buffer(data, &mut self.compress_buf)
+                        .is_ok()
+                    && self.compress_buf.len() < data.len()
                 {
-                    (Cow::Owned(compressed), CompressionType::Zstd)
+                    CompressionType::Zstd
                 } else {
-                    (Cow::Borrowed(data), CompressionType::None)
+                    CompressionType::None
                 }
             }
-            CompressionType::None => (Cow::Borrowed(data), CompressionType::None),
+            CompressionType::None => CompressionType::None,
+        };
+        let block_data: &[u8] = if compression_type == CompressionType::None {
+            data
+        } else {
+            &self.compress_buf
         };
 
         let handle = BlockHandle::new(self.offset, block_data.len() as u64);
 
-        self.writer.write_all(&block_data).ctx()?;
+        self.writer.write_all(block_data).ctx()?;
 
         // Write block trailer: compression_type(1) + crc32(4)
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&block_data);
+        hasher.update(block_data);
         hasher.update(&[compression_type as u8]);
         let crc = hasher.finalize();
 
@@ -1579,5 +1609,51 @@ mod tests {
             "prefix_set must stay empty when bloom is disabled"
         );
         builder.finish().unwrap();
+    }
+
+    #[test]
+    fn zstd_builder_compresses_data_blocks_and_writes_zstd_trailer() {
+        use crate::sst::table_reader::TableReader;
+
+        let dir = tempfile::tempdir().unwrap();
+        let build = |name: &str, compression: CompressionType| -> u64 {
+            let path = dir.path().join(name);
+            let mut b = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    compression,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let val = [0x5au8; 4096];
+            for i in 0..256u32 {
+                let ik = InternalKey::new(&i.to_be_bytes(), 1, ValueType::Value);
+                b.add(ik.as_bytes(), &val).unwrap();
+            }
+            b.finish().unwrap().file_size
+        };
+
+        let none_size = build("none.sst", CompressionType::None);
+        let zstd_size = build("zstd.sst", CompressionType::Zstd);
+        assert!(
+            zstd_size * 10 < none_size,
+            "Zstd SST ({zstd_size} B) did not compress relative to uncompressed ({none_size} B)"
+        );
+
+        let zstd_path = dir.path().join("zstd.sst");
+        let reader = TableReader::open(&zstd_path).unwrap();
+        let entries = reader.cached_index_entries().unwrap();
+        assert!(!entries.is_empty());
+        let raw = std::fs::read(&zstd_path).unwrap();
+        let first_h = entries[0].handle;
+        let trailer_type = raw[(first_h.offset + first_h.size) as usize];
+        assert_eq!(trailer_type, CompressionType::Zstd as u8);
+        for i in [0u32, 127, 255] {
+            let got = reader
+                .point_value::<Vec<u8>>(&i.to_be_bytes(), 10, false)
+                .unwrap();
+            assert_eq!(got, Some((Some(vec![0x5au8; 4096]), 1)));
+        }
     }
 }

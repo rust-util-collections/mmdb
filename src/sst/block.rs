@@ -177,14 +177,26 @@ impl Block {
             self.restart_offset
         };
         let data = &self.data[..seg_end];
-        if let Some(&[0, b1, b2]) = offset.checked_add(3).and_then(|end| data.get(offset..end))
-            && (b1 | b2) & 0x80 == 0
+        if let Some(&[0, b1, b2, ref rest @ ..]) = data.get(offset..)
+            && b1 < 0x80
         {
-            let key_start = offset + 3;
-            let key_end = key_start + b1 as usize;
-            let val_end = key_end + b2 as usize;
-            if val_end <= data.len() {
-                return Ok((&data[key_start..key_end], &data[key_end..val_end], val_end));
+            if b2 < 0x80 {
+                let key_start = offset + 3;
+                let key_end = key_start + b1 as usize;
+                let val_end = key_end + b2 as usize;
+                if val_end <= data.len() {
+                    return Ok((&data[key_start..key_end], &data[key_end..val_end], val_end));
+                }
+            } else if let Some(&b3) = rest.first()
+                && b3 < 0x80
+            {
+                let vlen = ((b2 & 0x7f) as usize) | ((b3 as usize) << 7);
+                let key_start = offset + 4;
+                let key_end = key_start + b1 as usize;
+                let val_end = key_end + vlen;
+                if val_end <= data.len() {
+                    return Ok((&data[key_start..key_end], &data[key_end..val_end], val_end));
+                }
             }
         }
         decode_restart_entry_slow(data, offset)
@@ -598,6 +610,7 @@ impl KeyBuffer for SmallVec<[u8; 128]> {
     }
 }
 
+#[cold]
 fn decode_restart_entry_slow(data: &[u8], offset: usize) -> Result<(&[u8], &[u8], usize)> {
     if offset >= data.len() {
         return Err(Error::corruption("entry offset past block data"));
@@ -627,14 +640,26 @@ fn decode_restart_entry_slow(data: &[u8], offset: usize) -> Result<(&[u8], &[u8]
 
 #[inline]
 fn decode_entry_header(data: &[u8], offset: usize) -> Result<(usize, usize, usize, usize, usize)> {
-    if let Some(&[b0, b1, b2]) = offset.checked_add(3).and_then(|end| data.get(offset..end))
-        && (b0 | b1 | b2) & 0x80 == 0
+    if let Some(&[b0, b1, b2, ref rest @ ..]) = data.get(offset..)
+        && (b0 | b1) < 0x80
     {
-        let pos = offset + 3;
-        let key_end = pos + b1 as usize;
-        let value_end = key_end + b2 as usize;
-        if value_end <= data.len() {
-            return Ok((b0 as usize, b1 as usize, b2 as usize, pos, key_end));
+        if b2 < 0x80 {
+            let pos = offset + 3;
+            let key_end = pos + b1 as usize;
+            let value_end = key_end + b2 as usize;
+            if value_end <= data.len() {
+                return Ok((b0 as usize, b1 as usize, b2 as usize, pos, key_end));
+            }
+        } else if let Some(&b3) = rest.first()
+            && b3 < 0x80
+        {
+            let vlen = ((b2 & 0x7f) as usize) | ((b3 as usize) << 7);
+            let pos = offset + 4;
+            let key_end = pos + b1 as usize;
+            let value_end = key_end + vlen;
+            if value_end <= data.len() {
+                return Ok((b0 as usize, b1 as usize, vlen, pos, key_end));
+            }
         }
     }
     decode_entry_header_slow(data, offset)

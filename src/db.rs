@@ -224,14 +224,24 @@ impl SnapshotList {
     }
 }
 
+/// Lifecycle bitflags of a queued [`WriteRequest`].
+const REQ_QUEUED: u8 = 0;
+const STATE_PARKED: u8 = 1 << 0;
+const STATE_IN_GROUP: u8 = 1 << 1;
+const STATE_WAKE: u8 = 1 << 2;
+const STATE_DONE: u8 = 1 << 3;
+
+type WriteGroup = smallvec::SmallVec<[*mut WriteRequest; 16]>;
+
 /// A pending write request for group commit.
 struct WriteRequest {
     batch: WriteBatch,
     kind: WriteRequestKind,
     no_slowdown: bool,
     durability: DurabilityMode,
+    waiter: Option<thread::Thread>,
     result: Option<Result<()>>,
-    done: bool,
+    state: AtomicU8,
 }
 
 #[derive(Clone, Copy)]
@@ -248,14 +258,37 @@ struct WriteQueueState {
     leader_active: bool,
 }
 
-// SAFETY: each pointer refers to a queued writer's live stack frame. The
-// writer stays in enqueue_write until the leader sets done under write_queue.
-// Only the leader accesses result before then. Unlocked access projects the
-// immutable input fields directly, allowing waiters to check done under lock.
+// SAFETY: each pointer refers to a queued writer's live stack frame. A follower
+// stays in `enqueue_write` projecting only `(*req_ptr).state` until the leader
+// swaps `STATE_DONE` with `AcqRel` (after writing `result` and taking `waiter`).
+// Neither side forms `&WriteRequest` or `&mut WriteRequest` while queued,
+// preserving Stacked/Tree Borrows provenance, and no thread dereferences a
+// request pointer after `STATE_DONE` is published.
 unsafe impl Send for WriteQueueState {}
 
 impl WriteQueueState {
-    fn drain_group(&mut self, write_buffer_size: usize) -> Vec<*mut WriteRequest> {
+    fn can_drain_with(&self, new_payload_len: usize, write_buffer_size: usize) -> bool {
+        if self.queue.is_empty() {
+            return true;
+        }
+        const MAX_WRITE_BATCH_GROUP_BYTES: usize = 16 << 20;
+        let cap = (write_buffer_size / 2).min(MAX_WRITE_BATCH_GROUP_BYTES);
+        let mut bytes = new_payload_len;
+        if bytes > cap {
+            return false;
+        }
+        for &request in &self.queue {
+            // SAFETY: queued requests remain live until drained and completed.
+            let len = unsafe { (*request).batch.payload.len() };
+            bytes = bytes.saturating_add(len);
+            if bytes > cap {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn drain_group(&mut self, write_buffer_size: usize) -> WriteGroup {
         const MAX_WRITE_BATCH_GROUP_BYTES: usize = 16 << 20;
         let cap = (write_buffer_size / 2).min(MAX_WRITE_BATCH_GROUP_BYTES);
         let mut bytes = 0usize;
@@ -287,7 +320,49 @@ impl WriteQueueState {
             p.max_group_requests = p.max_group_requests.max(count as u64);
             p.max_group_bytes = p.max_group_bytes.max(group_bytes);
         });
-        self.queue.drain(..count).collect()
+        let group: WriteGroup = self.queue.drain(..count).collect();
+        for &rp in &group {
+            // SAFETY: drained requests remain live until `complete_write_group`
+            // swaps `STATE_DONE`.
+            unsafe {
+                (*rp).state.fetch_or(STATE_IN_GROUP, Ordering::AcqRel);
+            }
+        }
+        group
+    }
+}
+
+/// RAII guard holding `write_queue` after draining any in-flight write leader.
+/// Unless converted into write leadership via [`Self::claim_leadership`],
+/// dropping the guard wakes the head queued writer when no leader or other
+/// barrier remains active.
+pub(super) struct WriteBarrier<'a> {
+    db: &'a DB,
+    wq: Option<MutexGuard<'a, WriteQueueState>>,
+}
+
+impl WriteBarrier<'_> {
+    pub(super) fn claim_leadership(&mut self) {
+        if let Some(ref mut wq) = self.wq {
+            wq.leader_active = true;
+        }
+    }
+}
+
+impl Drop for WriteBarrier<'_> {
+    fn drop(&mut self) {
+        let _ = self.db;
+        if let Some(wq) = self.wq.take() {
+            let wake = if !wq.leader_active && wq.waiting_barriers == 0 {
+                DB::wake_queue_head(&wq)
+            } else {
+                None
+            };
+            drop(wq);
+            if let Some(t) = wake {
+                t.unpark();
+            }
+        }
     }
 }
 
@@ -1337,23 +1412,186 @@ impl DB {
                         // thread death from panics in corrupt data paths.
                         let result = catch_unwind(AssertUnwindSafe(
                             || -> std::result::Result<(), String> {
-                                // Drain read-compaction hints (lock released during I/O)
-                                {
+                                // Run pending organic compactions first (L0 and byte-budget
+                                // levels take strict precedence over optional read hints),
+                                // and re-check organic budgets whenever a hint installs an
+                                // edit that may push its target level over budget.
+                                loop {
+                                    loop {
+                                        if shutdown.load(Ordering::Acquire) {
+                                            return Ok(());
+                                        }
+                                        // Phase 1: pick and claim (short lock)
+                                        let pick = {
+                                            let inner = bg_inner.lock();
+                                            let version = inner.versions.current();
+                                            let mut claimed = bg_compacting_files.lock();
+                                            match LeveledCompaction::pick_compaction(
+                                                &version,
+                                                &bg_options,
+                                                &claimed,
+                                            ) {
+                                                Some(task) => {
+                                                    let l0_inputs: Vec<u64> = if task.level == 0 {
+                                                        task.input_files_level
+                                                            .iter()
+                                                            .map(|f| f.meta.number)
+                                                            .collect()
+                                                    } else {
+                                                        Vec::new()
+                                                    };
+                                                    let file_numbers =
+                                                        inner.versions.file_numbers.clone();
+                                                    let all_inputs: Vec<_> = task
+                                                        .input_files_level
+                                                        .iter()
+                                                        .chain(task.input_files_next.iter())
+                                                        .cloned()
+                                                        .collect();
+                                                    let is_bottom =
+                                                        LeveledCompaction::is_bottommost_level(
+                                                            &version,
+                                                            task.level,
+                                                            bg_options.num_levels,
+                                                            &all_inputs,
+                                                        );
+                                                    let claimed_numbers: Vec<u64> = all_inputs
+                                                        .iter()
+                                                        .map(|f| f.meta.number)
+                                                        .collect();
+                                                    claimed.extend(claimed_numbers.iter().copied());
+                                                    let active_snaps =
+                                                        bg_snapshot_list.as_sorted_vec();
+                                                    Some((
+                                                        task,
+                                                        file_numbers,
+                                                        l0_inputs,
+                                                        is_bottom,
+                                                        active_snaps,
+                                                        claimed_numbers,
+                                                    ))
+                                                }
+                                                None => None,
+                                            }
+                                        };
+
+                                        let Some((
+                                            task,
+                                            file_numbers,
+                                            l0_inputs,
+                                            is_bottom,
+                                            active_snaps,
+                                            claimed_numbers,
+                                        )) = pick
+                                        else {
+                                            break;
+                                        };
+                                        let _claim = CompactionClaim {
+                                            claims: Arc::clone(&bg_compacting_files),
+                                            numbers: claimed_numbers,
+                                        };
+
+                                        // Phase 2: I/O (no lock held)
+                                        let ctx = CompactionContext {
+                                            db_path: &bg_path,
+                                            dir_sync: &bg_dir_sync,
+                                            manifest_poisoned: &bg_manifest_poisoned,
+                                            options: &bg_options,
+                                            builds: &bg_builds,
+                                            rate_limiter: Some(&bg_rate_limiter),
+                                            stats: Some(&bg_stats),
+                                            active_snapshots: &active_snaps,
+                                        };
+                                        let output = LeveledCompaction::execute_compaction_io(
+                                            &ctx,
+                                            &task,
+                                            &file_numbers,
+                                            is_bottom,
+                                        )
+                                        .map_err(|e| format!("compaction error: {}", e))?;
+
+                                        bg_table_cache.prewarm(
+                                            output
+                                                .edit
+                                                .new_files
+                                                .iter()
+                                                .map(|(_, meta)| meta.number),
+                                        );
+
+                                        // Phase 3: validate and install the directory-synced outputs.
+                                        let cleanup = {
+                                            let mut inner = bg_inner.lock();
+                                            let cleanup = LeveledCompaction::install_compaction(
+                                                output,
+                                                &mut inner.versions,
+                                                Some(&bg_table_cache),
+                                                Some(&bg_block_cache),
+                                                &bg_path,
+                                                Some(&bg_stats),
+                                                !bg_snapshot_list.is_empty(),
+                                            )
+                                            .map_err(|e| {
+                                                format!("compaction install error: {}", e)
+                                            })?;
+                                            if !l0_inputs.is_empty() {
+                                                let current = inner.versions.current();
+                                                for num in &l0_inputs {
+                                                    if !current
+                                                        .level_files(0)
+                                                        .iter()
+                                                        .any(|tf| tf.meta.number == *num)
+                                                    {
+                                                        bg_block_cache.unpin_file(*num);
+                                                    }
+                                                }
+                                            }
+                                            bg_l0_count.store(
+                                                inner.versions.current().l0_file_count(),
+                                                Ordering::Relaxed,
+                                            );
+                                            refresh_super_version(&bg_sv, &inner);
+                                            cleanup
+                                        };
+                                        // Phase 4: sync manifest + delete old SSTs (no lock)
+                                        if let Err(e) = {
+                                            let manifest_handle =
+                                                bg_inner.lock().versions.manifest_sync_handle();
+                                            confirm_manifest_durable(
+                                                &manifest_handle,
+                                                &bg_manifest_poisoned,
+                                            )
+                                        } {
+                                            return Err(format!("manifest sync error: {}", e));
+                                        }
+                                        LeveledCompaction::run_post_compaction_cleanup(
+                                            &cleanup, &bg_path,
+                                        );
+                                    }
+
+                                    // Drain read-compaction hints only after organic backlog clears.
+                                    let mut hint_installed = false;
                                     let hints: Vec<CompactionHint> =
                                         mem::take(&mut *bg_hints.lock());
                                     if !hints.is_empty() {
                                         for hint in &hints {
-                                            // Close waits only for the job in flight.
                                             if shutdown.load(Ordering::Acquire) {
                                                 return Ok(());
                                             }
-                                            // Phase 1: pick and claim (short lock)
+                                            // Evaluate user filter `is_noop()` outside `DB::inner`.
+                                            let allow_trivial_move = bg_options
+                                                .compaction_filter
+                                                .as_ref()
+                                                .is_none_or(|f| f.is_noop());
                                             let pick = {
                                                 let inner = bg_inner.lock();
                                                 let version = inner.versions.current();
                                                 let mut claimed = bg_compacting_files.lock();
                                                 LeveledCompaction::pick_compaction_for_hint(
-                                                    &version, hint, &claimed,
+                                                    &version,
+                                                    &bg_options,
+                                                    hint,
+                                                    &claimed,
+                                                    allow_trivial_move,
                                                 )
                                                 .map(|task| {
                                                     let file_numbers =
@@ -1376,8 +1614,6 @@ impl DB {
                                                         .map(|f| f.meta.number)
                                                         .collect();
                                                     claimed.extend(claimed_numbers.iter().copied());
-                                                    // Capture the snapshot list under the
-                                                    // DB lock, consistent with the inputs.
                                                     let active_snaps =
                                                         bg_snapshot_list.as_sorted_vec();
                                                     (
@@ -1388,7 +1624,7 @@ impl DB {
                                                         claimed_numbers,
                                                     )
                                                 })
-                                            }; // lock released
+                                            };
 
                                             if let Some((
                                                 task,
@@ -1398,13 +1634,10 @@ impl DB {
                                                 claimed_numbers,
                                             )) = pick
                                             {
-                                                // Claim released on every exit
-                                                // (success or `?`) via Drop.
                                                 let _claim = CompactionClaim {
                                                     claims: Arc::clone(&bg_compacting_files),
                                                     numbers: claimed_numbers,
                                                 };
-                                                // Phase 2: I/O (no lock)
                                                 let ctx = CompactionContext {
                                                     db_path: &bg_path,
                                                     dir_sync: &bg_dir_sync,
@@ -1426,12 +1659,6 @@ impl DB {
                                                         format!("hint compaction error: {}", e)
                                                     })?;
 
-                                                // Pre-warm the table cache for the new
-                                                // output files while unlocked, so the
-                                                // install phase's log_and_apply (which
-                                                // opens each new file to install its
-                                                // reader) hits a warm cache instead of
-                                                // parsing footers/indexes under the lock.
                                                 bg_table_cache.prewarm(
                                                     output
                                                         .edit
@@ -1440,7 +1667,6 @@ impl DB {
                                                         .map(|(_, meta)| meta.number),
                                                 );
 
-                                                // Phase 3: validate and install the directory-synced outputs.
                                                 let cleanup = {
                                                     let mut inner = bg_inner.lock();
                                                     let cleanup =
@@ -1466,7 +1692,6 @@ impl DB {
                                                     refresh_super_version(&bg_sv, &inner);
                                                     cleanup
                                                 };
-                                                // Phase 4: sync manifest + cleanup (no lock)
                                                 if let Err(e) = {
                                                     let manifest_handle = bg_inner
                                                         .lock()
@@ -1482,176 +1707,16 @@ impl DB {
                                                         e
                                                     ));
                                                 }
+                                                hint_installed |= cleanup.installed;
                                                 LeveledCompaction::run_post_compaction_cleanup(
                                                     &cleanup, &bg_path,
                                                 );
                                             }
                                         }
                                     }
-                                }
-
-                                // Run pending compactions (lock released during I/O)
-                                loop {
-                                    if shutdown.load(Ordering::Acquire) {
-                                        return Ok(());
-                                    }
-                                    // Phase 1: pick and claim (short lock)
-                                    let pick = {
-                                        let inner = bg_inner.lock();
-                                        let version = inner.versions.current();
-                                        let mut claimed = bg_compacting_files.lock();
-                                        match LeveledCompaction::pick_compaction(
-                                            &version,
-                                            &bg_options,
-                                            &claimed,
-                                        ) {
-                                            Some(task) => {
-                                                let l0_inputs: Vec<u64> = if task.level == 0 {
-                                                    task.input_files_level
-                                                        .iter()
-                                                        .map(|f| f.meta.number)
-                                                        .collect()
-                                                } else {
-                                                    Vec::new()
-                                                };
-                                                let file_numbers =
-                                                    inner.versions.file_numbers.clone();
-                                                let all_inputs: Vec<_> = task
-                                                    .input_files_level
-                                                    .iter()
-                                                    .chain(task.input_files_next.iter())
-                                                    .cloned()
-                                                    .collect();
-                                                let is_bottom =
-                                                    LeveledCompaction::is_bottommost_level(
-                                                        &version,
-                                                        task.level,
-                                                        bg_options.num_levels,
-                                                        &all_inputs,
-                                                    );
-                                                // Claim all input file numbers so a
-                                                // concurrent compaction thread's next
-                                                // pick skips them until we install or
-                                                // discard (see below).
-                                                let claimed_numbers: Vec<u64> = all_inputs
-                                                    .iter()
-                                                    .map(|f| f.meta.number)
-                                                    .collect();
-                                                claimed.extend(claimed_numbers.iter().copied());
-                                                // Capture the snapshot list under the DB
-                                                // lock, consistent with the picked inputs.
-                                                let active_snaps = bg_snapshot_list.as_sorted_vec();
-                                                Some((
-                                                    task,
-                                                    file_numbers,
-                                                    l0_inputs,
-                                                    is_bottom,
-                                                    active_snaps,
-                                                    claimed_numbers,
-                                                ))
-                                            }
-                                            None => None,
-                                        }
-                                    }; // lock released
-
-                                    let Some((
-                                        task,
-                                        file_numbers,
-                                        l0_inputs,
-                                        is_bottom,
-                                        active_snaps,
-                                        claimed_numbers,
-                                    )) = pick
-                                    else {
+                                    if !hint_installed {
                                         break;
-                                    };
-                                    // Claim released on every exit (success or
-                                    // `?`) via Drop — dropped before the next
-                                    // loop iteration re-picks.
-                                    let _claim = CompactionClaim {
-                                        claims: Arc::clone(&bg_compacting_files),
-                                        numbers: claimed_numbers,
-                                    };
-
-                                    // Phase 2: I/O (no lock held)
-                                    let ctx = CompactionContext {
-                                        db_path: &bg_path,
-                                        dir_sync: &bg_dir_sync,
-                                        manifest_poisoned: &bg_manifest_poisoned,
-                                        options: &bg_options,
-                                        builds: &bg_builds,
-                                        rate_limiter: Some(&bg_rate_limiter),
-                                        stats: Some(&bg_stats),
-                                        active_snapshots: &active_snaps,
-                                    };
-                                    let output = LeveledCompaction::execute_compaction_io(
-                                        &ctx,
-                                        &task,
-                                        &file_numbers,
-                                        is_bottom,
-                                    )
-                                    .map_err(|e| format!("compaction error: {}", e))?;
-
-                                    // Pre-warm the table cache for the new output files
-                                    // while unlocked (see hint-compaction branch above).
-                                    bg_table_cache.prewarm(
-                                        output.edit.new_files.iter().map(|(_, meta)| meta.number),
-                                    );
-
-                                    // Phase 3: validate and install the directory-synced outputs.
-                                    let cleanup = {
-                                        let mut inner = bg_inner.lock();
-                                        let cleanup = LeveledCompaction::install_compaction(
-                                            output,
-                                            &mut inner.versions,
-                                            Some(&bg_table_cache),
-                                            Some(&bg_block_cache),
-                                            &bg_path,
-                                            Some(&bg_stats),
-                                            !bg_snapshot_list.is_empty(),
-                                        )
-                                        .map_err(|e| format!("compaction install error: {}", e))?;
-                                        // Unpin L0 inputs that actually left L0.
-                                        // Covers both a normal install (input
-                                        // consumed and scheduled for deletion)
-                                        // and a trivial move (same physical file
-                                        // relabeled to L1, so not in
-                                        // files_to_delete). A discarded (stale,
-                                        // raced) install leaves the file in L0
-                                        // and its first-block pin must stay.
-                                        if !l0_inputs.is_empty() {
-                                            let current = inner.versions.current();
-                                            for num in &l0_inputs {
-                                                if !current
-                                                    .level_files(0)
-                                                    .iter()
-                                                    .any(|tf| tf.meta.number == *num)
-                                                {
-                                                    bg_block_cache.unpin_file(*num);
-                                                }
-                                            }
-                                        }
-                                        bg_l0_count.store(
-                                            inner.versions.current().l0_file_count(),
-                                            Ordering::Relaxed,
-                                        );
-                                        refresh_super_version(&bg_sv, &inner);
-                                        cleanup
-                                    };
-                                    // Phase 4: sync manifest + delete old SSTs (no lock)
-                                    if let Err(e) = {
-                                        let manifest_handle =
-                                            bg_inner.lock().versions.manifest_sync_handle();
-                                        confirm_manifest_durable(
-                                            &manifest_handle,
-                                            &bg_manifest_poisoned,
-                                        )
-                                    } {
-                                        return Err(format!("manifest sync error: {}", e));
                                     }
-                                    LeveledCompaction::run_post_compaction_cleanup(
-                                        &cleanup, &bg_path,
-                                    );
                                 }
 
                                 // A pending sweep stays queued while snapshots
@@ -1941,9 +2006,7 @@ impl DB {
     }
 
     pub fn get_with_options(&self, options: &ReadOptions, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .get_pinned_with_options(options, key)?
-            .map(PinnedSlice::into_vec))
+        self.read.point_lookup(options, key)
     }
 
     /// Look up a visible value and retain its backing memory.
@@ -2718,10 +2781,9 @@ impl DB {
         // registration set turns an unlocked scan into a proportional write
         // stall.
         for chunk in settled.chunks(DEAD_KEY_RECONFIRM_CHUNK) {
-            let mut wq = self.write_queue.lock();
             #[cfg(test)]
             PRUNE_SETTLED_LOCK_COUNT.with(|c| c.set(c.get() + 1));
-            self.wait_for_write_leader_idle(&mut wq);
+            let _barrier = self.acquire_write_barrier();
             let reconfirmed: Vec<&Vec<u8>> = chunk
                 .iter()
                 .filter(|key| matches!(self.get_with_options(&read_options, key), Ok(None)))
@@ -2781,9 +2843,7 @@ impl DB {
                 self.maintenance_cv.wait(&mut maintenance);
             }
         }
-        let mut wq = self.write_queue.lock();
-        self.wait_for_write_leader_idle(&mut wq);
-        drop(wq);
+        drop(self.acquire_write_barrier());
         let mut first_error = self.read.fail_stop_error();
         if first_error.is_none() && !self.read.read_only {
             let result = self
@@ -2822,22 +2882,58 @@ impl DB {
 
     // -- Internal --
 
-    /// Block until no group-commit leader is in `write_batch_group`.
-    ///
-    /// Leaders drop `write_queue` for I/O and only keep `leader_active`;
-    /// admin paths that interpret empty-active or release the directory lock
-    /// must wait here while holding `write_queue`.
-    fn wait_for_write_leader_idle(&self, wq: &mut MutexGuard<'_, WriteQueueState>) {
+    /// Acquire `write_queue` and wait until no group-commit leader is active.
+    pub(super) fn acquire_write_barrier(&self) -> WriteBarrier<'_> {
+        let mut wq = self.write_queue.lock();
         if wq.leader_active {
-            // Give flush/close a turn at the next group boundary even while
-            // new writes keep arriving. The caller still holds the queue lock
-            // when it claims the barrier or installs its own leadership.
             wq.waiting_barriers += 1;
             while wq.leader_active {
-                self.write_cv.wait(wq);
+                self.write_cv.wait(&mut wq);
             }
             wq.waiting_barriers -= 1;
-            self.write_cv.notify_all();
+            if wq.waiting_barriers > 0 {
+                self.write_cv.notify_all();
+            }
+        }
+        WriteBarrier {
+            db: self,
+            wq: Some(wq),
+        }
+    }
+
+    /// Notify `wq.queue.front()` that it may claim leadership once awake, while
+    /// leaving `leader_active` false so an already-running writer can drain the
+    /// queue immediately without waiting for an OS scheduler wakeup.
+    fn wake_queue_head(wq: &WriteQueueState) -> Option<thread::Thread> {
+        let &head = wq.queue.front()?;
+        // SAFETY: `head` is still in `wq.queue` (`STATE_IN_GROUP` and `STATE_DONE`
+        // are unset while `wq` is held), so its stack frame is live and `waiter`
+        // is immutable. Projecting fields avoids forming `&WriteRequest`.
+        unsafe {
+            let waiter = (*head).waiter.clone();
+            let prev = (*head).state.fetch_or(STATE_WAKE, Ordering::AcqRel);
+            if (prev & STATE_PARKED) != 0 {
+                waiter
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Release `leader_active` and wake waiting barriers or notify the head queued writer.
+    pub(super) fn release_write_leadership(&self) {
+        let wake = {
+            let mut wq = self.write_queue.lock();
+            wq.leader_active = false;
+            if wq.waiting_barriers != 0 {
+                self.write_cv.notify_all();
+                None
+            } else {
+                Self::wake_queue_head(&wq)
+            }
+        };
+        if let Some(t) = wake {
+            t.unpark();
         }
     }
 
@@ -2896,8 +2992,7 @@ impl DB {
             // cannot take the barrier, release LOCK/caches, and let this path
             // install SST/MANIFEST afterwards. Keep the slowdown sleep outside
             // the mutex: it does not mutate durable state.
-            let mut wq = self.write_queue.lock();
-            self.wait_for_write_leader_idle(&mut wq);
+            let _barrier = self.acquire_write_barrier();
             self.check_writable().ctx()?;
             let still_over = {
                 let inner = self.inner.lock();
@@ -2924,7 +3019,7 @@ impl DB {
                 self.inner.lock().versions.current().l0_file_count(),
                 Ordering::Relaxed,
             );
-            drop(wq);
+            drop(_barrier);
         } else if l0_count >= self.options.l0_slowdown_trigger {
             // Ensure the backlog is actually being worked on. The slowdown
             // state can be entered without any prior signal (e.g. an L0
@@ -2986,8 +3081,9 @@ impl DB {
             kind: WriteRequestKind::Batch,
             no_slowdown: write_options.no_slowdown,
             durability: write_options.durability,
+            waiter: None,
             result: None,
-            done: false,
+            state: AtomicU8::new(REQ_QUEUED),
         })
     }
 
@@ -3003,60 +3099,159 @@ impl DB {
             no_slowdown: false,
             batch: WriteBatch::new(),
             durability: DurabilityMode::DisableWal,
+            waiter: None,
             result: None,
-            done: false,
+            state: AtomicU8::new(REQ_QUEUED),
         })
     }
 
+    fn complete_write_group(
+        batch_group: &[*mut WriteRequest],
+        self_ptr: *mut WriteRequest,
+        default_result: &Result<()>,
+    ) {
+        for &rp in batch_group {
+            // SAFETY: all request pointers were drained exclusively by this
+            // leader and stay live on their owners' stacks until `STATE_DONE`
+            // is published via `swap`. Raw field projections avoid forming
+            // `&WriteRequest` / `&mut WriteRequest`, and `rp` is never touched
+            // again after swapping `STATE_DONE`.
+            unsafe {
+                if (*rp).result.is_none() {
+                    (*rp).result = Some(default_result.clone());
+                }
+                let waiter = if rp == self_ptr {
+                    None
+                } else {
+                    (*rp).waiter.take()
+                };
+                let prev = (*rp).state.swap(STATE_DONE, Ordering::AcqRel);
+                if (prev & STATE_PARKED) != 0
+                    && let Some(t) = waiter
+                {
+                    t.unpark();
+                }
+            }
+        }
+    }
+
     fn enqueue_write(&self, mut req: WriteRequest) -> Result<()> {
+        let spin_limit: u32 = if req.durability == DurabilityMode::WalSync
+            || matches!(req.kind, WriteRequestKind::WalFence { .. })
+        {
+            0
+        } else {
+            384
+        };
+        let payload_len = req.batch.payload.len();
         let req_ptr = &raw mut req;
 
-        // Enqueue and check if we should become the leader.
-        // The leader_active flag prevents new arrivals from becoming false
-        // "leaders" while the real leader holds `inner` — this is critical for
-        // group commit to actually batch writes.
-        let mut wq = self.write_queue.lock();
-        wq.queue.push_back(req_ptr);
-
-        let mut group_flushed = false;
-        #[cfg(feature = "bench-metrics")]
-        let mut waited = false;
-        loop {
-            if req.done {
-                break;
-            }
-            if wq.leader_active || wq.waiting_barriers != 0 {
-                #[cfg(feature = "bench-metrics")]
-                if !waited {
-                    crate::profile::record(|p| p.queue_waits += 1);
-                    waited = true;
-                }
-                crate::profile::timed!(queue_wait_ns, queue_wakeups, self.write_cv.wait(&mut wq));
-                continue;
-            }
-            wq.leader_active = true;
-            let batch_group = wq.drain_group(self.options.write_buffer_size);
-            drop(wq); // release queue lock while doing I/O
-
-            let result = self.write_batch_group(&batch_group);
-            group_flushed |= matches!(result, Ok(true));
-
-            // Signal everyone in this batch
-            wq = self.write_queue.lock();
-            for &rp in &batch_group {
-                // SAFETY: all request pointers came from queue entries whose
-                // callers are blocked until this leader sets `done`.
+        // Fast path: become leader and drain immediately in one lock acquisition
+        // when no leader or barrier is active and `drain_group` will admit `req_ptr`
+        // (either the queue is empty so `req_ptr` is index 0, or the entire pending
+        // queue plus `req_ptr` fits within the group byte cap). Otherwise register
+        // our `Thread` handle, enqueue, and wait without re-locking on completion.
+        let mut wake_head: Option<thread::Thread> = None;
+        let initial_group = {
+            let mut wq = self.write_queue.lock();
+            if !wq.leader_active
+                && wq.waiting_barriers == 0
+                && wq.can_drain_with(payload_len, self.options.write_buffer_size)
+            {
+                wq.leader_active = true;
+                wq.queue.push_back(req_ptr);
+                Some(wq.drain_group(self.options.write_buffer_size))
+            } else {
+                // SAFETY: `req` has not been shared yet; we hold `wq` before pushing `req_ptr`.
                 unsafe {
-                    if (*rp).result.is_none() {
-                        (*rp).result = Some(result.as_ref().map(|_| ()).map_err(Clone::clone));
-                    }
-                    (*rp).done = true;
+                    (*req_ptr).waiter = Some(thread::current());
                 }
+                wq.queue.push_back(req_ptr);
+                if !wq.leader_active && wq.waiting_barriers == 0 {
+                    wake_head = Self::wake_queue_head(&wq);
+                }
+                None
             }
-            wq.leader_active = false;
-            self.write_cv.notify_all();
+        };
+        if let Some(t) = wake_head {
+            t.unpark();
         }
-        drop(wq);
+
+        let batch_group = match initial_group {
+            Some(group) => group,
+            None => {
+                #[cfg(feature = "bench-metrics")]
+                crate::profile::record(|p| p.queue_waits += 1);
+                let mut completed = false;
+                let mut promoted_group: Option<WriteGroup> = None;
+                let mut spins = 0u32;
+                loop {
+                    // SAFETY: `req_ptr` points to our own stack `req`;
+                    // projecting `state` avoids forming `&req` while queued.
+                    let s = unsafe { (*req_ptr).state.load(Ordering::Acquire) };
+                    if (s & STATE_DONE) != 0 {
+                        completed = true;
+                        break;
+                    }
+                    if (s & STATE_WAKE) != 0 && (s & STATE_IN_GROUP) == 0 {
+                        let mut wq = self.write_queue.lock();
+                        let s_locked = unsafe { (*req_ptr).state.load(Ordering::Acquire) };
+                        if (s_locked & STATE_DONE) != 0 {
+                            completed = true;
+                            break;
+                        }
+                        if (s_locked & STATE_IN_GROUP) == 0 {
+                            if !wq.leader_active
+                                && wq.waiting_barriers == 0
+                                && wq.queue.front() == Some(&req_ptr)
+                            {
+                                wq.leader_active = true;
+                                promoted_group =
+                                    Some(wq.drain_group(self.options.write_buffer_size));
+                                break;
+                            }
+                            unsafe {
+                                (*req_ptr)
+                                    .state
+                                    .fetch_and(!(STATE_WAKE | STATE_PARKED), Ordering::AcqRel);
+                            }
+                        }
+                        drop(wq);
+                    }
+                    if spins < spin_limit {
+                        spins += 1;
+                        std::hint::spin_loop();
+                    } else {
+                        let prev =
+                            unsafe { (*req_ptr).state.fetch_or(STATE_PARKED, Ordering::AcqRel) };
+                        if (prev & STATE_DONE) != 0 {
+                            completed = true;
+                            break;
+                        }
+                        if (prev & STATE_WAKE) != 0 && (prev & STATE_IN_GROUP) == 0 {
+                            continue;
+                        }
+                        crate::profile::timed!(queue_wait_ns, queue_wakeups, thread::park());
+                    }
+                }
+                if completed {
+                    return req.result.take().unwrap_or(Ok(()));
+                }
+                promoted_group.expect("woken non-completed follower must hold promoted group")
+            }
+        };
+        debug_assert!(batch_group.contains(&req_ptr));
+
+        let mut followers_completed = false;
+        let result = self.write_batch_group(&batch_group, req_ptr, &mut followers_completed);
+        let group_flushed = matches!(result, Ok(true));
+
+        if !followers_completed {
+            let default_res = result.as_ref().map(|_| ()).map_err(Clone::clone);
+            Self::complete_write_group(&batch_group, req_ptr, &default_res);
+        }
+
+        self.release_write_leadership();
 
         // Leadership released and every waiter woken: harvest dead-key
         // registrations settled by compactions since the previous flush.
@@ -3072,7 +3267,7 @@ impl DB {
     // range write covering any elementary interval, one sequence can be needed
     // per distinct snapshot plus the group's newest visible sequence. Snapshots
     // taken later all see that same latest range unless another write covers it.
-    fn admit_range_stripes(&self, requests: &mut Vec<*mut WriteRequest>) {
+    fn admit_range_stripes(&self, requests: &mut WriteGroup) {
         #[cfg(not(test))]
         let limit = MAX_RANGE_STRIPES;
         #[cfg(test)]
@@ -3084,9 +3279,9 @@ impl DB {
             return;
         }
         let mut full = None;
-        requests.retain(|&ptr| {
+        requests.retain(|&mut ptr| {
             // SAFETY: the leader has exclusive access to result, and batch is
-            // immutable until completion under the queue lock.
+            // immutable until completion.
             let batch = unsafe { &(*ptr).batch };
             if batch
                 .entries()
@@ -3106,7 +3301,7 @@ impl DB {
 
     // SST files split between user keys. Bound the root-index footprint of
     // a single unsplittable run before assigning sequences or appending WAL.
-    fn admit_same_key_runs(memtable: &MemTable, requests: &mut Vec<*mut WriteRequest>) {
+    fn admit_same_key_runs(memtable: &MemTable, requests: &mut WriteGroup) {
         let group_bound = requests.iter().fold(0usize, |sum, &ptr| {
             // SAFETY: queued batches are immutable until completion.
             let batch = unsafe { &(*ptr).batch };
@@ -3119,7 +3314,7 @@ impl DB {
         }
 
         let mut charges = std::collections::HashMap::<&[u8], usize>::new();
-        requests.retain(|&ptr| {
+        requests.retain(|&mut ptr| {
             // SAFETY: the owner's frame stays live until this group completes.
             let batch = unsafe { &(*ptr).batch };
             let suspect = |entry: &types::BatchEntry<'_>| {
@@ -3138,7 +3333,7 @@ impl DB {
                     for applied in batch.entries().filter(suspect).take(index) {
                         *charges.get_mut(applied.key).unwrap() -= applied.metadata_charge();
                     }
-                    // SAFETY: only the active leader writes result before done.
+                    // SAFETY: only the active leader writes result before REQ_DONE.
                     unsafe {
                         (*ptr).result = Some(Err(Error::invalid_argument(
                             "same-key metadata exceeds SST partition index budget",
@@ -3156,10 +3351,15 @@ impl DB {
     /// Returns `true` when the group's writes triggered a memtable flush, so
     /// the leader can harvest settled dead-key registrations after it has
     /// woken the group's waiters.
-    fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<bool> {
+    fn write_batch_group(
+        &self,
+        orig_batch_group: &[*mut WriteRequest],
+        self_ptr: *mut WriteRequest,
+        followers_completed: &mut bool,
+    ) -> Result<bool> {
         self.check_writable()?;
-        let mut group = Vec::with_capacity(batch_group.len());
-        for &ptr in batch_group {
+        let mut group = WriteGroup::with_capacity(orig_batch_group.len());
+        for &ptr in orig_batch_group {
             // SAFETY: the leader exclusively processes the queued request's fields.
             let no_slowdown =
                 unsafe { matches!((*ptr).kind, WriteRequestKind::Batch) && (*ptr).no_slowdown };
@@ -3229,7 +3429,8 @@ impl DB {
         }
         self.sequence.store(last_group_seq + 1, Ordering::Release);
 
-        let mut assigned = Vec::with_capacity(batch_group.len());
+        let mut assigned =
+            smallvec::SmallVec::<[(*mut WriteRequest, u64); 16]>::with_capacity(batch_group.len());
         let mut append_error: Option<Error> = None;
         let mut next_seq = first_group_seq;
 
@@ -3281,8 +3482,7 @@ impl DB {
         if let Some(e) = wal_sync_err {
             self.set_bg_error(format!("WAL sync failed: {}", e));
             for &rp in batch_group {
-                // SAFETY: the owner is blocked until `done` and reads only
-                // `done` meanwhile; see the write_queue SAFETY note.
+                // SAFETY: the owner is blocked until `REQ_DONE`.
                 unsafe { (*rp).result = Some(Err(e.clone())) };
             }
             return Err(e);
@@ -3291,21 +3491,17 @@ impl DB {
         {
             crate::profile::time_scope!(apply_ns);
             let mut applied_last_seq = None;
+            let mut group_bytes = 0u64;
             for &(req_ptr, first_seq) in &assigned {
                 // SAFETY: request pointers are still owned by this leader.
                 let batch = unsafe { &(*req_ptr).batch };
-                let mut batch_bytes = 0u64;
-                for (i, entry) in batch.entries().enumerate() {
-                    let seq = first_seq + i as u64;
-                    inner
-                        .active_memtable
-                        .put(entry.key, entry.value, seq, entry.value_type);
-                    batch_bytes += entry.key.len() as u64 + entry.value.len() as u64;
-                }
                 if !batch.is_empty() {
+                    group_bytes += inner.active_memtable.put_batch(batch, first_seq);
                     applied_last_seq = Some(first_seq + batch.len() as u64 - 1);
-                    self.read.stats.record_write(batch_bytes);
                 }
+            }
+            if group_bytes != 0 {
+                self.read.stats.record_write(group_bytes);
             }
             if let Some(last_seq) = applied_last_seq {
                 self.read
@@ -3322,8 +3518,7 @@ impl DB {
             let mut assigned_iter = assigned.iter().map(|&(p, _)| p);
             for &rp in batch_group {
                 if assigned_iter.next().is_some_and(|p| p == rp) {
-                    // SAFETY: the owner is blocked until `done` and reads only
-                    // `done` meanwhile; see the write_queue SAFETY note.
+                    // SAFETY: the owner is blocked until `REQ_DONE`.
                     unsafe { (*rp).result = Some(Ok(())) };
                 } else {
                     // SAFETY: as above.
@@ -3345,10 +3540,12 @@ impl DB {
         }
         if freeze {
             // Every batch in this group is already in WAL_old and visible in
-            // active_memtable via committed_sequence. A rotation or flush-queue
-            // failure latches fail-stop bg_error for subsequent operations and
-            // close(), so acknowledge the committed group rather than reporting
-            // a false write failure across the commit boundary.
+            // active_memtable via committed_sequence. Complete and wake group
+            // followers BEFORE running `old_wal.sync_data()` inside
+            // `submit_active()`, while keeping `leader_active` held across the
+            // rotation. Any rotation/queue failure latches fail-stop bg_error.
+            Self::complete_write_group(orig_batch_group, self_ptr, &Ok(()));
+            *followers_completed = true;
             return Ok(self.submit_active().is_ok());
         }
         Ok(false)
@@ -3365,14 +3562,12 @@ impl DB {
     }
 
     fn flush_generation(&self) -> Result<()> {
-        let mut wq = self.write_queue.lock();
-        self.wait_for_write_leader_idle(&mut wq);
+        let mut barrier = self.acquire_write_barrier();
         self.check_writable()?;
-        wq.leader_active = true;
-        drop(wq);
+        barrier.claim_leadership();
+        drop(barrier);
         let target = self.submit_active();
-        self.write_queue.lock().leader_active = false;
-        self.write_cv.notify_all();
+        self.release_write_leadership();
         self.flush_queue.wait(target?)
     }
 
@@ -3929,18 +4124,47 @@ impl DB {
         let mut carry = Vec::new();
         let mut pending_cut = false;
         let mut last_uk: Vec<u8> = Vec::new();
+        let mut has_last_uk = false;
+        let mut last_point_uk: Vec<u8> = Vec::new();
+        let mut has_last_point_uk = false;
+        let mut last_written_point_seq = 0u64;
+        let mut snapshot_idx = 0usize;
 
         for (key, value) in mem.iter_ref() {
-            let uk_changed = types::user_key(key) != last_uk.as_slice();
+            let (uk, entry_seq, vt) = types::decode_internal_key(key).ctx()?;
+            if vt != ValueType::RangeDeletion {
+                if has_last_point_uk && last_point_uk.as_slice() == uk {
+                    while snapshot_idx > 0 && snapshots[snapshot_idx - 1] >= last_written_point_seq
+                    {
+                        snapshot_idx -= 1;
+                    }
+                    if snapshot_idx > 0 && snapshots[snapshot_idx - 1] >= entry_seq {
+                        last_written_point_seq = entry_seq;
+                    } else {
+                        // Completely shadowed by `last_written_point_seq` with no
+                        // intervening live snapshot.
+                        continue;
+                    }
+                } else {
+                    last_point_uk.clear();
+                    last_point_uk.extend_from_slice(uk);
+                    has_last_point_uk = true;
+                    last_written_point_seq = entry_seq;
+                    snapshot_idx = snapshots.len();
+                }
+            }
+
+            let uk_changed = !has_last_uk || uk != last_uk.as_slice();
             if uk_changed {
                 last_uk.clear();
-                last_uk.extend_from_slice(types::user_key(key));
+                last_uk.extend_from_slice(uk);
+                has_last_uk = true;
             }
             if pending_cut
                 && uk_changed
                 && let Some((num, mut b)) = builder.take()
             {
-                carry = b.clip_at(types::user_key(key));
+                carry = b.clip_at(uk);
                 results.push((num, b.finish().ctx()?));
                 pending_cut = false;
             }
@@ -4256,11 +4480,17 @@ mod tests {
             kind: WriteRequestKind::Batch,
             no_slowdown: false,
             durability: DurabilityMode::WalAsync,
+            waiter: None,
             result: None,
-            done: false,
+            state: AtomicU8::new(REQ_QUEUED),
         });
-        db.write_batch_group(&requests.each_mut().map(std::ptr::from_mut))
-            .unwrap();
+        let mut completed = false;
+        db.write_batch_group(
+            &requests.each_mut().map(std::ptr::from_mut),
+            std::ptr::null_mut(),
+            &mut completed,
+        )
+        .unwrap();
         assert_eq!(
             requests[0].result.take().unwrap().unwrap_err().kind(),
             ErrorKind::InvalidArgument
@@ -4326,8 +4556,9 @@ mod tests {
                 kind: WriteRequestKind::Batch,
                 no_slowdown: false,
                 durability: DurabilityMode::WalAsync,
-                done: false,
+                waiter: None,
                 result: None,
+                state: AtomicU8::new(REQ_QUEUED),
             }
         });
         let ptrs = requests.each_mut().map(std::ptr::from_mut);
@@ -4337,9 +4568,9 @@ mod tests {
             leader_active: true,
         };
         // Encoded sizes are 8, 8, 6, and 25 bytes. The group limit is 16.
-        assert_eq!(wq.drain_group(32), ptrs[..2]);
-        assert_eq!(wq.drain_group(32), ptrs[2..3]);
-        assert_eq!(wq.drain_group(32), ptrs[3..]);
+        assert_eq!(wq.drain_group(32).as_slice(), &ptrs[..2]);
+        assert_eq!(wq.drain_group(32).as_slice(), &ptrs[2..3]);
+        assert_eq!(wq.drain_group(32).as_slice(), &ptrs[3..]);
         assert!(wq.queue.is_empty());
     }
 
@@ -6916,5 +7147,384 @@ mod tests {
                 assert_eq!(fs::read(&wal_path).unwrap(), before);
             }
         }
+    }
+
+    #[test]
+    fn flush_deduplicates_overwrites_while_preserving_snapshot_and_rangedel_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions::default()
+                .with_write_buffer_size(64 << 20)
+                .with_l0_compaction_trigger(usize::MAX),
+            dir.path(),
+        )
+        .unwrap();
+
+        // 1. Without snapshots, repeated overwrites coalesce in the flushed L0 SST.
+        for round in 0..16u8 {
+            for k in 0..64u32 {
+                db.put(&format!("hot_{k:04}").into_bytes(), &[round; 256])
+                    .unwrap();
+            }
+        }
+        // Snapshot boundaries + interleaved range deletion must remain exact after flush.
+        db.put(b"snap_k", b"v1").unwrap();
+        db.put(b"ranged_k", b"rv1").unwrap();
+        let s1 = db.snapshot();
+
+        db.put(b"snap_k", b"v2").unwrap();
+        db.delete_range(b"ranged_a", b"ranged_z").unwrap();
+        let s2 = db.snapshot();
+
+        // Multiple overwrites inside the same `(s2, latest]` stripe still deduplicate
+        // to `v4`, while `s1` and `s2` keep `v1` and `v2`.
+        db.put(b"snap_k", b"v3").unwrap();
+        db.put(b"snap_k", b"v4").unwrap();
+        db.put(b"ranged_k", b"rv2").unwrap();
+
+        db.flush().unwrap();
+
+        let sst_bytes: u64 = db.get_property("total-sst-size").unwrap().parse().unwrap();
+        // 64 keys * 256B = ~16 KiB deduplicated vs > 260 KiB un-deduplicated.
+        assert!(
+            sst_bytes < 64 * 1024,
+            "unexpected flushed L0 size: {sst_bytes}"
+        );
+
+        for k in 0..64u32 {
+            assert_eq!(
+                db.get(&format!("hot_{k:04}").into_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some([15u8; 256].as_slice())
+            );
+        }
+        assert_eq!(
+            s1.get(b"snap_k").unwrap().as_deref(),
+            Some(b"v1".as_slice())
+        );
+        assert_eq!(
+            s2.get(b"snap_k").unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
+        assert_eq!(
+            db.get(b"snap_k").unwrap().as_deref(),
+            Some(b"v4".as_slice())
+        );
+
+        assert_eq!(
+            s1.get(b"ranged_k").unwrap().as_deref(),
+            Some(b"rv1".as_slice())
+        );
+        assert_eq!(s2.get(b"ranged_k").unwrap(), None);
+        assert_eq!(
+            db.get(b"ranged_k").unwrap().as_deref(),
+            Some(b"rv2".as_slice())
+        );
+    }
+
+    #[test]
+    fn hinted_trivial_move_drains_newly_over_budget_target_level_and_respects_filters() {
+        struct RewriteCountingFilter(Arc<AtomicUsize>);
+        impl CompactionFilter for RewriteCountingFilter {
+            fn filter(&self, _lvl: usize, _k: &[u8], _v: &[u8]) -> CompactionFilterDecision {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                CompactionFilterDecision::Keep
+            }
+        }
+
+        // 1. Five-level layout: two under-budget L2 files + L3 just below budget.
+        //    A single read hint on L2 moves one file to L3, pushing L3 over budget;
+        //    the worker must automatically drain L3 -> L4 without another wakeup!
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(
+            DbOptions::default()
+                .with_num_levels(5)
+                .with_compression(crate::CompressionType::None)
+                .with_max_bytes_for_level_base(20_000)
+                .with_max_bytes_for_level_multiplier(1.0), // L1=20KB, L2=20KB, L3=20KB
+            dir.path(),
+        )
+        .unwrap();
+
+        let build_sst = |path: &Path, num: u64, lo: &[u8], hi: &[u8], val_len: usize| {
+            let sst = path.join(format!("{num:06}.sst"));
+            let mut b = TableBuilder::new(
+                &sst,
+                TableBuildOptions {
+                    compression: crate::CompressionType::None,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let v = vec![b'p'; val_len];
+            b.add(
+                types::InternalKey::new(lo, 10, ValueType::Value).as_bytes(),
+                &v,
+            )
+            .unwrap();
+            b.add(
+                types::InternalKey::new(hi, 10, ValueType::Value).as_bytes(),
+                &v,
+            )
+            .unwrap();
+            flush::file_metadata((num, b.finish().unwrap()))
+        };
+
+        {
+            let synced = sync_new_sst_parent_dir(&db.dir_sync, &db.read.manifest_poisoned).unwrap();
+            let mut inner = db.inner.lock();
+            let f1 = inner.versions.file_numbers.allocate().unwrap();
+            let f2 = inner.versions.file_numbers.allocate().unwrap();
+            let f3 = inner.versions.file_numbers.allocate().unwrap();
+            let mut edit = VersionEdit::new();
+            // L2 total = ~13 KB (< 20 KB budget), 2 disjoint files (~6.5 KB each)
+            edit.add_file(2, build_sst(&db.storage_path, f1, b"a0", b"a9", 3_000));
+            edit.add_file(2, build_sst(&db.storage_path, f2, b"c0", b"c9", 3_000));
+            // L3 total = ~17 KB (< 20 KB budget); moving 1 L2 file pushes L3 > 20 KB!
+            edit.add_file(3, build_sst(&db.storage_path, f3, b"m0", b"m9", 8_000));
+            edit.set_next_file_number(inner.versions.next_file_number());
+            inner.versions.log_and_apply_synced(edit, synced).unwrap();
+            inner.versions.sync_manifest().unwrap();
+            db.install_super_version(&inner);
+        }
+        assert_eq!(db.get_property("compaction-pending").as_deref(), Some("0"));
+
+        // Push one L2 hint and signal the worker ONCE.
+        db.read
+            .read_compaction_hints
+            .lock()
+            .push(CompactionHint { level: 2 });
+        db.read.signal_compaction();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if db.get_property("compaction-pending").as_deref() == Some("0")
+                && db.get_property("num-files-at-level4").as_deref() != Some("0")
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(db.get_property("compaction-pending").as_deref(), Some("0"));
+        assert_eq!(db.get_property("num-files-at-level2").as_deref(), Some("1"));
+        assert!(
+            db.get_property("num-files-at-level4")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                >= 1
+        );
+
+        // 2. Under-budget L2 with an active `CompactionFilter` must NOT rewrite SSTs on hint.
+        let dir2 = tempfile::tempdir().unwrap();
+        let filter_calls = Arc::new(AtomicUsize::new(0));
+        let db2 = DB::open(
+            DbOptions::default()
+                .with_num_levels(4)
+                .with_compression(crate::CompressionType::None)
+                .with_max_bytes_for_level_base(50_000)
+                .with_max_bytes_for_level_multiplier(1.0)
+                .with_compaction_filter(Some(Arc::new(RewriteCountingFilter(Arc::clone(
+                    &filter_calls,
+                ))))),
+            dir2.path(),
+        )
+        .unwrap();
+        {
+            let synced =
+                sync_new_sst_parent_dir(&db2.dir_sync, &db2.read.manifest_poisoned).unwrap();
+            let mut inner = db2.inner.lock();
+            let f1 = inner.versions.file_numbers.allocate().unwrap();
+            let f2 = inner.versions.file_numbers.allocate().unwrap();
+            let mut edit = VersionEdit::new();
+            edit.add_file(2, build_sst(&db2.storage_path, f1, b"a0", b"a9", 2_000));
+            edit.add_file(2, build_sst(&db2.storage_path, f2, b"c0", b"c9", 2_000));
+            edit.set_next_file_number(inner.versions.next_file_number());
+            inner.versions.log_and_apply_synced(edit, synced).unwrap();
+            inner.versions.sync_manifest().unwrap();
+            db2.install_super_version(&inner);
+        }
+        db2.read
+            .read_compaction_hints
+            .lock()
+            .push(CompactionHint { level: 2 });
+        db2.read.signal_compaction();
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(filter_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            db2.get_property("stats.compaction_bytes_written")
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            db2.get_property("num-files-at-level2").as_deref(),
+            Some("2")
+        );
+
+        // 3. Under-budget L2 where a range tombstone pulls multiple source files
+        //    (`input_files_level.len() > 1`) is NOT a trivial move and must also skip rewrite.
+        let dir3 = tempfile::tempdir().unwrap();
+        let db3 = DB::open(
+            DbOptions::default()
+                .with_num_levels(4)
+                .with_compression(crate::CompressionType::None)
+                .with_max_bytes_for_level_base(50_000)
+                .with_max_bytes_for_level_multiplier(1.0),
+            dir3.path(),
+        )
+        .unwrap();
+        {
+            let synced =
+                sync_new_sst_parent_dir(&db3.dir_sync, &db3.read.manifest_poisoned).unwrap();
+            let mut inner = db3.inner.lock();
+            let f1 = inner.versions.file_numbers.allocate().unwrap();
+            let f2 = inner.versions.file_numbers.allocate().unwrap();
+            let sst1 = db3.storage_path.join(format!("{f1:06}.sst"));
+            let mut b1 = TableBuilder::new(
+                &sst1,
+                TableBuildOptions {
+                    compression: crate::CompressionType::None,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            b1.add(
+                types::InternalKey::new(b"a0", 11, ValueType::RangeDeletion).as_bytes(),
+                b"z9",
+            )
+            .unwrap();
+            b1.add(
+                types::InternalKey::new(b"a0", 10, ValueType::Value).as_bytes(),
+                &[b'p'; 1_000],
+            )
+            .unwrap();
+            let m1 = flush::file_metadata((f1, b1.finish().unwrap()));
+            let m2 = build_sst(&db3.storage_path, f2, b"c0", b"c9", 1_000);
+            let mut edit = VersionEdit::new();
+            edit.add_file(2, m1);
+            edit.add_file(2, m2);
+            edit.set_next_file_number(inner.versions.next_file_number());
+            inner.versions.log_and_apply_synced(edit, synced).unwrap();
+            inner.versions.sync_manifest().unwrap();
+            db3.install_super_version(&inner);
+        }
+        db3.read
+            .read_compaction_hints
+            .lock()
+            .push(CompactionHint { level: 2 });
+        db3.read.signal_compaction();
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            db3.get_property("stats.compaction_bytes_written")
+                .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            db3.get_property("num-files-at-level2").as_deref(),
+            Some("2")
+        );
+    }
+
+    #[cfg(feature = "bench-metrics")]
+    #[test]
+    fn write_profile_counts_actual_parks_not_spin_completions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(open_test_db(dir.path()));
+
+        // 1. Spin-only completion: hold `write_queue` with `leader_active = true` briefly,
+        //    let follower enqueue and spin, then complete its request immediately before 384 spins.
+        let db_spin = Arc::clone(&db);
+        let (enq_tx, enq_rx) = std::sync::mpsc::channel();
+        let follower = thread::spawn(move || {
+            let _ = crate::take_thread_write_profile();
+            enq_tx.send(()).unwrap();
+            db_spin.put(b"spin_k", b"v").unwrap();
+            crate::take_thread_write_profile()
+        });
+        enq_rx.recv().unwrap();
+        // Wait until follower pushes into queue while we simulate an active leader:
+        // easier & race-free: acquire `write_barrier`, `claim_leadership`, drop `barrier`,
+        // then once `wq.queue` is non-empty, drain and complete!
+        let _ = follower.join().unwrap(); // warm call
+
+        let mut barrier = db.acquire_write_barrier();
+        barrier.claim_leadership();
+        drop(barrier);
+        let db_spin2 = Arc::clone(&db);
+        let spin_handle = thread::spawn(move || {
+            let _ = crate::take_thread_write_profile();
+            db_spin2.put(b"spin_k2", b"v2").unwrap();
+            crate::take_thread_write_profile()
+        });
+        while db.write_queue.lock().queue.is_empty() {
+            std::hint::spin_loop();
+        }
+        // Complete immediately while follower is still in its spin window (or check WalSync repeated park)
+        let group = db
+            .write_queue
+            .lock()
+            .drain_group(db.options.write_buffer_size);
+        let mut dummy = false;
+        let res = db.write_batch_group(&group, std::ptr::null_mut(), &mut dummy);
+        let ok = res.map(|_| ());
+        DB::complete_write_group(&group, std::ptr::null_mut(), &ok);
+        db.release_write_leadership();
+        let spin_prof = spin_handle.join().unwrap();
+        assert_eq!(spin_prof.queue_waits, 1);
+        if spin_prof.queue_wakeups == 0 {
+            assert_eq!(spin_prof.queue_wait_ns, 0);
+        }
+
+        // 2. Repeated park (`WalSync` has `spin_limit = 0`, so follower parks immediately):
+        //    issue one spurious `unpark()` before completing -> `queue_waits == 1, queue_wakeups >= 2`!
+        let mut barrier = db.acquire_write_barrier();
+        barrier.claim_leadership();
+        drop(barrier);
+        let db_park = Arc::clone(&db);
+        let park_handle = thread::spawn(move || {
+            let _ = crate::take_thread_write_profile();
+            db_park
+                .put_with_options(
+                    &WriteOptions::default().with_durability(DurabilityMode::WalSync),
+                    b"park_k",
+                    b"v",
+                )
+                .unwrap();
+            crate::take_thread_write_profile()
+        });
+        let follower_thread = loop {
+            let wq = db.write_queue.lock();
+            if let Some(&rp) = wq.queue.front() {
+                let s = unsafe { (*rp).state.load(Ordering::Acquire) };
+                if (s & STATE_PARKED) != 0 {
+                    break unsafe { (*rp).waiter.clone().unwrap() };
+                }
+            }
+            drop(wq);
+            thread::yield_now();
+        };
+        // Spurious wakeup #1 -> follower wakes from park #1 and parks a second time!
+        follower_thread.unpark();
+        thread::sleep(Duration::from_millis(5));
+        let group = db
+            .write_queue
+            .lock()
+            .drain_group(db.options.write_buffer_size);
+        let mut dummy = false;
+        let res = db.write_batch_group(&group, std::ptr::null_mut(), &mut dummy);
+        let ok = res.map(|_| ());
+        DB::complete_write_group(&group, std::ptr::null_mut(), &ok);
+        db.release_write_leadership();
+        let park_prof = park_handle.join().unwrap();
+        assert_eq!(park_prof.queue_waits, 1);
+        assert!(
+            park_prof.queue_wakeups >= 2,
+            "expected >= 2 park returns, got {}",
+            park_prof.queue_wakeups
+        );
+        assert!(park_prof.queue_wait_ns > 0);
     }
 }

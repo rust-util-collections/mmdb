@@ -25,6 +25,11 @@ struct Progress {
 pub(super) struct FlushQueue {
     progress: Mutex<Progress>,
     changed: Condvar,
+    /// Mirrors `submitted - durable` so `check_capacity` avoids locking `progress`
+    /// on the common unthrottled write path.
+    inflight: AtomicU64,
+    /// Mirrors `progress.error.is_some()` for lock-free fast-path admission checks.
+    has_error: AtomicBool,
     standby_wal: Mutex<Option<(u64, WalWriter)>>,
     pub(super) standby_armed: AtomicBool,
     #[cfg(test)]
@@ -48,8 +53,12 @@ impl FlushQueue {
         let mut p = self.progress.lock();
         p.submitted += 1;
         p.pending.push_back(frozen);
+        self.inflight
+            .store(p.submitted - p.durable, Ordering::Release);
+        let submitted = p.submitted;
+        drop(p);
         self.changed.notify_all();
-        p.submitted
+        submitted
     }
 
     pub(super) fn target(&self) -> u64 {
@@ -57,7 +66,11 @@ impl FlushQueue {
     }
 
     pub(super) fn fail(&self, error: Error) {
-        self.progress.lock().error.get_or_insert(error);
+        {
+            let mut p = self.progress.lock();
+            p.error.get_or_insert(error);
+            self.has_error.store(true, Ordering::Release);
+        }
         self.changed.notify_all();
         #[cfg(test)]
         if let Some(hook) = self.on_fail.lock().take() {
@@ -65,7 +78,18 @@ impl FlushQueue {
         }
     }
 
+    #[inline]
     pub(super) fn check_capacity(&self, limit: usize, no_slowdown: bool) -> Result<()> {
+        if !self.has_error.load(Ordering::Acquire)
+            && self.inflight.load(Ordering::Acquire) < limit as u64
+        {
+            return Ok(());
+        }
+        self.check_capacity_slow(limit, no_slowdown)
+    }
+
+    #[cold]
+    fn check_capacity_slow(&self, limit: usize, no_slowdown: bool) -> Result<()> {
         let mut p = self.progress.lock();
         loop {
             if let Some(e) = &p.error {
@@ -186,7 +210,12 @@ impl FlushQueue {
                         self.fail(e);
                         return;
                     }
-                    self.progress.lock().durable += 1;
+                    {
+                        let mut p = self.progress.lock();
+                        p.durable += 1;
+                        self.inflight
+                            .store(p.submitted - p.durable, Ordering::Release);
+                    }
                     self.changed.notify_all();
                 }
             }
@@ -405,8 +434,7 @@ mod tests {
             while db.write_queue.lock().queue.is_empty() {
                 thread::yield_now();
             }
-            db.write_queue.lock().leader_active = false;
-            db.write_cv.notify_all();
+            db.release_write_leadership();
             flush.join().unwrap().unwrap();
             writer.join().unwrap().unwrap();
         });
@@ -579,8 +607,7 @@ mod tests {
             let admitted = scope.spawn(|| submit(&synced, b"admitted", b"value"));
             let queued = wait_for(|| db.write_queue.lock().queue.len() == 2);
             let freeze = db.submit_active();
-            db.write_queue.lock().leader_active = false;
-            db.write_cv.notify_all();
+            db.release_write_leadership();
             freeze.unwrap();
             running.recv_timeout(Duration::from_secs(5)).unwrap();
             // The flush worker is parked in the build hook. Only the group leader
