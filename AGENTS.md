@@ -32,9 +32,9 @@ A defect that also affects a supported target follows normal review and fix tria
 
 ```bash
 make all          # fmt + lint + test
-make test         # debug/release suites, optional profile-counter tests, exporter
+make test         # debug/release suites and optional profile-counter tests
 make ci           # fmt check + clippy + the CI test set (no release, no scale_profile)
-make lint         # default and bench-metrics clippy, exporter clippy, rustdoc
+make lint         # default and bench-metrics clippy, rustdoc
 make bench        # cargo bench with default features
 cargo test --test integration   # integration tests only
 cargo test --test crash_recovery
@@ -44,7 +44,7 @@ cargo test --test grouped_reads    # bounded pinned reads and snapshot visibilit
 cargo test --lib --features bench-metrics  # include opt-in diagnostic counters
 ```
 
-Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks (including `--manifest-path tools/v4-export/Cargo.toml` for the separately built v4 exporter crate). Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
+Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
 
 Toolchain: official latest stable Rust (edition 2024) for development, CI, and
 releases, selected via `RUSTUP_TOOLCHAIN=stable` or `cargo +stable`. Do not run
@@ -55,12 +55,11 @@ jobs, or older-compiler compatibility shims.
 
 ## Architecture
 
-Follow a write, read, compaction, or reopen in the [v5 storage architecture](docs/architecture.md).
+Follow a write, read, compaction, or reopen in the [storage architecture](docs/architecture.md).
 The [subsystem map](docs/ai/review-core.md#subsystem-map) pairs each source area
-with its review checklist. The [v5 contract checks](docs/ai/review-core.md#v5-contract-checks)
-connect admission, WAL fences, grouped reads, memory accounting and export
-to their implementing paths and tests. For public behavior and format conversion, see
-[Using MMDB v5](docs/usage.md) and [Migrating to v5](docs/migration.md).
+with its review checklist. The [storage contract checks](docs/ai/review-core.md#storage-contract-checks)
+connect admission, WAL fences, grouped reads, memory accounting and reopen
+to their implementing paths and tests. See the [usage guide](docs/usage.md) for public behavior.
 
 ## Skills
 

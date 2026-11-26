@@ -30,18 +30,13 @@ def registry_packages(blocks):
 def derive(original, version):
     header, *blocks = original.decode().split(PACKAGE)
     fields = [package_fields(b) for b in blocks]
-    local = [i for i, f in enumerate(fields) if f.get('name') == 'mmdb' and 'source' not in f]
-    if len(local) != 1:
+    engine = [i for i, f in enumerate(fields) if f.get('name') == 'mmdb']
+    if len(engine) != 1 or 'source' in fields[engine[0]]:
         raise ValueError('expected exactly one local mmdb package')
-    idx = local[0]
+    idx = engine[0]
     old = fields[idx]['version']
-    if any(f.get('name') == 'mmdb' and f['version'] == version and 'source' in f for f in fields):
-        raise ValueError(f'mmdb {version} would collide with a frozen registry package ID')
     changed = list(blocks)
     changed[idx] = changed[idx].replace(f'\nversion = "{old}"\n', f'\nversion = "{version}"\n', 1)
-    for i, block in enumerate(changed):
-        # Cargo qualifies references in mixed-version locks (the exporter uses v4 and v5).
-        changed[i] = block.replace(f'\n "mmdb {old}",\n', f'\n "mmdb {version}",\n')
     if registry_packages(changed) != registry_packages(blocks):
         raise ValueError('registry package names, versions or checksums changed')
     return PACKAGE.join([header, *changed]).encode()
@@ -49,10 +44,10 @@ def derive(original, version):
 
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('output', type=Path, help='directory for root.lock, storage.lock, capacity.lock and exporter.lock')
+    cli.add_argument('output', type=Path, help='directory for root.lock, storage.lock and capacity.lock')
     cli.add_argument('--manifest', type=Path, default=HERE.parents[2] / 'Cargo.toml',
                      help='MMDB Cargo.toml supplying the target package version')
-    cli.add_argument('--check', action='store_true', help='verify the four existing output files')
+    cli.add_argument('--check', action='store_true', help='verify the three existing output files')
     args = cli.parse_args()
     section = re.search(r'^\[package\][ \t]*\n(.*?)(?=^\[|\Z)', args.manifest.read_text(), re.M | re.S)
     fields = package_fields(section[1]) if section else {}
@@ -63,7 +58,6 @@ def main():
         'root': (HERE.parent / 'apple-m5/bench.Cargo.lock.gz', freeze['engine_lock_sha256']),
         'storage': (HERE / 'storage.lock.gz', freeze['standalone_storage_lock_sha256']),
         'capacity': (HERE / 'capacity.lock.gz', freeze['supplements']['capacity_external_lock_sha256']),
-        'exporter': (HERE / 'exporter.lock.gz', freeze['exporter_lock_sha256']),
     }
     outputs = {}
     for name, (source, expected) in archives.items():

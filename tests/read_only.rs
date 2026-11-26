@@ -286,15 +286,10 @@ fn read_only_uses_no_store_mutating_syscalls() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("current");
-    let old_path = dir.path().join("previous");
-    fs::create_dir(&old_path).unwrap();
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v4.3.15");
-    for entry in fs::read_dir(fixture).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_name() != "LOCK" {
-            fs::copy(entry.path(), old_path.join(entry.file_name())).unwrap();
-        }
-    }
+    let corrupt_path = dir.path().join("corrupt");
+    fs::create_dir(&corrupt_path).unwrap();
+    fs::write(corrupt_path.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+    fs::write(corrupt_path.join("MANIFEST-000001"), []).unwrap();
     let db = DB::open(DbOptions::default(), &path).unwrap();
     db.put(b"probe", b"value").unwrap();
     db.simulate_crash();
@@ -317,7 +312,7 @@ fn read_only_uses_no_store_mutating_syscalls() {
             "--nocapture",
         ])
         .env("MMDB_READ_ONLY_PROBE_PATH", &path)
-        .env("MMDB_READ_ONLY_OLD_PATH", old_path)
+        .env("MMDB_READ_ONLY_CORRUPT_PATH", corrupt_path)
         .output()
         .unwrap();
     assert!(
@@ -350,9 +345,9 @@ fn read_only_syscall_probe_child() {
     );
     assert!(db.contains_key(b"probe").unwrap());
     assert_eq!(db.sync_wal().unwrap_err().kind(), ErrorKind::ReadOnly);
-    let old = std::env::var_os("MMDB_READ_ONLY_OLD_PATH").unwrap();
+    let corrupt = std::env::var_os("MMDB_READ_ONLY_CORRUPT_PATH").unwrap();
     assert_eq!(
-        DB::open_read_only(old).err().unwrap().kind(),
+        DB::open_read_only(corrupt).err().unwrap().kind(),
         ErrorKind::Corruption
     );
     drop(db);

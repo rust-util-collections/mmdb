@@ -31,9 +31,7 @@ by this invocation.
      and its `agents/openai.yaml` interface and explicit-only policy.
    - For changes to CI, Make targets or Cargo settings, compare the affected
      command, manifest, target and feature set to the Final repository gate.
-   - Rust edits in root crate: `cargo +stable fmt --all -- --check` (and when
-     `tools/v4-export/**` is owned, also
-     `cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check`).
+   - For Rust edits in the root crate, run `cargo +stable fmt --all -- --check`.
      If an owned `.rs` file needs formatting, run
      `rustfmt +stable --edition 2024 --config skip_children=true <owned-paths>`
      and inspect the diff (`cargo fmt -- <paths>` still walks discovered module
@@ -56,10 +54,7 @@ by this invocation.
      installed locally, also run `cargo +nightly miri test --test arena_miri`
      (never install toolchains automatically; note if `miri` is absent);
    - optional diagnostic counters or profiles → exercise the affected test with
-     `--features bench-metrics` and check the caller with the feature disabled;
-   - `tools/v4-export/**` →
-     `CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml` (clean
-     `tools/v4-export/target` if `.gitignore` does not yet ignore nested `target/`).
+     `--features bench-metrics` and check the caller with the feature disabled.
 4. Fix failures caused by the unit before committing. Report pre-existing
    out-of-scope failures with the command and output rather than looping.
 5. Stage only the owned change. Use `git add -- <path>` for a wholly owned
@@ -99,22 +94,18 @@ on which checks actually ran.
 After the last behavior commit, run these commands once (do not substitute a
 `make` target unless requested by the user). Including `clippy --lib` checks the
 production library configuration without `[dev-dependencies]` enabling
-`test-utils`, `--all-targets` and the test binaries mirror
-`.github/workflows/ci.yml` and `make ci`, and the explicit `--manifest-path`
-commands cover the standalone `tools/v4-export` crate (if CI and
-`Makefile` diverge, run the union and report the drift):
+`test-utils`. The all-target checks and test binaries mirror
+`.github/workflows/ci.yml` and `make ci`. If CI and the Makefile diverge,
+run the union and report the drift.
 
 ```bash
 cargo +stable fmt --all -- --check
-cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check
 cargo +stable check --all-targets
 cargo +stable check --benches --features bench-metrics
-cargo +stable check --manifest-path tools/v4-export/Cargo.toml --all-targets
 cargo +stable clippy --lib -- -D warnings
 cargo +stable clippy --lib --features bench-metrics -- -D warnings
 cargo +stable clippy --all-targets -- -D warnings
 cargo +stable clippy --all-targets --features bench-metrics -- -D warnings
-cargo +stable clippy --manifest-path tools/v4-export/Cargo.toml --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps
 RUSTDOCFLAGS="-D warnings" cargo +stable doc --no-deps --features bench-metrics
 cargo +stable test --lib
@@ -129,7 +120,6 @@ cargo +stable test --test lazy_delete
 cargo +stable test --test shared_cache
 cargo +stable test --test grouped_reads
 cargo +stable test --test read_only
-CI=1 cargo +stable test --manifest-path tools/v4-export/Cargo.toml
 ```
 
 Notes on gate execution:
@@ -146,12 +136,6 @@ Notes on gate execution:
   `strace` is installed (enforced in CI via `CI=1`). If `strace` is absent on
   the local host, note in the report that the optional `strace` probe skipped
   while the read-only suite passed.
-- The exporter command sets `CI=1` so the Linux gate must actually publish
-  and reopen the exported shard. Other local filesystems may exercise the
-  unsupported-exclusive-rename fallback in ordinary exporter tests.
-- If `.gitignore` uses root-anchored `/target` rather than `target/`, run
-  `cargo +stable clean --manifest-path tools/v4-export/Cargo.toml` after the
-  exporter checks so `tools/v4-export/target/` is not left untracked.
 - Skip the Rust gate for docs-only runs unless the scope is `all` or an eligible
   version bump is being finalized. `all` runs the full gate even with zero code
   edits.
@@ -223,10 +207,9 @@ When eligible:
    the version commit and any existing tag. Report the incomplete step with
    the tag name, expected commit, and error or observed target.
 
-Never accept a public API or persisted on-disk format break on the user's
-behalf: keep unaccepted breaking findings `Open` and uncommitted; an explicitly
-user-approved breaking change uses a major bump and migration docs instead of an
-automatic patch. Never backfill missing tags, push, open a PR, publish, or
+Keep findings that break a public API or the persisted format `Open` and
+uncommitted until the user explicitly approves the break. An approved breaking
+change uses a major version bump with caller-facing upgrade notes. Never backfill missing tags, push, open a PR, publish, or
 force-add gitignored `Cargo.lock`.
 
 ## Final state

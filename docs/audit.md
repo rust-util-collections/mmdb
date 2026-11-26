@@ -24,12 +24,6 @@ None.
 - **What**: Compaction casts the configured `u64` target to `usize`. On a 32-bit target, `target_file_size_base = 1 << 32` becomes zero, so a rewrite requests an SST split at every distinct user-key boundary.
 - **Reason**: Confirmed by tracing the integer conversion and split predicate. The supported 64-bit ABIs preserve this value. The project accepts the 32-bit behavior under its [architecture policy](../README.md#supported-architectures).
 
-### [MEDIUM] v4 exporter: the Windows rename binding uses the wrong ABI on 32-bit x86
-
-- **Where**: `tools/v4-export/src/main.rs` (`publish`), `tools/v4-export/Cargo.toml`, and `renamest` 0.1.3 (`src/windows.rs:8–13,26`).
-- **What**: The exporter's Windows backend declares `MoveFileExW` with `extern "C"`. The Win32 binding uses `extern "system"`, which selects `stdcall` on 32-bit x86. This mismatch can prevent linking or cause incorrect stack cleanup if the call resolves. [Windows binding](https://docs.rs/windows-sys/0.61.2/src/windows_sys/Windows/Win32/Storage/FileSystem/mod.rs.html#273) · [Rust ABI reference](https://doc.rust-lang.org/reference/items/external-blocks.html#abi)
-- **Reason**: Static inspection establishes the declaration mismatch. Its effect is specific to the unsupported 32-bit x86 Windows ABI. Re-check the entry when the exporter changes rename backends or updates the dependency.
-
 ### [LOW] lazy_delete: in-flight compaction wait test uses a fixed sleep
 - **Where**: `tests/lazy_delete.rs` (`compact_waits_for_inflight_compaction_and_removes_dead_keys`, the 200 ms delay before opening the filter gate)
 - **What**: The test releases the background compaction gate after a fixed delay instead of after `compact_range` has observed the in-flight claim. An unlucky schedule can let `compact_range` start after the release, so the wait path is not exercised; the final assertion can still pass.
@@ -47,7 +41,7 @@ None.
 ### SST: an index separator that is a range-deletion key makes point lookups miss a visible entry
 - **Where**: `src/sst/table_builder.rs` (`shorten_separator`), `src/sst/table_reader/mod.rs` (`point_value_with_probe`, `partition_point_index_leaf`)
 - **Claim**: An index separator encoded with `ValueType::RangeDeletion` can exceed a visible data key in its block or skip a block that holds the target.
-- **Reason**: In v5, `RangeDeletion` entries route directly to `add_range_fragment` without touching `data_block`, and `shorten_separator` emits `InternalKey::new(&prefix, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion)` only when `lo < prefix < hi` strictly as user keys (equal-user-key boundaries retain the full unshortened `last_key`). Thus `last_key < separator < next_first_key` holds in internal-key order without crossing any data key's user key, and `ReadState::point_lookup` folds covering range tombstones independently via `covering_sequence`.
+- **Reason**: `RangeDeletion` entries route directly to `add_range_fragment` without touching `data_block`, and `shorten_separator` emits `InternalKey::new(&prefix, MAX_SEQUENCE_NUMBER, ValueType::RangeDeletion)` only when `lo < prefix < hi` strictly as user keys (equal-user-key boundaries retain the full unshortened `last_key`). Thus `last_key < separator < next_first_key` holds in internal-key order without crossing any data key's user key, and `ReadState::point_lookup` folds covering range tombstones independently via `covering_sequence`.
 
 ### write path: `close`/`compact_range`/stop-drain holding `write_queue` across install can deadlock a group-commit leader
 - **Where**: `src/db.rs` (`acquire_write_barrier`, `release_write_leadership`, `maybe_throttle_writes`, `prune_settled_dead_keys`)

@@ -250,7 +250,7 @@ mod tests {
     use std::result::Result as StdResult;
 
     #[test]
-    fn record_parts_match_contiguous_v4_fragments() {
+    fn record_parts_match_contiguous_fragments() {
         let dir = tempfile::tempdir().unwrap();
         let flat = dir.path().join("flat.wal");
         let split = dir.path().join("split.wal");

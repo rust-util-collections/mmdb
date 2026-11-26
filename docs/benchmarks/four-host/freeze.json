@@ -6,7 +6,6 @@
   "engine_lock_sha256": "6a212e9b0094bdd134fac3a3cda14120a82869fa2eef27f25144420c7f9eb27a",
   "standalone_storage_lock_sha256": "48475b5f55d411b48940925a7d79076f304233ebd152193b878544960b2ff414",
   "file_sha256": {
-    "protocol.md": "1a912534d97afeff9b412a486cb63eb46efcaaae1a5610590c72316216b98ebd",
     "memory-plan.jsonl.gz": "1599631ea7a7fea5e5ac088226f2823007cb2e0fef5295ac9e35b8eae7138228",
     "storage/Cargo.toml": "e5437d9f00cd92b1841d1d75a9116138e44f6736d77e9c10fae12f197119b446",
     "storage/src/main.rs": "1dca05fe7aa079fba0dfc488bd66dbeca4d901c3a361e1c0cb63ab4d226a2e93",
@@ -45,7 +44,6 @@
     "capacity_external_lock_sha256": "d3fd06d388cc16f398f16495fcbe8abd45cab8786d71738df55b79fddc21d989"
   },
   "git_archive_tar_sha256": "3856c59f593af427a4b347056c4c4e1a9fce01309f937e3ea8cd15b8299c7e88",
-  "exporter_lock_sha256": "b875d37eaf5205f093af353572d7e551bf1c489136b41bb3f7c32eb93c7fe842",
   "archived_evidence": {
     "engine_revision": "828e47a1d019e3fd0854a3d9a0d98b72e873350c",
     "physical_hosts": 4,
@@ -66,6 +64,18 @@
       "excluded_m5_pool256_reopen": 10
     },
     "raw_files": 132,
-    "archive_sha256": "32a541f77c958c1dc1aebb6e2f74b7e1d46415dbcbbf616e12d0a631be9c0df2"
+    "archive_sha256": "7d8362edc28da09d71ef981813352588c35db71f40f14d90fb6e120112019113"
+  },
+  "engine_evidence_extract": {
+    "source_commit": "e0e490dce4eb53f03ed7e56d036779e906dfb3c1",
+    "original_archive_sha256": "32a541f77c958c1dc1aebb6e2f74b7e1d46415dbcbbf616e12d0a631be9c0df2",
+    "archive_sha256": "7d8362edc28da09d71ef981813352588c35db71f40f14d90fb6e120112019113",
+    "archive_bytes": 198853,
+    "local_file_sha256": {
+      "protocol.md": "4f01013b58b008336559536ae9c1fbfd9dcf277343ca7f41962438a399e0230f"
+    },
+    "original_file_sha256": {
+      "protocol.md": "1a912534d97afeff9b412a486cb63eb46efcaaae1a5610590c72316216b98ebd"
+    }
   }
 }

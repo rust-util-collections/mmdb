@@ -98,7 +98,7 @@ pub(crate) fn confirm_manifest_durable(
     check_manifest_poison(poisoned)
 }
 
-/// First WAL-framed record in every v5 MANIFEST. Fixed-width integers are LE.
+/// First WAL-framed record in the MANIFEST. Fixed-width integers are LE.
 #[derive(Clone, Copy)]
 struct DBHeader {
     levels: u32,
@@ -106,6 +106,9 @@ struct DBHeader {
 }
 
 impl DBHeader {
+    // The on-disk format version is independent of the crate's major version.
+    const FORMAT_VERSION: u32 = 5;
+
     fn new(levels: usize, prefix_len: usize) -> Result<Self> {
         if !(2..=16).contains(&levels) {
             return Err(Error::invalid_argument("num_levels must be in 2..=16"));
@@ -120,14 +123,17 @@ impl DBHeader {
     fn encode(self) -> [u8; 16] {
         let mut bytes = [0; 16];
         bytes[..4].copy_from_slice(b"MMDB");
-        bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&Self::FORMAT_VERSION.to_le_bytes());
         bytes[8..12].copy_from_slice(&self.levels.to_le_bytes());
         bytes[12..].copy_from_slice(&self.prefix_len.to_le_bytes());
         bytes
     }
 
     fn decode(data: &[u8]) -> Result<Self> {
-        if data.len() != 16 || &data[..4] != b"MMDB" || data[4..8] != 5u32.to_le_bytes() {
+        if data.len() != 16
+            || &data[..4] != b"MMDB"
+            || data[4..8] != Self::FORMAT_VERSION.to_le_bytes()
+        {
             return Err(Error::corruption(
                 "missing or unsupported MMDB v5 MANIFEST header",
             ));

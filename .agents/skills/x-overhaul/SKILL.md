@@ -100,9 +100,8 @@ latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
 | `refactor(...)` | No behavior change: same `ErrorKind`, same order of fsync / dir-sync / MANIFEST append / `CURRENT` rename / unlink, same lock scope | Behavior defect at its own severity |
 
 **Revert probe** (each `fix(...)` commit in the frozen range): identify the
-behavior-changing hunks, including those in the standalone exporter or an
-evidence validator where applicable. Run the relevant check at `HEAD` and
-confirm it actually exercises the case. On eligible clean paths, reverse-apply
+behavior-changing hunks, including any in an evidence validator. Run the
+relevant check at `HEAD` and confirm it actually exercises the case. On eligible clean paths, reverse-apply
 only those implementation hunks, retaining the regression test even when
 it lives in the same Rust file. Run the same check and record whether the
 expected failure occurs. Reapply the identical patch and confirm `git diff --quiet -- <paths>` before
@@ -116,7 +115,7 @@ tests gives no coverage evidence.
    latched by an iterator stays latched on every later advance", "a partitioned
    SST leaf agrees with its resident directory bounds", "already-committed
    writes still return `Ok(())` when post-commit rotation fails").
-2. Follow the affected [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks)
+2. Follow the affected [storage contract checks](../../../docs/ai/review-core.md#storage-contract-checks)
    across API, subsystem and caller boundaries. Search sibling paths including forward/reverse
    twins (`seek` vs `seek_for_prev` / `seek_to_last`), lending `step_next` /
    `step_prev` vs `Iterator::next` / `next_back`, `DBIterator` / `BidiIterator` /

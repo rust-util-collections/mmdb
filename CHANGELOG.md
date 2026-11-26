@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased v5
+## Unreleased v6
+
+- MMDB 6.0 opens existing v5 databases in place, including their residual WALs.
+  Conversion of earlier databases is handled by the v5 release. [Upgrade path](docs/migration.md)
+
+## v5
 
 - `DB::get_many_pinned` and `get_many_pinned_with_options` return one
   ordered slot per input key at a single database view and sequence.
@@ -13,6 +18,3 @@
   L0 pin payload bytes. `BlockCachePool::usage()` reports the configured
   capacities and approximate weighted charges of the two shared cache stores.
   A same-key cache replacement retains its registration for file invalidation.
-- The v4 exporter is tested with a three-level, eight-byte-prefix store
-  containing both SST and residual WAL rows, including writable reopen with
-  matching geometry. [Migration guide](docs/migration.md)

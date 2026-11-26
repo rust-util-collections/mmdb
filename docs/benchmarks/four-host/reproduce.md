@@ -1,6 +1,10 @@
 # Reproducing the four-host comparison
 
 Use the SHA and dependency digests in [freeze.json](freeze.json).
+The `engine_evidence_extract` entries in the two manifests identify the
+local archives and the hashes of protocol and helper files edited for
+this checkout. To inspect the documents as originally frozen, use the
+pinned [v5 publication](https://github.com/rust-util-collections/mmdb/tree/e0e490dce4eb53f03ed7e56d036779e906dfb3c1/docs/benchmarks/four-host).
 Create an independent checkout for each host. Keep all fixtures, Cargo
 targets and results in that experiment's own paths on the intended device.
 Verify the mount of `$scratch`, rather than relying on the path name.
@@ -12,9 +16,7 @@ git clone "$source" "$work/clone"
 git -C "$work/clone" checkout --detach 828e47a1d019e3fd0854a3d9a0d98b72e873350c
 cd "$work/clone"
 gzip -dc docs/benchmarks/apple-m5/bench.Cargo.lock.gz > Cargo.lock
-gzip -dc "$campaign/exporter.lock.gz" > tools/v4-export/Cargo.lock
 cargo +stable test --locked --test grouped_reads --test crash_recovery
-CI=1 cargo +stable test --locked --manifest-path tools/v4-export/Cargo.toml --test golden
 cargo +stable bench --locked --no-run --bench engine_profile
 cargo +stable bench --locked --no-run --bench grouped_reads --features test-utils
 ```

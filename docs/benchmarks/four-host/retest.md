@@ -15,10 +15,9 @@ normal MMDB and VSDB working directories.
 ### Changes to collection
 
 1. Preflight source/tree, dependencies, binary hashes, tool versions,
-   CPU mask, scratch device and cache policy. Derive the four Cargo locks
-   from the archived locks: change only the local MMDB path package and
-   its qualified references. Verify every registry version and checksum,
-   including the exporter's independent MMDB 4.3.15 reader. Check actual
+   CPU mask, scratch device and cache policy. Derive the engine, storage
+   and capacity Cargo locks by changing the local MMDB package version.
+   Verify every registry version and checksum. Check actual
    reopen configuration on the first run and probe the capacity tool's
    `fincore` output before the first formal pair.
 2. Serialize deliberate workloads using one host lock. Checkpoint a

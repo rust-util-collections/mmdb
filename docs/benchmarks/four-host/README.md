@@ -1,5 +1,10 @@
 # MMDB v5 on four physical hosts
 
+Both archives preserve the v5 performance observations byte for byte. This
+checkout carries engine-only excerpts of the accompanying build and test
+receipts. The campaign manifests identify the source commit, original
+archive digests, and digests of the excerpts. [Original v5 publication](https://github.com/rust-util-collections/mmdb/tree/e0e490dce4eb53f03ed7e56d036779e906dfb3c1/docs/benchmarks/four-host)
+
 ## Follow-up on MMDB 5.0.1
 
 The follow-up freezes production revision `b18532d` and retains
@@ -128,7 +133,7 @@ The hot-shard p99 loss remained reproducible on 9950X/ZFS: 0.398 to 1.665 ms, a 
 
 ### Evidence and verification
 
-The archived retest contains **1,510 formal physical observations**, including 160 independent old/new sentinel processes. Reusing storage controls eliminated 90 duplicated executions, and the warm-read selection omitted 60 redundant secondary-volume processes. The comparable tuning matrix used 1,350 executions versus 1,500 before the added version sentinels. There are separately labelled 40 CPU-mask confirmation processes, 20 explicitly prewarmed capacity confirmations and four rejected ZFS device pilots. All four hosts passed their functional gates, including the revised shared-cache tests. The [raw retest archive](retest-observations.tar.gz) contains 136 canonical files and their SHA-256 manifest (267,904 compressed bytes). Archive SHA-256: `f5e83768a4f6ca0d9ef168b499eea67eb5962203040864b3b729da8e3af6cc82`. [Reproduce both summaries and their differences](reproduce.md#optimized-501-retest).
+The archived retest contains **1,510 formal physical observations**, including 160 independent old/new sentinel processes. Reusing storage controls eliminated 90 duplicated executions, and the warm-read selection omitted 60 redundant secondary-volume processes. The comparable tuning matrix used 1,350 executions versus 1,500 before the added version sentinels. There are separately labelled 40 CPU-mask confirmation processes, 20 explicitly prewarmed capacity confirmations and four rejected ZFS device pilots. All four hosts passed their functional gates, including the revised shared-cache tests. The retest archive contains 136 files and their SHA-256 manifest. [Raw retest archive](retest-observations.tar.gz) · [Archive digests](retest-5.0.1.json) · [Reproduce both summaries and their differences](reproduce.md#optimized-501-retest)
 
 ## Historical campaign at `828e47a`
 
@@ -144,10 +149,9 @@ diagnostic trials. The final summaries were regenerated from an extraction
 of the published archive. All seven paths had the same small-SST SHA-256,
 and the four accepted scattered-device cells had the same large-SST
 SHA-256. For each payload, seed and codec, the encoded SST byte counts
-matched across all seven paths. Each physical host passed the grouped-read,
-crash-recovery and exporter preflight (7, 27 and 5 cases) and the final
-library and integration checks (435 and 74 cases). The M5 also passed
-the full 25-command repository gate. [Raw observations and receipts](observations.tar.gz) ·
+matched across all seven paths. Each physical host passed the grouped-read
+and crash-recovery suites (7 and 27 cases), followed by the final library
+and integration checks (435 and 74 cases). [Raw observations and receipts](observations.tar.gz) ·
 [Coverage and archive digest](freeze.json) · [Regenerate detailed tables and per-stack decisions](reproduce.md#recalculate-the-results)
 
 ### Which configuration to use

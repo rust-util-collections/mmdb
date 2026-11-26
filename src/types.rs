@@ -902,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_batch_matches_v4_record_body_and_reuses_allocation() {
+    fn prefixed_batch_encodes_wal_entries_and_reuses_allocation() {
         let mut b = WriteBatch::with_capacity(128);
         let (_, allocated) = crate::test_alloc::count_allocated(|| {
             b.put_prefixed(b"p", b"a", b"v");

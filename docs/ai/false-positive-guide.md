@@ -34,8 +34,7 @@ caller guards, and tests (panics OK).
 ## FP-5: Clippy already enforces
 
 CI is `-D warnings`. Skip unused vars, needless clones, redundant closures, etc.
-Focus on semantics clippy cannot see. Check the exporter separately with
-`--manifest-path tools/v4-export/Cargo.toml`.
+Focus on semantics clippy cannot see.
 
 ## FP-6: Advice without downside
 
@@ -59,8 +58,8 @@ assumptions, or missing/vague comment.
 Point reads, iteration, group commit, block decoding and Bloom probes run on
 core paths. Flush and compaction affect them when writers wait for capacity
 or readers contend for resources. Quantify allocations, lock time, I/O or
-throughput at the affected API. For occasional cleanup jobs or a one-time
-export, assess the cost within that task. A bounded local cost can be an
+throughput at the affected API. For occasional cleanup jobs, assess the
+cost within that task. A bounded local cost can be an
 acceptable trade for correctness or simplicity. [Performance priorities](review-core.md#performance-priorities)
 
 ## FP-10: Incomplete lock analysis

@@ -35,8 +35,6 @@ tombstone test and all 22 WAL reader/writer tests passed under that limit.
 Starting `make test` at soft limit 256 with a higher hard limit ran the
 children at 4,096. Debug and release each passed 577 runtime cases and two
 doctests. The feature-enabled library suite passed 429 overlapping cases.
-The exporter passed its publication test and five integration cases,
-including the writable reopen of the migrated eight-byte-prefix shard.
 The profiling-only test was ignored as configured. The syscall trace in
 the earlier Linux suite is Linux-specific. [Native test counts](validation.json)
 

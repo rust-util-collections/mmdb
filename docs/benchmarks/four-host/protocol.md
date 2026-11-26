@@ -40,7 +40,7 @@ comparisons; none isolates the causal effect of a kernel version.
   settings and the [frozen Cargo lock](../apple-m5/bench.Cargo.lock.gz)
   (uncompressed SHA-256 `6a212e9b0094bdd134fac3a3cda14120a82869fa2eef27f25144420c7f9eb27a`).
   Keep any external measurement harness and its lock separately identified.
-- Run the grouped-read, crash-recovery and v4-exporter golden tests.
+- Run the grouped-read and crash-recovery tests.
   Confirm actual mount, physical devices, free space, CPU topology,
   affinity, quotas and memory. Record compression and cache policy. On
   Btrfs mark only the empty scratch directory NOCOMP before creating

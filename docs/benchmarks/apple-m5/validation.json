@@ -96,14 +96,6 @@
       "src/lib.rs": {
         "passed": 429
       }
-    },
-    "cargo test --manifest-path tools/v4-export/Cargo.toml": {
-      "src/main.rs": {
-        "passed": 1
-      },
-      "tests/golden.rs": {
-        "passed": 5
-      }
     }
   },
   "bare_default_libtest_soft_256": {
@@ -136,8 +128,9 @@
   "documentation_head": "1a28fc5",
   "additional_checks": [
     "cargo +stable fmt --all -- --check",
-    "cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check",
     "cargo +stable clippy --all-targets --features bench-metrics,test-utils -- -D warnings",
     "15 Python measurement-tool unit tests"
-  ]
+  ],
+  "scope": "Engine checks selected from the original v5 validation receipt.",
+  "original_receipt": "https://github.com/rust-util-collections/mmdb/blob/e0e490dce4eb53f03ed7e56d036779e906dfb3c1/docs/benchmarks/apple-m5/validation.json"
 }

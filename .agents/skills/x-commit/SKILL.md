@@ -54,7 +54,7 @@ Preflight, then freeze owned paths before editing.
 For documentation and skill changes, use the [documentation map](../../../docs/ai/review-core.md#documentation-map)
 and the [per-unit validation rules](../../../docs/ai/commit-protocol.md#per-unit-validate-and-commit).
 For code, trace the complete changed operation and error or cleanup path.
-Select the relevant [v5 contract checks](../../../docs/ai/review-core.md#v5-contract-checks)
+Select the relevant [storage contract checks](../../../docs/ai/review-core.md#storage-contract-checks)
 and subsystem guide. A change in a benchmark driver or validator needs
 verification against its input, marker for the measured path and output metric.
 Fix confirmed defects in the owned unit and cover behavior changes with a

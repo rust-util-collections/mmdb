@@ -1,58 +1,21 @@
-# Migrating to v5
+# Upgrading to MMDB v6
 
-## Convert a v4 directory
+The supported data upgrade path is **v4 → v5 → v6**. Complete the first
+step with the [v5 release's migration guide](https://github.com/rust-util-collections/mmdb/blob/e0e490dce4eb53f03ed7e56d036779e906dfb3c1/docs/migration.md).
 
-MMDB v5 requires a v5 MANIFEST header and SST v2. Use the standalone exporter
-to copy the visible rows from a stable v4 store into a new v5 directory.
-Run from the repository root. The destination must be absent, its parent must
-already exist, and it must be outside the source directory.
+## Reopen a v5 database
 
-```sh
-cargo +stable run --manifest-path tools/v4-export/Cargo.toml -- /data/v4 /data/v5 3 2
-```
+MMDB v6 uses the same MANIFEST header (format 5), SST v2 tables and WAL
+records as v5. Existing v5 data can be upgraded in place.
 
-The last two positional arguments are the **source** v4 level count and
-fixed prefix length. The example uses three levels and a two-byte prefix.
-Omitting both selects the v4 defaults of seven levels and a zero prefix length.
+1. Stop the v5 writer and close its database handles. Keep the complete
+   database directory together, including any residual WALs.
+2. Update the application's Cargo dependency to `mmdb = "6"`. Open the
+   same path with `DB::open`, using the original `num_levels` and
+   `prefix_len`. Opening replays eligible WAL records as usual.
+3. Check the expected keys or scan the database before resuming writes.
+   An owned iterator exposes errors through `error()` after the scan.
 
-1. The exporter opens the source read-only with MMDB 4.3.15, including valid residual WAL records.
-2. It creates a staging directory under the destination parent. It preserves the prefix length and clamps the destination level count to 2–16.
-3. It streams visible pairs in key order through `DB::ingest_sorted` and checks the source iterator's final error. Ingestion writes bottommost SSTs directly. The new database contains the visible values with a new sequence history.
-4. After closing both databases, the exporter moves the staging directory into place with an exclusive rename. If another process has created the destination, its contents are preserved. Unix builds sync the parent directory after publication.
-
-Publication requires a filesystem and OS that support an exclusive directory
-rename. The exporter uses a native operation on Linux, Android, Apple
-platforms, Redox, FreeBSD with `renameat2`, and Windows. An unsupported
-rename returns an error. An interruption before the move leaves the destination
-name available for retry. If the final directory sync fails on Unix, the
-completed store is already visible and its survival across power loss is
-uncertain.
-
-Verify the destination through a writable reopen with the geometry the caller
-will actually use. For a v4 shard with three levels and an eight-byte prefix,
-pass `3 8` to the exporter. A v5 read-only open adopts the recorded geometry
-and can succeed even if the export used the wrong prefix length. Check the
-visible rows in key order and the final iterator status on both sides before
-switching the caller. The exporter preserves the visible contents at the
-offline cut and assigns fresh engine sequence history.
-
-For a VSDB universe, use the offline `vsdb-stage-v5` tool. It stages the
-default and named namespaces together, rebinds external placements and
-checks allocator floors. A v18-on-v4 universe keeps its collection
-encodings. Applications upgrading v17 also convert saved and embedded
-handles in their staging copy. [MMDB exporter and golden tests](../tools/v4-export/tests/golden.rs) · [VSDB migration guide](https://github.com/rust-util-collections/vsdb/blob/master/migration/README.md)
-
-## Update Rust callers
-
-| v4 usage | v5 usage |
-|----------|----------|
-| Exhaustive option struct literals | Start with `Default` or a preset and chain `with_*` setters |
-| `sync` and `disable_wal` write flags | Select `DurabilityMode::{WalAsync, WalSync, DisableWal}`. Use `DB::sync_wal()` to fence prior WAL-enabled writes |
-| Raw snapshot sequence in `ReadOptions` | Pass a live snapshot to `with_snapshot` or call `snapshot.read_options()` |
-| Owned iteration bounds | Supply borrowed slices or owned buffers to the range-bound setters |
-| Value-sensitive block properties | Collect user keys from values and point deletions. Keep each collector name's meaning stable. A block may be skipped only if every collected key fails `key_matches` |
-| Indexed batch conversion and range access | Propagate `into_batch()?`. `range_tombstones()` iterates borrowed endpoints and write positions |
-| String iterator errors | Use fallible lending steps or check `error() -> Option<&Error>` after owned iteration |
-| `pin_l0_filter_and_index_blocks_in_cache` | Use `pin_l0_first_block_and_warm_index` |
-
-[Public exports](../src/lib.rs) · [Options and filter contracts](../src/options.rs) · [v5 usage](usage.md)
+For read-only inspection, `DB::open_read_only` adopts the geometry from
+the MANIFEST and replays valid residual WAL records in memory.
+[Open and read options](usage.md) · [Database files and recovery](architecture.md#database-files-and-recovery)
