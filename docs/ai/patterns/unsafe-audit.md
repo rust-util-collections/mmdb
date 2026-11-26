@@ -57,7 +57,7 @@ rather than `unsafe`.
   - `cargo +nightly miri test --test arena_miri` exercises concurrent insertion, traversal, and `MemTablePin` reads under Miri.
 - **Group commit, file lock, & WAL writeback (`db.rs`)**:
   - Each `*mut WriteRequest` points to a writer thread's live stack frame inside `enqueue_write` until the leader publishes `STATE_DONE` via `(*rp).state.swap(STATE_DONE, Ordering::AcqRel)` (after writing `result` and taking `waiter`). Neither follower nor leader forms `&WriteRequest` or `&mut WriteRequest` while queued; `write_queue` serializes `wake_queue_head` (which clones `waiter` and sets `STATE_WAKE` before `drain_group`) against `drain_group` (which sets `STATE_IN_GROUP`), and no thread dereferences `req_ptr` once `STATE_DONE` is swapped.
-  - `flock` and `sync_file_range` borrow live descriptors owned by `DirLock` / `WalWriter` (`i64::try_from` checked offsets).
+  - `flock` borrows the live descriptor owned by `DirLock`; advisory `sync_file_range` (`hint_wal_writeback`) borrows the live `WalWriter` descriptor with `i64::try_from`-checked offset and length.
 - **SST readahead (`sst/table_reader/mod.rs`)**:
   - `posix_fadvise` passes `self.file.as_raw_fd()` with checked `i64::try_from` offsets while `TableReader` owns the open `SstFile`; cached data blocks are safe `Arc<Vec<u8>>` buffers.
 - **Test counting allocator (`test_alloc.rs`, `#[cfg(test)]`)**:
