@@ -6427,7 +6427,14 @@ mod tests {
                 }
             }));
         }
-        thread::sleep(Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while db.get_property("stats.flushes_completed").as_deref() == Some("0") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writers never triggered an auto-flush before close"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
         db.close().expect("close during auto-flush");
         stop.store(true, Ordering::Relaxed);
         for h in writers {
@@ -6563,10 +6570,12 @@ mod tests {
             }
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let progressed = Arc::new(AtomicBool::new(false));
         let mut workers = Vec::new();
         for t in 0..3u8 {
             let db = Arc::clone(&db);
             let stop = Arc::clone(&stop);
+            let progressed = Arc::clone(&progressed);
             workers.push(thread::spawn(move || {
                 let mut i = 0u32;
                 while !stop.load(Ordering::Relaxed) {
@@ -6575,11 +6584,19 @@ mod tests {
                     let _ = db.compact_range(Some(begin.as_bytes()), Some(end.as_bytes()));
                     let key = format!("w{t}-{:05}", i);
                     let _ = db.put(key.as_bytes(), b"x");
+                    progressed.store(true, Ordering::Release);
                     i = i.wrapping_add(1);
                 }
             }));
         }
-        thread::sleep(Duration::from_millis(40));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !progressed.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workers never completed a compact_range iteration before close"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
         db.close().expect("close during compact_range");
         stop.store(true, Ordering::Relaxed);
         for h in workers {
@@ -6799,7 +6816,16 @@ mod tests {
                 }
             }));
         }
-        thread::sleep(Duration::from_millis(60));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while db.get_property("stats.compactions_completed").as_deref() == Some("0")
+            && db.l0_file_count.load(Ordering::Relaxed) < 3
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "writers never reached L0 stop-trigger drain before close"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
         db.close().expect("close during L0 stop drain");
         stop.store(true, Ordering::Relaxed);
         for h in writers {
@@ -6853,6 +6879,14 @@ mod tests {
                     i = i.wrapping_add(1);
                 }
             }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while written.lock().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disable_wal writers never landed a key before flush loop"
+            );
+            thread::sleep(Duration::from_millis(2));
         }
         for _ in 0..8 {
             db.flush()
@@ -7692,6 +7726,11 @@ mod tests {
             dir2.path(),
         )
         .unwrap();
+        let startup2 = std::time::Instant::now() + Duration::from_secs(5);
+        while db2.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
+            assert!(std::time::Instant::now() < startup2);
+            thread::sleep(Duration::from_millis(2));
+        }
         {
             let synced =
                 sync_new_sst_parent_dir(&db2.dir_sync, &db2.read.manifest_poisoned).unwrap();
@@ -7706,12 +7745,21 @@ mod tests {
             inner.versions.sync_manifest().unwrap();
             db2.install_super_version(&inner);
         }
+        let passes_before2 = db2.dead_key_sweep.completed_passes.load(Ordering::Acquire);
         db2.read
             .read_compaction_hints
             .lock()
             .push(CompactionHint { level: 2 });
         db2.read.signal_compaction();
-        thread::sleep(Duration::from_millis(80));
+        let hint_deadline2 = std::time::Instant::now() + Duration::from_secs(5);
+        while db2.dead_key_sweep.completed_passes.load(Ordering::Acquire) <= passes_before2 {
+            assert!(
+                std::time::Instant::now() < hint_deadline2,
+                "compaction worker never processed db2 read hint"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(db2.read.read_compaction_hints.lock().is_empty());
         assert_eq!(filter_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             db2.get_property("stats.compaction_bytes_written")
@@ -7735,6 +7783,11 @@ mod tests {
             dir3.path(),
         )
         .unwrap();
+        let startup3 = std::time::Instant::now() + Duration::from_secs(5);
+        while db3.dead_key_sweep.completed_passes.load(Ordering::Acquire) < 1 {
+            assert!(std::time::Instant::now() < startup3);
+            thread::sleep(Duration::from_millis(2));
+        }
         {
             let synced =
                 sync_new_sst_parent_dir(&db3.dir_sync, &db3.read.manifest_poisoned).unwrap();
@@ -7771,12 +7824,21 @@ mod tests {
             inner.versions.sync_manifest().unwrap();
             db3.install_super_version(&inner);
         }
+        let passes_before3 = db3.dead_key_sweep.completed_passes.load(Ordering::Acquire);
         db3.read
             .read_compaction_hints
             .lock()
             .push(CompactionHint { level: 2 });
         db3.read.signal_compaction();
-        thread::sleep(Duration::from_millis(80));
+        let hint_deadline3 = std::time::Instant::now() + Duration::from_secs(5);
+        while db3.dead_key_sweep.completed_passes.load(Ordering::Acquire) <= passes_before3 {
+            assert!(
+                std::time::Instant::now() < hint_deadline3,
+                "compaction worker never processed db3 read hint"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(db3.read.read_compaction_hints.lock().is_empty());
         assert_eq!(
             db3.get_property("stats.compaction_bytes_written")
                 .as_deref(),
