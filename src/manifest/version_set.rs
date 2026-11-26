@@ -2540,6 +2540,44 @@ mod tests {
         };
 
         let mut vs = VersionSet::create(path, 7).unwrap();
+        // Mixed point + multi-partition range-deletion SST (`000012.sst`) where
+        // narrowing `largest_key` to the last point key hides trailing range partitions.
+        let valid_mixed = {
+            let mut b =
+                TableBuilder::new(&path.join("000012.sst"), TableBuildOptions::default()).unwrap();
+            b.add(
+                InternalKey::new(b"a000", 2, ValueType::RangeDeletion).as_bytes(),
+                b"a001",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"a000", 1, ValueType::Value).as_bytes(),
+                b"va",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"m000", 1, ValueType::Value).as_bytes(),
+                b"vm",
+            )
+            .unwrap();
+            for i in 0..300u32 {
+                let start = format!("r{i:03}");
+                let end = format!("r{i:03}~");
+                b.add(
+                    InternalKey::new(start.as_bytes(), 2, ValueType::RangeDeletion).as_bytes(),
+                    end.as_bytes(),
+                )
+                .unwrap();
+            }
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 12,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: true,
+            }
+        };
         for bad in [
             // Narrowed largest_key hides "z".
             FileMetaData {
@@ -2557,6 +2595,11 @@ mod tests {
                 largest_key: InternalKey::new(b"d", 2, ValueType::RangeDeletion).into_bytes(),
                 ..valid_range.clone()
             },
+            // Narrowed largest_key to final point key hides trailing range partitions.
+            FileMetaData {
+                largest_key: InternalKey::new(b"m000", 1, ValueType::Value).into_bytes(),
+                ..valid_mixed
+            },
         ] {
             let mut edit = VersionEdit::new();
             edit.add_file(1, bad);
@@ -2571,7 +2614,7 @@ mod tests {
         let mut bad_persisted = VersionEdit::new();
         bad_persisted.set_log_number(2);
         bad_persisted.set_last_sequence(2);
-        bad_persisted.set_next_file_number(12);
+        bad_persisted.set_next_file_number(13);
         bad_persisted.add_file(
             1,
             FileMetaData {

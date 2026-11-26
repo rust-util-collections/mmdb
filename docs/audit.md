@@ -31,7 +31,7 @@ None.
 
 ### [LOW] sst: Linux `advise_willneed` converts `posix_fadvise` arguments to `i64` instead of `libc::off_t`
 
-- **Where**: `src/sst/table_reader/mod.rs:1810-1829` (`TableReader::advise_willneed`).
+- **Where**: `src/sst/table_reader/mod.rs:1861-1880` (`TableReader::advise_willneed`).
 - **What**: `advise_willneed` converts `offset` and `len` with `i64::try_from` and passes them directly to `libc::posix_fadvise`. On 32-bit GNU, uClibc, and Android Linux targets (`libc` `b32`), `libc::off_t` is `i32`, so compiling for those targets fails with `E0308` mismatched types.
 - **Reason**: Confirmed against `libc-0.2.191` target definitions (`off_t = i32` on 32-bit Linux ABIs vs `off_t = i64` on 64-bit Linux ABIs). Both supported architectures (`x86_64` and `aarch64` with 64-bit ABIs) define `libc::off_t` as `i64`, so 32-bit targets are outside the [supported architecture guarantee](../README.md#supported-architectures).
 

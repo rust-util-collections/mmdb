@@ -21,8 +21,8 @@ use crate::sst::format::{
 use crate::sst::range::RangeFragment;
 use crate::stats::DbStats;
 use crate::types::{
-    MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key, decode_internal_key,
-    pack_sequence_and_type, tombstone_overlaps_bounds,
+    InternalKey, MAX_SEQUENCE_NUMBER, SequenceNumber, ValueType, compare_internal_key,
+    decode_internal_key, pack_sequence_and_type, tombstone_overlaps_bounds,
 };
 
 /// A range tombstone: (begin_key, end_key, sequence_number).
@@ -213,6 +213,7 @@ pub struct TableReader {
     block_cache: Option<Arc<BlockCache>>,
     stats: Option<Arc<DbStats>>,
     range_partitions: Vec<RangePartition>,
+    range_key_bounds: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 #[cfg(feature = "test-utils")]
@@ -395,7 +396,7 @@ impl TableReader {
             Vec::new()
         };
 
-        let reader = Self {
+        let mut reader = Self {
             file_number,
             partitions,
             index_dir_pages,
@@ -417,9 +418,25 @@ impl TableReader {
             stats,
 
             range_partitions,
+            range_key_bounds: None,
         };
-        for part in &reader.range_partitions {
-            reader.range_leaf_block(part, true)?;
+        if !reader.range_partitions.is_empty() {
+            let mut first_block = None;
+            let mut last_block = None;
+            let last_idx = reader.range_partitions.len() - 1;
+            for (idx, part) in reader.range_partitions.iter().enumerate() {
+                let block = reader.range_leaf_block(part, true)?;
+                if idx == 0 {
+                    first_block = Some(block.clone());
+                }
+                if idx == last_idx {
+                    last_block = Some(block);
+                }
+            }
+            reader.range_key_bounds = Some(Self::range_leaf_extremes(
+                first_block.as_ref().unwrap(),
+                last_block.as_ref().unwrap(),
+            )?);
         }
 
         Ok(reader)
@@ -1121,61 +1138,95 @@ impl TableReader {
         !self.range_partitions.is_empty()
     }
 
+    fn range_leaf_extremes(first_block: &Block, last_block: &Block) -> Result<(Vec<u8>, Vec<u8>)> {
+        let first_seg_end = if first_block.num_restarts() > 1 {
+            first_block.restart_point(1) as usize
+        } else {
+            first_block.data_end_offset()
+        };
+        let mut end = SmallVec::<[u8; 128]>::new();
+        let (vs, vl, _) = decode_entry_reuse(&first_block.data()[..first_seg_end], 0, &mut end)?;
+        let (first_begin, first_seqs) = decode_interval(&first_block.data()[vs..vs + vl])?;
+        let first_stripes = first_seqs.as_chunks::<8>().0;
+        let first_seq = u64::from_le_bytes(*first_stripes.last().unwrap());
+        let min_ikey =
+            InternalKey::new(first_begin, first_seq, ValueType::RangeDeletion).into_bytes();
+
+        let last_data_end = last_block.data_end_offset();
+        let mut offset = last_block.restart_point(last_block.num_restarts() - 1) as usize;
+        end.clear();
+        let mut max_ikey = None;
+        while offset < last_data_end {
+            let (vs, vl, next_off) =
+                decode_entry_reuse(&last_block.data()[..last_data_end], offset, &mut end)?;
+            if next_off == last_data_end {
+                let (last_begin, last_seqs) = decode_interval(&last_block.data()[vs..vs + vl])?;
+                let last_stripes = last_seqs.as_chunks::<8>().0;
+                let last_seq = u64::from_le_bytes(last_stripes[0]);
+                max_ikey = Some(
+                    InternalKey::new(last_begin, last_seq, ValueType::RangeDeletion).into_bytes(),
+                );
+                break;
+            }
+            offset = next_off;
+        }
+        Ok((
+            min_ikey,
+            max_ikey.ok_or_else(|| Error::corruption("empty range leaf block"))?,
+        ))
+    }
+
     pub(crate) fn validate_manifest_bounds(
         &self,
         smallest_key: &[u8],
         largest_key: &[u8],
     ) -> Result<()> {
-        let (s_uk, _, s_vt) = decode_internal_key(smallest_key)?;
-        let (l_uk, _, l_vt) = decode_internal_key(largest_key)?;
-        if let (Some((first_part, _)), Some((last_part, _))) =
-            (self.partitions.first(), self.partitions.last())
-        {
-            if first_part.compare_internal(smallest_key).is_lt()
-                || last_part.compare_internal(largest_key).is_gt()
-            {
-                return Err(Error::corruption(
-                    "MANIFEST file bounds disagree with SST index directory",
-                ));
-            }
-            if self.range_partitions.is_empty() {
+        let (_, _, s_vt) = decode_internal_key(smallest_key)?;
+        let (_, _, l_vt) = decode_internal_key(largest_key)?;
+        match (
+            self.partitions.first().zip(self.partitions.last()),
+            self.range_key_bounds.as_ref(),
+        ) {
+            (Some((first_part, last_part)), None) => {
                 if s_vt == ValueType::RangeDeletion
                     || l_vt == ValueType::RangeDeletion
-                    || !last_part.compare_internal(largest_key).is_eq()
+                    || first_part.0.compare_internal(smallest_key).is_lt()
+                    || !last_part.0.compare_internal(largest_key).is_eq()
                 {
                     return Err(Error::corruption(
                         "MANIFEST file bounds disagree with point-only SST",
                     ));
                 }
-            } else if last_part.compare_internal(largest_key).is_lt()
-                && l_vt != ValueType::RangeDeletion
-            {
-                return Err(Error::corruption(
-                    "MANIFEST largest_key exceeds SST point bounds without RangeDeletion type",
-                ));
             }
-        }
-        if let (Some(first_range), Some(last_range)) =
-            (self.range_partitions.first(), self.range_partitions.last())
-        {
-            if s_uk > first_range.begin.as_slice() || l_uk < first_range.begin.as_slice() {
-                return Err(Error::corruption(
-                    "MANIFEST file bounds exclude SST range-deletion directory",
-                ));
-            }
-            if self.partitions.is_empty() {
-                if s_vt != ValueType::RangeDeletion
-                    || l_vt != ValueType::RangeDeletion
-                    || s_uk != first_range.begin.as_slice()
-                    || l_uk >= last_range.end.as_slice()
-                {
+            (None, Some((range_min, range_max))) => {
+                if smallest_key != range_min.as_slice() || largest_key != range_max.as_slice() {
                     return Err(Error::corruption(
                         "MANIFEST file bounds disagree with range-only SST",
                     ));
                 }
-            } else if l_vt == ValueType::RangeDeletion && l_uk >= last_range.end.as_slice() {
+            }
+            (Some((first_part, last_part)), Some((range_min, range_max))) => {
+                let largest_matches = if last_part.0.compare_internal(range_max).is_lt() {
+                    largest_key == range_max.as_slice()
+                } else {
+                    last_part.0.compare_internal(largest_key).is_eq()
+                };
+                let smallest_valid = if compare_internal_key(smallest_key, range_min).is_eq() {
+                    first_part.0.compare_internal(smallest_key).is_ge()
+                } else {
+                    s_vt != ValueType::RangeDeletion
+                        && compare_internal_key(smallest_key, range_min).is_lt()
+                        && first_part.0.compare_internal(smallest_key).is_ge()
+                };
+                if !smallest_valid || !largest_matches {
+                    return Err(Error::corruption(
+                        "MANIFEST file bounds disagree with mixed SST directories",
+                    ));
+                }
+            }
+            (None, None) => {
                 return Err(Error::corruption(
-                    "MANIFEST range largest_key exceeds SST range-deletion upper bound",
+                    "SST has neither data blocks nor range deletions",
                 ));
             }
         }
