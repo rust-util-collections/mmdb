@@ -200,58 +200,80 @@ fn read_only_handles_share_lock_and_exclude_writers() {
     writer.close().unwrap();
 }
 
-#[cfg(target_os = "linux")]
+const STORE_TRACE: &str = "trace=open,openat,creat,write,writev,pwrite64,pwritev,pwritev2,truncate,ftruncate,rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,rmdir,fsync,fdatasync";
+
+fn descriptor_path(argument: &str) -> Option<&Path> {
+    let (fd, rest) = argument.trim().split_once('<')?;
+    if fd != "AT_FDCWD" && fd.parse::<i32>().is_err() {
+        return None;
+    }
+    Some(Path::new(rest.split_once('>')?.0))
+}
+
 fn store_mutating_syscall(line: &str, store: &str) -> bool {
     let Some((prefix, args)) = line.split_once('(') else {
         return false;
     };
     let syscall = prefix.split_whitespace().last().unwrap_or("");
-    let writable_open = matches!(syscall, "open" | "openat")
-        && ["O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND"]
-            .iter()
-            .any(|flag| args.contains(flag));
-    let store_path_mutation = args.contains(store)
-        && (writable_open
-            || matches!(
-                syscall,
-                "creat"
-                    | "truncate"
-                    | "rename"
-                    | "renameat"
-                    | "renameat2"
-                    | "unlink"
-                    | "unlinkat"
-                    | "mkdir"
-                    | "mkdirat"
-                    | "rmdir"
-            ));
-    // -yy annotates the descriptor itself, so a log message mentioning the
-    // store does not look like a write to a database file.
-    let descriptor = args.split(',').next().unwrap_or("");
-    let target = descriptor
-        .split_once('<')
-        .and_then(|(_, path)| path.strip_suffix('>'));
-    let store_fd_write = matches!(syscall, "write" | "pwrite64")
-        && target.is_some_and(|path| {
-            path == store
-                || path
-                    .strip_prefix(store)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        });
-    let forbidden_fd_mutation = matches!(syscall, "ftruncate" | "fsync" | "fdatasync");
-    store_path_mutation || store_fd_write || forbidden_fd_mutation
+    let args = args.split_once(") =").map_or(args, |(args, _)| args);
+    match syscall {
+        "write" | "writev" | "pwrite64" | "pwritev" | "pwritev2" | "ftruncate" | "fsync"
+        | "fdatasync" => return descriptor_path(args).is_some_and(|path| path.starts_with(store)),
+        "open" | "openat" => {
+            // Flags follow the quoted pathname. A filename may contain flag names.
+            let flags = args.rsplit('"').next().unwrap_or("");
+            if !["O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND"]
+                .iter()
+                .any(|flag| flags.contains(flag))
+            {
+                return false;
+            }
+        }
+        "creat" | "truncate" | "rename" | "renameat" | "renameat2" | "unlink" | "unlinkat"
+        | "mkdir" | "mkdirat" | "rmdir" => {}
+        _ => return false,
+    }
+    // For *at calls, resolve each relative pathname against its annotated
+    // directory descriptor. An absolute pathname ignores that descriptor.
+    let mut fields = args.split('"');
+    while let (Some(before), Some(name)) = (fields.next(), fields.next()) {
+        let path = Path::new(name);
+        if path.starts_with(store)
+            || (path.is_relative()
+                && descriptor_path(before.trim().trim_matches(','))
+                    .is_some_and(|dir| dir.join(path).starts_with(store)))
+        {
+            return true;
+        }
+    }
+    false
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn read_only_trace_rejects_descriptor_write_intent() {
     let store = "/tmp/mmdb-store";
     for line in [
         r#"123 write(3</tmp/mmdb-store/000001.wal>, "x", 1) = -1 EBADF (Bad file descriptor)"#,
         r#"123 pwrite64(3</tmp/mmdb-store/000001.sst>, "x", 1, 0) = -1 EBADF (Bad file descriptor)"#,
+        r#"123 writev(3</tmp/mmdb-store/000001.wal>, [{iov_base="x", iov_len=1}], 1) = -1 EBADF"#,
+        r#"123 openat(3</tmp/mmdb-store>, "LOCK", O_RDWR) = -1 EACCES"#,
+        r#"123 rename("/tmp/scratch/new", "/tmp/mmdb-store/CURRENT") = -1 EACCES"#,
         r#"123 openat(AT_FDCWD, "/tmp/mmdb-store/LOCK", O_WRONLY) = -1 EACCES (Permission denied)"#,
         "123 fsync(3</tmp/mmdb-store/000001.wal>) = 0",
     ] {
+        let syscall = line
+            .split_once('(')
+            .unwrap()
+            .0
+            .split_whitespace()
+            .last()
+            .unwrap();
+        assert!(
+            STORE_TRACE
+                .trim_start_matches("trace=")
+                .split(',')
+                .any(|s| s == syscall)
+        );
         assert!(
             store_mutating_syscall(line, store),
             "missed write intent: {line}"
@@ -262,6 +284,11 @@ fn read_only_trace_rejects_descriptor_write_intent() {
         r#"123 write(1<pipe:[123]>, "/tmp/mmdb-store", 15) = 15"#,
         r#"123 write(2</dev/pts/0>, "probe passed", 12) = 12"#,
         r#"123 write(3</tmp/mmdb-store-other/log>, "x", 1) = 1"#,
+        "123 fsync(3</tmp/mmdb-store-other/log>) = 0",
+        "123 fdatasync(3</tmp/unrelated>) = 0",
+        "123 ftruncate(3</tmp/unrelated>, 0) = 0",
+        r#"123 openat(AT_FDCWD, "/tmp/mmdb-store-other/LOCK", O_RDWR) = 3</tmp/mmdb-store-other/LOCK>"#,
+        r#"123 openat(3</tmp/mmdb-store>, "/tmp/unrelated", O_RDWR) = -1 EACCES"#,
     ] {
         assert!(
             !store_mutating_syscall(line, store),
@@ -296,13 +323,7 @@ fn read_only_uses_no_store_mutating_syscalls() {
 
     let trace_file = tempfile::NamedTempFile::new().unwrap();
     let output = Command::new("strace")
-        .args([
-            "-f",
-            "-yy",
-            "-e",
-            "trace=open,openat,creat,write,pwrite64,truncate,ftruncate,rename,renameat,renameat2,unlink,unlinkat,mkdir,mkdirat,rmdir,fsync,fdatasync",
-            "-o",
-        ])
+        .args(["-f", "-yy", "-e", STORE_TRACE, "-o"])
         .arg(trace_file.path())
         .arg(std::env::current_exe().unwrap())
         .args([
