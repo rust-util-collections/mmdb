@@ -1121,6 +1121,67 @@ impl TableReader {
         !self.range_partitions.is_empty()
     }
 
+    pub(crate) fn validate_manifest_bounds(
+        &self,
+        smallest_key: &[u8],
+        largest_key: &[u8],
+    ) -> Result<()> {
+        let (s_uk, _, s_vt) = decode_internal_key(smallest_key)?;
+        let (l_uk, _, l_vt) = decode_internal_key(largest_key)?;
+        if let (Some((first_part, _)), Some((last_part, _))) =
+            (self.partitions.first(), self.partitions.last())
+        {
+            if first_part.compare_internal(smallest_key).is_lt()
+                || last_part.compare_internal(largest_key).is_gt()
+            {
+                return Err(Error::corruption(
+                    "MANIFEST file bounds disagree with SST index directory",
+                ));
+            }
+            if self.range_partitions.is_empty() {
+                if s_vt == ValueType::RangeDeletion
+                    || l_vt == ValueType::RangeDeletion
+                    || !last_part.compare_internal(largest_key).is_eq()
+                {
+                    return Err(Error::corruption(
+                        "MANIFEST file bounds disagree with point-only SST",
+                    ));
+                }
+            } else if last_part.compare_internal(largest_key).is_lt()
+                && l_vt != ValueType::RangeDeletion
+            {
+                return Err(Error::corruption(
+                    "MANIFEST largest_key exceeds SST point bounds without RangeDeletion type",
+                ));
+            }
+        }
+        if let (Some(first_range), Some(last_range)) =
+            (self.range_partitions.first(), self.range_partitions.last())
+        {
+            if s_uk > first_range.begin.as_slice() || l_uk < first_range.begin.as_slice() {
+                return Err(Error::corruption(
+                    "MANIFEST file bounds exclude SST range-deletion directory",
+                ));
+            }
+            if self.partitions.is_empty() {
+                if s_vt != ValueType::RangeDeletion
+                    || l_vt != ValueType::RangeDeletion
+                    || s_uk != first_range.begin.as_slice()
+                    || l_uk >= last_range.end.as_slice()
+                {
+                    return Err(Error::corruption(
+                        "MANIFEST file bounds disagree with range-only SST",
+                    ));
+                }
+            } else if l_vt == ValueType::RangeDeletion && l_uk >= last_range.end.as_slice() {
+                return Err(Error::corruption(
+                    "MANIFEST range largest_key exceeds SST range-deletion upper bound",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn bloom_filter_byte_len(&self) -> Option<usize> {
         self.filter_data.as_ref().map(AlignedBytes::byte_len)

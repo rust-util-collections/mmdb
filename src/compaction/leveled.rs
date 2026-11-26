@@ -3484,8 +3484,8 @@ mod tests {
             out
         };
 
-        // Case 1: interior user-key regression ("a"@3, "y"@2, "m"@1, "z"@1).
-        // Case 2: same-key ascending sequence inversion ("a"@3, "k"@1->"old", "k"@2->"new", "z"@1).
+        // Case 1: interior user-key regression ("a"@1, "y"@2, "m"@1, "z"@2).
+        // Case 2: same-key ascending sequence inversion ("a"@1, "k"@1->"old", "k"@2->"new", "z"@2).
         for inverted_same_key in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let opts = DbOptions::default()
@@ -3508,8 +3508,8 @@ mod tests {
             let meta_end = (meta_h.offset + meta_h.size + 5) as usize;
             let orig_meta_slice = &orig[meta_h.offset as usize..meta_end];
 
-            let first_ik = InternalKey::new(b"a", 3, ValueType::Value);
-            let last_ik = InternalKey::new(b"z", 1, ValueType::Value);
+            let first_ik = InternalKey::new(b"a", 1, ValueType::Value);
+            let last_ik = InternalKey::new(b"z", 2, ValueType::Value);
             let mut data_b = BlockBuilder::new(1);
             data_b.add(first_ik.as_bytes(), b"va");
             if inverted_same_key {

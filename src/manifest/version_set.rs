@@ -279,6 +279,9 @@ impl VersionSet {
                 meta.number
             )));
         }
+        reader
+            .validate_manifest_bounds(&meta.smallest_key, &meta.largest_key)
+            .with_ctx(|| format!("SST {} bounds mismatch", meta.number))?;
         Ok(TableFile {
             meta: meta.clone(),
             reader,
@@ -2459,6 +2462,118 @@ mod tests {
             fs::read(&manifest_path).unwrap(),
             expected_manifest,
             "failed DB open must not truncate MANIFEST before sequence validation"
+        );
+    }
+
+    #[test]
+    fn manifest_file_bounds_disagreeing_with_sst_directories_are_rejected() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        // Two-block point SST (`block_size: 1`) with keys "a" and "z".
+        let valid_point = {
+            let mut b = TableBuilder::new(
+                &path.join("000010.sst"),
+                TableBuildOptions {
+                    block_size: 1,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"a", 1, ValueType::Value).as_bytes(),
+                b"va",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"z", 1, ValueType::Value).as_bytes(),
+                b"vz",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 10,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+
+        // Range-deletion-only SST covering ["c", "m").
+        let valid_range = {
+            let mut b =
+                TableBuilder::new(&path.join("000011.sst"), TableBuildOptions::default()).unwrap();
+            b.add(
+                InternalKey::new(b"c", 2, ValueType::RangeDeletion).as_bytes(),
+                b"m",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 11,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: true,
+            }
+        };
+
+        let mut vs = VersionSet::create(path, 7).unwrap();
+        for bad in [
+            // Narrowed largest_key hides "z".
+            FileMetaData {
+                largest_key: InternalKey::new(b"a", 1, ValueType::Value).into_bytes(),
+                ..valid_point.clone()
+            },
+            // Inflated largest_key on point-only SST disagrees with final separator.
+            FileMetaData {
+                largest_key: InternalKey::new(b"zz", 1, ValueType::Value).into_bytes(),
+                ..valid_point.clone()
+            },
+            // Shifted smallest_key on range-only SST misses ["c", "d").
+            FileMetaData {
+                smallest_key: InternalKey::new(b"d", 2, ValueType::RangeDeletion).into_bytes(),
+                largest_key: InternalKey::new(b"d", 2, ValueType::RangeDeletion).into_bytes(),
+                ..valid_range.clone()
+            },
+        ] {
+            let mut edit = VersionEdit::new();
+            edit.add_file(1, bad);
+            assert_eq!(
+                vs.log_and_apply(edit).unwrap_err().kind(),
+                ErrorKind::Corruption
+            );
+        }
+
+        // Valid metadata still installs cleanly, while persisted narrowed bounds
+        // in MANIFEST fail recovery before exposing truncated key ranges.
+        let mut bad_persisted = VersionEdit::new();
+        bad_persisted.set_log_number(2);
+        bad_persisted.set_last_sequence(2);
+        bad_persisted.set_next_file_number(12);
+        bad_persisted.add_file(
+            1,
+            FileMetaData {
+                largest_key: InternalKey::new(b"a", 1, ValueType::Value).into_bytes(),
+                ..valid_point
+            },
+        );
+        drop(vs);
+        {
+            let manifest_path = path.join("MANIFEST-000001");
+            let valid_len = fs::metadata(&manifest_path).unwrap().len();
+            let mut writer = WalWriter::open_append_truncated(&manifest_path, valid_len).unwrap();
+            writer.add_record(&bad_persisted.encode()).unwrap();
+            writer.sync().unwrap();
+        }
+        assert_eq!(
+            VersionSet::recover(path, 7).err().unwrap().kind(),
+            ErrorKind::Corruption
         );
     }
 }
