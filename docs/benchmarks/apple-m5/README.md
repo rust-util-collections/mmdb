@@ -7,8 +7,8 @@ arm64 processes, with AC power connected. Rust 1.100.0 targeted
 `aarch64-apple-darwin`. The Linux measurements use a Ryzen 9 5900X and
 explicit core affinity. Compare the two methods **within each host**.
 
-The primary engine control was `d5569da` with the test and benchmark changes
-in this checkout. The documentation updates through `1a28fc5` have the same
+The primary engine control was `d5569da` with the test and benchmark overlays
+recorded at `25be24a`. The documentation updates through `25be24a` have the same
 production engine source. The production scalar comparison used `277ef08`, and the historical
 flush-cut and writer-trace experiments used `5528950` and `7b46443`.
 The earlier AArch64 validation executed tests in a full-system Linux VM.

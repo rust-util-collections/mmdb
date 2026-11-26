@@ -13,7 +13,7 @@ Separate production builds with default features confirmed a **37.55%**
 paired p99 reduction on the single-SST workload and **26.79%** on a
 two-SST fixture with odd-key updates in L0. A scalar API control using
 one million requests per process measured a −0.63% gain, within its
-3.20% scalar/scalar variation. The effect of using grouped reads in an
+3.18% scalar/scalar variation. The effect of using grouped reads in an
 application depends on its keys and traversal. [Production single SST](results/final/integration-release.csv) · [Overlapping SSTs](results/final/release-overlap.csv) · [Scalar control](results/final/default-scalar-extended.csv) · [Build fingerprints](results/final/production-builds.json) · [VSDB VecDex query measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-vecdex-v5/README.md)
 
 ## Request latency

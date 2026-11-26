@@ -1,6 +1,7 @@
 {
   "host": "aarch64-apple-darwin",
   "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "overlay_revision": "25be24a61cef1a9b63cd5e7bfe45fb7b72b790cc",
   "locks": {
     "bench": {
       "file": "bench.Cargo.lock.gz",
@@ -12,7 +13,7 @@
     }
   },
   "reconstruction": [
-    "Use a fresh directory per source variant. Export its revision with git archive. For an inherited source, start from the parent variant. Copy each overlay from the checkout containing this packet to the same relative path in the export. Verify SHA-256 and apply the listed patch with git apply from the exported tree. Paths in source hashes are relative to the repository root.",
+    "Use a fresh directory per source variant. Export its revision with git archive. For an inherited source, start from the parent variant. Export each overlay from overlay_revision (for example with git show 25be24a:<path>) to the same relative path in the export. Verify SHA-256 and apply the listed patch with git apply from the exported tree. Paths in source hashes are relative to the repository root.",
     "For each benchmark, decompress bench.Cargo.lock.gz to Cargo.lock in the exported tree, set a separate CARGO_TARGET_DIR for each source variant and run the listed command there. Cargo prints the benchmark executable. The bench profile inherits the release settings: opt-level 3, thin LTO and one codegen unit. The self dev-dependency enables test-utils on every in-crate benchmark. The timing, l0 and two-range builds also enable bench-metrics.",
     "For each standalone guard, export its MMDB source to mmdb/ and create a sibling guard/ directory. Write guard_manifest to guard/Cargo.toml, copy scalar_guard.path to guard/src/main.rs and decompress guard.Cargo.lock.gz to guard/Cargo.lock. Run its listed command in guard/ with its own CARGO_TARGET_DIR. Both link MMDB with only the default feature; the candidate also enables grouped-api on the guard crate.",
     "The grouped probe and candidate guard used a checkout with the test-only WAL fixture change in src/db/flush.rs. The isolated engine benchmark source used that file from the base revision. RUSTFLAGS was empty in all eight Cargo fingerprints. Binary hashes identify the measured executables; build paths and toolchains can affect rebuilt hashes."
