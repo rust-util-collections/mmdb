@@ -938,21 +938,26 @@ mod tests {
     #[test]
     fn failed_wal_creation_keeps_the_sealed_writer_and_generation() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DB::open(options(), dir.path()).unwrap();
+        // Keep this write below the standby threshold so flush creates the next WAL itself.
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
+        db.put(b"key", b"value").unwrap();
         let old_wal = db.inner.lock().wal_number;
         let occupied = dir.path().join(format!(
             "{:06}.wal",
             db.inner.lock().versions.next_file_number()
         ));
         fs::create_dir(&occupied).unwrap();
-        db.put(b"key", b"value").unwrap();
         assert_eq!(db.flush().unwrap_err().kind(), ErrorKind::Io);
-        assert_eq!(db.inner.lock().wal_number, old_wal);
+        {
+            let inner = db.inner.lock();
+            assert_eq!(inner.wal_number, old_wal);
+            assert!(inner.wal_writer.is_some());
+            assert!(inner.immutable_memtables.is_empty());
+        }
         assert_eq!(db.flush_queue.target(), 0);
-        assert!(db.inner.lock().immutable_memtables.is_empty());
         assert!(db.close().is_err());
         fs::remove_dir(occupied).unwrap();
-        let db = DB::open(options(), dir.path()).unwrap();
+        let db = DB::open(DbOptions::default(), dir.path()).unwrap();
         assert_eq!(
             db.get(b"key").unwrap().as_deref(),
             Some(b"value".as_slice())
