@@ -20,7 +20,7 @@ None.
 
 ### [MEDIUM] compaction: a 4 GiB SST size target truncates to zero on 32-bit targets
 
-- **Where**: `src/compaction/leveled.rs:724,791` (`execute_sub_compaction_io`).
+- **Where**: `src/compaction/leveled.rs:718,940` (`execute_sub_compaction_io`).
 - **What**: Compaction casts the configured `u64` target to `usize`. On a 32-bit target, `target_file_size_base = 1 << 32` becomes zero, so a rewrite requests an SST split at every distinct user-key boundary.
 - **Reason**: Confirmed by tracing the integer conversion and split predicate. The supported 64-bit ABIs preserve this value. The project accepts the 32-bit behavior under its [architecture policy](../README.md#supported-architectures).
 
@@ -62,7 +62,7 @@ None.
 ### memtable: range tombstones evade `approximate_size` accounting
 - **Where**: `src/memtable/mod.rs`, `src/types.rs`
 - **Claim**: valid `delete_range(begin, end)` entries with `begin < end` are nearly free in `approximate_size()`, so their volume never triggers a flush.
-- **Reason**: Valid range deletions charge arena slabs, the raw range vector and its endpoint bytes in both `MemTable::put` and `put_batch`. Those charges accumulate toward rotation. The additional storage owned by the active index is covered by the separate Open finding.
+- **Reason**: Valid range deletions charge arena slabs, the raw range vector, endpoint bytes, and tombstone-index heap (`tombstone_index_bytes`) across `MemTable::put`, `put_batch`, and frozen fragmentation. Those charges accumulate toward rotation.
 
 ### write path: group-commit queue depth is unbounded
 - **Where**: `src/db.rs` (`WriteQueueState`)
