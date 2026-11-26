@@ -33,6 +33,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static BEFORE_SYNC_POISON: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_CURRENT_RENAME: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Evidence that all new SST directory entries precede the referencing edit.
@@ -1149,12 +1151,21 @@ impl VersionSet {
         *self.manifest_writer.lock() = Some(new_writer);
         self.edits_since_snapshot = 0;
 
+        #[cfg(test)]
+        if let Some(hook) = AFTER_CURRENT_RENAME.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+
         {
             let dir = self.parent_dir.lock();
+            if check_manifest_poison(&self.poisoned).is_err() {
+                return;
+            }
             let sync_res = dir
                 .as_ref()
                 .ok_or_else(Error::read_only)
                 .and_then(|f| f.sync_all().ctx());
+            let _writer = self.manifest_writer.lock();
             if let Err(e) = sync_res {
                 // The CURRENT rename is visible in the live filesystem (the new
                 // writer stays installed for in-process consistency) but its
@@ -1163,13 +1174,15 @@ impl VersionSet {
                 // writer sync above. Poison further edits while holding both
                 // sync guards so concurrent directory/manifest syncs observe
                 // poison before proceeding, and keep the old MANIFEST.
-                let _writer = self.manifest_writer.lock();
                 self.poisoned.store(true, Ordering::Release);
                 tracing::error!(
                     "MANIFEST rotation could not fsync the DB directory; \
                      poisoning manifest writer (reopen the database to recover): {}",
                     e
                 );
+                return;
+            }
+            if check_manifest_poison(&self.poisoned).is_err() {
                 return;
             }
         }
@@ -2325,5 +2338,50 @@ mod tests {
             .collect();
         assert_eq!(l1_nums, vec![10, 22, 23, 12]);
         assert_eq!(recovered.current().level_files(2).len(), 32);
+    }
+
+    #[test]
+    fn rotation_retains_fallback_manifest_when_concurrent_sync_poisons_store() {
+        for poison_manifest_writer in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            let mut vs = VersionSet::create(path, 7).unwrap();
+            let dir_handle = vs.dir_sync_handle();
+            let manifest_handle = vs.manifest_sync_handle();
+            let poison_flag = vs.poison_flag();
+
+            AFTER_CURRENT_RENAME.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    if poison_manifest_writer {
+                        crate::wal::writer::FAIL_NEXT_SYNC.with(|f| f.set(true));
+                        assert_eq!(
+                            confirm_manifest_durable(&manifest_handle, &poison_flag)
+                                .unwrap_err()
+                                .kind(),
+                            ErrorKind::Io
+                        );
+                    } else {
+                        FAIL_NEXT_SST_DIR_SYNC.with(|f| f.set(true));
+                        assert_eq!(
+                            sync_new_sst_parent_dir(&dir_handle, &poison_flag)
+                                .unwrap_err()
+                                .kind(),
+                            ErrorKind::Io
+                        );
+                    }
+                }));
+            });
+
+            vs.edits_since_snapshot = 1000;
+            let mut edit = VersionEdit::new();
+            edit.set_log_number(2);
+            vs.apply_metadata(edit).unwrap();
+
+            assert!(vs.is_poisoned());
+            assert!(
+                path.join("MANIFEST-000001").exists(),
+                "fallback MANIFEST-000001 must remain on disk when poison_manifest_writer={poison_manifest_writer}"
+            );
+        }
     }
 }
