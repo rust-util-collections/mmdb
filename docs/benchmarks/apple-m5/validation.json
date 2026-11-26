@@ -1,0 +1,143 @@
+{
+  "engine_base": "d5569da912c2e9c59d915f20d04611a9322386d9",
+  "os": "macOS 27.2.1 (26B131), Darwin 27.2.0",
+  "cpu": "Apple M5 (Mac17,2)",
+  "target": "aarch64-apple-darwin",
+  "compiler": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "command": "(ulimit -Sn 256 && RUSTUP_TOOLCHAIN=stable make test)",
+  "exit_code": 0,
+  "test_process_soft_limit": 4096,
+  "runtime_tests": {
+    "cargo test": {
+      "src/lib.rs": {
+        "passed": 425
+      },
+      "tests/arena_miri.rs": {
+        "passed": 0
+      },
+      "tests/bidi_debug.rs": {
+        "passed": 1
+      },
+      "tests/crash_recovery.rs": {
+        "passed": 27
+      },
+      "tests/e2e_scenarios.rs": {
+        "passed": 10
+      },
+      "tests/grouped_reads.rs": {
+        "passed": 7
+      },
+      "tests/integration.rs": {
+        "passed": 74
+      },
+      "tests/lazy_delete.rs": {
+        "passed": 21
+      },
+      "tests/proptest_db.rs": {
+        "passed": 3
+      },
+      "tests/read_only.rs": {
+        "passed": 5
+      },
+      "tests/scale_profile.rs": {
+        "passed": 0,
+        "ignored": 1
+      },
+      "tests/shared_cache.rs": {
+        "passed": 4
+      },
+      "Doc-tests mmdb": {
+        "passed": 2
+      }
+    },
+    "cargo test --release": {
+      "src/lib.rs": {
+        "passed": 425
+      },
+      "tests/arena_miri.rs": {
+        "passed": 0
+      },
+      "tests/bidi_debug.rs": {
+        "passed": 1
+      },
+      "tests/crash_recovery.rs": {
+        "passed": 27
+      },
+      "tests/e2e_scenarios.rs": {
+        "passed": 10
+      },
+      "tests/grouped_reads.rs": {
+        "passed": 7
+      },
+      "tests/integration.rs": {
+        "passed": 74
+      },
+      "tests/lazy_delete.rs": {
+        "passed": 21
+      },
+      "tests/proptest_db.rs": {
+        "passed": 3
+      },
+      "tests/read_only.rs": {
+        "passed": 5
+      },
+      "tests/scale_profile.rs": {
+        "passed": 0,
+        "ignored": 1
+      },
+      "tests/shared_cache.rs": {
+        "passed": 4
+      },
+      "Doc-tests mmdb": {
+        "passed": 2
+      }
+    },
+    "cargo test --lib --features bench-metrics": {
+      "src/lib.rs": {
+        "passed": 429
+      }
+    },
+    "cargo test --manifest-path tools/v4-export/Cargo.toml": {
+      "src/main.rs": {
+        "passed": 1
+      },
+      "tests/golden.rs": {
+        "passed": 5
+      }
+    }
+  },
+  "bare_default_libtest_soft_256": {
+    "passed": 417,
+    "failed_with_EMFILE": [
+      "compaction::leveled::tests::test_compaction_trigger",
+      "compaction::leveled::tests::test_sub_compaction_correctness",
+      "compaction::leveled::tests::test_sub_compaction_with_range_tombstones",
+      "compaction::leveled::tests::test_sub_compaction_with_snapshots",
+      "db::read::tests::tombstone_discovery_visits_only_files_with_range_deletions",
+      "db::tests::close_waits_for_flush_after_the_writer_returns",
+      "db::tests::initial_manifest_without_a_wal_can_be_opened",
+      "db::tests::iterators_share_the_pinned_version_file_list"
+    ]
+  },
+  "hard_256_launcher": {
+    "initial_soft": 128,
+    "effective_soft": 256,
+    "test_threads": 1,
+    "focused_passed": 23,
+    "prior_single_thread_integration_failure": "test_multi_thread_compaction returned EMFILE on the one-row-SST fixture",
+    "revised_compaction_fixture_repeats": {
+      "debug_passed": 5,
+      "release_passed": 5
+    },
+    "complete_command": "(ulimit -Sn 128 && ulimit -Hn 256 && RUSTUP_TOOLCHAIN=stable make test)",
+    "exit_code": 0,
+    "runtime_tests": "identical to the per-binary runtime_tests counts above"
+  },
+  "documentation_head": "1a28fc5",
+  "additional_checks": [
+    "cargo +stable fmt --all -- --check",
+    "cargo +stable fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check",
+    "cargo +stable clippy --all-targets --features bench-metrics,test-utils -- -D warnings",
+    "15 Python measurement-tool unit tests"
+  ]
+}

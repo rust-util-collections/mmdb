@@ -1,0 +1,9 @@
+case,metric,n_pairs,ab_reference,candidate,gain_pct,max_AA_pct,pairs_favoring_candidate,kept_pairs,min_value,max_value
+parallel,stall_ms_per_GiB,5,183921.842,135060.6,28.15,11.45,5,,120422.935,232869.846
+parallel,read_p99_us,5,20.125,21.75,-8.34,2.72,0,,19.875,22.25
+parallel,write_p99_us,5,8726266.208,8087703.333,8.09,9.66,5,,7642310.417,10419927.084
+parallel,initial_cold_consumed_bytes,5,1709586,1709586,-0.0,0.0,0,,1709586,1709586
+parallel,output_file_bytes,5,223218911,223211621,0.0,0.0,5,,223211621,223218911
+parallel,peak_ranges,5,1,2,,0.0,,,1,2
+parallel,l0_end,5,1,1,,0.0,,,1,1
+parallel,rewrite_jobs,5,79,79,,0.0,,,79,79

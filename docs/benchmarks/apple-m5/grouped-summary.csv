@@ -1,0 +1,11 @@
+case,regime,locality,fanout,requests_per_run,pairs_per_comparison,scalar_p99_us,candidate_p99_us,median_paired_gain_pct,max_abs_AA_pct,pairs_favoring_candidate,min_gain_pct,max_gain_pct,min_device_coverage_pct
+warm-clustered,warm,clustered,32,300000,5,23.08,17.21,25.30,1.99,5,22.38,26.12,
+warm-singleton,warm,clustered,1,1000000,5,1.75,1.67,2.40,15.57,4,-5.31,13.90,
+warm-scattered,warm,scattered,32,10000,5,32.88,31.50,6.05,29.19,3,-80.18,26.53,
+page32,page,scattered,32,10000,5,529.21,176.12,65.14,8.51,5,64.76,67.81,
+page32,page,clustered,32,10000,5,506.46,34.12,93.19,86.76,5,93.09,94.63,
+device-clustered,device,clustered,32,10000,5,793.21,264.62,66.64,9.41,5,66.27,66.92,96.89
+device-scattered,device,scattered,32,10000,5,3997.38,3777.04,5.48,2.01,5,5.03,6.68,100.00
+singleton,production warm,clustered,1,1000000,5,1.46,1.50,-2.81,2.73,0,-2.88,-2.80,
+single-sst,production warm,clustered,32,50000,5,13.79,9.29,33.24,2.07,5,30.79,37.97,
+overlap,production warm,clustered,32,50000,5,15.04,11.12,26.09,6.27,5,18.00,38.46,

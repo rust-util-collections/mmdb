@@ -1,0 +1,10 @@
+case,metric,n_pairs,ab_reference,candidate,gain_pct,max_AA_pct,pairs_favoring_candidate,kept_pairs,min_value,max_value
+fence,stall_ms_per_GiB,5,134711.8,27070.815,78.67,10.03,5,,25782.624,171959.293
+fence,read_p99_us,5,20.416,19.833,2.86,9.74,4,,19.334,24.375
+fence,write_p99_us,5,1668465.666,537456.5,68.62,7.89,5,,479935.5,1893681.625
+fence,initial_cold_consumed_bytes,5,2004219,0,100.0,0.0,5,,0,2004219
+fence,output_file_bytes,5,51277277,11238105,78.08,5.27,5,,11238105,51277277
+fence,peak_ranges,5,1,1,,0.0,,,1,1
+fence,l0_end,5,0,0,,,,,0,2
+fence,rewrite_jobs,5,20,20,,5.26,,,19,20
+fence,logical_cold_emitted_bytes,5,38993920,0,100.0,5.26,5,,0,38993920

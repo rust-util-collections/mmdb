@@ -1,0 +1,46 @@
+{
+  "target": "aarch64-apple-darwin",
+  "hardware": "Mac17,2",
+  "chip": "Apple M5",
+  "cores": "10",
+  "macos": "27.2.1",
+  "os_build": "26B131",
+  "kernel": "27.2.0",
+  "filesystem": "Filesystem   512-blocks      Used Available Capacity  Mounted on\n/dev/disk3s7  965492904 207966008 294909632    42%    /Volumes/Development",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)\nbinary: rustc\ncommit-hash: 0ef1bc386059596dada8fb65b50425aab2ea637a\ncommit-date: 2026-11-09\nhost: aarch64-apple-darwin\nrelease: 1.100.0\nLLVM version: 23.1.5",
+  "scheduler": "macOS native, no CPU affinity",
+  "cargo": "release, opt-level 3, thin LTO, codegen-units 1, bench-metrics, distinct target directories, locked",
+  "archive_repository_head": "4ceae8e47790f0de264ade3c4b836a5c474d2974",
+  "prefix_engine": "552895056040d660d32f0e447cb3b6cb8d91a4cf",
+  "trace_engine": "7b4644369d65b4d7a0a09a582840b99991518e16",
+  "cargo_lock_archive": "../bench.Cargo.lock.gz",
+  "cargo_lock_sha256": "6a212e9b0094bdd134fac3a3cda14120a82869fa2eef27f25144420c7f9eb27a",
+  "patches": {
+    "l0-profile/prefix-cuts/one-cut.patch": "67ba24c250d1eaee1f8ecbb588cd91cc4c4ef5f09810a4a6eb54c87057e2d06f",
+    "engine-profile/writer-trace/trace.patch": "0a4538687df0e9e77f5c76d20cc0de2579d782b33e1135dcf946bd1b9d02f6fb"
+  },
+  "executables": {
+    "control": "ed0ae0ca2749e91da5565b24c1531c49a38d897beb4f29827ffa23baaab77ed9",
+    "cut": "0f46b55f683480bb6fe119c7d3cecd7e33538948d764232800cc23be0d9af5d5",
+    "writer": "940feabf74e6aa7f26cd513786bf468fd23a0d3b23b52973e624cc2b77396df6"
+  },
+  "checks": {
+    "rows": 20,
+    "matched_prefix_pairs": 5,
+    "trace_on_off_pairs": 5,
+    "serial_replay_matches_all_recorded_acks": true,
+    "prefix_unit_tests": [
+      "full_l0_claim_selects_the_same_cold_gap_after_disjoint_flushes",
+      "one_prefix_cut_preserves_stripes_and_crossing_range_deletion"
+    ]
+  },
+  "timed_files": {
+    "prefix.csv": "565ea8e81e17836a16c2f19f55d7423e19f55397ce84c158855a2baaffcfa886",
+    "writer/summary.jsonl": "6f75d786b2d32556b98c20d4509e938ac0d4c02ad6fd76bf7fe3cc60faa76f8f",
+    "writer/trace-1.csv.gz": "c3cb11f6f886a68d25577b3be49e3460c4a968e9dc5babb3793421a654a5c0e5",
+    "writer/trace-2.csv.gz": "4517052c5719bbb0ccab9f30636f06eddda9056632772e06c0ea31ddc4e717d8",
+    "writer/trace-3.csv.gz": "a5da45b1b444f10be3f67ba72e91555631cea30e4ea887379af88e7d7917745b",
+    "writer/trace-4.csv.gz": "160f0c3ffcf70526d77af2f5f47804cec57f8e0fe1b42353cfb223f5f686c6f9",
+    "writer/trace-5.csv.gz": "ff2e0ec0551d17e55ab2343ecad26f302bc489f2e93f4b40804644ca90eccd80"
+  }
+}

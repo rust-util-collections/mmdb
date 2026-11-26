@@ -1,0 +1,111 @@
+{
+  "host": "aarch64-apple-darwin",
+  "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+  "locks": {
+    "bench": {
+      "file": "bench.Cargo.lock.gz",
+      "sha256_uncompressed": "6a212e9b0094bdd134fac3a3cda14120a82869fa2eef27f25144420c7f9eb27a"
+    },
+    "guard": {
+      "file": "guard.Cargo.lock.gz",
+      "sha256_uncompressed": "2d4347343af40e741b87f5a274282aa9bfd8cc343d51caa45f8be73f8f04466c"
+    }
+  },
+  "reconstruction": [
+    "Use a fresh directory per source variant. Export its revision with git archive. For an inherited source, start from the parent variant. Copy each overlay from the checkout containing this packet to the same relative path in the export. Verify SHA-256 and apply the listed patch with git apply from the exported tree. Paths in source hashes are relative to the repository root.",
+    "For each benchmark, decompress bench.Cargo.lock.gz to Cargo.lock in the exported tree, set a separate CARGO_TARGET_DIR for each source variant and run the listed command there. Cargo prints the benchmark executable. The bench profile inherits the release settings: opt-level 3, thin LTO and one codegen unit. The self dev-dependency enables test-utils on every in-crate benchmark. The timing, l0 and two-range builds also enable bench-metrics.",
+    "For each standalone guard, export its MMDB source to mmdb/ and create a sibling guard/ directory. Write guard_manifest to guard/Cargo.toml, copy scalar_guard.path to guard/src/main.rs and decompress guard.Cargo.lock.gz to guard/Cargo.lock. Run its listed command in guard/ with its own CARGO_TARGET_DIR. Both link MMDB with only the default feature; the candidate also enables grouped-api on the guard crate.",
+    "The grouped probe and candidate guard used a checkout with the test-only WAL fixture change in src/db/flush.rs. The isolated engine benchmark source used that file from the base revision. RUSTFLAGS was empty in all eight Cargo fingerprints. Binary hashes identify the measured executables; build paths and toolchains can affect rebuilt hashes."
+  ],
+  "sources": {
+    "engine": {
+      "revision": "d5569da912c2e9c59d915f20d04611a9322386d9",
+      "overlay_sha256": {
+        "benches/engine_profile/main.rs": "4ea4d9966a62801b80bf4a19432af26af3b9c13825478dec0a4401bc5a0859f8",
+        "benches/engine_profile/macos.rs": "004b1592c8f8e1635c46c0b794b8700a27dcae0f8f499dfffb51e1dd853e4291"
+      }
+    },
+    "handoff": {
+      "inherits": "engine",
+      "patch": "docs/benchmarks/engine-profile/short-group.patch",
+      "patch_sha256": "7857e79e005b1d25b8c29b56f32488c3a1fd0212ef8c5d915d8d49c25e8cac76",
+      "patched_sha256": {
+        "src/db.rs": "4a892c87b87d84e624c6cf4b65c615a65b349c7829aa58fc47ca97266ca9e2d6"
+      }
+    },
+    "parallel-l0": {
+      "inherits": "engine",
+      "patch": "docs/benchmarks/l0-profile/two-range.patch",
+      "patch_sha256": "cb89d9dea086fd32e0e2a352c6e2270106755e1395afc1f00bb0f005849b7d31",
+      "patched_sha256": {
+        "src/compaction/leveled.rs": "79eb999098203bed8b4f6a56e2b8deb3a1260c729be39974e0cbf4c444878031",
+        "src/db.rs": "237912e03e57e92cd673c26a29eb83e65c29928274479b01cdb7b715eaf54599",
+        "src/options.rs": "f6801c394b6c79ecc68de29675c258c2cf47b880358f4dcb77887e113df212ef"
+      }
+    },
+    "grouped": {
+      "revision": "d5569da912c2e9c59d915f20d04611a9322386d9",
+      "overlay_sha256": {
+        "src/db/flush.rs": "f16a819824a93de08728294d985f5bfc38b73791302c938d87f8fc9da135991d",
+        "benches/grouped_reads.rs": "76724f2a1092c0bb0ff4b2a64ed576605bc1e2be049fb9a522b1ccfc7c39adcb",
+        "benches/grouped_reads/macos.rs": "fc100f462f86d2983b9443c5997bd7cf0b11002fe824fa5b47dfb938943e903d"
+      }
+    },
+    "guard-baseline": {
+      "revision": "277ef08e5e0fa9ebf66b61084c4aea957f68c80a"
+    },
+    "guard-candidate": {
+      "revision": "d5569da912c2e9c59d915f20d04611a9322386d9",
+      "overlay_sha256": {
+        "src/db/flush.rs": "f16a819824a93de08728294d985f5bfc38b73791302c938d87f8fc9da135991d"
+      }
+    }
+  },
+  "scalar_guard": {
+    "path": "docs/benchmarks/grouped-reads/scalar_guard.rs",
+    "sha256": "8b1e212f419c520df2e0445e168c7ea8c771b6e5ecec14f6aaf81da6481aa46c"
+  },
+  "guard_manifest": "[package]\nname = \"mmdb-production-guard\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nmmdb = { path = \"../mmdb\" }\n\n[features]\ngrouped-api = []\n\n[profile.release]\nlto = \"thin\"\ncodegen-units = 1\nopt-level = 3\n",
+  "binaries": {
+    "control": {
+      "source": "engine",
+      "rebuild": "cargo +stable build --locked --profile bench --bench engine_profile",
+      "sha256": "82e718b1f11937687f331f0c236acddac6ecf70ed98aa236e82daf79f8e8750e"
+    },
+    "timing": {
+      "source": "engine",
+      "rebuild": "cargo +stable build --locked --profile bench --bench engine_profile --features bench-metrics",
+      "sha256": "358dd677b4019ea4933d524ebc88d724abd0d8f9ec56e3864dfbdc6cf41a835d"
+    },
+    "l0": {
+      "source": "engine",
+      "rebuild": "cargo +stable build --locked --profile bench --bench l0_profile --features bench-metrics",
+      "sha256": "1fd83d0babc7083c43d8ca4a266f60f4426d29598e19ca4d47adfdf42a3c9c76"
+    },
+    "handoff": {
+      "source": "handoff",
+      "rebuild": "cargo +stable build --locked --profile bench --bench engine_profile",
+      "sha256": "7f1dec7ae588ce6fc96f8017148e10cd1c421a20631aca9ab3d0e297d2b1526a"
+    },
+    "two-range": {
+      "source": "parallel-l0",
+      "rebuild": "cargo +stable build --locked --profile bench --bench l0_profile --features bench-metrics",
+      "sha256": "6a62d294ee9fe66b52b2e9557eead8eb2df8167ef13d7a8af3705c0721808303"
+    },
+    "grouped-probe": {
+      "source": "grouped",
+      "rebuild": "cargo +stable bench --locked --features test-utils --bench grouped_reads --no-run",
+      "sha256": "e9e3e0e439a4aabab4cfee74649b9a9a83244d98d9d900ce188fe390941807f8"
+    },
+    "guard-baseline": {
+      "source": "guard-baseline",
+      "rebuild": "cargo +stable build --locked --release",
+      "sha256": "b50f83179798ff354eaade04722b2e189b71c4af84f2b0680d933a9b1368f22f"
+    },
+    "guard-candidate": {
+      "source": "guard-candidate",
+      "rebuild": "cargo +stable build --locked --release --features grouped-api",
+      "sha256": "b48c24bf14743d09e6c808e20affdcfb1d67df64fe0372bc1352573f5a047d38"
+    }
+  }
+}

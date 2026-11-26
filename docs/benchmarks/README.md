@@ -2,7 +2,7 @@
 
 ## Engine workloads
 
-| Workload | Result on the measured fixture |
+| Workload | Result on the x86_64 fixture |
 |---|---|
 | [Grouped point reads](grouped-reads/README.md) | Grouping 32 clustered keys reduced request p99 on a warm SST and on verified storage reads. The scattered-key storage result fell within control variation. |
 | [Foreground puts during bulk writes](engine-profile/README.md#small-foreground-writes-during-bulk-updates) | Moving bulk writes to a second DB improved small-put p99 beyond control variation in the repeated-byte asynchronous trial. |
@@ -16,8 +16,20 @@ At revision `90b220e`, all 25 engine validation commands passed on native
 x86_64 Linux and in an AArch64 Linux full-system virtual machine. Each
 target passed 585 default runtime cases and two doctests, plus 429
 overlapping feature-enabled library tests. The arena pin test also passed
-under Miri. The reported latency and throughput runs used native x86_64.
+under Miri.
 [Validation receipt](engine-profile/validation.json)
+
+### Physical ARM64 on macOS
+
+On Apple M5, 32 clustered keys had 25.30% lower request p99 with grouped
+reads on a warm SST and 66.64% lower p99 with verified device reads. The
+scattered device gain was 5.48%, above this host's 2.01% control spread.
+At an equal 30 MiB write-buffer allowance per shard, two immutable slots
+and a 10 MiB buffer improved hot-shard foreground p99 by 10.89% and
+saturation throughput by 35.06% relative to four slots and a 6 MiB buffer.
+Two-range L0 compaction exceeded the read p99 regression ceiling on this
+host. Debug and release each passed 577 runtime cases and two doctests.
+[M5 measurements, controls and native test receipt](apple-m5/README.md)
 
 ## VSDB application results
 

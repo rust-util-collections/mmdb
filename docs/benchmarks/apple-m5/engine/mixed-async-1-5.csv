@@ -1,0 +1,9 @@
+case,metric,n_pairs,ab_reference,candidate,gain_pct,max_AA_pct,pairs_favoring_candidate,kept_pairs,min_value,max_value
+mixed-false,smallput_p99_us,5,5928.408,3440.986,43.18,55.57,5,5,2999.762,10446.593
+mixed-false,read_p99_us,5,33.994,33.437,3.74,12552.07,4,5,31.182,5793.132
+mixed-false,peak_rss_MiB,5,47.484,45.562,3.69,4.34,5,5,45.344,52.25
+mixed-false,logical_MiB_s,5,105.921,105.916,-0.01,0.12,1,5,105.774,105.922
+mixed-false,compaction_output_MiB,5,13.992,13.339,4.67,0.02,5,5,13.339,13.995
+mixed-false,compaction_output_per_logical_byte,5,0.164,0.156,4.67,0.02,5,5,0.156,0.164
+mixed-false,final_l0,5,2,3,,0.0,,5,2,3
+mixed-false,final_immutables,5,0,0,,,,5,0,0

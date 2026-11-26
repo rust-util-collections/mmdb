@@ -92,10 +92,12 @@ lifetime and footprint.
 
 ## Reproduction
 
-From the repository root use the current [Rust benchmark](../../../benches/grouped_reads.rs)
-and a fresh local Linux fixture. Set `probe` to the executable Cargo prints,
-`fixture` to an unused directory, and `cpus` to the desired CPU affinity.
+From the repository root build the Rust benchmark and prepare a fresh local
+fixture. Set `probe` to the executable Cargo prints and `fixture` to an
+unused directory. Set `cpus` to the desired affinity on Linux or to
+`native` for macOS scheduling.
 The runner stores the executable and fixture digests beside each output CSV.
+[Rust benchmark](../../../benches/grouped_reads.rs) · [Apple M5 results and I/O accounting](../apple-m5/README.md)
 
 ```sh
 cargo +stable bench --features test-utils --bench grouped_reads --no-run
