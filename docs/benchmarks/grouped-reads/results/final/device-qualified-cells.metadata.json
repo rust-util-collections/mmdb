@@ -30,7 +30,6 @@
   "selected_fanout": null,
   "selected_locality": null,
   "selection": {
-    "source": "device-original.csv",
     "rule": "Copy every original row of a cell only if all twenty runs meet the storage rule.",
     "cells": [
       {

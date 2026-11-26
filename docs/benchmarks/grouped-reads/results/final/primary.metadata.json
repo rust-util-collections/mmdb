@@ -28,5 +28,11 @@
   "base_seed": 20261125,
   "trace": "splitmix over power-of-two keys; clustered permutes within consecutive fanout keys, scattered independent",
   "selected_fanout": null,
-  "selected_locality": null
+  "selected_locality": null,
+  "retained_cells": [
+    {
+      "locality": "clustered",
+      "fanout": 32
+    }
+  ]
 }

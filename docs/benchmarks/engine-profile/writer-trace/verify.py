@@ -4,11 +4,10 @@ import hashlib
 import json
 from pathlib import Path
 import statistics
-import sys
+
+from replay import load, replay
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
-from replay import load, replay
 
 
 def verify():
@@ -45,11 +44,9 @@ def verify():
         with gzip.open(trace_file, "rb") as stream:
             assert hashlib.sha256(stream.read()).hexdigest() == traced["trace_sha256"]
         calls, groups = load(trace_file)
-        earlier_calls, _ = load(HERE.parent / f"trace-{number}.csv.xz")
-        for operation in ("SmallPut", "Batch"):
-            assert [c.scheduled for c in calls[operation]] == [
-                c.scheduled for c in earlier_calls[operation]
-            ]
+        period_ns = 1_000_000_000 // context["rate"]
+        for operation, interval in (("SmallPut", period_ns), ("Batch", period_ns * 128)):
+            assert all(call.scheduled == index * interval for index, call in enumerate(calls[operation]))
         observed = replay(calls, groups, context["burst"], False)
         projected = replay(calls, groups, context["burst"], True)
         sensitivity = replay(calls, groups, context["burst"], True, True)

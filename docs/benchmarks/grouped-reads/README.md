@@ -1,50 +1,32 @@
 # Grouped pinned point reads
 
-At revision `fca4802`, a 32-key clustered request against a warm single SST
-had median run p99 of **18.21 µs** with `DB::get_many_pinned_with_options`
-and **27.12 µs** with 32 pinned gets on one snapshot. The median within-pair
-gain was **33.30%** across five pairs (32.27–35.88%). Its largest A/A
-difference was 7.41%. The same trace reduced index/data block acquisitions
-from 64 to 3.07 per request on average. Both arms delivered the same 32
-values with the same ownership lifetime. These trials used the MMDB API.
-VSDB collection workloads require separate measurement. [Primary raw trials](results/final/primary.csv) · [Host and fixture](results/final/primary.metadata.json)
+For 32 clustered keys in a warm single SST, 32 scalar pinned reads took
+**27.12 µs** at request p99 and one `DB::get_many_pinned_with_options`
+took **18.21 µs**. The median paired reduction was **33.30%** (32.27–35.88%,
+five favorable pairs, largest scalar/scalar change 7.41%). Index/data block
+acquisitions fell from 64 to 3.07 per request. The public API resolves up to
+32 keys against one view and sequence, retains the validated blocks in two
+SST cursors and restores the original input order. The same snapshot and
+result lifetime apply to both benchmark arms. [Implementation](../../../src/db/read.rs) · [Regression tests](../../../tests/grouped_reads.rs)
 
-A separate normal-dependency build compared the existing single-key API
-at `72d1dd9` and the corrected code, with all engine profiling features
-disabled. The initial 300,000-request runs had a 6.21% maximum A/A
-difference. A longer calibration of 1,000,000 requests per process gave a
-paired median change of −0.63% and a maximum absolute A/A difference of
-3.20%. Every A/B pair stayed within the 5% regression budget.
-[Initial guard](results/final/default-scalar.csv) · [Longer guard](results/final/default-scalar-extended.csv)
+Separate production builds with default features confirmed a **37.55%**
+paired p99 reduction on the single-SST workload and **26.79%** on a
+two-SST fixture with odd-key updates in L0. A scalar API control using
+one million requests per process measured a −0.63% gain, within its
+3.20% scalar/scalar variation. The effect of using grouped reads in an
+application depends on its keys and traversal. [Production single SST](results/final/integration-release.csv) · [Overlapping SSTs](results/final/release-overlap.csv) · [Scalar control](results/final/default-scalar-extended.csv) · [Build fingerprints](results/final/production-builds.json) · [VSDB VecDex query measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-vecdex-v5/README.md)
 
-The grouped singleton itself also passed its longer calibration at 1,000,000
-requests per process. Its paired median change was 0.00% (−1.29% to +1.56%),
-with a largest A/A difference of 2.20%. In separate uninstrumented 32-key
-release builds, clustered single-SST p99 improved by 31.54% and the overlapping L0/bottom-SST fixture
-by 26.79%, both across five favorable pairs. The latter checks returned
-versions for known odd-key overwrites. [Grouped singleton](results/final/primary-singleton-extended.csv) · [Production single SST](results/final/release-fixture.csv) · [Production overlapping SSTs](results/final/release-overlap.csv)
+## Request latency
 
-The production integration check repeated the 32-key single-SST workload
-with separate release builds of `277ef08` (scalar control) and `736b87e`
-(grouped after integration with the writer/metrics work). At 50,000 requests
-per process the five paired gains were 35.16–51.29%, with median **37.55%**.
-Median run p99 was 28.71 µs / 17.93 µs and the largest A/A difference was
-3.87%. MMDB used its default feature set in both binaries.
-[Integrated production trials](results/final/integration-release.csv) · [Production build and overlap fixture digests](results/final/production-builds.json)
-
-## Workload matrix
-
-These Linux/x86_64 trials used a Ryzen 9 5900X pinned to CPU 4 and the
-release binary identified in the fixture metadata. Each cell has five scalar/scalar pairs and five scalar/grouped pairs. Each
-pair uses the same key trace and alternates execution order across rounds.
-The two p99 columns show the median of each arm across five scalar/grouped pairs.
-The gain is the median change calculated *within* those pairs. This accounts
-for shifts in host latency between runs. The A/A column gives the largest
-absolute difference between two scalar runs on a matched trace. Block probes
-count index and data block acquisitions, including engine-cache hits.
-In these single-SST fixtures scalar calls probe one table per key. Grouped
-calls probe one per distinct key. The verifier replays the scattered trace
-to check the count across duplicate keys.
+Each Linux/x86_64 cell used five independent scalar/scalar (A/A) and five
+scalar/grouped pairs pinned to CPU 4 of a Ryzen 9 5900X. The p99 columns
+are per-arm medians. Gain is computed inside each matched pair over the
+full completed request population. A/A is the largest absolute change
+in a matched pair of scalar controls. Each warm/page trial observed zero
+Linux storage reads. The warm arm used a 128 MiB MMDB cache. The page
+arm read the SST into the OS page cache with MMDB block caching disabled.
+The disk arm verified Linux read traffic and also disabled the MMDB cache.
+[Fixture, compiler and host](results/final/primary.metadata.json)
 
 | Cache | Locality | Keys | Scalar p99 µs | Grouped p99 µs | Paired gain | Max A/A difference | Block probes per request, scalar / grouped |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -67,29 +49,20 @@ to check the count across duplicate keys.
 | device | scattered | 8 | 1,383.90 | 1,331.74 | +4.65% | 20.31% | 16.00 / 13.42 |
 | device | scattered | 32 | 5,776.73 | 4,607.26 | +10.10% | 10.26% | 64.00 / 52.88 |
 
-The 8- and 32-key clustered gains exceeded the A/A spread in all three
-regimes. On scattered keys, gains exceeded the measured spread only in
-the page-cache runs. With zero engine-cache admission, both arms issued
-buffered reads and checksum validations for blocks they acquired. Reusing
-validated blocks can save CPU even when Linux issues zero storage reads.
-Across all six singleton controls, the median paired change stayed within
-0.4% on this host.
+The 8- and 32-key clustered gains exceeded control variation in all three
+regimes. For scattered keys, only the page-cache cell showed a gain beyond
+that variation. All six singleton median changes were within 0.4%. The
+table uses longer controls for both warm singletons and the clustered
+page-cache singleton. [Warm primary](results/final/primary.csv) · [Warm matrix](results/final/warm.csv) · [Page matrix](results/final/page.csv) · [Clustered singleton](results/final/primary-singleton-extended.csv) · [Scattered singleton](results/final/warm-singleton.csv) · [Page singleton](results/final/page-singleton-clustered-extended.csv)
 
-The table uses the extended controls for both warm singletons and the
-page-cache clustered singleton. The original short warm scattered A/A
-spread was 29.08%, and the extended 300,000-request maximum was 0.93%.
-For the page-cache clustered singleton, a short A/A pair differed by
-47.38%. The prespecified 50,000-request recalibration gave 2.77% maximum
-A/A. Other secondary cells used 10,000 requests per process.
-[Warm trace](results/final/warm.csv) · [Extended warm scattered singleton](results/final/warm-singleton.csv) · [Page trace](results/final/page.csv) · [Extended page singleton](results/final/page-singleton-clustered-extended.csv)
+## Verified storage reads and pins
 
-### Device evidence
-
-Coverage below is the minimum across all twenty runs in a cell. The
-conditional p99 includes only requests with at least 4 KiB of Linux
-`read_bytes`. The final column divides each process's Linux `read_bytes`
-by **all completed requests**, then takes the median per arm across the
-five scalar/grouped pairs. The workload matrix above uses full-request p99.
+Every accepted disk trial registered at least 4 KiB in Linux process
+`read_bytes` on at least 95% of its requests. Coverage is the minimum across
+all 20 processes in each cell. The conditional p99 below includes only
+qualified requests. The preceding table uses the complete trace. Storage
+bytes per request divides by **all** completed requests. Device readahead
+and mixed page hits in one query can affect those counts.
 
 | Locality | Keys | Minimum coverage | I/O-qualified p99 µs, scalar / grouped | Linux read bytes per request, scalar / grouped |
 |---|---:|---:|---:|---:|
@@ -100,104 +73,67 @@ five scalar/grouped pairs. The workload matrix above uses full-request p99.
 | scattered | 8 | 100.00% | 1,383.90 / 1,331.74 | 70,864 / 71,286 |
 | scattered | 32 | 100.00% | 5,776.73 / 4,607.26 | 284,125 / 285,696 |
 
-Five of the six device cells used the original 262,144 rows. Eight
-of the twenty original 32-key scattered observations missed 95% coverage,
-with a minimum of 92.94%. The original 120 observations are archived.
-The eligible subset contains all twenty rows of each qualifying original
-cell. The entire scattered 32-key cell was then repeated with matched arms,
-seeds and cache settings on one 1,048,576-row SST (152,622,691 bytes).
-All 200,000 requests in that replacement met the 4 KiB condition. The
-larger keyspace also changes the potential for block reuse.
-[Unfiltered device trace](results/final/device-original.csv) · [Eligible original cells](results/final/device-qualified-cells.csv) · [Cell-selection metadata](results/final/device-qualified-cells.metadata.json) · [Larger fixture trace](results/final/device-scattered-32-large.csv) · [Larger fixture and binary digests](results/final/device-scattered-32-large.metadata.json)
+The main fixture is one 38,155,840-byte SST with 262,144 eight-byte
+keys, 128-byte high-entropy values and 4 KiB blocks. For 32 scattered
+disk reads the storage coverage at that size fell to 92.94%. The reported
+cell uses the complete five pairs of each kind on one 1,048,576-row SST
+instead. All 200,000 requests in the larger fixture met the threshold.
+The larger keyspace also changes the opportunity for block reuse.
+[Qualified disk cells](results/final/device-qualified-cells.csv) · [Coverage and selection](results/final/device-qualified-cells.metadata.json) · [Larger matched fixture](results/final/device-scattered-32-large.csv)
 
-## Mechanism and correctness
+The timed operation ends when the complete result vector returns. The
+driver then validates each value and releases the pins together.
+`peak_pin_bytes` counts capacity of distinct SST allocations held by
+returned pins. The maximum observed was 131,890 bytes against the
+143,360-byte fixture budget. In the first clustered 32-key page-cache
+trace, the maxima were 131,890 bytes for scalar reads and 12,361 for
+grouped reads. A caller releasing pins as it decodes has a different
+lifetime and footprint.
 
-One DB read view fixes the sources and one read sequence fixes visibility.
-The request sorts input slots internally, coalesces duplicates and retains
-validated blocks in two recent SST cursors. Results are restored to original
-input order. Storage misses use the existing synchronous positional reads.
-With the engine cache disabled, reusing one index leaf also avoids repeatedly
-validating its OS-cached bytes. In an uncached fixture with alternating odd
-keys in L0 and a bottom table, earlier code acquired 64 blocks across 32 slots. The two
-cursors acquired four (one index leaf and one data block per SST) and the
-32 returned values shared two allocations. A snapshot lookup past the
-final partition of a third SST preserves these cursors. That case acquired
-eight blocks before the partition check was corrected and four afterward.
-A separate regression test reads a valid lower key twice and then encounters
-a corrupt later SST. Before correction the failed request added 12 to
-`stats.bytes_read`. It now drops the earlier pins and adds zero. Overlapping
-more than two candidate files can evict a cursor and require another block access.
-[Grouped-read regression tests](../../../tests/grouped_reads.rs) · [Preliminary experiments](results/README.md)
+## Reproduction
 
-## Reproduce the comparison
-
-Use a supported Linux local filesystem, Python 3.11+, and an explicit CPU
-affinity. The device arm uses Python's file-scoped `posix_fadvise` to request
-eviction and samples the calling process's Linux `read_bytes` counter.
-Compile a release binary with the test instrumentation enabled. Cargo prints
-the executable path. Use a new directory for the store and retain the
-neighboring `.rows` file across trials.
+From the repository root use the current [Rust benchmark](../../../benches/grouped_reads.rs)
+and a fresh local Linux fixture. Set `probe` to the executable Cargo prints,
+`fixture` to an unused directory, and `cpus` to the desired CPU affinity.
+The runner stores the executable and fixture digests beside each output CSV.
 
 ```sh
 cargo +stable bench --features test-utils --bench grouped_reads --no-run
 "$probe" prepare "$fixture" 262144
-python3 -B docs/benchmarks/grouped-reads/trials.py "$probe" "$fixture" primary.csv \
-    --matrix primary --samples 300000 --cpus "$cpus" --revision "$revision"
+d=docs/benchmarks/grouped-reads
+python3 -B "$d/trials.py" "$probe" "$fixture" primary.csv \
+    --matrix primary --samples 300000 --cpus "$cpus" --revision HEAD
+python3 -B "$d/summarize.py" "$d"/results/final/{primary,warm,page,device-qualified-cells,device-scattered-32-large}.csv
+python3 -B "$d/summarize.py" "$d"/results/final/{primary-singleton-extended,warm-singleton,page-singleton-clustered-extended}.csv
+python3 -B -m unittest discover -s "$d"
 ```
 
-Run the remaining `warm`, `page` and `device` matrices with 10,000 requests
-per run. To extend the scattered singleton control, select `--matrix warm
---fanout 1 --locality scattered --samples 300000`. The runner places machine,
-binary, fixture and filesystem metadata beside the CSV and checks each
-run's cache evidence. Use `summarize.py FILE.csv ...` for the paired results
-and `python3 -B -m unittest discover -s docs/benchmarks/grouped-reads` for the
-cache-regime classification checks.
+For the warm, page and device matrices use 10,000 requests per process.
+The clustered warm singleton used `--matrix primary --fanout 1` with one
+million requests, the scattered warm singleton used 300,000 requests and
+the clustered page singleton used 50,000. The latter two use `--matrix warm --fanout 1 --locality scattered` and
+`--matrix page --fanout 1 --locality clustered`, respectively. For
+the large disk cell create a separate 1,048,576-row fixture and select
+`--matrix device --locality scattered --fanout 32`.
 
-If a device cell fails the storage criterion, preserve the observations and
-repeat the entire paired cell on a larger fixture. To reproduce this case,
-prepare 1,048,576 rows and select `--matrix device --locality scattered --fanout 32` with both arms using that new fixture.
+The measured grouped sources carry the identifiers `fca4802` and
+`736b87e` in the raw metadata. For the integrated comparison, main-history
+`c97bb5c` contains the exact same crate manifest, Rust library and benchmarks
+as `736b87e`. Build the scalar control at `277ef08`. The earlier measured
+engine and probe can be reconstructed in a detached checkout at `72d1dd9`
+using the grouped-read change from main history:
 
-Both read methods pin the same snapshot. Timing starts after construction
-of the key list and stops when the complete result vector returns.
-Every value is then checked against its key and all pins released together.
-A caller that releases a scalar pin immediately after decoding it has a
-different retention pattern from this all-results workload.
-`peak_pin_bytes` charges each distinct returned SST allocation once, using its
-buffer capacity. The fixture budget of 143,360 bytes covers the returned
-allocations for this 128-byte value, 4 KiB block workload. Reader scratch,
-memtables, and process RSS have different ownership and sizes. With cache
-admission disabled a scalar loop may load the same data block into a new
-allocation for each key. Grouped pins can instead share that allocation.
-For example, on the first 10,000-request clustered 32-key page-cache trace,
-the maximum simultaneous returned capacity was 131,890 bytes for the scalar
-loop and 12,361 bytes for grouped reads. The largest observed capacity across
-all accepted cells and both arms was 131,890 bytes.
+```sh
+git diff c97bb5c^ c97bb5c -- src benches/grouped_reads.rs | git apply --3way
+git show c97bb5c:Cargo.toml | tail -5 >> Cargo.toml
+```
 
-The 38,155,840-byte bottom-level SST contains 262,144 deterministic eight-byte
-keys and high-entropy inline values. Nearby queries permute keys in one
-consecutive group. Scattered queries draw uniformly over the same keyspace.
-The warm arm preloads all rows into a 128 MiB engine cache. The page and device
-arms disable engine cache admission. The page arm reads the entire SST through
-the OS cache before timing. The device arm requests eviction every 128 queries
-on the fixture SST only. A warm or page trial requires zero kernel-reported
-storage reads during measurement. A device trial requires at least 4 KiB of Linux
-`read_bytes` on at least 95% of requests. Its primary statistic is p99 over the full matched
-trace. The percentile conditional on those I/O-qualified requests is
-reported separately. Other blocks in a qualified request can be OS-cache hits.
-Readahead and the underlying SSD controller can affect those latencies.
-
-For production-build controls, build `scalar_guard.rs` twice as a standalone
-binary whose sole dependency is the corresponding MMDB path.
-Use separate Cargo target directories for the two builds, the resolved
-lockfile, and the regular release profile with thin LTO and one codegen unit.
-Leave MMDB's default features in effect. Pass those
-two binaries and the same fixture to `guard.py BASELINE CANDIDATE FIXTURE
-OUTPUT --cpus CPUSET --samples 300000`. This guard calls the published
-single-key API and checks the returned value after its timer. Declare a local
-`grouped-api = []` feature in the guard crate. Enable it only when building the
-candidate guard so it can also invoke the new method. MMDB itself retains its
-default feature set. Use `--fanout 32 --samples 50000` for uninstrumented
-group trials on the single-SST fixture and a separately prepared
-`prepare-overlap DIR 262144` fixture. The latter holds all keys at the bottom
-and odd-key replacements in one L0 file. The guard checks the visible version
-besides the key and value length.
+For the independent uninstrumented guard, build [scalar_guard.rs](scalar_guard.rs)
+as a standalone binary with MMDB as its sole path dependency. Use separate
+target directories, a regular release profile with thin LTO/one codegen
+unit and MMDB default features for both builds. Enable a guard-local
+`grouped-api = []` feature only for the candidate. Run [guard.py](guard.py)
+with the baseline, candidate, fixture and output paths, `--cpus "$cpus"`
+and `--samples 1000000` for the singleton or `--fanout 32 --samples 50000`
+for grouped reads. The overlapping fixture is built with
+`"$probe" prepare-overlap "$fixture" 262144`.

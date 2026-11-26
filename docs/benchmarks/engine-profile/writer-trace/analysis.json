@@ -7,7 +7,6 @@
     "burst": 4096,
     "cpus": "4-7",
     "filesystem": "Btrfs directory NOCOMPRESS",
-    "same_recorded_arrivals_as_prior": true,
     "trace_patch_sha256": "0a4538687df0e9e77f5c76d20cc0de2579d782b33e1135dcf946bd1b9d02f6fb",
     "executable_sha256": "0f5ada5a25a46dbab5f324798901f322ebb022da8c13a96c9613ccc0d98b773c"
   },

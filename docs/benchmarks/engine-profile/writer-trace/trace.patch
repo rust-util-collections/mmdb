@@ -1,8 +1,8 @@
 diff --git a/benches/engine_profile/concurrent.rs b/benches/engine_profile/concurrent.rs
-index 0a872bd..0a8f3eb 100644
+index fd60611..c67ad82 100644
 --- a/benches/engine_profile/concurrent.rs
 +++ b/benches/engine_profile/concurrent.rs
-@@ -45,6 +45,8 @@ struct Samples {
+@@ -48,6 +48,8 @@ struct Samples {
      rows: Vec<Sample>,
      #[cfg(feature = "bench-metrics")]
      profile: mmdb::ThreadWriteProfile,
@@ -11,8 +11,8 @@ index 0a872bd..0a8f3eb 100644
  }
 
  fn streams(config: &Config, memory: bool, placement: &str) -> Vec<Stream> {
-@@ -133,6 +135,12 @@ fn run_stream(
-         rows: Vec::with_capacity(s.count),
+@@ -139,6 +141,12 @@ fn run_stream(
+         }),
          ..Default::default()
      };
 +    #[cfg(feature = "bench-metrics")]
@@ -24,7 +24,7 @@ index 0a872bd..0a8f3eb 100644
      barrier.wait();
      barrier.wait();
      let start = *clock.get().unwrap();
-@@ -214,6 +222,7 @@ fn run_stream(
+@@ -244,6 +252,7 @@ fn run_stream(
      #[cfg(feature = "bench-metrics")]
      {
          samples.profile = mmdb::take_thread_write_profile();
@@ -32,16 +32,30 @@ index 0a872bd..0a8f3eb 100644
      }
      samples
  }
-@@ -338,6 +347,44 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
-             super::cpu_ticks().saturating_sub(cpu_before),
-         )
-     });
+@@ -393,6 +402,13 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
+         #[cfg(feature = "bench-metrics")]
+         println!("stage leader_stream={op:?} {:?}", run.profile);
+         let all = by_class.entry(op).or_default();
++        #[cfg(feature = "bench-metrics")]
++        if let Some(trace) = run.trace.take() {
++            assert!(
++                all.trace.replace(trace).is_none(),
++                "trace requires one worker per recorded write class"
++            );
++        }
+         all.offered += run.offered;
+         all.completed += run.completed;
+         all.rejected += run.rejected;
+@@ -423,6 +439,44 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
+     if let Some(sampled) = mem {
+         println!("sampled_peaks {sampled:?}");
+     }
 +    #[cfg(feature = "bench-metrics")]
 +    if let Some(path) = std::env::var_os("MMDB_GROUP_TRACE") {
 +        use std::io::Write;
 +        let mut output = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
 +        let offset = |time: Instant| nanos(time.duration_since(*clock.get().unwrap()));
-+        for (op, run) in &runs {
++        for (op, run) in &by_class {
 +            let Some(trace) = &run.trace else { continue };
 +            assert_eq!(trace.enqueued.len(), run.rows.len());
 +            for (i, (queued, row)) in trace.enqueued.iter().zip(&run.rows).enumerate() {
@@ -74,14 +88,14 @@ index 0a872bd..0a8f3eb 100644
 +        }
 +        output.flush().unwrap();
 +    }
-     let wall = runs
-         .iter()
-         .filter_map(|(_, run)| run.rows.last())
+     for (op, all) in by_class {
+         assert!(
+             all.completed > 0 && all.completed == all.offered,
 diff --git a/src/db.rs b/src/db.rs
-index 20eb490..07df8a5 100644
+index 03cdc93..28002f4 100644
 --- a/src/db.rs
 +++ b/src/db.rs
-@@ -2984,6 +2984,8 @@ impl DB {
+@@ -2995,6 +2995,8 @@ impl DB {
          // group commit to actually batch writes.
          let mut wq = self.write_queue.lock();
          wq.queue.push_back(req_ptr);
@@ -90,7 +104,7 @@ index 20eb490..07df8a5 100644
 
          let mut group_flushed = false;
          #[cfg(feature = "bench-metrics")]
-@@ -3010,6 +3012,8 @@ impl DB {
+@@ -3021,6 +3023,8 @@ impl DB {
 
              // Signal everyone in this batch
              wq = self.write_queue.lock();
@@ -99,7 +113,7 @@ index 20eb490..07df8a5 100644
              for &rp in &batch_group {
                  // SAFETY: all request pointers came from queue entries whose
                  // callers are blocked until this leader sets `done`.
-@@ -3124,6 +3128,8 @@ impl DB {
+@@ -3135,6 +3139,8 @@ impl DB {
      /// the leader can harvest settled dead-key registrations after it has
      /// woken the group's waiters.
      fn write_batch_group(&self, batch_group: &[*mut WriteRequest]) -> Result<bool> {
@@ -108,7 +122,7 @@ index 20eb490..07df8a5 100644
          self.check_writable()?;
          let mut group = Vec::with_capacity(batch_group.len());
          for &ptr in batch_group {
-@@ -3195,6 +3201,8 @@ impl DB {
+@@ -3206,6 +3212,8 @@ impl DB {
              ));
          }
          self.sequence.store(last_group_seq + 1, Ordering::Release);
@@ -117,7 +131,7 @@ index 20eb490..07df8a5 100644
 
          let mut assigned = Vec::with_capacity(batch_group.len());
          let mut append_error: Option<Error> = None;
-@@ -3245,6 +3253,8 @@ impl DB {
+@@ -3256,6 +3264,8 @@ impl DB {
          } else {
              None
          };
@@ -126,7 +140,7 @@ index 20eb490..07df8a5 100644
          if let Some(e) = wal_sync_err {
              self.set_bg_error(format!("WAL sync failed: {}", e));
              for &rp in batch_group {
-@@ -3257,6 +3267,8 @@ impl DB {
+@@ -3268,6 +3278,8 @@ impl DB {
 
          {
              crate::profile::time_scope!(apply_ns);
@@ -135,7 +149,7 @@ index 20eb490..07df8a5 100644
              let mut applied_last_seq = None;
              for &(req_ptr, first_seq) in &assigned {
                  // SAFETY: request pointers are still owned by this leader.
-@@ -3282,6 +3294,33 @@ impl DB {
+@@ -3293,6 +3305,33 @@ impl DB {
                      self.synced_wal_seq.store(last_seq, Ordering::Release);
                  }
              }

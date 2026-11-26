@@ -1,6 +1,8 @@
 # Bounded prefix cuts during flush
 
-**Retain the existing flush policy.** The bounded prefix cut doubled installed L0 SSTs for the same 40 durable flushes in every candidate run. All original cold-only L1 files still entered a compaction. The lower file count in the control limited how often it rewrote those cold prefixes.
+MMDB keeps its existing flush policy. A single additional prefix cut doubled
+the file count at the same number of flushes and increased cold-row rewrites.
+All original cold-only L1 files still entered compaction.
 
 | Five A/B pairs, 16,384 requests per class | Control median | One-cut median | Paired gain | Paired gain range | Max A/A difference |
 |---|---:|---:|---:|---:|---:|
@@ -14,15 +16,15 @@
 
 Positive gain favors the optional cut. Stall time increased in all five comparisons, and each arm retired 1,717,902 bytes of original cold-only SSTs. The cold-row collector was enabled identically on both arms. Short latency tails varied appreciably, but the candidate missed both its cold-rewrite objective and the 20% stall-improvement screen. Each process completed the prescribed trace and checked its snapshot, live and writable-reopened rows.
 
-Closing debt varied. The control closed with zero L0 files in all five comparisons and the candidate with 0–4. At foreground completion, the control had emitted 53,611,715 bytes of new compaction SSTs in each run. The candidate had already emitted 70,016,530–75,706,198 bytes. Extra output was therefore present before cleanup as well. A different picker that skipped disjoint gaps would need new output-interval and crossing-tombstone proofs. This trial measures cuts with today's complete L0 claim and serial execution. [All 20 observations](runs.csv) · [Replay driver](trials.py)
+At close, the remaining L0 file counts differed. The control closed with zero L0 files in all five comparisons and the candidate with 0–4. At foreground completion, the control had emitted 53,611,715 bytes of new compaction SSTs in each run. The candidate had already emitted 70,016,530–75,706,198 bytes. Extra output was therefore present before cleanup as well. A different picker that skipped disjoint gaps would need new output-interval and crossing-tombstone proofs. This trial measures cuts with today's complete L0 claim and serial execution. [All 20 observations](runs.csv) · [Replay driver](trials.py)
 
-## Design and correctness
-
-This experiment changes one decision inside `DB::write_memtable_ssts`. For an uncompressed output with a configured prefix, it can start one additional SST at a prefix change, provided each side contains at least 32 KiB of point-value payload. Uncompressed data blocks store those value bytes verbatim. The prepass therefore gives a conservative bound that excludes key savings and range-tombstone endpoints. Existing mandatory metadata cuts continue to take precedence. The extra boundary uses the same user-key transition, tombstone clipping, carry and atomic flush install as an ordinary cut.
-
-The deterministic picker control ingests a single cold L1 point file between two hot prefixes. It repeats the pick with one broad L0 SST and with two explicitly flushed, point-disjoint L0 SSTs. Both picks include the cold L1 input. Current whole-L0 selection seeds the target overlap search with the aggregate key span. Splitting the flush can reach the existing file-count thresholds sooner without shrinking that span. [Picker](../../../../src/compaction/leveled.rs)
-
-The candidate test produced two L0 SSTs instead of one with three substantial prefixes, a crossing range deletion, two versions at a cut boundary and old/deleted/current snapshots. It checked point reads and the full ordered scan through flush, compaction and writable reopen. A second flush with a small trailing prefix emitted one SST. The two-file assertion failed on the control with the test alone and passed once the patch enabled the cut.
+The cut separates two eight-byte prefixes when there is at least 32 KiB
+of uncompressed payload on each side. Both resulting SSTs still belong
+to the same whole-L0 claim. Its aggregate key span includes the cold gap,
+and the extra files reach the existing L0 thresholds sooner. The candidate
+test covers a range deletion across the cut and the visibility of boundary
+versions through flush, compaction and writable reopen.
+[Picker implementation](../../../../src/compaction/leveled.rs)
 
 ## Replay
 
@@ -38,7 +40,7 @@ cargo +stable bench --manifest-path "$control_tree/Cargo.toml" --features bench-
 cargo +stable bench --manifest-path "$candidate_tree/Cargo.toml" --features bench-metrics --bench l0_profile --no-run
 python3 trials.py --baseline "$control_binary" --candidate "$candidate_binary" \
     --l0-replay ../replay.py --tmpdir "$scratch" --cpus 4-7 --operations 16384 --rate 20000 \
-    --output runs.csv
+    --output fresh-runs.csv
 ```
 
 The runner uses the original `gap` fixture with one serial range in both arms, six cold prefixes between the two updated prefixes, and the cold-row observer enabled in every run. All comparisons use the same durability, seeds, CPU allocation, starting LSM layout, collector, and 20,000 operations/s offered per reader and writer. Each fresh process verifies every held snapshot, current row and reopened row. Compare matched A/B runs against the independently repeated A/A band. [Original workload and accounting](../README.md)

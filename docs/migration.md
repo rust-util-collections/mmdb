@@ -36,10 +36,11 @@ visible rows in key order and the final iterator status on both sides before
 switching the caller. The exporter preserves the visible contents at the
 offline cut and assigns fresh engine sequence history.
 
-Use the destination's geometry for a subsequent writable open. To inspect
-the result, `DB::open_read_only` adopts those values automatically. The
-exporter works on MMDB key/value pairs. Changes to vsdb collection formats
-require a migration at the vsdb layer. [Exporter](../tools/v4-export/src/main.rs) · [Golden-store tests](../tools/v4-export/tests/golden.rs)
+For a VSDB universe, use the offline `vsdb-stage-v5` tool. It stages the
+default and named namespaces together, rebinds external placements and
+checks allocator floors. A v18-on-v4 universe keeps its collection
+encodings. Applications upgrading v17 also convert saved and embedded
+handles in their staging copy. [MMDB exporter and golden tests](../tools/v4-export/tests/golden.rs) · [VSDB migration guide](https://github.com/rust-util-collections/vsdb/blob/master/migration/README.md)
 
 ## Update Rust callers
 

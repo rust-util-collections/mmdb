@@ -28,7 +28,7 @@ to unsupported architectures under `Won't Fix`.
 | Read, write, recovery, format, or resource behavior | [Storage architecture](../architecture.md), the subsystem implementation and its tests |
 | Store and caller migration | [Migration guide](../migration.md), `tools/v4-export/src/main.rs` and its golden-store tests |
 | Engine performance and diagnostic changes | [Engine workloads](../benchmarks/engine-profile/), [L0 trial and disposition](../benchmarks/l0-profile/), [grouped read trials](../benchmarks/grouped-reads/), and [performance priorities](pragmatic-engineering.md#performance-priorities). Match revision, feature flags, load and counter scope. |
-| Historical measurements or proposed designs | [Design records](../proposals/) and their cited revisions. Use the current implementation to establish what shipped |
+| Historical measurements or proposed designs | [Engine comparison and release decisions](../proposals/mmdb-v5-vsdb-v18-improvements.md) and the measured revisions in the benchmark reports |
 | Skill scope, outputs, and validation | [Project guide](../../AGENTS.md#skills), the four skill entry points and their `agents/openai.yaml`, [workflow policy](workflow-policy.md) and [commit protocol](commit-protocol.md) |
 
 The [README](../../README.md#documentation) is the reader index. Update the
@@ -88,7 +88,7 @@ per namespace shard. Its `migration/src/universe/staging.rs`
 publishes a complete universe, including external namespaces. The MMDB exporter
 operates on one store. Use the actual adapter operation and its own workload
 for collection latency, pin lifetime or namespace-wide memory claims.
-[VSDB v18 implementation record](https://github.com/rust-util-collections/vsdb/blob/master/docs/proposals/v18-mmdb-v5-execution.md)
+[VSDB v18 implementation record](https://github.com/rust-util-collections/vsdb/blob/master/docs/v18.md)
 
 ## 2. Review priority (effort allocation, not automatic severity)
 
