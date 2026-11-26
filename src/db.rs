@@ -7470,6 +7470,8 @@ mod tests {
     #[cfg(feature = "bench-metrics")]
     #[test]
     fn write_profile_counts_actual_parks_not_spin_completions() {
+        use std::time::Instant;
+
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(open_test_db(dir.path()));
 
@@ -7498,7 +7500,12 @@ mod tests {
             db_spin2.put(b"spin_k2", b"v2").unwrap();
             crate::take_thread_write_profile()
         });
+        let spin_deadline = Instant::now() + Duration::from_secs(5);
         while db.write_queue.lock().queue.is_empty() {
+            assert!(
+                Instant::now() < spin_deadline,
+                "timed out waiting for spin follower to enqueue"
+            );
             std::hint::spin_loop();
         }
         // Complete immediately while follower is still in its spin window (or check WalSync repeated park)
@@ -7518,7 +7525,8 @@ mod tests {
         }
 
         // 2. Repeated park (`WalSync` has `spin_limit = 0`, so follower parks immediately):
-        //    issue one spurious `unpark()` before completing -> `queue_waits == 1, queue_wakeups >= 2`!
+        //    wake the head with `STATE_WAKE` while `leader_active` stays true and wait
+        //    until it clears `STATE_WAKE` and re-sets `STATE_PARKED` before completing.
         let mut barrier = db.acquire_write_barrier();
         barrier.claim_leadership();
         drop(barrier);
@@ -7534,20 +7542,51 @@ mod tests {
                 .unwrap();
             crate::take_thread_write_profile()
         });
-        let follower_thread = loop {
+        let park_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
             let wq = db.write_queue.lock();
             if let Some(&rp) = wq.queue.front() {
+                // SAFETY: `wq` is held while `leader_active` prevents draining or
+                // completing `rp`, so the parked follower's stack `WriteRequest` is live.
                 let s = unsafe { (*rp).state.load(Ordering::Acquire) };
                 if (s & STATE_PARKED) != 0 {
-                    break unsafe { (*rp).waiter.clone().unwrap() };
+                    break;
                 }
             }
             drop(wq);
+            assert!(
+                Instant::now() < park_deadline,
+                "timed out waiting for follower initial park"
+            );
             thread::yield_now();
+        }
+        // Ensure non-zero elapsed wait time across coarse timers, then issue a
+        // leader-blocked `STATE_WAKE` handoff so the follower wakes from park #1,
+        // clears `STATE_WAKE | STATE_PARKED` under `write_queue`, and parks a second time.
+        thread::sleep(Duration::from_millis(1));
+        let wake_thread = {
+            let wq = db.write_queue.lock();
+            DB::wake_queue_head(&wq)
         };
-        // Spurious wakeup #1 -> follower wakes from park #1 and parks a second time!
-        follower_thread.unpark();
-        thread::sleep(Duration::from_millis(5));
+        wake_thread.expect("parked head waiter").unpark();
+        let repark_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let wq = db.write_queue.lock();
+            if let Some(&rp) = wq.queue.front() {
+                // SAFETY: `wq` is held while `leader_active` prevents draining or
+                // completing `rp`, so the follower's stack `WriteRequest` stays live.
+                let s = unsafe { (*rp).state.load(Ordering::Acquire) };
+                if (s & (STATE_WAKE | STATE_PARKED)) == STATE_PARKED {
+                    break;
+                }
+            }
+            drop(wq);
+            assert!(
+                Instant::now() < repark_deadline,
+                "timed out waiting for follower second park"
+            );
+            thread::yield_now();
+        }
         let group = db
             .write_queue
             .lock()
