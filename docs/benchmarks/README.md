@@ -1,5 +1,11 @@
 # MMDB benchmarks and VSDB v18 results
 
+The four-host tuning study runs the same v5 engine on Apple M5/macOS and
+three physical Linux systems, covering APFS, ext4, ZFS and single- and
+dual-device Btrfs. Its independent controls cover grouped reads, shard
+buffer geometries, SST compression, durable WAL writes and application
+cache capacity. [Four-host findings](four-host/README.md) · [Measurement protocol](four-host/protocol.md)
+
 ## Engine workloads
 
 | Workload | Result on the x86_64 fixture |

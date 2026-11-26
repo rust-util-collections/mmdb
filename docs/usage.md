@@ -28,6 +28,16 @@ Start with `DbOptions::default()` or the `balanced()`, `read_heavy()`, and
 `with_block_cache(Some(pool))` shares the pool across handles and gives the
 pool control over cache sizing. [Options and presets](../src/options.rs) · [Cache accounting](architecture.md#sst-v2-and-cache-memory)
 
+For a machine with ample RAM, budget the decoded working set and the
+kernel's resident file pages separately. If several DBs share a pool,
+configure its capacity once: each of its two weighted stores gets that
+capacity. For latency-sensitive reads, measure the effective hit fraction
+and process RSS before increasing it. When values contain repeated data,
+`with_compression(CompressionType::Lz4)` can save substantial SST space
+at the cost of decoding on misses. The four-host trials give paired
+measurements for these choices on APFS, Btrfs, ext4 and ZFS.
+[Measured tuning examples](benchmarks/four-host/README.md)
+
 ## Write and choose durability
 
 | Operation | Guarantee on success |
