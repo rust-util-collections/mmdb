@@ -91,7 +91,28 @@ def single(location, case, metric, values):
     return (location, case, metric, round(median(values), 4), min(values), max(values), len(values))
 
 
-def shard_results(location, path):
+def drain_metrics(row, values):
+    lines = row["raw"].splitlines()
+    run = counters(next(line for line in lines if line.startswith("run ")))
+    terminal = counters(next(line for line in lines if line.startswith("drain ")))
+    classes = [counters(line) for line in lines if line.startswith("class ")]
+    logical = sum(c["bytes"] for c in classes)
+    require(terminal["terminal_us"] >= run["seconds"] * 1e6 - 1
+            and 0 < terminal["micros"] <= terminal["terminal_us"]
+            and terminal["total_compaction_bytes"] >= run["compaction_output_bytes"]
+            and terminal["final_l0"] == terminal["final_immutables"] == 0
+            and terminal["sst_bytes"] > 0, "invalid post-window compact state")
+    values.update(drain_ms=terminal["micros"] / 1000,
+                  through_compact_MiB_s=(logical / 2**20) / (terminal["terminal_us"] / 1e6),
+                  compacted_output_per_logical_byte=terminal["total_compaction_bytes"] / logical)
+    for classes_row in classes:
+        if classes_row["op"] == "SmallPut":
+            qualified = classes_row["sampled"] >= 10000
+            values["smallput_service_p99_us"] = classes_row["service_p99_us"] if qualified else None
+            values["smallput_issue_delay_p99_us"] = classes_row["issue_delay_p99_us"] if qualified else None
+
+
+def shard_results(location, path, *, drain=False):
     _, rows = packet(path)
     _, plan = packet(HERE / "memory-plan.jsonl.gz")
     require(len(rows) == len(plan) == 80, f"{location}: incomplete memory matrix")
@@ -101,22 +122,24 @@ def shard_results(location, path):
         for key in ("case", "mode", "arm", "round", "settings"):
             require(row[key] == scheduled[key], f"{location}: wrong memory schedule: {row['case']} {key}")
         values, keeps_load = observation(row)
+        if drain:
+            drain_metrics(row, values)
         add(groups[row["case"]], row, values, bool(keeps_load))
         peak.append(values["peak_rss_MiB"])
     pairs = [r for case, g in sorted(groups.items())
-             for r in paired(location, "shards-" + case, g, higher=("logical_MiB_s",))]
+             for r in paired(location, "shards-" + case, g, higher=("logical_MiB_s", "through_compact_MiB_s"))]
     return pairs, [single(location, "shards-all-arms", "peak_rss_MiB", peak)]
 
 
-def input_receipt(folder):
-    warm = json.loads((folder / "grouped" / "warm.metadata.json").read_text())
+def input_receipt(folder, revision=REVISION, *, warm_measured=True):
     page = json.loads((folder / "grouped" / "page.metadata.json").read_text())
+    warm = json.loads((folder / "grouped" / "warm.metadata.json").read_text()) if warm_measured else page
     require(warm["sst_sha256"] == page["sst_sha256"] and warm["probe_sha256"] == page["probe_sha256"],
             f"{folder}: small fixture or probe changed between cache regimes")
     mem_meta, _ = packet(folder / "memory.jsonl.gz")
     open_meta, reopens = packet(folder / "reopen.jsonl.gz")
     storage_meta, ssts = packet(folder / "storage.jsonl.gz")
-    require(open_meta["engine_revision"] == REVISION and
+    require(open_meta["engine_revision"] == revision and
             open_meta["binary_sha256"] == mem_meta["binary_sha256"]["control"],
             f"{folder}: mismatched engine executables")
     lengths = {}
@@ -139,7 +162,7 @@ def input_receipt(folder):
                 sst_lengths=lengths)
 
 
-def read_results(location, path, kind):
+def read_results(location, path, kind, revision=REVISION):
     meta = json.loads(path.with_suffix(".metadata.json").read_text())
     with path.open() as f:
         rows = list(csv.DictReader(f))
@@ -148,7 +171,7 @@ def read_results(location, path, kind):
         "page": ("clustered", 10000, 262144),
         "device": ("scattered", 10000, 1048576),
     }[kind]
-    require(meta["build_revision"] == REVISION and meta["rows"] == size, f"{path}: incorrect source or fixture")
+    require(meta["build_revision"] == revision and meta["rows"] == size, f"{path}: incorrect source or fixture")
     if location == "9950x-zfs" and kind == "device":
         proof = json.loads((path.parent / "device-qualification.json").read_text())
         sectors = proof["physical_device_read_bytes"]
@@ -178,9 +201,9 @@ def read_results(location, path, kind):
             [single(location, "grouped-device", "io_qualified_pct", coverage)] if coverage else [])
 
 
-def storage_results(location, path):
+def storage_results(location, path, revision=REVISION):
     header, rows = packet(path)
-    require(header["engine_revision"] == REVISION and len(rows) == 50, f"{path}: wrong version or size")
+    require(header["engine_revision"] == revision and len(rows) == 50, f"{path}: wrong version or size")
     groups = defaultdict(dict)
     wal = defaultdict(dict)
     for row in rows:
@@ -243,9 +266,9 @@ def reopen_results(location, path):
             for ro in (True,False) for key in ("open_us", "open_peak_kib", "wal_bytes")]
 
 
-def volume_results(location, path):
+def volume_results(location, path, revision=REVISION):
     meta, rows = packet(path)
-    require(meta["engine_revision"] == REVISION and len(rows) == 40, f"{path}: incomplete disk comparison")
+    require(meta["engine_revision"] == revision and len(rows) == 40, f"{path}: incomplete disk comparison")
     groups = defaultdict(dict)
     for r in rows:
         require(r["seed"] == 20261126 + r["round"] and
@@ -267,7 +290,45 @@ def volume_results(location, path):
     return [row for case,g in sorted(groups.items()) for row in paired(location, "volume-" + case, g)]
 
 
-def capacity_result(location, path):
+def version_results(location, folder, freeze):
+    result = []
+    for workload, filename in (("memory", "version-memory.jsonl.gz"), ("storage", "version-bridge.jsonl.gz")):
+        header, rows = packet(folder / filename)
+        if workload == "memory":
+            old, new = header["old_revision"], header["engine_revision"]
+            old_binary, new_binary = header["old_binary_sha256"], header["binary_sha256"]["control"]
+        else:
+            old, new = header["old_engine_revision"], header["new_engine_revision"]
+            old_binary, new_binary = header["old_binary_sha256"], header["new_binary_sha256"]
+        require((old, new) == (freeze["baseline_engine"], freeze["engine"]) and
+                old_binary != new_binary and len(rows) == 20, f"{folder}: invalid version comparison")
+        groups = defaultdict(dict)
+        for r in rows:
+            candidate = r["arm"] == "B"
+            if workload == "memory":
+                expected = dict(SEED=20261126+r["round"], OPS=20000, RATE=0, SECONDS=8,
+                                BUFFER_MIB=6, IMMUTABLES=4, POOL_MIB=256, PLACEMENT="hot", BATCH_ENTRIES=32)
+                require(r["settings"] == expected and r["binary"] == ("new" if candidate else "old"),
+                        f"{folder}: mismatched version memory work")
+                values, kept = observation(r)
+                drain_metrics(r, values)
+                add(groups["hot-saturation"], r, values, bool(kept))
+            else:
+                require(r["measurement_revision"] == (new if candidate else old)
+                        and r["arguments"] == ["sst","none","entropy",str(20261126+r["round"])]
+                        and r["sst"]["rows"] == 262144 and r["sst"]["lookups"] == 40000,
+                        f"{folder}: mismatched version SST work")
+                s = r["sst"]
+                ok = (s["device_read_sectors"] == 0 if location == "9950x-zfs"
+                      else s["process_read_bytes"] == 0)
+                add(groups["sorted-ingest"], r, {"ingest_us":s["ingest_us"], "sst_bytes":s["sst_bytes"]})
+                add(groups["prewarmed-reads"], r, {"scan_us":s["scan_us"], "read_p99_ns":s["read_p99_ns"]}, ok)
+        for case, group in sorted(groups.items()):
+            result.extend(paired(location, "version-" + case, group, higher=("logical_MiB_s","through_compact_MiB_s")))
+    return result
+
+
+def capacity_result(location, path, revision=REVISION, lock=None):
     rows, small, large, min_charge, max_charge = {
         "9474f-raid": (8388608, 4096, 98304, 49152, 5120),
         "9950x-ext4": (1048576, 512, 12288, 6144, 640),
@@ -276,8 +337,9 @@ def capacity_result(location, path):
     fixture = json.loads((path.parent / "fixture.json").read_text())
     with path.open() as f:
         meta = json.loads(next(f))["metadata"]
-    lock = json.loads((HERE / "freeze.json").read_text())["supplements"]["capacity_external_lock_sha256"]
-    require(build["engine_revision"] == fixture["engine_revision"] == REVISION
+    if lock is None:
+        lock = json.loads((HERE / "freeze.json").read_text())["supplements"]["capacity_external_lock_sha256"]
+    require(build["engine_revision"] == fixture["engine_revision"] == revision
             and build["binary_sha256"] == meta["binary_sha256"] and build["cargo_lock_sha256"] == lock
             and int(fixture["rows"]) == rows and int(fixture["value_bytes"]) == 8192,
             f"{path}: mismatched capacity build or fixture")
@@ -330,19 +392,26 @@ def main():
     parser.add_argument("results", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--locations", nargs="+", choices=LOCATIONS, default=LOCATIONS)
+    parser.add_argument("--retest-freeze", type=Path, help="optimized campaign manifest; omit for the original study")
     args = parser.parse_args()
+    freeze = json.loads(args.retest_freeze.read_text()) if args.retest_freeze else {}
+    revision = freeze["engine"] if freeze else REVISION
+    capacity_lock = freeze.get("capacity_lock_sha256")
     pairs, descriptive, capacity, receipts, shard_screens = [], [], {}, {}, {}
     for location in args.locations:
         folder = args.results / location
-        receipts[location] = input_receipt(folder)
-        memory = shard_results(location, folder / "memory.jsonl.gz")
+        warm_measured = not freeze or location in freeze["primary_locations"]
+        receipts[location] = input_receipt(folder, revision, warm_measured=warm_measured)
+        memory = shard_results(location, folder / "memory.jsonl.gz", drain=bool(freeze))
         peak = memory[1][0][SINGLE_FIELDS.index("max")]
         shard_screens[location] = shard_decision(memory[0], peak)
-        checks = [memory, storage_results(location, folder / "storage.jsonl.gz")]
+        checks = [memory, storage_results(location, folder / "storage.jsonl.gz", revision)]
         if location in ("9950x-ext4", "9474f-raid"):
-            capacity[location] = capacity_result(location, folder / "capacity" / "trials.jsonl")
+            capacity[location] = capacity_result(location, folder / "capacity" / "trials.jsonl", revision, capacity_lock)
         descriptive.extend(reopen_results(location, folder / "reopen.jsonl.gz"))
         for kind in ("warm", "page", "device"):
+            if kind == "warm" and not warm_measured:
+                continue
             path = folder / "grouped" / (kind + ".csv")
             if kind == "device" and not path.exists() and location in ("5900x-single", "9474f-single", "9950x-zfs"):
                 if location == "9950x-zfs":
@@ -351,10 +420,12 @@ def main():
                             proof["physical_device_read_bytes"] == [0]*4 and
                             proof["arc_demand_misses"] == [0]*4, "ZFS pilot evidence missing")
                 continue
-            checks.append(read_results(location, path, kind))
+            checks.append(read_results(location, path, kind, revision))
         for p, d in checks:
             pairs.extend(p)
             descriptive.extend(d)
+        if freeze and location in freeze["primary_locations"]:
+            pairs.extend(version_results(location, folder, freeze))
     for label, ref, cand in (("5900x-single-to-raid", "5900x-single","5900x-raid"),
                              ("9474f-single-to-raid", "9474f-single","9474f-raid"),
                              ("9950x-ext4-to-zfs", "9950x-ext4","9950x-zfs")):
@@ -364,7 +435,7 @@ def main():
             for key in ("engine_profile_sha256", "grouped_probe_sha256", "storage_binary_sha256"):
                 require(receipts[ref][key] == receipts[cand][key], f"{label}: different {key} on two volumes")
             require(header["binary_sha256"] == receipts[ref]["storage_binary_sha256"], f"{label}: wrong binary")
-            pairs.extend(volume_results(label, path))
+            pairs.extend(volume_results(label, path, revision))
     reference = receipts[args.locations[0]]
     for loc, receipt in receipts.items():
         for key in ("grouped_small_sst_sha256", "sst_lengths", "residual_wal_bytes"):

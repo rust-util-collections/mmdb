@@ -6,10 +6,50 @@ import tempfile
 import unittest
 
 import analyze
+import derive_locks as locks
+from retest_run import Journal
+from retest_storage import blocks
 from storage_trials import schedule
 
 
 class FourHostChecks(unittest.TestCase):
+    def test_checkpoint_retries_the_whole_failed_block_and_rejects_drift(self):
+        with tempfile.TemporaryDirectory() as where:
+            folder = Path(where)
+            with Journal(folder, {"binary":"v1"}) as j:
+                self.assertEqual(j.block("aa", [1,2], lambda:[10,11]), [10,11])
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    j.block("ab", [3,4], lambda: (_ for _ in ()).throw(RuntimeError("interrupted")))
+                with self.assertRaises(RuntimeError):
+                    with Journal(folder, {"binary":"v1"}):
+                        self.fail("a concurrent writer entered the same journal")
+            with Journal(folder, {"binary":"v1"}) as j:
+                self.assertEqual(j.block("aa", [1,2], lambda:self.fail("re-executed a completed pair")), [10,11])
+                self.assertEqual(j.block("ab", [3,4], lambda:[12,13]), [12,13])
+            with Journal(folder, {"binary":"v1"}) as j:
+                with self.assertRaisesRegex(ValueError, "mismatched checkpoint"):
+                    j.block("aa", [1,3], lambda:[1,3])
+            with self.assertRaisesRegex(ValueError, "identity differs"):
+                with Journal(folder, {"binary":"v2"}):
+                    self.fail("resumed another binary")
+            self.assertEqual(len(list((folder/"attempts").glob("*.failed.json"))), 1)
+
+    def test_dual_volume_views_keep_distinct_controls_and_reduce_process_count(self):
+        schedule_rows = list(blocks(["single", "dual"], "dual", "standard"))
+        self.assertEqual(sum(len(work) for _,_,work in schedule_rows), 130)
+        views = {}
+        for i, block, jobs in schedule_rows:
+            for pos, job in enumerate(jobs):
+                for packet, (case, arm) in job["views"].items():
+                    key = (packet,i,case,arm)
+                    self.assertNotIn(key, views)
+                    views[key] = (block,pos)
+        for i in range(1,6):
+            for case in ("sst-none-entropy","wal-sync"):
+                ids = [views["volume-pairs.jsonl.gz",i,case,arm] for arm in ("A1","A2","AB1","B")]
+                self.assertEqual(len(set(ids)), 4)
+        self.assertEqual(sum(len(j) for _,_,j in blocks(["single"], "single", "version")), 20)
+
     def test_reopen_checks_actual_pool_against_requested_geometry(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "reopen.jsonl.gz"
@@ -79,6 +119,23 @@ class FourHostChecks(unittest.TestCase):
             save()
             with self.assertRaisesRegex(ValueError, "seed mismatch"):
                 analyze.storage_results("host", path)
+
+
+class FrozenLockTests(unittest.TestCase):
+    def test_exporter_keeps_its_registry_mmdb_package(self):
+        original = gzip.decompress((Path(__file__).parent / 'exporter.lock.gz').read_bytes())
+        derived = locks.derive(original, '5.0.1')
+        old_blocks = original.decode().split(locks.PACKAGE)[1:]
+        new_blocks = derived.decode().split(locks.PACKAGE)[1:]
+        index = next(i for i, b in enumerate(old_blocks) if locks.package_fields(b).get('version') == '4.3.15'
+                     and locks.package_fields(b)['name'] == 'mmdb')
+        self.assertEqual(old_blocks[index], new_blocks[index])
+        self.assertEqual(derived.count(b' "mmdb 4.3.15",'), 1)
+        self.assertEqual(derived.count(b' "mmdb 5.0.1",'), 1)
+        self.assertNotIn(b' "mmdb 5.0.0",', derived)
+        self.assertEqual(locks.derive(derived, '5.0.0'), original)
+        with self.assertRaisesRegex(ValueError, 'collide'):
+            locks.derive(original, '4.3.15')
 
 
 if __name__ == "__main__":

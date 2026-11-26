@@ -460,6 +460,29 @@ pub(super) fn run(config: &Config, mode: &str, path: &Path) {
             all.outstanding_end
         );
     }
+    // Outside the foreground clock and RSS sample. Force the same terminal
+    // maintenance operation in both arms and retain its separate cost.
+    if setting("MEASURE_DRAIN", false) {
+        let before_bytes = prop_sum("stats.compaction_bytes_written");
+        let start = Instant::now();
+        for db in &dbs {
+            db.flush().unwrap();
+            db.compact().unwrap();
+        }
+        let elapsed = start.elapsed();
+        let terminal_time = clock.get().unwrap().elapsed();
+        let total_compaction = prop_sum("stats.compaction_bytes_written");
+        println!(
+            "drain micros={} output_bytes={} terminal_us={} total_compaction_bytes={} final_l0={} final_immutables={} sst_bytes={}",
+            elapsed.as_micros(),
+            total_compaction - before_bytes,
+            terminal_time.as_micros(),
+            total_compaction - writes_before,
+            prop_sum("num-files-at-level0"),
+            sample(&dbs, &pool).generations,
+            prop_sum("total-sst-size")
+        );
+    }
     for db in dbs {
         db.close().unwrap();
     }

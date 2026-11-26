@@ -13,3 +13,13 @@ python3 run.py "$probe" "$fixture" capacity.jsonl --cpu 4
 ```
 
 The default matrix uses five independent small-cache/small-cache controls and five 4 GiB/96 GiB pairs with the same seeds. Each fresh process makes 100,000 uniform pseudorandom requests and holds its pin through validation. Report both capacities' warm charges, measured hits and misses, process memory and SST residency. For the 64 GiB fixture the intended contrast requires at least 48 GiB charged in the large cache and at most 5 GiB in the small cache. Both arms must have at least 99% SST residency at warm-up completion and after the random reads, plus zero measured disk read bytes to support a page-cache comparison. Report a tail-latency benefit when all five paired gains are positive and the median gain clears both 10% and the largest absolute A/A change.
+
+For a checkpointed run, supply the linked engine checkout and the lock used to build the standalone capacity executable. Use the same arguments and checkpoint directory to resume. The runner verifies the local SST inode and change-time inventory plus the MANIFEST and row marker before and after the run. Each checkpoint covers both fresh processes of one pair. Interrupted arms stay in the journal's attempts directory. A complete run publishes the same JSONL packet consumed by `summarize.py`.
+
+```sh
+MMDB_TRIAL_HOST_LOCK="$work/.host-measurement.lock" \
+python3 -B run.py "$probe" "$fixture" "$work/capacity.jsonl" --cpu 4 \
+  --checkpoint-dir "$work/capacity-journal" --engine-dir "$engine" --lockfile "$driver/Cargo.lock"
+```
+
+The shared journal implementation is in `../four-host/retest_run.py`. When copying the external driver to a sibling build directory, add the directory containing `retest_run.py` to `PYTHONPATH`. `fincore --bytes --noheadings --output RES,SIZE` must return numeric resident and file bytes for an actual SST before the first timed pair.
