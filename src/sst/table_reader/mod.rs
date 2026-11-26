@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 
 use crate::cache::block_cache::{BlockCache, ValidatedKind};
-use crate::error::{Error, Result, ResultExt};
+use crate::error::{Error, ErrorKind, Result, ResultExt};
 use crate::pinned::{PinnedSlice, PointValue};
 use crate::sst::block::{Block, decode_entry_reuse};
 use crate::sst::filter::AlignedBytes;
@@ -1349,6 +1349,10 @@ impl TableReader {
     /// trailers are not enough: internal-key order puts the newest sequence
     /// of the first user key first and the oldest sequence of the last user
     /// key last, so an interior key can be newer than both.
+    ///
+    /// A data block that fails its checksum is left for the read that visits
+    /// it. Open still succeeds so a block below an iterator lower bound can
+    /// stay unread.
     pub(crate) fn max_stored_sequence(&self) -> Result<SequenceNumber> {
         let mut max_seq = 0u64;
         for part in 0..self.partitions.len() {
@@ -1358,14 +1362,25 @@ impl TableReader {
             for idx in 0..leaf.num_restarts() {
                 let (_, raw, _) = leaf.decode_restart_entry(idx)?;
                 let handle = decode_index_entry(raw)?.handle;
-                let data = Self::read_block_data(&self.file, &handle).ctx()?;
-                let block = Block::from_vec(data).ctx()?;
+                let data = match Self::read_block_data(&self.file, &handle) {
+                    Ok(data) => data,
+                    Err(error) if error.kind() == ErrorKind::Corruption => continue,
+                    Err(error) => return Err(error),
+                };
+                let block = match Block::from_vec(data) {
+                    Ok(block) => block,
+                    Err(error) if error.kind() == ErrorKind::Corruption => continue,
+                    Err(error) => return Err(error),
+                };
                 let mut iter = block.iter();
                 for (key, _) in &mut iter {
                     let (_, seq, _) = decode_internal_key(&key)?;
                     max_seq = max_seq.max(seq);
                 }
                 if let Some(error) = iter.error() {
+                    if error.kind() == ErrorKind::Corruption {
+                        continue;
+                    }
                     return Err(error.clone()).ctx();
                 }
             }
