@@ -636,13 +636,17 @@ impl Drop for CompactionClaim {
 #[cfg(target_os = "linux")]
 pub(crate) fn hint_wal_writeback(file: &fs::File, offset: u64, length: u64) {
     use std::os::fd::AsRawFd;
-    // SAFETY: the borrowed fd stays open through the syscall. This advisory
-    // call never substitutes for sync_data at a durability boundary.
+    let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(length)) else {
+        return;
+    };
+    // SAFETY: the borrowed fd stays open through the syscall, and checked
+    // conversions keep offset and length non-negative in `off64_t`. This
+    // advisory call never substitutes for sync_data at a durability boundary.
     unsafe {
         libc::sync_file_range(
             file.as_raw_fd(),
-            offset as i64,
-            length as i64,
+            offset,
+            length,
             libc::SYNC_FILE_RANGE_WRITE,
         );
     }
@@ -3205,6 +3209,8 @@ impl DB {
                     }
                     if (s & STATE_WAKE) != 0 && (s & STATE_IN_GROUP) == 0 {
                         let mut wq = self.write_queue.lock();
+                        // SAFETY: `req_ptr` points to our own stack `req`;
+                        // projecting `state` avoids forming `&req` while queued.
                         let s_locked = unsafe { (*req_ptr).state.load(Ordering::Acquire) };
                         if (s_locked & STATE_DONE) != 0 {
                             completed = true;
@@ -3220,6 +3226,8 @@ impl DB {
                                     Some(wq.drain_group(self.options.write_buffer_size));
                                 break;
                             }
+                            // SAFETY: `req_ptr` points to our own stack `req`,
+                            // and `state` is updated atomically via raw projection.
                             unsafe {
                                 (*req_ptr)
                                     .state
@@ -3232,6 +3240,8 @@ impl DB {
                         spins += 1;
                         std::hint::spin_loop();
                     } else {
+                        // SAFETY: `req_ptr` points to our own stack `req`, and
+                        // `state` is updated atomically via raw projection.
                         let prev =
                             unsafe { (*req_ptr).state.fetch_or(STATE_PARKED, Ordering::AcqRel) };
                         if (prev & STATE_DONE) != 0 {
@@ -3298,6 +3308,7 @@ impl DB {
                 .any(|entry| entry.value_type == ValueType::RangeDeletion)
                 && *full.get_or_insert_with(|| self.snapshot_list.as_sorted_vec().len() >= limit)
             {
+                // SAFETY: only the active leader writes `result` before `STATE_DONE`.
                 unsafe {
                     (*ptr).result = Some(Err(Error::invalid_argument(
                         "too many distinct live snapshot sequences for a range-deletion SST leaf",
@@ -3343,7 +3354,7 @@ impl DB {
                     for applied in batch.entries().filter(suspect).take(index) {
                         *charges.get_mut(applied.key).unwrap() -= applied.metadata_charge();
                     }
-                    // SAFETY: only the active leader writes result before REQ_DONE.
+                    // SAFETY: only the active leader writes `result` before `STATE_DONE`.
                     unsafe {
                         (*ptr).result = Some(Err(Error::invalid_argument(
                             "same-key metadata exceeds SST partition index budget",
@@ -3492,7 +3503,7 @@ impl DB {
         if let Some(e) = wal_sync_err {
             self.set_bg_error(format!("WAL sync failed: {}", e));
             for &rp in batch_group {
-                // SAFETY: the owner is blocked until `REQ_DONE`.
+                // SAFETY: the owner is blocked until `STATE_DONE`.
                 unsafe { (*rp).result = Some(Err(e.clone())) };
             }
             return Err(e);
@@ -3528,7 +3539,7 @@ impl DB {
             let mut assigned_iter = assigned.iter().map(|&(p, _)| p);
             for &rp in batch_group {
                 if assigned_iter.next().is_some_and(|p| p == rp) {
-                    // SAFETY: the owner is blocked until `REQ_DONE`.
+                    // SAFETY: the owner is blocked until `STATE_DONE`.
                     unsafe { (*rp).result = Some(Ok(())) };
                 } else {
                     // SAFETY: as above.
@@ -7536,5 +7547,26 @@ mod tests {
             park_prof.queue_wakeups
         );
         assert!(park_prof.queue_wait_ns > 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hint_wal_writeback_skips_out_of_range_i64_bounds() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writeback.wal");
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&[0x5A; 64]).unwrap();
+        file.flush().unwrap();
+
+        super::hint_wal_writeback(&file, 0, 64);
+        super::hint_wal_writeback(&file, (i64::MAX as u64) + 1, 64);
+        super::hint_wal_writeback(&file, 0, (i64::MAX as u64) + 1);
+        super::hint_wal_writeback(&file, u64::MAX, u64::MAX);
     }
 }
