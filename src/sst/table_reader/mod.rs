@@ -1343,6 +1343,41 @@ impl TableReader {
         Ok(())
     }
 
+    /// Highest point-key or range-tombstone sequence stored in this SST.
+    ///
+    /// Recovery compares this with `MANIFEST` `last_sequence`. Endpoint
+    /// trailers are not enough: internal-key order puts the newest sequence
+    /// of the first user key first and the oldest sequence of the last user
+    /// key last, so an interior key can be newer than both.
+    pub(crate) fn max_stored_sequence(&self) -> Result<SequenceNumber> {
+        let mut max_seq = 0u64;
+        for part in 0..self.partitions.len() {
+            let Some(leaf) = self.index_leaf_block(part, false)? else {
+                continue;
+            };
+            for idx in 0..leaf.num_restarts() {
+                let (_, raw, _) = leaf.decode_restart_entry(idx)?;
+                let handle = decode_index_entry(raw)?.handle;
+                let data = Self::read_block_data(&self.file, &handle).ctx()?;
+                let block = Block::from_vec(data).ctx()?;
+                let mut iter = block.iter();
+                for (key, _) in &mut iter {
+                    let (_, seq, _) = decode_internal_key(&key)?;
+                    max_seq = max_seq.max(seq);
+                }
+                if let Some(error) = iter.error() {
+                    return Err(error.clone()).ctx();
+                }
+            }
+        }
+        self.visit_ranges(None, None, false, |_begin, _end, seqs| {
+            for seq in seqs {
+                max_seq = max_seq.max(u64::from_le_bytes(*seq));
+            }
+        })?;
+        Ok(max_seq)
+    }
+
     /// Iterate over all key-value pairs in the table.
     #[cfg(test)]
     pub fn iter(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {

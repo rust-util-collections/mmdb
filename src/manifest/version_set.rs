@@ -715,14 +715,18 @@ impl VersionSet {
         Self::validate_level_disjointness(&version).ctx()?;
 
         if enforce_db_wal_floor {
-            for (_, meta) in live_files.values() {
-                let (_, s_seq, _) = decode_internal_key(&meta.smallest_key)?;
-                let (_, l_seq, _) = decode_internal_key(&meta.largest_key)?;
-                if s_seq > last_sequence || l_seq > last_sequence {
-                    return Err(Error::corruption(format!(
-                        "MANIFEST last_sequence {} precedes live SST {} key sequence ({}, {})",
-                        last_sequence, meta.number, s_seq, l_seq
-                    )));
+            for level in 0..version.num_levels {
+                for file in version.level_files(level) {
+                    let max_seq = file
+                        .reader
+                        .max_stored_sequence()
+                        .with_ctx(|| format!("scanning sequences in SST {}", file.meta.number))?;
+                    if max_seq > last_sequence {
+                        return Err(Error::corruption(format!(
+                            "MANIFEST last_sequence {last_sequence} precedes live SST {} key sequence {max_seq}",
+                            file.meta.number
+                        )));
+                    }
                 }
             }
             if log_number == 0 {
@@ -2479,6 +2483,179 @@ mod tests {
             expected_manifest,
             "failed DB open must not truncate MANIFEST before sequence validation"
         );
+    }
+
+    /// Endpoint trailers are not the file's maximum sequence. An interior
+    /// point key above `last_sequence` must fail open: latest reads use that
+    /// floor, so `get` would return `Ok(None)`, and the next write would
+    /// reuse the hidden sequence.
+    #[test]
+    fn db_recovery_rejects_manifest_last_sequence_below_interior_sst_sequences() {
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+        use crate::{DB, DbOptions};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let sst_meta = {
+            let mut b =
+                TableBuilder::new(&path.join("000003.sst"), TableBuildOptions::default()).unwrap();
+            b.add(
+                InternalKey::new(b"a", 1, ValueType::Value).as_bytes(),
+                b"va",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"m", 9, ValueType::Value).as_bytes(),
+                b"vm",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"z", 1, ValueType::Value).as_bytes(),
+                b"vz",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 3,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+        drop(WalWriter::new(&path.join("000002.wal")).unwrap());
+
+        let manifest_path = path.join("MANIFEST-000001");
+        let mut writer = WalWriter::new(&manifest_path).unwrap();
+        writer
+            .add_record(&DBHeader::new(7, 0).unwrap().encode())
+            .unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_log_number(2);
+        edit.set_last_sequence(1);
+        edit.set_next_file_number(4);
+        edit.add_file(1, sst_meta);
+        writer.add_record(&edit.encode()).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&manifest_path)
+                .unwrap();
+            file.write_all(&[0, 0]).unwrap();
+        }
+        let expected_manifest = fs::read(&manifest_path).unwrap();
+        fs::write(path.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+
+        assert_eq!(
+            DB::open_read_only(path).err().unwrap().kind(),
+            ErrorKind::Corruption
+        );
+        assert_eq!(
+            DB::open(DbOptions::default(), path).err().unwrap().kind(),
+            ErrorKind::Corruption
+        );
+        assert_eq!(
+            fs::read(&manifest_path).unwrap(),
+            expected_manifest,
+            "failed DB open must not truncate MANIFEST before sequence validation"
+        );
+
+        let range_dir = tempfile::tempdir().unwrap();
+        let range_path = range_dir.path();
+        let range_meta = {
+            let mut b =
+                TableBuilder::new(&range_path.join("000003.sst"), TableBuildOptions::default())
+                    .unwrap();
+            b.add(
+                InternalKey::new(b"a", 1, ValueType::RangeDeletion).as_bytes(),
+                b"b",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"m", 50, ValueType::RangeDeletion).as_bytes(),
+                b"n",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"z", 1, ValueType::RangeDeletion).as_bytes(),
+                b"z~",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 3,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: true,
+            }
+        };
+        drop(WalWriter::new(&range_path.join("000002.wal")).unwrap());
+        let mut writer = WalWriter::new(&range_path.join("MANIFEST-000001")).unwrap();
+        writer
+            .add_record(&DBHeader::new(7, 0).unwrap().encode())
+            .unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_log_number(2);
+        edit.set_last_sequence(1);
+        edit.set_next_file_number(4);
+        edit.add_file(1, range_meta);
+        writer.add_record(&edit.encode()).unwrap();
+        writer.sync().unwrap();
+        fs::write(range_path.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+        assert_eq!(
+            DB::open_read_only(range_path).err().unwrap().kind(),
+            ErrorKind::Corruption
+        );
+
+        let ok_dir = tempfile::tempdir().unwrap();
+        let ok_path = ok_dir.path();
+        let ok_meta = {
+            let mut b =
+                TableBuilder::new(&ok_path.join("000003.sst"), TableBuildOptions::default())
+                    .unwrap();
+            b.add(
+                InternalKey::new(b"a", 1, ValueType::Value).as_bytes(),
+                b"va",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"m", 9, ValueType::Value).as_bytes(),
+                b"vm",
+            )
+            .unwrap();
+            b.add(
+                InternalKey::new(b"z", 1, ValueType::Value).as_bytes(),
+                b"vz",
+            )
+            .unwrap();
+            let res = b.finish().unwrap();
+            FileMetaData {
+                number: 3,
+                file_size: res.file_size,
+                smallest_key: res.smallest_key.unwrap(),
+                largest_key: res.largest_key.unwrap(),
+                has_range_deletions: false,
+            }
+        };
+        drop(WalWriter::new(&ok_path.join("000002.wal")).unwrap());
+        let mut writer = WalWriter::new(&ok_path.join("MANIFEST-000001")).unwrap();
+        writer
+            .add_record(&DBHeader::new(7, 0).unwrap().encode())
+            .unwrap();
+        let mut edit = VersionEdit::new();
+        edit.set_log_number(2);
+        edit.set_last_sequence(9);
+        edit.set_next_file_number(4);
+        edit.add_file(1, ok_meta);
+        writer.add_record(&edit.encode()).unwrap();
+        writer.sync().unwrap();
+        fs::write(ok_path.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+        let db = DB::open_read_only(ok_path).unwrap();
+        assert_eq!(db.get(b"m").unwrap().as_deref(), Some(b"vm".as_slice()));
     }
 
     #[test]
