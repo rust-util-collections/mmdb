@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, remove_file};
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicBool};
-use std::thread::scope;
+use std::thread::{self, scope};
 
 use parking_lot::Mutex;
 
@@ -1509,22 +1509,46 @@ impl LeveledCompaction {
             #[cfg(test)]
             PARALLEL_SUB_COMPACTIONS_TAKEN.fetch_add(1, Ordering::Relaxed);
             let thread_results: Vec<Result<SubCompactionOutput>> = scope(|s| {
-                let handles: Vec<_> = sub_tasks
-                    .iter()
-                    .map(|sub| {
-                        s.spawn(|| {
-                            let _build = ctx.builds.enter();
-                            run_range(sub)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| match h.join() {
+                let mut handles = Vec::with_capacity(sub_tasks.len());
+                let mut spawn_err: Option<Error> = None;
+                for (idx, sub) in sub_tasks.iter().enumerate() {
+                    #[cfg(test)]
+                    if FAIL_SUB_COMPACTION_SPAWN_AT.with(|f| f.get()) == Some(idx) {
+                        spawn_err = Some(
+                            Error::from(std::io::Error::new(
+                                std::io::ErrorKind::WouldBlock,
+                                "injected sub-compaction thread spawn failure",
+                            ))
+                            .context("failed to spawn sub-compaction thread"),
+                        );
+                        break;
+                    }
+                    let _ = idx;
+                    match thread::Builder::new().spawn_scoped(s, || {
+                        let _build = ctx.builds.enter();
+                        run_range(sub)
+                    }) {
+                        Ok(handle) => handles.push(handle),
+                        Err(err) => {
+                            spawn_err = Some(
+                                Error::from(err).context("failed to spawn sub-compaction thread"),
+                            );
+                            break;
+                        }
+                    }
+                }
+                let mut results =
+                    Vec::with_capacity(handles.len() + usize::from(spawn_err.is_some()));
+                for h in handles {
+                    results.push(match h.join() {
                         Ok(r) => r,
                         Err(_) => Err(Error::background("sub-compaction thread panicked")),
-                    })
-                    .collect()
+                    });
+                }
+                if let Some(err) = spawn_err {
+                    results.push(Err(err));
+                }
+                results
             });
             thread_results.into_iter().collect::<Result<Vec<_>>>()?
         };
@@ -3827,10 +3851,77 @@ mod tests {
             "expected linear O(F) file visits for 250 disjoint files, got {visits}"
         );
     }
+
+    #[test]
+    fn subcompaction_spawn_failure_returns_io_error_and_cleans_staged_outputs() {
+        use super::{FAIL_SUB_COMPACTION_SPAWN_AT, HashSet};
+        use crate::{DB, ErrorKind};
+        use std::{error::Error as _, fs, io};
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_num_levels(3)
+            .with_max_subcompactions(2)
+            .with_max_bytes_for_level_base(128)
+            .with_l0_compaction_trigger(usize::MAX);
+        let db = DB::open(opts, dir.path()).unwrap();
+
+        assert_eq!(db.ingest_sorted([(b"a0", b"1"), (b"m0", b"2")]).unwrap(), 2);
+        assert_eq!(db.ingest_sorted([(b"n0", b"3"), (b"z0", b"4")]).unwrap(), 2);
+        db.put(b"b0", &[b'x'; 256]).unwrap();
+        db.put(b"y0", &[b'y'; 256]).unwrap();
+        db.flush().unwrap();
+
+        FAIL_SUB_COMPACTION_SPAWN_AT.with(|f| f.set(Some(1)));
+        let err = db.compact_range(Some(b"a"), None).unwrap_err();
+        FAIL_SUB_COMPACTION_SPAWN_AT.with(|f| f.set(None));
+
+        assert_eq!(err.kind(), ErrorKind::Io);
+        let io_kind = err
+            .source()
+            .and_then(|s| s.downcast_ref::<io::Error>())
+            .map(io::Error::kind);
+        assert_eq!(io_kind, Some(io::ErrorKind::WouldBlock));
+
+        // Staged output SST from subcompaction #0 must be unlinked, while all
+        // live SSTs and rows remain intact and readable.
+        let disk_ssts: HashSet<u64> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().to_string_lossy().into_owned();
+                name.strip_suffix(".sst")?.parse::<u64>().ok()
+            })
+            .collect();
+        let total_live: usize = (0..3)
+            .map(|lvl| {
+                db.get_property(&format!("num-files-at-level{lvl}"))
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(disk_ssts.len(), total_live);
+
+        for (k, expected) in [
+            (b"a0".as_slice(), b"1".as_slice()),
+            (b"b0", &[b'x'; 256]),
+            (b"m0", b"2"),
+            (b"n0", b"3"),
+            (b"y0", &[b'y'; 256]),
+            (b"z0", b"4"),
+        ] {
+            assert_eq!(db.get(k).unwrap().as_deref(), Some(expected));
+        }
+
+        db.compact_range(None, None).unwrap();
+        assert_eq!(db.get(b"b0").unwrap().as_deref(), Some(&[b'x'; 256][..]));
+        db.close().unwrap();
+    }
 }
 
 #[cfg(test)]
 thread_local! {
     static LEVEL_BUDGET_MULS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PICKER_FILE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_SUB_COMPACTION_SPAWN_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
