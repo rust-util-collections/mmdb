@@ -652,10 +652,10 @@ impl BlockCache {
 
     /// Leave the pool: sweep every entry this member holds (pinned and
     /// unpinned) and turn this view into a permanent cache-bypass.
-    /// Idempotent; called from both `DB::close` and `DB::drop` (either
-    /// may run first). For a private cache this is a fast no-op-like
-    /// cleanup; for a shared pool it releases the member's capacity
-    /// promptly instead of waiting for LRU pressure to notice.
+    /// Idempotent; called eagerly from `DB::close`, `DB::drop`, and failed
+    /// `DB::open` paths, and automatically when `BlockCache` is dropped. For
+    /// a private cache this is a fast cleanup; for a shared pool it releases
+    /// the member's capacity promptly instead of waiting for LRU pressure.
     pub fn detach(&self) {
         if self.detached.swap(true, Ordering::SeqCst) {
             return;
@@ -703,6 +703,12 @@ impl BlockCache {
             return 0;
         }
         self.pool.entry_count() + self.pinned.load().entries.len() as u64
+    }
+}
+
+impl Drop for BlockCache {
+    fn drop(&mut self) {
+        self.detach();
     }
 }
 

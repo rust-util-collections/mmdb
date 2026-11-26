@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use mmdb::{BlockCachePool, DB, DbOptions};
+use mmdb::{BlockCachePool, DB, DbOptions, DurabilityMode, ErrorKind, WriteOptions};
 
 fn open_with_pool(dir: &std::path::Path, pool: &Arc<BlockCachePool>) -> DB {
     DB::open(
@@ -188,4 +188,65 @@ fn test_private_cache_default_unaffected() {
     db.flush().unwrap();
     assert_cached_value(&db, b"k", b"v");
     db.close().unwrap();
+}
+
+#[test]
+fn failed_open_and_dropped_member_release_shared_pool_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DB::open(
+        DbOptions::default().with_create_if_missing(true),
+        dir.path(),
+    )
+    .unwrap();
+    db.delete_range(b"a", b"z").unwrap();
+    db.flush().unwrap();
+    db.put_with_options(
+        &WriteOptions::default().with_durability(DurabilityMode::WalSync),
+        b"after",
+        b"wal",
+    )
+    .unwrap();
+    db.simulate_crash();
+
+    // Corrupt the active WAL payload so `VersionSet` opens the live range-del
+    // SST (admitting its rangedel leaf into the shared pool) before WAL replay
+    // aborts the open with `ErrorKind::Corruption`.
+    let wal_path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "wal"))
+        .expect("residual WAL present");
+    let mut wal_bytes = std::fs::read(&wal_path).unwrap();
+    let last = wal_bytes.len() - 1;
+    wal_bytes[last] ^= 0xFF;
+    std::fs::write(&wal_path, &wal_bytes).unwrap();
+
+    let pool = Arc::new(BlockCachePool::new(8 << 20));
+    let rw_err = DB::open(
+        DbOptions::default().with_block_cache(Some(pool.clone())),
+        dir.path(),
+    )
+    .err()
+    .expect("corrupt WAL must fail writable open");
+    assert_eq!(rw_err.kind(), ErrorKind::Corruption);
+
+    let ro_err = DB::open_read_only_with_options(
+        DbOptions::default().with_block_cache(Some(pool.clone())),
+        dir.path(),
+    )
+    .err()
+    .expect("corrupt WAL must fail read-only open");
+    assert_eq!(ro_err.kind(), ErrorKind::Corruption);
+
+    {
+        let member = pool.attach();
+        member.insert(9, 0, vec![0xAB; 4096]);
+        member.insert_pinned(9, 4096, vec![0xCD; 512]);
+    }
+
+    pool.run_pending_tasks();
+    assert_eq!(pool.entry_count(), 0);
+    assert_eq!(pool.usage().segmented_weighted_bytes, 0);
+    assert_eq!(pool.usage().overflow_weighted_bytes, 0);
 }

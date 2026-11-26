@@ -1063,6 +1063,15 @@ impl DB {
             // Private single-member pool — the historical behavior.
             None => BlockCache::new(options.block_cache_capacity),
         });
+        struct DetachOnOpenErr(Option<Arc<BlockCache>>);
+        impl Drop for DetachOnOpenErr {
+            fn drop(&mut self) {
+                if let Some(ref cache) = self.0 {
+                    cache.detach();
+                }
+            }
+        }
+        let mut detach_on_err = DetachOnOpenErr(Some(block_cache.clone()));
         let builds = Arc::new(SstBuilds::default());
         let rate_limiter = Arc::new(RateLimiter::new(options.rate_limiter_bytes_per_sec));
         let stats = Arc::new(DbStats::new());
@@ -1908,6 +1917,7 @@ impl DB {
             dead_key_sweep,
             dead_key_prune_cursor: AtomicUsize::new(0),
         };
+        detach_on_err.0 = None;
 
         if !read_only {
             let ctx = db.flush_context();
