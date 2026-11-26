@@ -20,7 +20,7 @@ None.
 
 ### [MEDIUM] compaction: a 4 GiB SST size target truncates to zero on 32-bit targets
 
-- **Where**: `src/compaction/leveled.rs:718,940` (`execute_sub_compaction_io`).
+- **Where**: `src/compaction/leveled.rs:940` (`execute_sub_compaction_io`).
 - **What**: Compaction casts the configured `u64` target to `usize`. On a 32-bit target, `target_file_size_base = 1 << 32` becomes zero, so a rewrite requests an SST split at every distinct user-key boundary.
 - **Reason**: Confirmed by tracing the integer conversion and split predicate. The supported 64-bit ABIs preserve this value. The project accepts the 32-bit behavior under its [architecture policy](../README.md#supported-architectures).
 
@@ -31,7 +31,7 @@ None.
 
 ### [LOW] sst: Linux `advise_willneed` converts `posix_fadvise` arguments to `i64` instead of `libc::off_t`
 
-- **Where**: `src/sst/table_reader/mod.rs:1861-1880` (`TableReader::advise_willneed`).
+- **Where**: `src/sst/table_reader/mod.rs:1891-1921` (`TableReader::advise_willneed`).
 - **What**: `advise_willneed` converts `offset` and `len` with `i64::try_from` and passes them directly to `libc::posix_fadvise`. On 32-bit GNU, uClibc, and Android Linux targets (`libc` `b32`), `libc::off_t` is `i32`, so compiling for those targets fails with `E0308` mismatched types.
 - **Reason**: Confirmed against `libc-0.2.191` target definitions (`off_t = i32` on 32-bit Linux ABIs vs `off_t = i64` on 64-bit Linux ABIs). Both supported architectures (`x86_64` and `aarch64` with 64-bit ABIs) define `libc::off_t` as `i64`, so 32-bit targets are outside the [supported architecture guarantee](../README.md#supported-architectures).
 
