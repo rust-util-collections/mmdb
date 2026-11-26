@@ -672,8 +672,22 @@ impl VersionSet {
         if edits_replayed == 0 {
             return Err(Error::corruption("MANIFEST contains no version edits"));
         }
-        if enforce_db_wal_floor && log_number == 0 && live_files.is_empty() {
-            if last_sequence != 0 {
+
+        // Pass 2: Open only live files
+        let mut version = Version::new(num_levels);
+        for (level, meta) in live_files.values() {
+            let file = Self::open_table(db_path, table_cache.as_deref(), meta).ctx()?;
+            let files = Arc::make_mut(&mut version.files[*level]);
+            files.insert(files.len(), file);
+        }
+
+        version.sort_recovered_files();
+        // The replayed record stream passed per-record checksums, but the
+        // recovered file set must still satisfy the read-path invariant.
+        Self::validate_level_disjointness(&version).ctx()?;
+
+        if enforce_db_wal_floor && log_number == 0 {
+            if !live_files.is_empty() || last_sequence != 0 {
                 return Err(Error::corruption(
                     "MANIFEST has zero log_number alongside persisted DB state",
                 ));
@@ -694,19 +708,6 @@ impl VersionSet {
                 }
             }
         }
-
-        // Pass 2: Open only live files
-        let mut version = Version::new(num_levels);
-        for (level, meta) in live_files.values() {
-            let file = Self::open_table(db_path, table_cache.as_deref(), meta).ctx()?;
-            let files = Arc::make_mut(&mut version.files[*level]);
-            files.insert(files.len(), file);
-        }
-
-        version.sort_recovered_files();
-        // The replayed record stream passed per-record checksums, but the
-        // recovered file set must still satisfy the read-path invariant.
-        Self::validate_level_disjointness(&version).ctx()?;
 
         // Writable recovery repairs a torn tail and reopens the MANIFEST for
         // append. Read-only recovery must leave the file byte-for-byte intact.

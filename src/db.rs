@@ -7949,4 +7949,56 @@ mod tests {
         );
         reopened.close().unwrap();
     }
+
+    #[test]
+    fn zero_log_number_with_live_sst_rejects_recovery_before_wal_replay_or_tail_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+
+        let sst_path = path.join("000004.sst");
+        let sst_meta = {
+            let mut b = TableBuilder::new(&sst_path, TableBuildOptions::default()).unwrap();
+            let ik = types::InternalKey::new(b"k", 2, ValueType::Value);
+            b.add(ik.as_bytes(), b"new").unwrap();
+            let res = b.finish().unwrap();
+            flush::file_metadata((4, res))
+        };
+
+        let wal_path = path.join("000002.wal");
+        {
+            let mut batch = WriteBatch::new();
+            batch.put(b"k", b"old");
+            let mut wal = WalWriter::new(&wal_path).unwrap();
+            wal.add_record_parts(&[&batch.wal_header(1), &batch.payload])
+                .unwrap();
+            wal.sync().unwrap();
+        }
+
+        let mut vs = VersionSet::create(path, DbOptions::default().num_levels).unwrap();
+        let mut edit = VersionEdit::new();
+        edit.add_file(0, sst_meta);
+        edit.set_last_sequence(2);
+        edit.set_next_file_number(5);
+        vs.log_and_apply(edit).unwrap();
+        let manifest_path = path.join(format!("MANIFEST-{:06}", vs.manifest_number()));
+        drop(vs);
+
+        // Append a zero-padded torn fragment header so any premature writable
+        // MANIFEST tail truncation would shrink the file.
+        let mut manifest_bytes = fs::read(&manifest_path).unwrap();
+        manifest_bytes.extend([0u8, 0u8]);
+        fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let sst_bytes = fs::read(&sst_path).unwrap();
+        let wal_bytes = fs::read(&wal_path).unwrap();
+
+        for res in [
+            DB::open_read_only(path),
+            DB::open(DbOptions::default(), path),
+        ] {
+            assert_eq!(res.err().unwrap().kind(), ErrorKind::Corruption);
+            assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+            assert_eq!(fs::read(&sst_path).unwrap(), sst_bytes);
+            assert_eq!(fs::read(&wal_path).unwrap(), wal_bytes);
+        }
+    }
 }
