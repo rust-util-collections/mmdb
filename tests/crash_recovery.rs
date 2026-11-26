@@ -11,7 +11,7 @@ use mmdb::{DB, DbOptions, WriteBatch, WriteOptions};
 fn make_opts() -> DbOptions {
     DbOptions::default()
         .with_create_if_missing(true)
-        .with_write_buffer_size(2048)
+        .with_write_buffer_size(64 * 1024)
 }
 
 #[test]
@@ -79,6 +79,10 @@ fn test_crash_after_single_write() {
             b"value2",
         )
         .unwrap();
+        assert_eq!(
+            db.get_property("stats.flushes_completed").as_deref(),
+            Some("0")
+        );
         // Simulate crash: don't call close()
         db.simulate_crash();
     }
@@ -112,6 +116,10 @@ fn test_crash_after_flush() {
             let val = format!("val_{:040}", i);
             db.put(key.as_bytes(), val.as_bytes()).unwrap();
         }
+        assert_eq!(
+            db.get_property("stats.flushes_completed").as_deref(),
+            Some("1")
+        );
         // Crash without close
         db.simulate_crash();
     }
@@ -199,6 +207,10 @@ fn test_crash_with_batch_writes() {
             b"ok",
         )
         .unwrap();
+        assert_eq!(
+            db.get_property("stats.flushes_completed").as_deref(),
+            Some("0")
+        );
 
         db.simulate_crash();
     }
@@ -1107,6 +1119,10 @@ fn test_sync_guarantees() {
             .unwrap();
         }
         // Simulate crash immediately after synced writes
+        assert_eq!(
+            db.get_property("stats.flushes_completed").as_deref(),
+            Some("0")
+        );
         db.simulate_crash();
     }
 
@@ -1211,6 +1227,7 @@ fn test_crash_after_compaction() {
 
         // Compact
         db.compact().unwrap();
+        let flushes_before = db.get_property("stats.flushes_completed").unwrap();
 
         // Write additional data after compaction (lives in WAL/memtable)
         for i in 0..10 {
@@ -1223,6 +1240,10 @@ fn test_crash_after_compaction() {
             )
             .unwrap();
         }
+        assert_eq!(
+            db.get_property("stats.flushes_completed").as_deref(),
+            Some(flushes_before.as_str())
+        );
 
         // Crash
         db.simulate_crash();

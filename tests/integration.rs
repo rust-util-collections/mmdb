@@ -431,7 +431,7 @@ fn test_snapshot_across_flush() {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions::default()
         .with_create_if_missing(true)
-        .with_write_buffer_size(1024);
+        .with_write_buffer_size(64 * 1024);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Write initial data
@@ -440,6 +440,10 @@ fn test_snapshot_across_flush() {
 
     // Take snapshot before flush
     let snap = db.snapshot();
+    assert_eq!(
+        db.get_property("stats.flushes_completed").as_deref(),
+        Some("0")
+    );
 
     // Flush to SST
     db.flush().unwrap();
@@ -1122,7 +1126,7 @@ fn test_delete_range_basic() {
     let dir = tempfile::tempdir().unwrap();
     let opts = DbOptions::default()
         .with_create_if_missing(true)
-        .with_write_buffer_size(1024);
+        .with_write_buffer_size(64 * 1024);
     let db = DB::open(opts, dir.path()).unwrap();
 
     // Insert keys: a, b, c, d, e, f, g
@@ -1141,6 +1145,10 @@ fn test_delete_range_basic() {
         keys,
         vec![vec![b'a'], vec![b'b'], vec![b'f'], vec![b'g']],
         "iterator should exclude range-deleted keys c, d, e"
+    );
+    assert_eq!(
+        db.get_property("stats.flushes_completed").as_deref(),
+        Some("0")
     );
 
     // Flush and verify iterator again (from SST)

@@ -599,7 +599,7 @@ fn test_restart_recovery() {
 
     let opts = DbOptions::default()
         .with_create_if_missing(true)
-        .with_write_buffer_size(1024)
+        .with_write_buffer_size(64 * 1024)
         .with_l0_compaction_trigger(3);
 
     // Phase 1: write + flush (data lands in SSTs).
@@ -633,6 +633,10 @@ fn test_restart_recovery() {
             b"synced",
         )
         .unwrap();
+        assert_eq!(
+            db.get_property("stats.flushes_completed").as_deref(),
+            Some("1")
+        );
         db.simulate_crash();
     }
 
