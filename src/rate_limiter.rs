@@ -1,6 +1,6 @@
 //! Token-bucket rate limiter for controlling compaction write throughput.
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Upper bound on a single `thread::sleep` call issued by `request()`.
@@ -24,6 +24,7 @@ pub struct RateLimiter {
     /// Immutable after construction, so disabled requests need no lock.
     rate_bytes_per_sec: u64,
     inner: Mutex<RateLimiterInner>,
+    wake: Condvar,
 }
 
 struct RateLimiterInner {
@@ -43,6 +44,8 @@ struct RateLimiterInner {
     /// wait-loop in `request` can be exercised in milliseconds instead of
     /// minutes without changing the accounting logic under test.
     max_sleep_secs: f64,
+    /// Set during engine teardown so in-flight sleeps wake immediately.
+    stopped: bool,
 }
 
 /// Result of accounting for one chunk of a `request()` call against the
@@ -116,7 +119,9 @@ impl RateLimiter {
                 available: rate_bytes_per_sec as f64,
                 last_refill: Instant::now(),
                 max_sleep_secs: MAX_SLEEP_SECS,
+                stopped: false,
             }),
+            wake: Condvar::new(),
         }
     }
 
@@ -149,6 +154,9 @@ impl RateLimiter {
         let mut remaining = bytes as f64;
         while remaining > 0.0 {
             let mut inner = self.inner.lock();
+            if inner.stopped {
+                return;
+            }
 
             // Refill tokens.
             let now = Instant::now();
@@ -166,12 +174,19 @@ impl RateLimiter {
             inner.available = plan.new_available;
             let max_sleep_secs = inner.max_sleep_secs;
             remaining -= chunk;
-            drop(inner);
 
             let mut remaining_wait = plan.wait_secs;
             while remaining_wait > 0.0 {
                 let sleep_secs = remaining_wait.min(max_sleep_secs);
-                std::thread::sleep(Duration::from_secs_f64(sleep_secs));
+                let deadline = Instant::now() + Duration::from_secs_f64(sleep_secs);
+                while !inner.stopped {
+                    if self.wake.wait_until(&mut inner, deadline).timed_out() {
+                        break;
+                    }
+                }
+                if inner.stopped {
+                    return;
+                }
                 remaining_wait -= sleep_secs;
             }
         }
@@ -179,10 +194,23 @@ impl RateLimiter {
 }
 
 impl RateLimiter {
+    /// Interrupt any in-flight sleeps and make future `request` calls return
+    /// immediately during engine shutdown.
+    pub fn stop(&self) {
+        let mut inner = self.inner.lock();
+        inner.stopped = true;
+        self.wake.notify_all();
+    }
+
     /// Whether a rate limit is configured (test helper).
     #[cfg(test)]
     pub(crate) fn is_enabled(&self) -> bool {
         self.rate_bytes_per_sec > 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_inflight_debt(&self) -> bool {
+        self.inner.lock().available < 0.0
     }
 }
 
@@ -205,7 +233,9 @@ mod tests {
                 available: rate_bytes_per_sec as f64,
                 last_refill: Instant::now(),
                 max_sleep_secs,
+                stopped: false,
             }),
+            wake: Condvar::new(),
         }
     }
 
@@ -381,5 +411,32 @@ mod tests {
              far below the configured rate of {rate} B/s (elapsed={elapsed:.3}s, \
              total_bytes={total_bytes})"
         );
+    }
+
+    #[test]
+    fn stop_interrupts_inflight_rate_limiter_sleep() {
+        let rl = Arc::new(RateLimiter::new(100));
+        rl.request(100);
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker_rl = Arc::clone(&rl);
+        thread::spawn(move || {
+            worker_rl.request(64 * 1024);
+            let _ = done_tx.send(());
+        });
+
+        let enter_deadline = Instant::now() + Duration::from_secs(5);
+        while !rl.has_inflight_debt() {
+            assert!(
+                Instant::now() < enter_deadline,
+                "worker never entered rate-limiter debt sleep"
+            );
+            thread::yield_now();
+        }
+
+        rl.stop();
+        done_rx
+            .recv_timeout(Duration::from_millis(400))
+            .expect("RateLimiter::stop did not wake in-flight multi-minute sleep");
     }
 }

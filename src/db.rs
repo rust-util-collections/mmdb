@@ -1995,6 +1995,7 @@ impl DB {
                         compaction_shutdown.store(true, Ordering::Release);
                         cvar.notify_all();
                     }
+                    rate_limiter.stop();
                     for h in compaction_handles.drain(..) {
                         let _ = h.join();
                     }
@@ -3103,6 +3104,7 @@ impl DB {
             self.compaction_shutdown.store(true, Ordering::Release);
             cvar.notify_all();
         }
+        self.rate_limiter.stop();
         for handle in self.compaction_handles.lock().drain(..) {
             let _ = handle.join();
         }
@@ -4432,6 +4434,7 @@ impl Drop for DB {
                 self.compaction_shutdown.store(true, Ordering::Release);
                 cvar.notify_all();
             }
+            self.rate_limiter.stop();
             drop(self.flush_worker.lock().take());
             drop(mem::take(&mut *self.compaction_handles.lock()));
             self.worker_lifecycle.defer_teardown(DeferredTeardown {
@@ -8087,5 +8090,37 @@ mod tests {
             assert_eq!(fs::read(&sst_path).unwrap(), sst_bytes);
             assert_eq!(fs::read(&wal_path).unwrap(), wal_bytes);
         }
+    }
+
+    #[test]
+    fn close_interrupts_rate_limited_background_compaction_sleep() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_compression(crate::CompressionType::None)
+            .with_l0_compaction_trigger(2)
+            .with_rate_limiter_bytes_per_sec(100);
+        let db = DB::open(opts, dir.path()).unwrap();
+        db.put(b"k", &[b'a'; 32 * 1024]).unwrap();
+        db.flush().unwrap();
+        db.put(b"k", &[b'b'; 32 * 1024]).unwrap();
+        db.flush().unwrap();
+
+        let enter_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !db.rate_limiter.has_inflight_debt() {
+            assert!(
+                std::time::Instant::now() < enter_deadline,
+                "background compaction never entered rate-limiter sleep"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            db.close().unwrap();
+            let _ = close_tx.send(());
+        });
+        close_rx
+            .recv_timeout(Duration::from_millis(800))
+            .expect("DB::close stalled behind uninterruptible RateLimiter sleep");
     }
 }
