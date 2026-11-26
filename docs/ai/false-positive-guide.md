@@ -41,7 +41,7 @@ Focus on semantics clippy cannot see. Check the exporter separately with
 
 No unsupported “consider” advice. Name an observable result.
 Vague: “add bounds check”. Concrete: “index leaf ending before its directory
-separator causes `find_data_block` to return `Ok(None)` instead of `Corruption`”.
+separator causes `point_value_with_probe` to return `Ok(None)` instead of `Corruption`”.
 
 ## FP-7: Test code standards
 

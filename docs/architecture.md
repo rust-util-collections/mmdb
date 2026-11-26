@@ -221,7 +221,8 @@ flowchart TD
    Inside the active `ConcurrentSkipList`, point entries occupy bump-allocated
    arena slabs (entries `> 256 KiB` receive dedicated slabs without disturbing
    the active shared slab cursor), and `approximate_size()` accounts for full
-   reserved slab bytes plus `MemRangeTombstone` capacity. At 50% of
+   reserved slab bytes plus `MemRangeTombstone` vector capacity, endpoint bytes,
+   and range-tombstone index heap (`tombstone_index_bytes`). At 50% of
    `write_buffer_size`, the leader arms asynchronous standby-WAL creation on
    `mmdb-flush`. At 100%, `freeze_memtable` takes `wal_writer` out of `DB::inner`,
    seals the old WAL with `sync_data()` unlocked, installs the zero-length

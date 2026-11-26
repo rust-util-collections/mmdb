@@ -121,7 +121,8 @@ tests gives no coverage evidence.
    twins (`seek` vs `seek_for_prev` / `seek_to_last`), lending `step_next` /
    `step_prev` vs `Iterator::next` / `next_back`, `DBIterator` / `BidiIterator` /
    `LevelIterator` / `TableIterator` / `MergingIterator`, point-index
-   (`partitions` / `index_leaf_block` / `find_data_block`) vs range-tombstone
+   (`partitions` / `index_leaf_block` / `point_value_with_probe` /
+   `grouped_point_value`) vs range-tombstone
    (`range_partitions` / `visit_ranges` / `covering_sequence`) leaves, `get` /
    `get_pinned` / `contains_key` on scalar paths, `DB::get_many_pinned` /
    `get_many_pinned_with_options` on grouped paths, and `Snapshot` / `ArcSnapshot`,

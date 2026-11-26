@@ -6,7 +6,7 @@
 
 ## Invariants
 
-**MAN1 Reject = not applied** — `log_and_apply_synced` validates level range, exact-level deletions, duplicate/live file numbers, `open_table` (actual file size, `has_range_deletions`, valid 8+-byte `InternalKey` bounds, `smallest_key <= largest_key`), and L1+ `validate_level_disjointness` (with no empty-key skips) *before* appending to MANIFEST or mutating `self.current`.
+**MAN1 Reject = not applied** — `log_and_apply_synced` validates level range, exact-level deletions, duplicate/live file numbers (against `live_file_numbers`, mutated only after MANIFEST append succeeds), `open_table` (actual file size, `has_range_deletions`, valid 8+-byte `InternalKey` bounds, `smallest_key <= largest_key`), and L1+ insertion-neighbor disjointness (preserving `recover_with_cache`'s full-level `validate_level_disjointness` with no empty-key skips) *before* appending to MANIFEST or mutating `self.current`.
 
 **MAN2 `DirSynced` & new-SST durability order** — SST `finish()` (`sync_all`) → `sync_new_sst_parent_dir` (`DirSynced`) → `log_and_apply_synced` → `confirm_manifest_durable` *before* acknowledging flush durability, retiring `immutable_memtables`, or unlinking superseded WAL/SST inputs.
 
