@@ -1,9 +1,27 @@
 """Validate cache/device evidence for complete trial records."""
 import csv
 from functools import cache
+import hashlib
 import json
 import platform
+import plistlib
 import subprocess
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def trial_command(command, cpus):
+    if platform.system() == "Darwin":
+        if cpus != "native":
+            raise ValueError("macOS trials use --cpus native (OS scheduling)")
+        return command
+    return ["taskset", "-c", cpus, *command]
 
 
 def has_cache_evidence(row):
@@ -74,20 +92,38 @@ def metadata(args):
     assert len(tables) == 1
     # Use the same taskset launcher as timed children: a caller serializing
     # disk access through that launcher also serializes the fixture hash.
-    hashes = capture(["taskset", "-c", args.cpus, "sha256sum", "--",
-                      str(args.probe), str(tables[0])]).splitlines()
+    if platform.system() == "Darwin":
+        trial_command([], args.cpus)
+        hashes = [file_sha256(path) for path in (args.probe, tables[0])]
+        mount = next(p for p in tables[0].resolve().parents if p.is_mount())
+        volume = plistlib.loads(subprocess.check_output(["diskutil", "info", "-plist", mount]))
+        host = {
+            "os_version": capture(["sw_vers", "-productVersion"]),
+            "cpu_model": capture(["sysctl", "-n", "machdep.cpu.brand_string"]),
+            "cpu_affinity": "OS scheduled",
+            "filesystem": volume["FilesystemName"],
+            "storage_counter": "ri_diskio_bytesread",
+            "device_cache_control": "file-scoped msync(MS_INVALIDATE) every 128 requests",
+        }
+    else:
+        hashes = [line.split()[0] for line in capture(trial_command(
+            ["sha256sum", "--", str(args.probe), str(tables[0])], args.cpus)).splitlines()]
+        host = {
+            "cpu_affinity": args.cpus,
+            "cpu_model": next(line.split(":", 1)[1].strip() for line in capture(["lscpu"]).splitlines() if line.startswith("Model name:")),
+            "filesystem": capture(["findmnt", "-n", "-T", str(tables[0]), "-o", "SOURCE,FSTYPE,OPTIONS"]),
+            "sst_attributes": capture(["lsattr", "-d", str(tables[0])]).split()[0],
+            "storage_counter": "linux_read_bytes",
+        }
     meta = {
+        **host,
         "build_revision": capture(["git", "rev-parse", "--verify", args.revision + "^{commit}"]),
-        "probe_sha256": hashes[0].split()[0],
+        "probe_sha256": hashes[0],
         "kernel": platform.release(),
         "architecture": platform.machine(),
-        "cpu_affinity": args.cpus,
-        "cpu_model": next(line.split(":", 1)[1].strip() for line in capture(["lscpu"]).splitlines() if line.startswith("Model name:")),
         "rustc": capture(["rustc", "+stable", "-vV"]),
-        "filesystem": capture(["findmnt", "-n", "-T", str(tables[0]), "-o", "SOURCE,FSTYPE,OPTIONS"]),
-        "sst_attributes": capture(["lsattr", "-d", str(tables[0])]).split()[0],
         "sst_bytes": tables[0].stat().st_size,
-        "sst_sha256": hashes[1].split()[0],
+        "sst_sha256": hashes[1],
         "rows": int(args.fixture.with_suffix(".rows").read_text()),
         "value_bytes": 128, "key_bytes": 8, "block_bytes": 4096, "prefix_len": 0,
         "sst_compression": "None", "warm_cache_bytes": 128 << 20,

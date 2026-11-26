@@ -1,4 +1,4 @@
-"""Run interleaved A/A and A/B trials from fresh, CPU-pinned processes."""
+"""Run interleaved A/A and A/B trials from fresh processes."""
 import argparse
 import csv
 import itertools
@@ -6,13 +6,13 @@ import random
 import subprocess
 from pathlib import Path
 
-from read_evidence import metadata, require_cache_evidence
+from read_evidence import metadata, require_cache_evidence, trial_command
 
 parser = argparse.ArgumentParser()
 parser.add_argument("probe", type=Path)
 parser.add_argument("fixture", type=Path)
 parser.add_argument("output", type=Path)
-parser.add_argument("--cpus", required=True)
+parser.add_argument("--cpus", required=True, help="Linux CPU list, or native for macOS scheduling")
 parser.add_argument("--revision", required=True, help="commit used to build the supplied release binary")
 parser.add_argument("--matrix", choices=["primary", "warm", "page", "device"], required=True)
 parser.add_argument("--fanout", type=int, choices=[1, 8, 32], help="restrict a repeated calibration to one fanout")
@@ -57,10 +57,10 @@ with args.output.open("x") as f:
                 arms.reverse()
             trace_seed = args.seed + 1021 * iteration
             for order, (arm, method) in enumerate(arms, 1):
-                result = subprocess.run([
-                    "taskset", "-c", args.cpus, args.probe, args.fixture, regime,
+                result = subprocess.run(trial_command([
+                    args.probe, args.fixture, regime,
                     method, locality, str(fanout), str(args.samples), str(trace_seed),
-                ], check=True, capture_output=True, text=True, timeout=900)
+                ], args.cpus), check=True, capture_output=True, text=True, timeout=900)
                 measurements = dict(s.split("=", 1) for s in result.stdout.strip().split())
                 writer.writerow(dict(round=iteration + 1, pair=pair, order=order, arm=arm,
                                      seed=trace_seed, **measurements))

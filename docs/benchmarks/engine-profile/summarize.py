@@ -64,7 +64,7 @@ def metrics(record):
 
 def validate_record(record):
     require(record["run"]["seconds"] > 0, f"invalid duration in {record['case']}")
-    require(record["run"]["peak_kib"] > 0, f"missing measured Linux peak RSS in {record['case']}")
+    require(record["run"]["peak_kib"] > 0, f"missing measured process peak RSS in {record['case']}")
     classes = record["classes"]
     control = record["settings"].get("CONTROL", "mixed")
     if control == "reader":

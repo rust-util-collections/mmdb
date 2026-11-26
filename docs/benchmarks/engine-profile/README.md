@@ -186,6 +186,12 @@ From the repository root, use an uncompressed scratch directory on a local
 filesystem. Each packet includes the effective configuration, seeds, binary
 fingerprints, raw counts and run metrics.
 
+On native macOS, pass `--cpus native` to use the system scheduler. The
+metadata records the mounted filesystem and the absence of a pinned CPU
+list. The engine profile obtains resident bytes from `proc_pidinfo`, peak
+resident bytes from `getrusage(RUSAGE_SELF)`, and user plus system CPU
+ticks from `times`. The RSS fields use KiB on both Linux and macOS.
+
 ```sh
 d=docs/benchmarks/engine-profile
 python3 "$d/run.py" mixed ./control mixed.jsonl.gz --metrics ./instrumented --cpus 4-7 --tmpdir "$scratch"

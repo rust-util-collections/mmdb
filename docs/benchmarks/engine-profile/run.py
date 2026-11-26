@@ -1,4 +1,4 @@
-"""Run deterministic release-build MMDB engine profiles in fresh Linux processes."""
+"""Run deterministic release-build MMDB engine profiles in fresh processes."""
 import argparse
 import gzip
 import hashlib
@@ -22,7 +22,7 @@ parser.add_argument("--handoff-rates", nargs=2, type=int, metavar=("WAL_ASYNC", 
                     help="reuse the high-entropy rates from the mixed control calibration")
 parser.add_argument("--candidate", type=Path, help="handoff candidate compiled with the same driver")
 parser.add_argument("--metrics", type=Path, help="instrumented copy of the control")
-parser.add_argument("--cpus", required=True, help="Linux CPU list passed to taskset")
+parser.add_argument("--cpus", required=True, help="CPU list for Linux taskset, or native for the OS scheduler")
 parser.add_argument("--tmpdir", type=Path, required=True, help="filesystem for fresh database directories")
 parser.add_argument("--ops", type=int, default=10_000, help="requests per primary foreground stream")
 parser.add_argument("--rounds", type=int, default=5)
@@ -30,6 +30,8 @@ parser.add_argument("--seed", type=int, default=20261125)
 parser.add_argument("--saturation-seconds", type=int, default=8,
                     help="common closed-loop measurement window with every stream active")
 args = parser.parse_args()
+if platform.system() == "Darwin" and args.cpus != "native":
+    parser.error("use --cpus native for macOS scheduling")
 if args.rounds < 1 or args.ops < 1:
     parser.error("ops and rounds must be positive")
 if args.suite == "handoff" and args.candidate is None:
@@ -64,7 +66,9 @@ def trial(out, mode, case, arm, settings, round_no=0, binary="control"):
     params = {"OPS": args.ops, "SEED": args.seed + round_no, **settings}
     env.update({"MMDB_PROFILE_" + k: str(v) for k, v in params.items()})
     env["TMPDIR"] = str(args.tmpdir.resolve())
-    cmd = ["taskset", "-c", args.cpus, str(binaries[binary]), mode]
+    cmd = [str(binaries[binary]), mode]
+    if args.cpus != "native":
+        cmd = ["taskset", "-c", args.cpus, *cmd]
     result = subprocess.run(cmd, env=env, text=True, capture_output=True)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
@@ -229,7 +233,13 @@ def reopen(out):
 
 args.tmpdir.mkdir(parents=True,exist_ok=True)
 with gzip.open(args.output,"xt") as output:
-    fs = subprocess.check_output(["findmnt","-T",str(args.tmpdir),"-no","SOURCE,FSTYPE,OPTIONS"],text=True).strip()
+    if platform.system() == "Darwin":
+        volume = subprocess.check_output(["df", "-P", str(args.tmpdir)], text=True).splitlines()[-1]
+        source, _, _, _, _, mountpoint = volume.split(maxsplit=5)
+        mounts = subprocess.check_output(["mount"], text=True).splitlines()
+        fs = next((line for line in mounts if line.startswith(f"{source} on {mountpoint} (")), volume)
+    else:
+        fs = subprocess.check_output(["findmnt","-T",str(args.tmpdir),"-no","SOURCE,FSTYPE,OPTIONS"],text=True).strip()
     meta = {"suite":args.suite,"cpus":args.cpus,"platform":platform.platform(),
             "fs":fs,"binary_sha256":{k:hashlib.sha256(p.read_bytes()).hexdigest() for k,p in binaries.items()}}
     meta["ticks_per_second"] = os.sysconf("SC_CLK_TCK")

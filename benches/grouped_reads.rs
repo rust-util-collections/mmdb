@@ -1,9 +1,15 @@
 //! Time lookup through return of all pins. Both arms verify and drop them after the timer.
 //! Prepare once, then open the immutable store in a fresh process per trial.
 //! `grouped_reads prepare DIR [ROWS]` or `grouped_reads DIR warm|page|device
-//! scalar|grouped clustered|scattered FANOUT REQUESTS SEED`. Linux device
-//! verification uses /proc/self/io and Python's file-scoped posix_fadvise.
-use std::{env, fs, io::Read, path::Path, process::Command, time::Instant};
+//! scalar|grouped clustered|scattered FANOUT REQUESTS SEED`. Device trials
+//! request eviction of the fixture SSTs and sample process disk-read bytes.
+use std::{env, fs, io::Read, path::Path, time::Instant};
+
+#[cfg(target_os = "macos")]
+#[path = "grouped_reads/macos.rs"]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::{evict_os_cache, storage_reads};
 
 use mmdb::{DB, DbOptions, PinnedSlice, ReadOptions, WriteBatch};
 use smallvec::SmallVec;
@@ -77,13 +83,15 @@ fn warm_os_cache(files: &[fs::DirEntry]) {
     }
 }
 
-fn evict_os_cache(dir: &Path) {
-    let success = Command::new("python3")
-        .args(["-c", "import glob,os,sys\nfor name in glob.glob(os.path.join(sys.argv[1],'*.sst')):\n with open(name,'rb') as f: os.posix_fadvise(f.fileno(),0,0,os.POSIX_FADV_DONTNEED)"])
-        .arg(dir).status().unwrap().success();
+#[cfg(not(target_os = "macos"))]
+fn evict_os_cache(files: &[fs::DirEntry]) {
+    let success = std::process::Command::new("python3")
+        .args(["-c", "import os,sys\nfor name in sys.argv[1:]:\n with open(name,'rb') as f: os.posix_fadvise(f.fileno(),0,0,os.POSIX_FADV_DONTNEED)"])
+        .args(files.iter().map(fs::DirEntry::path)).status().unwrap().success();
     assert!(success, "could not request file-scoped page eviction");
 }
 
+#[cfg(not(target_os = "macos"))]
 fn storage_reads() -> u64 {
     fs::read_to_string("/proc/self/io")
         .expect("cache-regime verification needs Linux process I/O accounting")
@@ -213,7 +221,7 @@ fn main() {
     let mut elapsed = Vec::with_capacity(samples);
     for n in 0..samples {
         if regime == "device" && n % 128 == 0 {
-            evict_os_cache(dir);
+            evict_os_cache(&files);
             before_storage = storage_reads();
         }
         let base = (next(&mut rng) & mask) & !((fanout - 1) as u64);

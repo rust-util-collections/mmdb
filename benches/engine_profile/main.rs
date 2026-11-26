@@ -1,7 +1,11 @@
 //! MMDB-only profiles. Each invocation owns a fresh temporary directory.
 mod concurrent;
+#[cfg(target_os = "macos")]
+mod macos;
 mod reopen;
 
+#[cfg(target_os = "macos")]
+use macos::{cpu_ticks, rss_kib};
 use std::{env, fmt::Display, path::Path, str::FromStr, sync::Arc};
 
 use mmdb::{BlockCachePool, DB, DbOptions, DurabilityMode, WriteOptions};
@@ -103,6 +107,7 @@ fn property(db: &DB, name: &str) -> u64 {
     db.get_property(name).unwrap().parse().unwrap()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn rss_kib(field: &str) -> Option<u64> {
     std::fs::read_to_string("/proc/self/status")
         .ok()?
@@ -117,6 +122,7 @@ fn rss_kib(field: &str) -> Option<u64> {
 }
 
 // Linux process user + system clock ticks. Sampling stays outside each request.
+#[cfg(not(target_os = "macos"))]
 fn cpu_ticks() -> u64 {
     let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
         return 0;
