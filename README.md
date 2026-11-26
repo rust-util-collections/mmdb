@@ -68,6 +68,12 @@ cargo +stable test --test integration
 cargo +stable doc --no-deps --open
 ```
 
+When the shell supports `ulimit -Sn` and `ulimit -Hn`, `make test` and
+`make ci` raise a low soft file descriptor limit to 4,096 when possible.
+If the limit stays lower, they default to one test thread. Other shells
+launch the tests with their inherited settings. For a focused run, use
+`sh tools/with-test-fds.sh cargo +stable test --lib`.
+
 ## License
 
 [MIT](LICENSE)

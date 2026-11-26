@@ -1,5 +1,7 @@
 .PHONY: all fmt lint check test ci bench clean update publish
 
+CARGO_TEST = sh tools/with-test-fds.sh cargo test
+
 all: fmt lint test
 
 fmt:
@@ -21,10 +23,10 @@ check:
 	cargo check --manifest-path tools/v4-export/Cargo.toml --all-targets
 
 test:
-	cargo test
-	cargo test --release
-	cargo test --lib --features bench-metrics
-	cargo test --manifest-path tools/v4-export/Cargo.toml
+	$(CARGO_TEST)
+	$(CARGO_TEST) --release
+	$(CARGO_TEST) --lib --features bench-metrics
+	$(CARGO_TEST) --manifest-path tools/v4-export/Cargo.toml
 
 # Same gate as .github/workflows/ci.yml. No release suite, no scale_profile.
 ci:
@@ -32,19 +34,19 @@ ci:
 	cargo fmt --manifest-path tools/v4-export/Cargo.toml --all -- --check
 	$(MAKE) check
 	$(MAKE) lint
-	cargo test --lib
-	cargo test --lib --features bench-metrics
-	cargo test --doc
-	cargo test --test crash_recovery
-	cargo test --test e2e_scenarios
-	cargo test --test integration
-	cargo test --test proptest_db
-	cargo test --test bidi_debug
-	cargo test --test lazy_delete
-	cargo test --test shared_cache
-	cargo test --test grouped_reads
-	cargo test --test read_only
-	CI=1 cargo test --manifest-path tools/v4-export/Cargo.toml
+	$(CARGO_TEST) --lib
+	$(CARGO_TEST) --lib --features bench-metrics
+	$(CARGO_TEST) --doc
+	$(CARGO_TEST) --test crash_recovery
+	$(CARGO_TEST) --test e2e_scenarios
+	$(CARGO_TEST) --test integration
+	$(CARGO_TEST) --test proptest_db
+	$(CARGO_TEST) --test bidi_debug
+	$(CARGO_TEST) --test lazy_delete
+	$(CARGO_TEST) --test shared_cache
+	$(CARGO_TEST) --test grouped_reads
+	$(CARGO_TEST) --test read_only
+	CI=1 $(CARGO_TEST) --manifest-path tools/v4-export/Cargo.toml
 
 bench:
 	cargo bench

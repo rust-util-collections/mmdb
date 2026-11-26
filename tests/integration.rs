@@ -1445,29 +1445,36 @@ fn test_iter_rev_after_flush_compact() {
 
 #[test]
 fn test_multi_thread_compaction() {
+    const ROWS: usize = 500;
+    const FLUSHES: usize = 25;
     let dir = tempfile::tempdir().unwrap();
     let db = DB::open(
         DbOptions::default()
             .with_create_if_missing(true)
-            .with_write_buffer_size(4 * 1024)
-            // tiny — force many flushes
             .with_l0_compaction_trigger(2)
             .with_max_background_compactions(4),
         dir.path(),
     )
     .unwrap();
 
-    // Write enough data to trigger many compactions
-    for i in 0..500u64 {
-        let key = format!("mt_{:06}", i);
-        db.put(key.as_bytes(), b"value").unwrap();
+    // Interleave keys so each flush overlaps earlier SSTs and forces rewrites.
+    for run in 0..FLUSHES {
+        for i in (run..ROWS).step_by(FLUSHES) {
+            let key = format!("mt_{i:06}");
+            db.put(key.as_bytes(), b"value").unwrap();
+        }
+        db.flush().unwrap();
     }
-    db.flush().unwrap();
+    let rewritten_bytes: u64 = db
+        .get_property("stats.compaction_bytes_written")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(rewritten_bytes > 0);
     db.compact().unwrap();
 
-    // Verify all data
-    for i in 0..500u64 {
-        let key = format!("mt_{:06}", i);
+    for i in 0..ROWS {
+        let key = format!("mt_{i:06}");
         assert_eq!(
             db.get(key.as_bytes()).unwrap(),
             Some(b"value".to_vec()),
@@ -1475,10 +1482,7 @@ fn test_multi_thread_compaction() {
             i
         );
     }
-
-    // Iterator should see all keys in order
-    let count = db.iter().unwrap().count();
-    assert_eq!(count, 500);
+    assert_eq!(db.iter().unwrap().count(), ROWS);
 }
 
 // ── Deferred block read (first_key in index) ────────────────────────────
