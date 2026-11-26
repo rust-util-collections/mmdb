@@ -3923,5 +3923,6 @@ mod tests {
 thread_local! {
     static LEVEL_BUDGET_MULS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PICKER_FILE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FAIL_SUB_COMPACTION_SPAWN_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(crate) static FAIL_SUB_COMPACTION_SPAWN_AT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }

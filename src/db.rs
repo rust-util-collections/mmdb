@@ -2627,10 +2627,22 @@ impl DB {
                 stats: Some(&self.read.stats),
                 active_snapshots: &active_snaps,
             };
-            let output =
-                LeveledCompaction::execute_compaction_io(&ctx, &task, &file_numbers, is_bottom)
-                    .inspect_err(|e| self.fail_stop_if_manifest_poisoned("compact_range", e))
-                    .ctx()?;
+            let output = match LeveledCompaction::execute_compaction_io(
+                &ctx,
+                &task,
+                &file_numbers,
+                is_bottom,
+            ) {
+                Ok(output) => output,
+                Err(e) => {
+                    self.fail_stop_if_manifest_poisoned("compact_range", &e);
+                    // Release the claim before waking a worker, or the woken
+                    // pick sees the files in flight and goes back to sleep.
+                    drop(_claim);
+                    self.signal_compaction_unless_fail_stopped();
+                    return Err(e).ctx();
+                }
+            };
 
             // Pre-warm the table cache for the new output files while
             // unlocked (see the background compaction loop for rationale).
@@ -2666,6 +2678,8 @@ impl DB {
                     Err(e) => {
                         drop(inner);
                         self.fail_stop_if_manifest_poisoned("compact_range", &e);
+                        drop(_claim);
+                        self.signal_compaction_unless_fail_stopped();
                         return Err(e).ctx();
                     }
                 };
@@ -4006,10 +4020,20 @@ impl DB {
                 stats: Some(&self.read.stats),
                 active_snapshots: &active_snaps,
             };
-            let output =
-                LeveledCompaction::execute_compaction_io(&ctx, &task, &file_numbers, is_bottom)
-                    .inspect_err(|e| self.fail_stop_if_manifest_poisoned("drain_l0", e))
-                    .ctx()?;
+            let output = match LeveledCompaction::execute_compaction_io(
+                &ctx,
+                &task,
+                &file_numbers,
+                is_bottom,
+            ) {
+                Ok(output) => output,
+                Err(e) => {
+                    self.fail_stop_if_manifest_poisoned("drain_l0", &e);
+                    drop(_claim);
+                    self.signal_compaction_unless_fail_stopped();
+                    return Err(e).ctx();
+                }
+            };
 
             // Pre-warm the table cache for the new output files while
             // unlocked (see the background compaction loop for rationale).
@@ -4032,6 +4056,8 @@ impl DB {
                     Err(e) => {
                         drop(inner);
                         self.fail_stop_if_manifest_poisoned("drain_l0", &e);
+                        drop(_claim);
+                        self.signal_compaction_unless_fail_stopped();
                         return Err(e).ctx();
                     }
                 };
@@ -4101,7 +4127,10 @@ impl DB {
         // rewritten by the passes below — or discard, instead of installing
         // stale-filtered data after this full pass has returned.
         self.compacting_files.wait_until_empty();
-        self.drain_l0(true)?;
+        if let Err(e) = self.drain_l0(true) {
+            self.signal_compaction_unless_fail_stopped();
+            return Err(e);
+        }
         let ctx = CompactionContext {
             db_path: &self.storage_path,
             dir_sync: &self.dir_sync,
@@ -4115,7 +4144,10 @@ impl DB {
         for level in (1..self.options.num_levels).rev() {
             self.level_rewrite()
                 .run(level, &ctx, false)
-                .inspect_err(|e| self.fail_stop_if_manifest_poisoned("compact", e))?;
+                .inspect_err(|e| {
+                    self.fail_stop_if_manifest_poisoned("compact", e);
+                    self.signal_compaction_unless_fail_stopped();
+                })?;
         }
         self.signal_compaction_if_pending();
         Ok(())
@@ -4128,6 +4160,14 @@ impl DB {
         };
         if pending {
             self.read.signal_compaction();
+        }
+    }
+
+    /// Wake a sleeper after a compaction error that left the inputs live.
+    /// A fail-stopped store must not start another job.
+    fn signal_compaction_unless_fail_stopped(&self) {
+        if self.read.fail_stop_error().is_none() {
+            self.signal_compaction_if_pending();
         }
     }
 
@@ -5160,6 +5200,44 @@ mod tests {
         assert!(*db.read.compaction_notify.0.lock());
         db.drain_l0(true).unwrap();
         db.put_with_options(&no_wait, b"retry", b"value").unwrap();
+    }
+
+    /// A compaction I/O error that does not fail-stop the store still leaves
+    /// the claimed inputs live. The background worker must be woken after the
+    /// claim drops, or it stays asleep until some later flush.
+    #[test]
+    fn compaction_io_error_signals_pending_work() {
+        use crate::compaction::leveled::FAIL_SUB_COMPACTION_SPAWN_AT;
+
+        let dir = tempfile::tempdir().unwrap();
+        let opts = DbOptions::default()
+            .with_num_levels(3)
+            .with_max_subcompactions(2)
+            .with_max_bytes_for_level_base(128)
+            .with_l0_compaction_trigger(usize::MAX);
+        let db = DB::open(opts, dir.path()).unwrap();
+        stop_background_workers(&db);
+        assert_eq!(db.ingest_sorted([(b"a0", b"1"), (b"m0", b"2")]).unwrap(), 2);
+        assert_eq!(db.ingest_sorted([(b"n0", b"3"), (b"z0", b"4")]).unwrap(), 2);
+        db.put(b"b0", &[b'x'; 256]).unwrap();
+        db.put(b"y0", &[b'y'; 256]).unwrap();
+        db.flush().unwrap();
+        *db.read.compaction_notify.0.lock() = false;
+
+        FAIL_SUB_COMPACTION_SPAWN_AT.with(|fail| fail.set(Some(1)));
+        let err = db.compact_range(Some(b"a"), None).unwrap_err();
+        FAIL_SUB_COMPACTION_SPAWN_AT.with(|fail| fail.set(None));
+
+        assert_eq!(err.kind(), ErrorKind::Io);
+        assert!(
+            db.read.fail_stop_error().is_none(),
+            "a thread-spawn failure must not fail-stop the store"
+        );
+        assert!(
+            *db.read.compaction_notify.0.lock(),
+            "live inputs remain compactable after the claim is released"
+        );
+        assert_eq!(db.get(b"b0").unwrap().as_deref(), Some(&[b'x'; 256][..]));
     }
 
     #[test]
