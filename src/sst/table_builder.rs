@@ -372,17 +372,41 @@ impl TableBuilder {
         BloomFilter::projected_size(self.prefix_set.len(), prefix_bits)
     }
 
+    fn next_filter_exceeds_hard_limit(&self) -> bool {
+        if self.options.bloom_bits_per_key > 0
+            && !self.filter_key_hashes.is_empty()
+            && BloomFilter::projected_size(
+                self.filter_key_hashes.len().saturating_add(1),
+                self.options.bloom_bits_per_key,
+            ) > META_BLOCK_HARD_LIMIT
+        {
+            return true;
+        }
+        let prefix_bits = self.prefix_bloom_bits();
+        self.options.prefix_len > 0
+            && prefix_bits > 0
+            && !self.prefix_set.is_empty()
+            && BloomFilter::projected_size(self.prefix_set.len().saturating_add(1), prefix_bits)
+                > META_BLOCK_HARD_LIMIT
+    }
+
     /// Largest projected single-block metadata structure. Callers that can
     /// split output across multiple SSTs should cut the current file once this
     /// reaches `META_BLOCK_SPLIT_THRESHOLD`.
     pub(crate) fn projected_meta_size(&self) -> usize {
-        self.projected_index_size()
+        let size = self
+            .projected_index_size()
             .max(
                 self.range_projection()
                     .saturating_sub(self.carried_projection),
             )
             .max(self.projected_filter_size())
-            .max(self.projected_prefix_filter_size())
+            .max(self.projected_prefix_filter_size());
+        if self.next_filter_exceeds_hard_limit() {
+            size.max(META_BLOCK_SPLIT_THRESHOLD)
+        } else {
+            size
+        }
     }
 
     fn range_projection(&self) -> usize {

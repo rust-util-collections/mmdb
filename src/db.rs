@@ -5270,6 +5270,55 @@ mod tests {
     }
 
     #[test]
+    fn bloom_budget_below_split_threshold_splits_across_flush_recovery_ingest_and_compact() {
+        // 1 key -> 33,553,408 bytes (< META_BLOCK_SPLIT_THRESHOLD = 33,554,432),
+        // 2 keys -> 67,106,816 bytes (> META_BLOCK_HARD_LIMIT = 67,104,768).
+        let bits_per_key = 268_427_264u32;
+        assert!(
+            BloomFilter::projected_size(1, bits_per_key) < META_BLOCK_SPLIT_THRESHOLD
+                && BloomFilter::projected_size(2, bits_per_key) > crate::sst::META_BLOCK_HARD_LIMIT
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            num_levels: 3,
+            prefix_len: 1,
+            bloom_bits_per_key: bits_per_key,
+            optimize_filters_for_hits: true,
+            l0_compaction_trigger: usize::MAX,
+            ..Default::default()
+        };
+
+        let db = DB::open(options.clone(), dir.path()).unwrap();
+        // Exercise bottommost prefix-only filter split (`bloom_bits_for_level(2) == 0`,
+        // `prefix_bloom_bits == bits_per_key`).
+        assert_eq!(db.ingest_sorted([(b"x", b"vx"), (b"y", b"vy")]).unwrap(), 2);
+        db.put(b"a", b"va").unwrap();
+        db.put(b"b", b"vb").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get_property("num-files-at-level0").as_deref(), Some("2"));
+        db.compact().unwrap();
+
+        let sync = WriteOptions::default().with_durability(DurabilityMode::WalSync);
+        db.put_with_options(&sync, b"c", b"vc").unwrap();
+        db.put_with_options(&sync, b"d", b"vd").unwrap();
+        db.simulate_crash();
+
+        let reopened = DB::open(options, dir.path()).unwrap();
+        for (k, v) in [
+            (b"a", b"va"),
+            (b"b", b"vb"),
+            (b"c", b"vc"),
+            (b"d", b"vd"),
+            (b"x", b"vx"),
+            (b"y", b"vy"),
+        ] {
+            assert_eq!(reopened.get(k).unwrap().as_deref(), Some(v.as_slice()));
+        }
+        reopened.close().unwrap();
+    }
+
+    #[test]
     fn disabled_cache_skips_first_block_pin_io() {
         use crate::sst::table_reader::PREPARE_FIRST_BLOCK_PIN_HOOK;
         let probe_flush_pin_io = |options: DbOptions| -> bool {
