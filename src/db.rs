@@ -1590,11 +1590,15 @@ impl DB {
                                             if shutdown.load(Ordering::Acquire) {
                                                 return Ok(());
                                             }
-                                            // Evaluate user filter `is_noop()` outside `DB::inner`.
-                                            let allow_trivial_move = bg_options
-                                                .compaction_filter
-                                                .as_ref()
-                                                .is_none_or(|f| f.is_noop());
+                                            // Evaluate user filter `is_noop()` outside `DB::inner`,
+                                            // covered by the SST callback re-entrancy guard.
+                                            let allow_trivial_move = {
+                                                let _build = bg_builds.enter();
+                                                bg_options
+                                                    .compaction_filter
+                                                    .as_ref()
+                                                    .is_none_or(|f| f.is_noop())
+                                            };
                                             let pick = {
                                                 let inner = bg_inner.lock();
                                                 let version = inner.versions.current();
@@ -7625,5 +7629,62 @@ mod tests {
         super::hint_wal_writeback(&file, (i64::MAX as u64) + 1, 64);
         super::hint_wal_writeback(&file, 0, (i64::MAX as u64) + 1);
         super::hint_wal_writeback(&file, u64::MAX, u64::MAX);
+    }
+
+    #[test]
+    fn read_hint_filter_is_noop_runs_under_callback_guard() {
+        use std::sync::{Weak, mpsc};
+
+        struct HintProbeFilter {
+            store: Arc<Mutex<Weak<DB>>>,
+            checked: Mutex<Option<mpsc::Sender<()>>>,
+        }
+        impl CompactionFilter for HintProbeFilter {
+            fn filter(&self, _: usize, _: &[u8], _: &[u8]) -> CompactionFilterDecision {
+                CompactionFilterDecision::Keep
+            }
+            fn is_noop(&self) -> bool {
+                if let Some(tx) = self.checked.lock().take() {
+                    let db = self.store.lock().upgrade().expect("live DB handle");
+                    assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+                    for attempt in [
+                        db.put(b"recursive", b"bad"),
+                        db.flush(),
+                        db.sync_wal(),
+                        db.compact_range(None, None),
+                        db.compact(),
+                        db.close(),
+                    ] {
+                        assert_eq!(attempt.unwrap_err().kind(), ErrorKind::InvalidArgument);
+                    }
+                    tx.send(()).unwrap();
+                }
+                true
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(Weak::new()));
+        let (tx, rx) = mpsc::channel();
+        let db = Arc::new(
+            DB::open(
+                DbOptions::default()
+                    .with_num_levels(3)
+                    .with_compaction_filter(Some(Arc::new(HintProbeFilter {
+                        store: Arc::clone(&store),
+                        checked: Mutex::new(Some(tx)),
+                    }))),
+                dir.path(),
+            )
+            .unwrap(),
+        );
+        *store.lock() = Arc::downgrade(&db);
+
+        assert_eq!(db.ingest_sorted([(b"k", b"v")]).unwrap(), 1);
+        assert_eq!(db.get(b"k").unwrap().as_deref(), Some(b"v".as_slice()));
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("read-hint worker never invoked CompactionFilter::is_noop");
+        assert_eq!(db.get(b"recursive").unwrap(), None);
+        db.close().unwrap();
     }
 }
