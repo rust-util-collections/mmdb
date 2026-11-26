@@ -544,7 +544,23 @@ impl VersionSet {
         // Pass 2: Open only the files that survive all deletions.
         // This handles the case where compaction adds + deletes files in
         // separate edits, and the deleted SST no longer exists on disk.
-        let mut reader = WalReader::new(&manifest_path).ctx()?;
+        let mut reader = WalReader::new(&manifest_path).map_err(|e| {
+            if e.source()
+                .and_then(|source| source.downcast_ref::<io::Error>())
+                .is_some_and(|cause| cause.kind() == io::ErrorKind::NotFound)
+            {
+                Error::corruption(format!(
+                    "CURRENT references missing MANIFEST {}",
+                    manifest_path.display()
+                ))
+                .with_source(e)
+            } else {
+                e.context(format!(
+                    "failed to open MANIFEST {}",
+                    manifest_path.display()
+                ))
+            }
+        })?;
         let header = DBHeader::read(&mut reader).ctx()?;
         if requested.is_some_and(|expected| {
             header.levels != expected.levels || header.prefix_len != expected.prefix_len
@@ -2575,5 +2591,47 @@ mod tests {
             VersionSet::recover(path, 7).err().unwrap().kind(),
             ErrorKind::Corruption
         );
+    }
+
+    #[test]
+    fn missing_current_referenced_manifest_returns_corruption_with_io_source() {
+        use std::error::Error as StdError;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        {
+            let db = crate::DB::open(crate::DbOptions::default(), path).unwrap();
+            db.put(b"k", b"v").unwrap();
+            db.close().unwrap();
+        }
+        fs::remove_file(path.join("MANIFEST-000001")).unwrap();
+
+        for err in [
+            crate::DB::open_read_only(path).err().unwrap(),
+            crate::DB::open(
+                crate::DbOptions::default().with_create_if_missing(false),
+                path,
+            )
+            .err()
+            .unwrap(),
+            VersionSet::recover(path, 7).err().unwrap(),
+        ] {
+            assert_eq!(err.kind(), ErrorKind::Corruption, "got {err:?}");
+            let mut cur: Option<&(dyn StdError + 'static)> = err.source();
+            let mut found_not_found = false;
+            while let Some(src) = cur {
+                if let Some(io_err) = src.downcast_ref::<io::Error>()
+                    && io_err.kind() == io::ErrorKind::NotFound
+                {
+                    found_not_found = true;
+                    break;
+                }
+                cur = src.source();
+            }
+            assert!(
+                found_not_found,
+                "expected preserved io::ErrorKind::NotFound source chain in {err:?}"
+            );
+        }
     }
 }
