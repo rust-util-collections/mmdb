@@ -450,6 +450,14 @@ Notice two critical recovery invariants:
 
 [Directory creation](../src/db/directory.rs) · [WAL framing](../src/wal/) · [MANIFEST and CURRENT](../src/manifest/version_set.rs) · [Recovery tests](../tests/crash_recovery.rs)
 
+Both open modes check that MANIFEST `last_sequence` covers each live SST
+before writable recovery repairs the MANIFEST tail. New SST v2 files store
+the highest point or range-deletion sequence as an eight-byte little-endian
+`table.max_sequence` entry in the checksummed metaindex. Older readers skip
+this optional entry. For older tables that lack it, recovery checks real index
+keys, readable point records and range stripes. An unreadable point block
+still reports corruption when a read visits it.
+
 ## SST v2 and cache memory
 
 ### SST v2 physical layout

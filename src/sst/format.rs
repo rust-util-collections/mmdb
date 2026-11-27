@@ -20,6 +20,8 @@ pub const FOOTER_SIZE: usize = 48;
 
 /// Metaindex key for the range-deletion block.
 pub const RANGE_DEL_BLOCK_NAME: &str = "rangedelblock";
+/// Optional SST v2 metaindex entry containing the highest stored MVCC sequence (u64 LE).
+pub const MAX_SEQUENCE_NAME: &str = "table.max_sequence";
 /// Metaindex key storing the fixed prefix length used by the prefix bloom.
 pub const PREFIX_FILTER_LEN_NAME: &str = "filter.prefix_len";
 /// Required layout marker shared by whole-key and prefix Bloom payloads.

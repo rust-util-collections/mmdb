@@ -15,8 +15,8 @@ use crate::sst::block::{Block, decode_entry_reuse};
 use crate::sst::filter::AlignedBytes;
 use crate::sst::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FILTER_FORMAT_BLOCKED_64B,
-    FILTER_FORMAT_NAME, FOOTER_SIZE, PREFIX_FILTER_LEN_NAME, RANGE_DEL_BLOCK_NAME, decode_footer,
-    decode_index_entry,
+    FILTER_FORMAT_NAME, FOOTER_SIZE, MAX_SEQUENCE_NAME, PREFIX_FILTER_LEN_NAME,
+    RANGE_DEL_BLOCK_NAME, decode_footer, decode_index_entry,
 };
 use crate::sst::range::RangeFragment;
 use crate::stats::DbStats;
@@ -61,6 +61,7 @@ pub struct PreparedBlockPin {
 
 /// Bloom filter data and range-del handle read from SST metaindex.
 struct MetaIndexData {
+    max_sequence: Option<SequenceNumber>,
     bloom: Option<Vec<u8>>,
     prefix: Option<Vec<u8>>,
     prefix_len: Option<usize>,
@@ -206,6 +207,7 @@ pub struct TableReader {
     partitions: Vec<(PartitionKey, BlockHandle)>,
     index_dir_pages: Vec<BlockHandle>,
     meta_min_offset: u64,
+    recorded_max_sequence: Option<SequenceNumber>,
     filter_data: Option<AlignedBytes>,
     prefix_filter_data: Option<AlignedBytes>,
     prefix_filter_len: Option<usize>,
@@ -401,6 +403,7 @@ impl TableReader {
             partitions,
             index_dir_pages,
             meta_min_offset,
+            recorded_max_sequence: meta.max_sequence,
             filter_data: meta
                 .bloom
                 .as_deref()
@@ -1231,6 +1234,15 @@ impl TableReader {
                 "MANIFEST file bounds disagree with SST directories",
             ));
         }
+        if let Some(maximum) = self.recorded_max_sequence {
+            let (_, first, _) = decode_internal_key(smallest_key)?;
+            let (_, last, _) = decode_internal_key(largest_key)?;
+            if first.max(last) > maximum {
+                return Err(Error::corruption(
+                    "SST sequence maximum precedes a file boundary",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1354,6 +1366,10 @@ impl TableReader {
     /// decoded. Shortened separators are synthetic and do not carry a stored
     /// point sequence.
     pub(crate) fn max_stored_sequence(&self) -> Result<SequenceNumber> {
+        if let Some(maximum) = self.recorded_max_sequence {
+            return Ok(maximum);
+        }
+        // Older SST v2 writers did not include table.max_sequence.
         let mut max_seq = 0u64;
         for part in 0..self.partitions.len() {
             let Some(leaf) = self.index_leaf_block(part, false)? else {
@@ -1531,6 +1547,7 @@ impl TableReader {
         let mut prefix_len = None;
         let mut filter_format = None;
         let mut range_del_handle = None;
+        let mut max_sequence = None;
         let mut min_offset = metaindex_handle.offset;
 
         let mut iter = metaindex.iter();
@@ -1564,6 +1581,17 @@ impl TableReader {
                 let handle = BlockHandle::decode(&value).ctx()?;
                 min_offset = min_offset.min(handle.offset);
                 range_del_handle = Some(handle);
+            } else if key == MAX_SEQUENCE_NAME.as_bytes() {
+                let bytes = value
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::corruption("invalid SST sequence maximum length"))?;
+                let maximum = u64::from_le_bytes(bytes);
+                if maximum > MAX_SEQUENCE_NUMBER || max_sequence.replace(maximum).is_some() {
+                    return Err(Error::corruption(
+                        "invalid or duplicate SST sequence maximum",
+                    ));
+                }
             }
         }
         if let Some(e) = iter.error() {
@@ -1573,6 +1601,7 @@ impl TableReader {
         Self::validate_filter_format(bloom.is_some() || prefix.is_some(), filter_format)?;
 
         Ok(MetaIndexData {
+            max_sequence,
             bloom,
             prefix,
             prefix_len,
@@ -1931,6 +1960,52 @@ impl TableReader {
 #[cfg(test)]
 mod tests {
     use super::{FILTER_FORMAT_BLOCKED_64B, TableReader};
+
+    #[test]
+    fn recovery_uses_the_stored_maximum_without_reading_point_or_range_blocks() {
+        use crate::sst::{
+            range::RangeFragment,
+            table_builder::{TableBuildOptions, TableBuilder},
+        };
+        use crate::types::{InternalKey, ValueType};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        for (point_seq, range_seq) in [(70, 61), (50, 61)] {
+            let path = dir.path().join(format!("{point_seq}.sst"));
+            let mut builder = TableBuilder::new(&path, TableBuildOptions::default()).unwrap();
+            builder.start_output(
+                &[2],
+                vec![RangeFragment::new(
+                    b"k",
+                    b"l",
+                    Arc::from([1, 17, range_seq]),
+                )],
+            );
+            for (key, seq, kind) in [
+                (b"a", 1, ValueType::Value),
+                (b"m", point_seq, ValueType::Deletion),
+                (b"z", 2, ValueType::Value),
+            ] {
+                builder
+                    .add(InternalKey::new(key, seq, kind).as_bytes(), b"")
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+            let mut reader = TableReader::open(&path).unwrap();
+            super::AFTER_BLOCK_READ.set(Some(Box::new(|| panic!("sequence lookup read a block"))));
+            assert_eq!(
+                reader.max_stored_sequence().unwrap(),
+                point_seq.max(range_seq)
+            );
+            super::AFTER_BLOCK_READ.take();
+            reader.recorded_max_sequence = None;
+            assert_eq!(
+                reader.max_stored_sequence().unwrap(),
+                point_seq.max(range_seq)
+            );
+        }
+    }
 
     #[test]
     fn partitioned_index_seeks_and_scans_across_every_leaf() {

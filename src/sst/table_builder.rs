@@ -19,7 +19,8 @@ use crate::sst::{
 };
 use crate::types::{
     InternalKey, MAX_RANGE_DELETE_SIZE, MAX_SEQUENCE_NUMBER, MAX_USER_KEY_SIZE,
-    MAX_WRITE_ENTRY_SIZE, ValueType, compare_internal_key, decode_internal_key, user_key,
+    MAX_WRITE_ENTRY_SIZE, SequenceNumber, ValueType, compare_internal_key, decode_internal_key,
+    user_key,
 };
 
 /// Soft threshold at which callers that can split their output across
@@ -270,6 +271,7 @@ pub struct TableBuilder {
 
     // Smallest key in the table; last_key supplies the largest at finish.
     smallest_key: Option<Vec<u8>>,
+    max_sequence: SequenceNumber,
 
     // Prefix bloom: collected unique prefixes
     prefix_set: HashSet<Vec<u8>>,
@@ -319,6 +321,7 @@ impl TableBuilder {
             offset: 0,
             last_key: Vec::new(),
             smallest_key: None,
+            max_sequence: 0,
             prefix_set: HashSet::new(),
             has_range_deletions: false,
 
@@ -431,7 +434,7 @@ impl TableBuilder {
     /// Add a key-value pair. Must be called in sorted key order.
     pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         assert!(!self.finished);
-        let (user_key_for_bloom, _, vt) = decode_internal_key(key).ctx()?;
+        let (user_key_for_bloom, seq, vt) = decode_internal_key(key).ctx()?;
         assert!(
             self.last_key.is_empty() || compare_internal_key(key, &self.last_key).is_gt(),
             "keys must be added in order"
@@ -466,8 +469,11 @@ impl TableBuilder {
             if user_key(key) >= value {
                 return Err(Error::invalid_argument("empty range tombstone"));
             }
-            let (begin, seq, _) = decode_internal_key(key)?;
-            self.add_range_fragment(RangeFragment::new(begin, value, Arc::from([seq])));
+            self.add_range_fragment(RangeFragment::new(
+                user_key_for_bloom,
+                value,
+                Arc::from([seq]),
+            ));
             self.last_key.clear();
             self.last_key.extend_from_slice(key);
             return Ok(());
@@ -523,6 +529,7 @@ impl TableBuilder {
         }
 
         self.data_block.add(key, value);
+        self.max_sequence = self.max_sequence.max(seq);
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
 
@@ -789,6 +796,9 @@ impl TableBuilder {
 
     pub(crate) fn add_range_fragment(&mut self, range: RangeFragment) {
         let seqs = range.sequences();
+        // Every nonempty fragment retains its newest stripe, including after
+        // snapshot pruning and when a file split carries it into another SST.
+        self.max_sequence = self.max_sequence.max(*seqs.last().unwrap());
         self.has_range_deletions = true;
         self.range_versions = self.range_versions.saturating_add(seqs.len());
         self.range_del_projected = self
@@ -918,6 +928,10 @@ impl TableBuilder {
             let handle_bytes = range_del_handle.encode();
             builder.add(RANGE_DEL_BLOCK_NAME.as_bytes(), &handle_bytes);
         }
+        builder.add(
+            MAX_SEQUENCE_NAME.as_bytes(),
+            &self.max_sequence.to_le_bytes(),
+        );
 
         let data = builder.finish();
         self.write_raw_block(&data).ctx()
