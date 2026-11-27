@@ -161,7 +161,7 @@ flowchart TD
     B -- "Yes" --> C{"Admission & L0 backpressure"}
     C -- "no_slowdown & (FlushQueue full or L0 >= slowdown)" --> BUSY["Signal compaction if L0 >= trigger; return ErrorKind::Busy"]
     C -- "Normal write & FlushQueue full" --> WAITQ["Wait on FlushQueue::changed"]
-    C -- "Normal write & L0 >= stop_trigger" --> DRAIN["Acquire write_queue barrier & run inline drain_l0(true)"]
+    C -- "Normal write & L0 >= stop_trigger" --> DRAIN["Acquire the write_queue barrier and drain L0 in WriteStall mode"]
     C -- "Normal write & L0 >= slowdown_trigger" --> SLEEP["Signal compaction & sleep progressive delay"]
     WAITQ --> ENQ
     DRAIN --> ENQ
@@ -623,6 +623,10 @@ flowchart LR
      `(check_poison, fsync, store_poison)` under their respective file locks so
      a later clean `fsync` can never mask an earlier failed durability claim or
      allow premature WAL/SST unlinking.
+- **Failed L0 write stall.** A failed inline drain publishes the background error
+  before releasing its input claims. Workers check for this error at wakeup and
+  the MANIFEST writer rechecks it before appending an edit. A retryable manual
+  compaction wakes pending work after releasing its claims.
 - **Explicit `DB::close()` vs `Drop`.** Calling `DB::close()` acquires
   `lock_file`, atomically marks `closed = true`, drains active `MaintenanceState`
   operations (`flush`, `compact*`, `ingest_sorted`), waits for any active

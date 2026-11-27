@@ -700,6 +700,13 @@ impl Drop for WorkerExitGuard {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum L0Drain {
+    Opportunistic,
+    WaitForClaims,
+    WriteStall,
+}
+
 /// File numbers claimed by in-flight compaction picks, paired with a condvar
 /// so the explicit full-compaction path can wait for in-flight picks to
 /// install or discard instead of silently skipping their input files.
@@ -1451,6 +1458,7 @@ impl DB {
         let sequence_start = Arc::new(AtomicU64::new(next_sequence));
         let committed_sequence = Arc::new(AtomicU64::new(max_sequence));
 
+        let has_bg_error = versions.has_bg_error.clone();
         let manifest_poisoned = versions.poison_flag();
         let dir_sync = versions.dir_sync_handle();
 
@@ -1471,7 +1479,6 @@ impl DB {
         #[cfg(test)]
         LAST_COMPACTION_SHUTDOWN_FLAG
             .with(|sink| *sink.borrow_mut() = Some(compaction_shutdown.clone()));
-        let has_bg_error = Arc::new(AtomicBool::new(false));
         let bg_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let compacting_files = Arc::new(CompactionClaims::new());
 
@@ -1543,18 +1550,23 @@ impl DB {
                             bg_flush_queue.fail(Error::background(msg));
                         };
 
+                        let should_stop = || {
+                            shutdown.load(Ordering::Acquire)
+                                || bg_has_error.load(Ordering::Acquire)
+                                || bg_manifest_poisoned.load(Ordering::Acquire)
+                        };
                         let mut retry_l0 = false;
                         loop {
                             // Wait for notification
                             {
                                 let (lock, cvar) = &*notify;
                                 let mut has_work = lock.lock();
-                                while !*has_work && !shutdown.load(Ordering::Acquire) {
+                                while !*has_work && !should_stop() {
                                     cvar.wait(&mut has_work);
                                 }
                                 *has_work = false; // consumed
                             }
-                            if shutdown.load(Ordering::Acquire) {
+                            if should_stop() {
                                 break;
                             }
 
@@ -1570,14 +1582,14 @@ impl DB {
                                     loop {
                                         loop {
                                             loop {
-                                                if shutdown.load(Ordering::Acquire) {
-                                                return Ok(());
-                                            }
                                             // Phase 1: pick and claim (short lock)
                                             let pick = {
                                                 let inner = bg_inner.lock();
                                                 let version = inner.versions.current();
                                                 let mut claimed = bg_compacting_files.lock();
+                                                if should_stop() {
+                                                    return Ok(());
+                                                }
                                                 match LeveledCompaction::pick_compaction(
                                                     &version,
                                                     &bg_options,
@@ -1723,7 +1735,7 @@ impl DB {
                                             mem::take(&mut *bg_hints.lock());
                                         if !hints.is_empty() {
                                             for hint in &hints {
-                                                if shutdown.load(Ordering::Acquire) {
+                                                if should_stop() {
                                                     return Ok(());
                                                 }
                                                 // Evaluate user filter `is_noop()` outside `DB::inner`,
@@ -1739,6 +1751,9 @@ impl DB {
                                                     let inner = bg_inner.lock();
                                                     let version = inner.versions.current();
                                                     let mut claimed = bg_compacting_files.lock();
+                                                    if should_stop() {
+                                                        return Ok(());
+                                                    }
                                                     LeveledCompaction::pick_compaction_for_hint(
                                                         &version,
                                                         &bg_options,
@@ -1875,7 +1890,7 @@ impl DB {
                                     // levels first so removing older copies can make
                                     // shallower copies eligible in the same pass.
                                     while !hold_deferred_sweep {
-                                        if shutdown.load(Ordering::Acquire)
+                                        if should_stop()
                                             || !bg_dead_key_sweep.is_pending()
                                             || !bg_snapshot_list.is_empty()
                                             || !bg_dead_key_sweep.try_start()
@@ -1886,7 +1901,7 @@ impl DB {
                                         let mut blocked_by_snapshot = false;
                                         let mut deferred_l0 = false;
                                         for level in (0..bg_options.num_levels).rev() {
-                                            if shutdown.load(Ordering::Acquire) {
+                                            if should_stop() {
                                                 bg_dead_key_sweep.finish(true);
                                                 return Ok(());
                                             }
@@ -1949,7 +1964,7 @@ impl DB {
                                         }
                                     }
                                     let more_organic_work =
-                                        !shutdown.load(Ordering::Acquire) && {
+                                        !should_stop() && {
                                             let inner = bg_inner.lock();
                                             let version = inner.versions.current();
                                             let claimed = bg_compacting_files.lock();
@@ -1976,7 +1991,9 @@ impl DB {
                                         .fetch_add(1, Ordering::Release);
                                 }
                                 Ok(Err(msg)) => {
-                                    set_error(msg);
+                                    if !bg_has_error.load(Ordering::Acquire) {
+                                        set_error(msg);
+                                    }
                                     break;
                                 }
                                 Err(panic_payload) => {
@@ -2479,11 +2496,12 @@ impl DB {
         let _maintenance = self.begin_maintenance()?;
         self.flush_generation().ctx()?;
         if self.l0_file_count.load(Ordering::Relaxed) >= self.options.l0_compaction_trigger
-            && let Err(e) = self.drain_l0(false)
+            && let Err(e) = self.drain_l0(L0Drain::Opportunistic)
         {
             if let Some(fatal) = self.read.fail_stop_error() {
                 return Err(fatal);
             }
+            self.signal_compaction_if_pending();
             tracing::warn!("post-flush L0 drain failed (will retry): {}", e);
         }
         // Off the writer-serializing lock: harvest dead-key registrations
@@ -3209,17 +3227,13 @@ impl DB {
                 crate::profile::record(|p| p.l0_drains += 1);
                 // Slow path: drain L0, not the whole database, and do not hold
                 // db_mutex across the merge I/O. write_queue stays held for
-                // close serialization. drain_l0(false) returns Ok while another
+                // close serialization. An opportunistic drain returns Ok while another
                 // compaction holds the L0 claim; admitting the write then lets
                 // later flushes add L0 files for as long as that claim is live.
                 // Wait until L0 is actually drained. If compaction fails,
                 // admitting the write would silently disable the stall —
                 // fail-stop instead, matching the background thread.
-                if let Err(e) = self.drain_l0(true) {
-                    let msg = format!("inline L0 compaction failed: {}", e);
-                    self.set_bg_error(msg.clone());
-                    return Err(Error::background(msg));
-                }
+                self.drain_l0(L0Drain::WriteStall)?;
             }
             self.l0_file_count.store(
                 self.inner.lock().versions.current().l0_file_count(),
@@ -3907,16 +3921,10 @@ impl DB {
     /// neither of which should pay for a full-database compaction, and by
     /// `force_compact_all`.
     ///
-    /// When a pick is blocked because another in-flight compaction has
-    /// claimed the current L0 files, `wait_for_inflight` selects the policy:
-    /// `false` returns immediately (opportunistic callers such as flush's
-    /// post-trigger drain — the in-flight compaction is already doing the
-    /// work), while `true` waits for the claim to settle and re-picks so L0
-    /// is genuinely drained on return. The L0 stop trigger and
-    /// `force_compact_all` require `true`: returning while the claim is held
-    /// leaves L0 at or above the stop count, and later flushes then add files
-    /// without bound.
-    fn drain_l0(&self, wait_for_inflight: bool) -> Result<()> {
+    /// Opportunistic flushes yield to a current claim. Explicit compaction
+    /// and write stalls wait for it and pick again. A write stall also latches
+    /// failure before releasing its claim, so no worker retries those inputs.
+    fn drain_l0(&self, mode: L0Drain) -> Result<()> {
         let force_opts = DbOptions {
             l0_compaction_trigger: 1,
             ..self.options.clone()
@@ -3975,7 +3983,7 @@ impl DB {
             let Some((task, file_numbers, l0_inputs, is_bottom, active_snaps, claimed_numbers)) =
                 pick
             else {
-                if wait_for_inflight && l0_blocked {
+                if mode != L0Drain::Opportunistic && l0_blocked {
                     // Wait (without holding `inner`) for the in-flight
                     // compaction to install or discard, then re-pick.
                     // Breaking here instead would return with L0 undrained.
@@ -4003,20 +4011,10 @@ impl DB {
                 stats: Some(&self.read.stats),
                 active_snapshots: &active_snaps,
             };
-            let output = match LeveledCompaction::execute_compaction_io(
-                &ctx,
-                &task,
-                &file_numbers,
-                is_bottom,
-            ) {
-                Ok(output) => output,
-                Err(e) => {
-                    self.fail_stop_if_manifest_poisoned("drain_l0", &e);
-                    drop(_claim);
-                    self.signal_compaction_unless_fail_stopped();
-                    return Err(e).ctx();
-                }
-            };
+            let output =
+                LeveledCompaction::execute_compaction_io(&ctx, &task, &file_numbers, is_bottom)
+                    .map_err(|e| self.l0_drain_error(mode, e))
+                    .ctx()?;
 
             // Phase 3: install (short lock)
             let cleanup = {
@@ -4033,10 +4031,7 @@ impl DB {
                     Ok(cleanup) => cleanup,
                     Err(e) => {
                         drop(inner);
-                        self.fail_stop_if_manifest_poisoned("drain_l0", &e);
-                        drop(_claim);
-                        self.signal_compaction_unless_fail_stopped();
-                        return Err(e).ctx();
+                        return Err(self.l0_drain_error(mode, e)).ctx();
                     }
                 };
                 // Unpin L0 inputs that actually left L0. Covers both a
@@ -4071,8 +4066,7 @@ impl DB {
                 // thread treats as fail-stop. confirm_manifest_durable
                 // enforces poison; record it so `flush()` and `check_usable`
                 // see a fatal engine state, not a retryable hiccup.
-                self.set_bg_error(format!("drain_l0 manifest sync failed: {}", e));
-                return Err(e).ctx();
+                return Err(self.l0_drain_error(mode, e)).ctx();
             }
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, &self.storage_path);
             installed = true;
@@ -4082,6 +4076,20 @@ impl DB {
             self.read.signal_compaction();
         }
         Ok(())
+    }
+
+    fn l0_drain_error(&self, mode: L0Drain, error: Error) -> Error {
+        if mode == L0Drain::WriteStall {
+            // Serialize the stop with competing installs while the failed
+            // inputs are still claimed. The MANIFEST itself can be healthy.
+            let _inner = self.inner.lock();
+            let message = format!("inline L0 compaction failed: {error}");
+            self.set_bg_error(message.clone());
+            Error::background(message).with_source(error)
+        } else {
+            self.fail_stop_if_manifest_poisoned("drain_l0", &error);
+            error
+        }
     }
 
     fn level_rewrite(&self) -> LevelRewrite<'_> {
@@ -4105,7 +4113,7 @@ impl DB {
         // rewritten by the passes below — or discard, instead of installing
         // stale-filtered data after this full pass has returned.
         self.compacting_files.wait_until_empty();
-        if let Err(e) = self.drain_l0(true) {
+        if let Err(e) = self.drain_l0(L0Drain::WaitForClaims) {
             self.signal_compaction_unless_fail_stopped();
             return Err(e);
         }
@@ -5049,7 +5057,7 @@ mod tests {
                 *hook.borrow_mut() = Some(Box::new(move || {
                     writer.put(b"m", b"new").unwrap();
                     writer.flush().unwrap();
-                    writer.drain_l0(true).unwrap();
+                    writer.drain_l0(L0Drain::WaitForClaims).unwrap();
                     let version = writer.inner.lock().versions.current();
                     assert!(version.level_files(0).is_empty());
                     assert!(version.level_files(1).iter().all(|file| {
@@ -5144,6 +5152,17 @@ mod tests {
         assert!(synced.is_err(), "a sync write must fsync the WAL");
     }
 
+    fn wait_for_compaction_worker(predicate: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "compaction worker did not settle"
+            );
+            thread::yield_now();
+        }
+    }
+
     /// Join the compaction workers so a test drives compaction itself.
     fn stop_background_workers(db: &DB) {
         {
@@ -5177,8 +5196,93 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Busy);
         assert!(*db.read.compaction_notify.0.lock());
-        db.drain_l0(true).unwrap();
+        db.drain_l0(L0Drain::WaitForClaims).unwrap();
         db.put_with_options(&no_wait, b"retry", b"value").unwrap();
+    }
+
+    #[test]
+    fn write_stall_failure_keeps_claim_until_fail_stop_and_preserves_l0() {
+        use crate::BlockPropertyCollector;
+        use std::cell::Cell;
+
+        thread_local! { static REJECT_OUTPUT: Cell<bool> = const { Cell::new(false) }; }
+        struct Property;
+        impl BlockPropertyCollector for Property {
+            fn name(&self) -> &str {
+                "test"
+            }
+            fn add(&mut self, _: &[u8]) {}
+            fn finish_block(&mut self) -> Vec<u8> {
+                if REJECT_OUTPUT.replace(false) {
+                    vec![0; usize::from(u16::MAX) + 1]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let options = DbOptions {
+            block_property_collectors: vec![Arc::new(|| Box::new(Property))],
+            ..DbOptions::default()
+        }
+        .with_num_levels(2)
+        .with_l0_compaction_trigger(1)
+        .with_l0_slowdown_trigger(1)
+        .with_l0_stop_trigger(1);
+        let db = DB::open(options, dir.path()).unwrap();
+        let passes = &db.dead_key_sweep.completed_passes;
+        wait_for_compaction_worker(|| passes.load(Ordering::Acquire) > 0);
+        db.ingest_sorted([(b"k", b"old")]).unwrap();
+        let l1 = db.inner.lock().versions.current().level_files(1)[0]
+            .meta
+            .number;
+        let prior = passes.load(Ordering::Acquire);
+        db.compacting_files.lock().insert(l1);
+        db.put(b"k", b"new").unwrap();
+        db.flush_generation().unwrap();
+        wait_for_compaction_worker(|| passes.load(Ordering::Acquire) > prior);
+        let l0 = db.inner.lock().versions.current().level_files(0)[0]
+            .meta
+            .number;
+        db.compacting_files.release(&[l1]);
+
+        let claimed_at_failure = Arc::new(AtomicBool::new(false));
+        let observed = claimed_at_failure.clone();
+        let claims = db.compacting_files.clone();
+        db.flush_queue
+            .on_next_fail(move || observed.store(claims.lock().contains(&l0), Ordering::Release));
+        REJECT_OUTPUT.set(true);
+        assert_eq!(
+            db.put(b"other", b"value").unwrap_err().kind(),
+            ErrorKind::Background
+        );
+        // Even a separate notification sent after the error must leave the
+        // original inputs available for reopen.
+        let prior = passes.load(Ordering::Acquire);
+        db.read.signal_compaction();
+        wait_for_compaction_worker(|| {
+            db.compaction_handles
+                .lock()
+                .iter()
+                .all(JoinHandle::is_finished)
+                || passes.load(Ordering::Acquire) > prior
+        });
+        stop_background_workers(&db);
+        assert!(claimed_at_failure.load(Ordering::Acquire));
+        assert_eq!(
+            db.inner.lock().versions.current().level_files(0)[0]
+                .meta
+                .number,
+            l0
+        );
+        assert!(dir.path().join(format!("{l0:06}.sst")).exists());
+        assert_eq!(db.close().unwrap_err().kind(), ErrorKind::Background);
+        let reopened = DB::open_read_only(dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"k").unwrap().as_deref(),
+            Some(b"new".as_slice())
+        );
+        assert!(reopened.get(b"other").unwrap().is_none());
     }
 
     /// A compaction I/O error that does not fail-stop the store still leaves
@@ -5195,13 +5299,16 @@ mod tests {
             .with_max_bytes_for_level_base(128)
             .with_l0_compaction_trigger(usize::MAX);
         let db = DB::open(opts, dir.path()).unwrap();
-        stop_background_workers(&db);
+        let passes = &db.dead_key_sweep.completed_passes;
+        wait_for_compaction_worker(|| passes.load(Ordering::Acquire) > 0);
         assert_eq!(db.ingest_sorted([(b"a0", b"1"), (b"m0", b"2")]).unwrap(), 2);
         assert_eq!(db.ingest_sorted([(b"n0", b"3"), (b"z0", b"4")]).unwrap(), 2);
         db.put(b"b0", &[b'x'; 256]).unwrap();
         db.put(b"y0", &[b'y'; 256]).unwrap();
+        let prior = passes.load(Ordering::Acquire);
         db.flush().unwrap();
-        *db.read.compaction_notify.0.lock() = false;
+        wait_for_compaction_worker(|| passes.load(Ordering::Acquire) > prior);
+        let prior = passes.load(Ordering::Acquire);
 
         FAIL_SUB_COMPACTION_SPAWN_AT.with(|fail| fail.set(Some(1)));
         let err = db.compact_range(Some(b"a"), None).unwrap_err();
@@ -5212,10 +5319,8 @@ mod tests {
             db.read.fail_stop_error().is_none(),
             "a thread-spawn failure must not fail-stop the store"
         );
-        assert!(
-            *db.read.compaction_notify.0.lock(),
-            "live inputs remain compactable after the claim is released"
-        );
+        wait_for_compaction_worker(|| passes.load(Ordering::Acquire) > prior);
+        assert!(db.inner.lock().versions.current().level_files(1).is_empty());
         assert_eq!(db.get(b"b0").unwrap().as_deref(), Some(&[b'x'; 256][..]));
     }
 
@@ -5573,7 +5678,7 @@ mod tests {
         db.put(b"k", b"v").unwrap();
         db.flush().unwrap();
 
-        db.drain_l0(false).unwrap();
+        db.drain_l0(L0Drain::Opportunistic).unwrap();
         let files_at = |level: usize| db.get_property(&format!("num-files-at-level{level}"));
         assert_eq!(files_at(0).as_deref(), Some("0"));
         assert_eq!(files_at(1).as_deref(), Some("1"));
@@ -7450,7 +7555,7 @@ mod tests {
             db.put(format!("p2_{i:04}").as_bytes(), b"v2").unwrap();
         }
         db.flush().unwrap();
-        db.drain_l0(true).unwrap();
+        db.drain_l0(L0Drain::WaitForClaims).unwrap();
         {
             let v = db.inner.lock().versions.current();
             assert_eq!(v.level_files(0).len(), 0);

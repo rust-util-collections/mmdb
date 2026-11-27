@@ -186,6 +186,9 @@ pub struct VersionSet {
     parent_dir: Arc<Mutex<Option<fs::File>>>,
     /// Table cache for opening SST readers.
     table_cache: Option<Arc<TableCache>>,
+    /// Shared with the DB workers. A stopped handle may finish syncing an
+    /// already appended edit, but must reject a new MANIFEST append.
+    pub(crate) has_bg_error: Arc<AtomicBool>,
     /// Count of edits since last MANIFEST snapshot (for Phase I compaction).
     edits_since_snapshot: u64,
     /// Set when the MANIFEST writer is in an unrecoverable state: a record
@@ -474,6 +477,7 @@ impl VersionSet {
             table_cache,
             edits_since_snapshot: 0,
             poisoned: Arc::new(AtomicBool::new(false)),
+            has_bg_error: Arc::new(AtomicBool::new(false)),
         };
 
         // Write initial snapshot edit
@@ -807,6 +811,7 @@ impl VersionSet {
             table_cache,
             edits_since_snapshot: edits_replayed,
             poisoned: Arc::new(AtomicBool::new(false)),
+            has_bg_error: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -990,6 +995,11 @@ impl VersionSet {
         {
             let mut w = self.manifest_writer.lock();
             check_manifest_poison(&self.poisoned)?;
+            if self.has_bg_error.load(Ordering::Acquire) {
+                return Err(Error::background(
+                    "database stopped before MANIFEST install",
+                ));
+            }
             if let Some(n) = edit.log_number
                 && (n == u64::MAX || n < self.log_number)
             {
@@ -1434,6 +1444,26 @@ mod tests {
                 ErrorKind::Background
             );
         });
+    }
+
+    #[test]
+    fn stopped_handle_rejects_an_edit_prepared_before_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut versions = VersionSet::create(dir.path(), 3).unwrap();
+        let manifest = dir.path().join("MANIFEST-000001");
+        let previous = fs::read(&manifest).unwrap();
+        let flag = versions.has_bg_error.clone();
+        BEFORE_MANIFEST_APPEND.set(Some(Box::new(move || flag.store(true, Ordering::Release))));
+        let mut edit = VersionEdit::new();
+        edit.set_last_sequence(7);
+        assert_eq!(
+            versions.apply_metadata(edit).unwrap_err().kind(),
+            ErrorKind::Background
+        );
+        assert!(!versions.is_poisoned());
+        versions.sync_manifest().unwrap();
+        assert_eq!(versions.last_sequence(), 0);
+        assert_eq!(fs::read(manifest).unwrap(), previous);
     }
 
     #[test]
