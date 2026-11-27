@@ -21,10 +21,9 @@ MMDB v6 reads MANIFEST format 5, SST v2 files, and v5 WAL records.
    resuming writes. For an ordered scan, `step_next()?` propagates a read
    failure. If you consume the owned `Iterator`, check `error()` after the scan.
 
-For example, the checked-in v5.0.1 fixture uses three levels and a two-byte
-prefix. Its compatibility test reads SST and WAL rows in read-only mode,
-reopens the same files writable with those settings, writes another key,
-flushes and compacts, and checks the rows again after reopen.
+The v5.0.1 fixture uses `num_levels = 3` and `prefix_len = 2`. On reopen,
+`get(b"p:w")` returns the bytes `WAL only` from the replayed log, and
+`get(b"p:b")` returns `None` because the log also recorded its deletion.
 [v5.0.1 fixture](../tests/fixtures/v5.0.1/) · [Compatibility test](../tests/integration.rs)
 
 To inspect before switching writers, `DB::open_read_only` adopts the stored

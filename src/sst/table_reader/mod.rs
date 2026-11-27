@@ -2409,15 +2409,8 @@ mod tests {
                 .copy_from_slice(&crc.to_le_bytes());
         };
 
-        // Case A: Leaf 0 ends strictly before partitions[0].0 while keeping
-        // intra-leaf ordering valid (rebuild a 1-entry leaf and pad? No:
-        // keep all entries except replace the last entry's separator with a
-        // same-length key between its first_key and partitions[0].0: since
-        // step is 3, last entry is k(3m)_xxx and next partition starts at
-        // k(3m+3)_xxx; if shorten_separator shortened at digit 4, e.g. 3m=81
-        // vs 84 -> sep is "k0082", lowering first_key to k0080_z.. and sep to
-        // "k0081"? Even simpler: build a fresh 1-entry leaf at the start of
-        // part0_handle and update part0_handle.size in the directory block!).
+        // Leaf 0 contains only its first entry. Its last separator now falls
+        // short of the upper bound recorded in the partition directory.
         {
             let mut short_leaf = BlockBuilder::new(1);
             let e0 = &first_leaf_entries[0];
@@ -2471,7 +2464,8 @@ mod tests {
             );
         }
 
-        // Case B: Leaf 1 first_key <= partitions[0].0 (violates lower partition bound).
+        // Leaf 1 starts inside partition 0. A point read and an iterator
+        // seek must both report the overlapping bounds as corruption.
         {
             let mut leaf_builder = BlockBuilder::new(1);
             for (idx, e) in second_leaf_entries.iter().enumerate() {

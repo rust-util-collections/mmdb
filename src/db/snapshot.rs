@@ -13,13 +13,14 @@ pub(super) static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
 
 /// RAII snapshot guard. Automatically releases the snapshot when dropped.
 ///
-/// Every read option derived from this guard borrows its live registration.
+/// [`ReadOptions`] borrow this guard. Bind `let snapshot = db.snapshot();`
+/// before keeping `snapshot.read_options()` for a later read.
 ///
-/// ```compile_fail
-/// # fn example(db: &mmdb::DB) -> mmdb::Result<()> {
-/// let opts = db.snapshot().read_options();
-/// db.get_with_options(&opts, b"key")?;
-/// # Ok(()) }
+/// ```compile_fail,E0716
+/// # fn read_user(db: &mmdb::DB) -> mmdb::Result<bool> {
+/// let options = db.snapshot().read_options(); // The temporary snapshot drops here.
+/// db.contains_key_with_options(&options, b"user:alice")
+/// # }
 /// ```
 #[must_use]
 pub struct Snapshot<'a> {

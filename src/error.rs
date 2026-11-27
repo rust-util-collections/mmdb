@@ -11,16 +11,8 @@
 //!   reachable through [`std::error::Error::source`] (so it can be downcast,
 //!   e.g. to [`std::io::Error`]).
 //!
-//! Both `Display` and `Debug` render the *complete* chain — message, every
-//! trace frame, and the source — so `unwrap()`/`expect()`/log output never
-//! lose diagnostic information:
-//!
-//! ```text
-//! Corruption: WAL 000012 CRC mismatch
-//!     at src/wal/reader.rs:116:38
-//!     at src/db.rs:410:36 -- refusing prefix recovery
-//! caused by: unexpected end of file
-//! ```
+//! Both `Display` and `Debug` print the message, every trace frame, and any
+//! underlying cause. [`ResultExt`] shows how to add the file being read.
 //!
 //! `Error` is `Clone + Send + Sync`, so a single failure can be distributed
 //! to multiple waiters (e.g. group-commit followers) without stringification.
@@ -247,6 +239,21 @@ impl From<io::Error> for Error {
 ///
 /// Implemented for `Result<T, Error>` and `Result<T, io::Error>`; each call
 /// records the caller's `file:line:column` in the error's trace.
+///
+/// If `path` names a missing `CURRENT` file, the error keeps its I/O kind
+/// and the operation that failed.
+///
+/// ```
+/// use mmdb::{ErrorKind, ResultExt};
+///
+/// # let dir = tempfile::tempdir()?;
+/// # let path = dir.path().join("CURRENT");
+/// let read = std::fs::read(path).with_ctx(|| "reading CURRENT");
+/// let error = read.unwrap_err();
+/// assert_eq!(error.kind(), ErrorKind::Io);
+/// assert!(error.to_string().contains("reading CURRENT"));
+/// # Ok::<(), mmdb::Error>(())
+/// ```
 pub trait ResultExt<T> {
     /// Append the caller's location to the error trace.
     fn ctx(self) -> Result<T>;

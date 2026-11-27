@@ -115,27 +115,6 @@ impl RangeTombstoneTracker {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FragmentedRangeTombstoneList — immutable, O(log T) binary-search index
-// ---------------------------------------------------------------------------
-//
-// Query index construction, illustrated for two raw tombstones [a,z)@seq5
-// and [d,f)@seq8:
-//
-//   boundaries         a    d    f    z
-//   elementary ivals   [a,d) [d,f) [f,z)     <- leaves of the tree, 0..3
-//
-//   segment-tree assignment (range-update style):
-//     seq5/lvl0  covers leaves [0,3): assigned to as few canonical
-//                ancestor nodes as needed (O(log N) of them), NOT
-//                cloned into each of the 3 leaves individually.
-//     seq8/lvl0  covers leaf [1,2) only: assigned directly to that leaf.
-//
-// A point query for a key inside leaf 1 (`[d,f)`) walks root -> leaf,
-// visiting the O(log N) ancestor nodes on that path. Each node groups
-// sequences by level and binary-searches each eligible level's descending
-// sequence list, so invisible versions do not require a linear scan.
-
 /// Elementary-interval boundaries for the query index: `bounds[i]` is the
 /// begin key of interval `i`; `bounds[i + 1]` is its (exclusive) end.
 /// Derived from every raw begin/end key, sorted and deduplicated. Some
@@ -253,15 +232,16 @@ fn tree_query(
 
 /// Pre-fragmented, immutable range tombstone index.
 ///
-/// Supports binary search + ancestor-walk lookup for any user key. Each
-/// ancestor binary-searches sequences at eligible levels, bounding lookup
-/// work by O(L log² T) for L levels and T tombstones, replacing a linear scan
-/// without materializing the full active-tombstone set at every elementary
-/// interval (which would be O(T) per interval and O(T^2) overall for deeply
-/// nested/overlapping input — see the module-level diagram above).
+/// Two L0 tombstones, `[a, z)` at sequence 5 and `[d, f)` at 8, divide
+/// the tree into leaves `[a, d)`, `[d, f)`, and `[f, z)`. The root stores
+/// sequence 5 because its tombstone covers all three. The middle leaf stores 8.
+/// Looking up `e` visits both nodes. The newest visible deletion is 5
+/// at snapshot 6 and 8 at snapshot 8.
 ///
-/// Constructed once at iterator creation time from all sources' cached
-/// tombstones; never mutated afterwards.
+/// Construction uses the sources' cached tombstones when the iterator opens.
+/// A lookup finds the leaf by binary search, then walks its path from the
+/// root. Each node binary-searches the sequences at eligible levels, for
+/// O(L log² T) work over L levels and T tombstones.
 pub(crate) struct FragmentedRangeTombstoneList {
     bounds: Bounds,
     tree: Tree,
@@ -377,19 +357,11 @@ impl FragmentedRangeTombstoneList {
         self.max_covering_tombstone_seq_for_level(user_key, snapshot, None)
     }
 
-    /// Level-aware variant: excludes tombstones from levels strictly deeper
-    /// than `source_level`. A tombstone that is *at or shallower than* the
-    /// key's own level may still delete it — that is the ordinary, essential
-    /// way range deletes (and same-level Put+DeleteRange, e.g. entirely
-    /// within one MemTable) work, and must not be excluded. Only a tombstone
-    /// strictly *deeper* than the key is excluded: since compaction only
-    /// ever moves data to deeper levels over time, a tombstone that has
-    /// already been compacted past the key's own level cannot represent a
-    /// legitimate later-in-time delete of that key — trusting it would risk
-    /// hiding a key whose sequence was zeroed at the bottommost level
-    /// (`is_bottommost && seq < oldest_snapshot_seq`) based on a coincidental
-    /// but unrelated deeper tombstone. Pass `None` for no level filtering
-    /// (backward compatible).
+    /// Search levels up to and including `source_level`, or all levels for `None`.
+    /// A point at L1 can see tombstones at L0 and L1. Within one memtable,
+    /// a range deletion can cover an earlier put at the same level.
+    /// A deeper tombstone may predate a point whose sequence compaction reset
+    /// to zero, so its sequence alone cannot establish a later delete.
     pub fn max_covering_tombstone_seq_for_level(
         &self,
         user_key: &[u8],

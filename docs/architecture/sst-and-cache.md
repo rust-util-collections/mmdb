@@ -65,7 +65,7 @@ purging other members' entries. [Block cache and pin map](../../src/cache/block_
 | `get_property("block-cache-usage")` | An approximate **entry count** including pool-wide evictable entries and this member's pins. Adding this property across members would count shared entries more than once. |
 | Process resident set size (RSS) | Includes resident memory outside those gauges, such as live table readers, retired blocks or arenas held by callers, and allocator overhead. The operating system's file-page residency is a separate measurement. |
 
-For example, after `DB::close()` the DB-local memory gauges are zero. A
-value pinned before close can still retain its backing block, and another
-DB can still occupy a shared pool. [DB memory gauges](../../src/db/memory.rs) ·
+Pin a nonempty SST value with `get_pinned`, then call `close()`.
+`db.memory_usage()` now reports zero for every gauge. The pin still keeps
+its block alive, and other open DBs can still use the shared pool. [DB memory gauges](../../src/db/memory.rs) ·
 [Cache capacity experiment](../benchmarks/cache-capacity/README.md)

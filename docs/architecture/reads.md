@@ -40,9 +40,9 @@ while a read continues using its original sources. [Read path](../../src/db/read
    Otherwise the reader follows the resident directory to an index leaf and
    data block. Hits at L2 or deeper can feed read-compaction sampling.
 
-For example, a range deletion `[b, d)` at sequence 12 hides an older `c` in
-a deeper level for reads at sequence 12 or later. A snapshot at sequence 11
-can still see that value, and the deletion does not cover `d`.
+Suppose a deeper SST holds `c` at sequence 10. After a deletion of
+`[b, d)` at sequence 12, a snapshot at 11 still reads the value of `c`.
+A read at 12 returns `None` for `c`. The exclusive end leaves `d` untouched.
 [Memtable and SST lookup](../../src/db/read.rs) · [Table reader](../../src/sst/table_reader/mod.rs)
 
 ### Grouped point reads

@@ -1,7 +1,7 @@
 # Using MMDB v6
 
 A `DB` handle operates on a local directory. Keys and values are byte
-strings. For a complete first program, see the [getting-started example](../README.md#getting-started).
+strings. The examples below use `db` for an open handle. [Complete first program](../README.md#getting-started)
 
 ## Open and configure a store
 
@@ -75,10 +75,18 @@ range `[begin, end)`. The prefixed methods concatenate prefix and suffix. For
 | `DB::flush()` | Writes through the generation captured by the call are in durably installed SSTs, including `DisableWal` writes. Concurrent later writes may still be in memory. |
 | `DB::close()` | A healthy writable handle has flushed its final generation, stopped its workers, and released its directory lock. Explicit close reports flush, sync, or earlier background failures. |
 
-For a single batch, pass `WriteOptions::default().with_durability(DurabilityMode::WalSync)`
-to `write_with_options(&options, batch)`. Use `close()` when the caller needs
-the final write or shutdown error. `Drop` attempts a WAL sync and cannot
-report failure. [Write and flush implementation](architecture/writes.md)
+Use `WalSync` when the write must be durable before the call returns.
+
+```rust
+use mmdb::{DurabilityMode, WriteOptions};
+
+let options = WriteOptions::default().with_durability(DurabilityMode::WalSync);
+db.put_with_options(&options, b"draft", b"hello")?;
+```
+
+Pass the same options to `db.write_with_options(&options, batch)` for an
+atomic batch. Use `close()` to receive shutdown errors. `Drop` attempts a
+WAL sync and cannot report failure. [Write and flush implementation](architecture/writes.md)
 
 ### Batch limits
 
@@ -95,8 +103,8 @@ key share a 32 MiB metadata budget. Each version charges the key length plus
 `DB::ingest_sorted` bulk-loads strictly increasing, unique byte keys directly
 into bottom-level SSTs. The **entire span** from the first key to the last
 must be disjoint from existing memtable entries, live SST key ranges, and
-range deletions. For example, a stored key `b` between input keys `a` and `c`
-makes that input invalid even if neither input key exists. A successful call
+range deletions. If the DB already holds `b`, ingesting `a` and `c` together
+returns `InvalidArgument` because their span includes `b`. A successful call
 returns the row count and publishes all rows at one sequence. An empty input
 returns zero on a usable writable handle. [Ingestion and snapshot visibility](architecture/writes.md#sorted-ingestion)
 
@@ -106,7 +114,7 @@ returns zero on a usable writable handle. [Ingestion and snapshot visibility](ar
 |---|---|
 | Own a copy of a value | `get` returns `Option<Vec<u8>>`. A missing or deleted key yields `None`. |
 | Test whether a key is visible | `contains_key` checks existence without copying the value. |
-| Borrow stored bytes beyond the read call | `get_pinned` returns a `PinnedSlice`. A nonempty pin can retain a whole SST block or memtable through eviction, flush, and close. `into_vec()` lets the caller keep only the value bytes. |
+| Borrow stored bytes beyond the read call | `get_pinned` returns `Option<PinnedSlice>`. A nonempty pin can retain a whole SST block or memtable through eviction, flush, and close. `into_vec()` lets the caller keep only the value bytes. |
 | Read several keys at one sequence | `get_many_pinned` returns one slot per input key in input order. Duplicates occupy separate slots. Any lookup error fails the call. |
 
 ### Snapshots and grouped reads
@@ -117,19 +125,21 @@ snapshot or the last owned clone drops. Read through the snapshot or pass its
 `read_options()` to the same DB. A different open DB rejects the snapshot with
 `InvalidArgument`. New reads through a snapshot after its DB closes return `DbClosed`.
 
-A grouped call accepts up to `MAX_GROUPED_READ_KEYS` (32) input slots. To
-read more keys at one sequence, reuse a snapshot across chunks. This example
-counts visible input slots, including repeated hits, and releases each chunk's
-pins before requesting the next one.
+A grouped read accepts up to `MAX_GROUPED_READ_KEYS` (32) keys. To count
+hits in a longer list, read each chunk through the same snapshot. If only
+Alice exists, asking for Alice, Bob, and Alice again counts as two hits.
+Each iteration releases its pins before reading the next chunk.
 
 ```rust
-fn count_hits(db: &mmdb::DB, keys: &[&[u8]]) -> mmdb::Result<usize> {
+use mmdb::{DB, MAX_GROUPED_READ_KEYS};
+
+fn count_hits(db: &DB, keys: &[&[u8]]) -> mmdb::Result<usize> {
     let snapshot = db.snapshot();
     let options = snapshot.read_options();
     let mut hits = 0;
-    for chunk in keys.chunks(mmdb::MAX_GROUPED_READ_KEYS) {
-        let values = db.get_many_pinned_with_options(&options, chunk)?;
-        hits += values.iter().flatten().count();
+    for chunk in keys.chunks(MAX_GROUPED_READ_KEYS) {
+        let slots = db.get_many_pinned_with_options(&options, chunk)?;
+        hits += slots.into_iter().flatten().count();
     }
     Ok(hits)
 }
@@ -140,15 +150,27 @@ fn count_hits(db: &mmdb::DB, keys: &[&[u8]]) -> mmdb::Result<usize> {
 `iter_with_range` intersects its explicit bounds with those in `ReadOptions`.
 The lower bound is inclusive and the upper bound exclusive. `iter_with_prefix`
 matches the full requested prefix. Both scans honor visible range deletions.
-For a one-off scan, `with_fill_cache(false)` serves cached hits and skips cache
-insertion on misses. Scan predicates apply to visible rows. `iter_with_batch`
-also overlays pending mutations from a `WriteBatchWithIndex`. [Scan behavior](architecture/reads.md#range-and-prefix-scans)
+With keys `a`, `b`, and `c` in `db`, this one-off scan prints `a` then `b`.
+
+```rust
+use mmdb::ReadOptions;
+
+let options = ReadOptions::default().with_fill_cache(false);
+let mut rows = db.iter_with_range(&options, Some(b"a"), Some(b"c"))?;
+while let Some((key, _)) = rows.step_next()? {
+    println!("{}", String::from_utf8_lossy(key));
+}
+```
+
+`with_fill_cache(false)` serves cached hits and skips insertion on misses.
+Scan predicates apply to visible rows. `iter_with_batch` also overlays pending
+mutations from a `WriteBatchWithIndex`. [Scan behavior](architecture/reads.md#range-and-prefix-scans)
 
 `step_next()` and `step_prev()` lend slices and return a typed error on the
 failing step, including a lookahead failure. The standard `Iterator` yields
 owned pairs. After consuming it, check `error()` to distinguish exhaustion
 from failure. `BidiIterator::lazy` consumes the remaining scan from either
-end, starting at the wrapped iterator's current position. [Iterator example](../examples/basic.rs)
+end, starting at the wrapped iterator's current position. [Runnable prefix scan](../examples/basic.rs)
 
 ## Compaction and properties
 

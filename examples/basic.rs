@@ -1,81 +1,28 @@
-//! Canonical MMDB usage: open, write, read, batch, snapshot, iterate, delete.
-//!
-//! Run with: `cargo run --example basic`
+//! List users from a snapshot taken before a deletion.
+//! Run with `cargo +stable run --example basic`.
 
-use mmdb::{DB, DbOptions, ErrorKind, ReadOptions, WriteBatch, WriteOptions};
+use mmdb::{DB, DbOptions, WriteBatch};
 
 fn main() -> mmdb::Result<()> {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = tempfile::tempdir()?;
+    let db = DB::open(DbOptions::default(), dir.path())?;
 
-    // --- Open (presets: DbOptions::balanced/write_heavy/read_heavy) ---
-    let opts = DbOptions::balanced()
-        .with_create_if_missing(true)
-        .with_prefix_len(5);
-    let db = DB::open(opts, dir.path())?;
-
-    // --- Point writes & reads ---
-    db.put(b"user:alice", b"1000")?;
-    db.put(b"user:bob", b"2000")?;
-    assert_eq!(db.get(b"user:alice")?, Some(b"1000".to_vec()));
-
-    // Durable write: fsync WAL before acknowledging.
-    let sync_opts = WriteOptions::default().with_durability(mmdb::DurabilityMode::WalSync);
-    db.put_with_options(&sync_opts, b"user:carol", b"3000")?;
-
-    // --- Atomic batch ---
     let mut batch = WriteBatch::new();
-    batch.put(b"acct:1", b"open");
-    batch.put(b"acct:2", b"open");
-    batch.delete(b"user:bob");
-    db.write(batch)?;
-    assert_eq!(db.get(b"user:bob")?, None);
+    batch.put(b"user:alice", b"active");
+    batch.put(b"user:bob", b"active");
+    db.write(batch)?; // Both users become visible together.
+    db.sync_wal()?; // The batch is now durable.
 
-    // --- Snapshot: consistent point-in-time reads (RAII guard) ---
-    let snap = db.snapshot();
-    db.put(b"user:alice", b"9999")?;
-    assert_eq!(
-        db.get_with_options(&snap.read_options(), b"user:alice")?,
-        Some(b"1000".to_vec()),
-        "snapshot sees the old value"
-    );
-    assert_eq!(db.get(b"user:alice")?, Some(b"9999".to_vec()));
-    drop(snap); // releases the snapshot so compaction may reclaim old versions
+    let snapshot = db.snapshot();
+    db.delete_range(b"user:alice", b"user:bob")?;
+    assert!(!db.contains_key(b"user:alice")?);
+    assert!(db.contains_key(b"user:bob")?); // The upper bound is exclusive.
 
-    // --- Prefix iteration (bloom-filter pruned) ---
-    let mut user_iter = db.iter_with_prefix(b"user:", &ReadOptions::default())?;
-    let users: Vec<_> = user_iter.by_ref().collect();
-    if let Some(error) = user_iter.error() {
-        return Err(error.clone());
-    }
-    println!("{} keys under user:", users.len());
-
-    // --- Range iteration [acct:1, acct:9) with SST pruning ---
-    // fill_cache=false keeps a one-shot scan from evicting hot blocks.
-    let scan_opts = ReadOptions::default().with_fill_cache(false);
-    let mut range_iter = db.iter_with_range(&scan_opts, Some(b"acct:1"), Some(b"acct:9"))?;
-    for (k, v) in range_iter.by_ref() {
-        println!("{} = {}", String::from_utf8_lossy(&k), v.len());
-    }
-    if let Some(error) = range_iter.error() {
-        return Err(error.clone());
+    // The snapshot still lists user:alice followed by user:bob.
+    let mut users = snapshot.iter_with_prefix(b"user:")?;
+    while let Some((key, _)) = users.step_next()? {
+        println!("{}", String::from_utf8_lossy(key));
     }
 
-    // --- Range deletion ---
-    db.delete_range(b"acct:1", b"acct:9")?;
-    assert_eq!(db.get(b"acct:1")?, None);
-
-    // --- Typed error handling ---
-    match DB::open(
-        DbOptions::default().with_num_levels(0),
-        dir.path().join("bad"),
-    ) {
-        Err(e) if e.kind() == ErrorKind::InvalidArgument => {
-            println!("rejected as expected:\n{e}");
-        }
-        Err(e) => panic!("expected InvalidArgument, got {e:?}"),
-        Ok(_) => panic!("expected InvalidArgument, got Ok"),
-    }
-
-    db.flush()?;
-    Ok(())
+    db.close()
 }

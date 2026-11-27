@@ -102,12 +102,23 @@ The runner stores the executable and fixture digests beside each output CSV.
 ```sh
 cargo +stable bench --features test-utils --bench grouped_reads --no-run
 "$probe" prepare "$fixture" 262144
-d=docs/benchmarks/grouped-reads
-python3 -B "$d/trials.py" "$probe" "$fixture" primary.csv \
+python3 -B docs/benchmarks/grouped-reads/trials.py "$probe" "$fixture" primary.csv \
     --matrix primary --samples 300000 --cpus "$cpus" --revision HEAD
-python3 -B "$d/summarize.py" "$d"/results/final/{primary,warm,page,device-qualified-cells,device-scattered-32-large}.csv
-python3 -B "$d/summarize.py" "$d"/results/final/{primary-singleton-extended,warm-singleton,page-singleton-clustered-extended}.csv
-python3 -B -m unittest discover -s "$d"
+```
+
+The published runs and analysis tests can be checked directly from the
+repository root.
+
+```sh
+bench=docs/benchmarks/grouped-reads
+results="$bench/results/final"
+python3 -B "$bench/summarize.py" \
+    "$results/primary.csv" "$results/warm.csv" "$results/page.csv" \
+    "$results/device-qualified-cells.csv" "$results/device-scattered-32-large.csv"
+python3 -B "$bench/summarize.py" \
+    "$results/primary-singleton-extended.csv" "$results/warm-singleton.csv" \
+    "$results/page-singleton-clustered-extended.csv"
+python3 -B -m unittest discover -s "$bench"
 ```
 
 For the warm, page and device matrices use 10,000 requests per process.

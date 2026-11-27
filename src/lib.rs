@@ -26,19 +26,23 @@
 //! mutation APIs return [`ErrorKind::ReadOnly`]; the infallible
 //! `DB::lazy_delete*` methods are no-ops.
 //!
-//! ```no_run
+//! Here `path` names a store whose writer saved `user:alice` and closed.
+//!
+//! ```
 //! use mmdb::{DB, ErrorKind};
 //!
-//! # fn main() -> mmdb::Result<()> {
-//! let db = DB::open_read_only("database-snapshot")?;
-//! let value = db.get(b"key")?;
+//! # let dir = tempfile::tempdir()?;
+//! # let path = dir.path();
+//! # let writer = DB::open(mmdb::DbOptions::default(), path)?;
+//! # writer.put(b"user:alice", b"active")?;
+//! # writer.close()?;
+//! let db = DB::open_read_only(path)?;
+//! assert!(db.contains_key(b"user:alice")?);
 //!
-//! let err = db.put(b"key", b"new value").unwrap_err();
-//! assert_eq!(err.kind(), ErrorKind::ReadOnly);
-//! # drop(value);
+//! let error = db.delete(b"user:alice").unwrap_err();
+//! assert_eq!(error.kind(), ErrorKind::ReadOnly);
 //! db.close()?;
-//! # Ok(())
-//! # }
+//! # Ok::<(), mmdb::Error>(())
 //! ```
 //!
 //! To choose read/cache settings for this handle, use

@@ -1,13 +1,11 @@
 //! SST file format constants and encoding helpers.
 //!
-//! Footer layout (48 bytes):
+//! The 48-byte footer contains two block handles, padding, and the file magic.
+//! Each handle stores its offset and size as little-endian `u64`s.
+//!
 //! ```text
-//! ┌───────────────────────────────┐
-//! │ metaindex_handle (BlockHandle)│  (fixed 16 bytes: offset u64 LE + size u64 LE)
-//! │ index_handle (BlockHandle)    │  (fixed 16 bytes: offset u64 LE + size u64 LE)
-//! │ padding (to 40 bytes)         │
-//! │ magic number (8 bytes)        │
-//! └───────────────────────────────┘
+//! bytes   0..16             16..32         32..40    40..48
+//! field   metaindex handle  index handle   padding   magic (u64 LE)
 //! ```
 
 use crate::error::{Error, Result, ResultExt};
@@ -65,12 +63,8 @@ impl BlockHandle {
     }
 }
 
-/// Block trailer appended after each block's data.
-/// ```text
-/// ┌──────────────┬──────────────┐
-/// │ type: u8     │ crc32: u32   │
-/// └──────────────┴──────────────┘
-/// ```
+/// Each block ends with a one-byte compression type and a little-endian
+/// four-byte CRC32 over the block data and type byte.
 pub const BLOCK_TRAILER_SIZE: usize = 5; // type(1) + crc32(4)
 
 /// Compression type for a block.

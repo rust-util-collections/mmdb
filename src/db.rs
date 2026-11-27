@@ -2336,6 +2336,17 @@ impl DB {
     /// from one committed sequence. The result preserves input order,
     /// repeated keys and missing values. A lookup error fails the call.
     /// Each returned [`PinnedSlice`] may retain a whole block or memtable.
+    ///
+    /// ```
+    /// # let dir = tempfile::tempdir()?;
+    /// # let db = mmdb::DB::open(mmdb::DbOptions::default(), dir.path())?;
+    /// db.put(b"user:alice", b"active")?;
+    /// let slots = db.get_many_pinned(&[b"user:alice", b"user:bob", b"user:alice"])?;
+    /// assert_eq!(slots[0].as_deref(), Some(b"active".as_slice()));
+    /// assert!(slots[1].is_none());
+    /// assert_eq!(slots[2].as_deref(), slots[0].as_deref());
+    /// # Ok::<(), mmdb::Error>(())
+    /// ```
     pub fn get_many_pinned(&self, keys: &[&[u8]]) -> Result<Vec<Option<PinnedSlice>>> {
         self.get_many_pinned_with_options(&ReadOptions::default(), keys)
     }

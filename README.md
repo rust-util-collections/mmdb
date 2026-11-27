@@ -15,34 +15,29 @@ A writable handle runs its flush and compaction workers inside the caller's proc
 
 ## Getting started
 
-Add `mmdb = "6"` to your application's `[dependencies]`. This example writes
-two keys in one batch, makes the batch durable, and reads it through a
-snapshot after deleting one of the keys.
+Add `mmdb = "6"` to your application's `[dependencies]`. Save a draft, take
+a snapshot, then delete the draft. The snapshot can still read its text.
 
 ```rust
-use mmdb::{DB, DbOptions, WriteBatch};
+use mmdb::{DB, DbOptions};
 
 fn main() -> mmdb::Result<()> {
     let db = DB::open(DbOptions::default(), "example.mmdb")?;
-    let mut batch = WriteBatch::new();
-    batch.put(b"user:alice", b"active");
-    batch.put(b"user:bob", b"active");
-    db.write(batch)?;
-    db.sync_wal()?;
-
+    db.put(b"draft", b"hello")?;
     let snapshot = db.snapshot();
-    db.delete(b"user:alice")?;
-    assert!(snapshot.contains_key(b"user:alice")?);
-    assert!(!db.contains_key(b"user:alice")?);
-    drop(snapshot);
+    db.delete(b"draft")?;
+
+    assert_eq!(snapshot.get(b"draft")?, Some(b"hello".to_vec()));
+    assert_eq!(db.get(b"draft")?, None);
     db.close()
 }
 ```
 
-By default, `write` makes the batch visible and flushes the write-ahead log
-(WAL) to the OS. `sync_wal` confirms durability for preceding WAL-enabled
-writes. For a runnable example that uses a temporary directory and also scans
-keys, run `cargo +stable run --example basic`. [Example source](examples/basic.rs)
+By default, `put` and `delete` flush the write-ahead log (WAL) to the OS.
+`sync_wal()` makes preceding WAL-enabled writes durable. Run
+`cargo +stable run --example basic` to sync a batch and scan its keys in a
+temporary directory. [Example source](examples/basic.rs) ·
+[Durability guarantees](https://github.com/rust-util-collections/mmdb/blob/master/docs/usage.md#write-and-choose-durability)
 
 ## Documentation
 

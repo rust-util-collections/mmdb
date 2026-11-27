@@ -1,16 +1,14 @@
 //! WAL record encoding/decoding.
 //!
-//! Record format:
+//! Each fragment has a seven-byte header followed by its payload.
+//!
 //! ```text
-//! ┌─────────────┬──────────┬───────────┬──────────────┐
-//! │ checksum: u32│ length: u16│ type: u8  │ payload      │
-//! │ (4 bytes)    │ (2 bytes)  │ (1 byte)  │ (length bytes)│
-//! └─────────────┴──────────┴───────────┴──────────────┘
+//! CRC32 (u32 LE) | payload length (u16 LE) | type (u8) | payload
 //! ```
 //!
-//! The WAL is divided into fixed-size blocks (default 32KB).
-//! A record that doesn't fit in the remaining block space is split
-//! across blocks using record types: Full, First, Middle, Last.
+//! The CRC covers the type byte followed by the payload. A record written
+//! entirely within one 32 KiB block uses `Full`. A split record starts with
+//! `First`, ends with `Last`, and uses `Middle` for any intervening blocks.
 
 /// WAL block size: 32 KB.
 pub const BLOCK_SIZE: usize = 32 * 1024;

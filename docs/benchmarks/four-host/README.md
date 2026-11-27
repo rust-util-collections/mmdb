@@ -187,11 +187,10 @@ with a >5% regression in individual pairs inside a wide A/A band as an
 uncertain guard. Report other stacks separately. A workload can use the
 existing setters to select a geometry with a measured local tradeoff.
 
-The runnable example starts with a shared 256 MiB-per-store cache and
-the caller's fixed prefix, then applies the two measured buffer layouts
-to separate local DBs. Run `cargo +stable run --example shard_buffers`
-to exercise both through batch writes, a durability fence and grouped
-reads. [Rust configuration example](../../../examples/shard_buffers.rs)
+Run `cargo +stable run --example shard_buffers` to try both layouts in
+temporary databases. Each uses the same 256 MiB-per-store cache pool and
+eight-byte prefix. The example prints the nominal write-buffer allowance
+for each layout, including its active memtable. [Rust configuration example](../../../examples/shard_buffers.rs)
 
 ### Sixteen write-active shards
 
@@ -410,15 +409,16 @@ budget. The shard matrix's 1 GiB ceiling counts process RSS only.
 The trials compare two endpoints; neither identifies the minimum
 capacity required to obtain the benefit.
 
+For a private cache, set `with_block_cache_capacity(bytes_per_store)` on
+the DB options. To share a budget, give each handle a clone of the same
+pool-backed options. These two shards share a 12 GiB capacity per store.
+
 ```rust
-use mmdb::{BlockCachePool, DbOptions};
+use mmdb::{BlockCachePool, DB, DbOptions};
 use std::sync::Arc;
 
-// Supply a measured budget for each evictable store.
-let per_store_bytes = 12_u64 << 30;
-let private = DbOptions::default().with_block_cache_capacity(per_store_bytes);
-
-// For multiple handles sharing that budget, create the pool once.
-let pool = Arc::new(BlockCachePool::new(per_store_bytes));
-let shared = DbOptions::default().with_block_cache(Some(Arc::clone(&pool)));
+let pool = Arc::new(BlockCachePool::new(12 << 30));
+let options = DbOptions::default().with_block_cache(Some(pool));
+let east = DB::open(options.clone(), "east.mmdb")?;
+let west = DB::open(options, "west.mmdb")?;
 ```

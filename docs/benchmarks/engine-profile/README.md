@@ -193,15 +193,32 @@ resident bytes from `getrusage(RUSAGE_SELF)`, and user plus system CPU
 ticks from `times`. The RSS fields use KiB on both Linux and macOS.
 
 ```sh
-d=docs/benchmarks/engine-profile
-python3 "$d/run.py" mixed ./control mixed.jsonl.gz --metrics ./instrumented --cpus 4-7 --tmpdir "$scratch"
-python3 "$d/run.py" memory ./control memory.jsonl.gz --metrics ./instrumented --cpus 4-7 --tmpdir "$scratch"
-python3 "$d/run.py" handoff ./control handoff.jsonl.gz --candidate ./candidate --cpus 4-7 --tmpdir "$scratch"
-python3 "$d/run.py" reopen ./reopen reopen.jsonl.gz --cpus 4-7 --tmpdir "$scratch"
-python3 "$d/run.py" memory-tail ./control tail.jsonl.gz --cpus 4-7 --tmpdir "$scratch" --ops 20000 --seed 20461125
-python3 "$d/extend_handoff.py" ./control ./candidate extended.jsonl.gz --cpus 4-7 --tmpdir "$scratch" --rate 18911
-python3 -B "$d/summarize.py" "$d/final-memory.jsonl.gz"
-python3 -B -m unittest discover -s "$d" -p 'test_*.py'
+runner=docs/benchmarks/engine-profile/run.py
+python3 "$runner" mixed ./control mixed.jsonl.gz \
+  --metrics ./instrumented --cpus 4-7 --tmpdir "$scratch"
+python3 "$runner" memory ./control memory.jsonl.gz \
+  --metrics ./instrumented --cpus 4-7 --tmpdir "$scratch"
+python3 "$runner" handoff ./control handoff.jsonl.gz \
+  --candidate ./candidate --cpus 4-7 --tmpdir "$scratch"
+python3 "$runner" reopen ./reopen reopen.jsonl.gz --cpus 4-7 --tmpdir "$scratch"
+```
+
+The extended trials use a fixed request count for memory and a fixed
+offered rate for handoff.
+
+```sh
+python3 docs/benchmarks/engine-profile/run.py memory-tail ./control tail.jsonl.gz \
+  --cpus 4-7 --tmpdir "$scratch" --ops 20000 --seed 20461125
+python3 docs/benchmarks/engine-profile/extend_handoff.py ./control ./candidate extended.jsonl.gz \
+  --cpus 4-7 --tmpdir "$scratch" --rate 18911
+```
+
+The published memory packet can also be checked directly from the repository root.
+
+```sh
+profiles=docs/benchmarks/engine-profile
+python3 -B "$profiles/summarize.py" "$profiles/final-memory.jsonl.gz"
+python3 -B -m unittest discover -s "$profiles" -p 'test_*.py'
 ```
 
 For the 20,000-request memory guard the hot and all-active offers were

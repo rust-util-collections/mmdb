@@ -15,11 +15,13 @@ MMDB v6. Each benchmark report identifies the engine revision it measured.
 | Compact a range, interpret a memory gauge, or handle a failed call | [Maintenance and properties](usage.md#compaction-and-properties) · [Errors](usage.md#errors) |
 | Upgrade a v4 or v5 store | [Upgrade guide](migration.md) · [Changelog](../CHANGELOG.md) |
 
-The Rust API reference lists the public methods and options. This checkout
-also includes runnable examples for basic operations and budgeting write
-buffers across shards. [API reference](https://docs.rs/mmdb) ·
-[Public exports](../src/lib.rs) · [Basic operations](../examples/basic.rs) ·
-[Shard buffer budgets](../examples/shard_buffers.rs)
+The Rust API reference lists the public methods and options. [API reference](https://docs.rs/mmdb) ·
+[Public exports](../src/lib.rs)
+
+Run either example from the repository root.
+
+- `cargo +stable run --example basic` writes two users and lists both from a snapshot taken before a deletion. [Basic operations](../examples/basic.rs)
+- `cargo +stable run --example shard_buffers` shows how buffer size and frozen slots add up to 30 MiB per shard. [Shard buffer budgets](../examples/shard_buffers.rs)
 
 ## Understand the engine
 

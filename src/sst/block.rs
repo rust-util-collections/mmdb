@@ -1,22 +1,15 @@
 //! Data block encoding and decoding with prefix compression.
 //!
-//! Block format:
+//! The entries come first, followed by the offsets where decoding can restart.
+//!
 //! ```text
-//! ┌──────────────────────────────────────────────────┐
-//! │ Entry 0: shared_len(varint) | unshared_len(varint)│
-//! │          | value_len(varint) | unshared_key_bytes │
-//! │          | value_bytes                            │
-//! │ Entry 1: ...                                      │
-//! │ ...                                               │
-//! │ Entry N: ...                                      │
-//! ├──────────────────────────────────────────────────┤
-//! │ Restart[0]: u32 LE                                │
-//! │ Restart[1]: u32 LE                                │
-//! │ ...                                               │
-//! │ Restart[R-1]: u32 LE                             │
-//! │ num_restarts: u32 LE                             │
-//! └──────────────────────────────────────────────────┘
+//! block = entries... | restart_offsets... | restart_count
+//! entry = shared_len | suffix_len | value_len | key_suffix | value
 //! ```
+//!
+//! Entry lengths are varints. Restart offsets and the count are little-endian
+//! `u32`s. Between restarts, the raw keys `car` then `cat` share two bytes, so
+//! the second entry stores just the suffix `t`. A restart stores the full key.
 
 use std::{cmp::Ordering, sync::Arc};
 
