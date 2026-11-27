@@ -2470,19 +2470,27 @@ mod tests {
         let expected_manifest = fs::read(&manifest_path).unwrap();
         fs::write(path.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
 
-        assert_eq!(
-            DB::open_read_only(path).err().unwrap().kind(),
-            ErrorKind::Corruption
-        );
-        assert_eq!(
-            DB::open(DbOptions::default(), path).err().unwrap().kind(),
-            ErrorKind::Corruption
-        );
-        assert_eq!(
-            fs::read(&manifest_path).unwrap(),
-            expected_manifest,
-            "failed DB open must not truncate MANIFEST before sequence validation"
-        );
+        for corrupt_data in [false, true] {
+            if corrupt_data {
+                let sst = path.join("000003.sst");
+                let mut bytes = fs::read(&sst).unwrap();
+                bytes[0] ^= 1;
+                fs::write(sst, bytes).unwrap();
+            }
+            assert_eq!(
+                DB::open_read_only(path).err().unwrap().kind(),
+                ErrorKind::Corruption
+            );
+            assert_eq!(
+                DB::open(DbOptions::default(), path).err().unwrap().kind(),
+                ErrorKind::Corruption
+            );
+            assert_eq!(
+                fs::read(&manifest_path).unwrap(),
+                expected_manifest,
+                "failed DB open must not truncate MANIFEST before sequence validation"
+            );
+        }
     }
 
     /// Endpoint trailers are not the file's maximum sequence. An interior

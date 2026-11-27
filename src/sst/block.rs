@@ -23,6 +23,7 @@ use std::{cmp::Ordering, sync::Arc};
 use smallvec::SmallVec;
 
 use crate::error::{Error, Result};
+use crate::types::{SequenceNumber, ValueType, decode_internal_key};
 
 /// Decode a varint from the given buffer. Returns (value, bytes_consumed).
 pub fn decode_varint(data: &[u8]) -> Result<(u32, usize)> {
@@ -408,6 +409,36 @@ impl Block {
     /// Return the number of restart points in this block.
     pub fn num_restarts(&self) -> u32 {
         self.num_restarts
+    }
+
+    /// Recover sequences without copying values. An invalid key still has a
+    /// known entry length. Broken entry framing only hides the rest of its
+    /// restart interval. The normal read path reports either error on access.
+    pub(crate) fn max_readable_point_sequence(&self) -> SequenceNumber {
+        let mut maximum = 0;
+        let mut key = SmallVec::<[u8; 128]>::new();
+        for restart in 0..self.num_restarts {
+            let mut offset = self.restart_point(restart) as usize;
+            let end = if restart + 1 < self.num_restarts {
+                self.restart_point(restart + 1) as usize
+            } else {
+                self.restart_offset
+            };
+            key.clear();
+            while offset < end {
+                let Ok((_, _, next)) = decode_entry_reuse(&self.data[..end], offset, &mut key)
+                else {
+                    break;
+                };
+                if let Ok((_, seq, ValueType::Value | ValueType::Deletion)) =
+                    decode_internal_key(&key)
+                {
+                    maximum = maximum.max(seq);
+                }
+                offset = next;
+            }
+        }
+        maximum
     }
 
     /// Return the offset where entry data ends and restart array begins.
@@ -927,6 +958,40 @@ impl<'a> Iterator for BlockIterator<'a> {
 mod tests {
     use super::*;
     use crate::sst::block_builder::BlockBuilder;
+
+    #[test]
+    fn recovery_keeps_readable_sequences_after_a_bad_key_or_restart_interval() {
+        use crate::types::InternalKey;
+
+        let mut builder = BlockBuilder::new(2);
+        let key = |name: &[u8], seq| InternalKey::new(name, seq, ValueType::Value);
+        builder.add(b"a", b"short internal key");
+        builder.add(key(b"b", 8).as_bytes(), b"value");
+        builder.add(key(b"c", 12).as_bytes(), b"value");
+        builder.add(key(b"d", 3).as_bytes(), b"value");
+        let data = builder.finish();
+        let block = Block::from_vec(data.clone()).unwrap();
+        assert_eq!(block.max_readable_point_sequence(), 12);
+
+        // Invalidate the second segment's framing. The valid key following
+        // the malformed internal key in the first segment still counts.
+        let mut unreadable_second = data.clone();
+        unreadable_second[block.restart_point(1) as usize] = 1;
+        assert_eq!(
+            Block::from_vec(unreadable_second)
+                .unwrap()
+                .max_readable_point_sequence(),
+            8
+        );
+        let mut unreadable_first = data;
+        unreadable_first[0] = 1;
+        assert_eq!(
+            Block::from_vec(unreadable_first)
+                .unwrap()
+                .max_readable_point_sequence(),
+            12
+        );
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]

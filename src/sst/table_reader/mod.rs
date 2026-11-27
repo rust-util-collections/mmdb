@@ -1350,9 +1350,9 @@ impl TableReader {
     /// of the first user key first and the oldest sequence of the last user
     /// key last, so an interior key can be newer than both.
     ///
-    /// A data block that fails its checksum is left for the read that visits
-    /// it. Open still succeeds so a block below an iterator lower bound can
-    /// stay unread.
+    /// The index still identifies real point keys if a data block cannot be
+    /// decoded. Shortened separators are synthetic and do not carry a stored
+    /// point sequence.
     pub(crate) fn max_stored_sequence(&self) -> Result<SequenceNumber> {
         let mut max_seq = 0u64;
         for part in 0..self.partitions.len() {
@@ -1360,35 +1360,27 @@ impl TableReader {
                 continue;
             };
             for idx in 0..leaf.num_restarts() {
-                let (_, raw, _) = leaf.decode_restart_entry(idx)?;
-                let handle = decode_index_entry(raw)?.handle;
-                let data = match Self::read_block_data(&self.file, &handle) {
-                    Ok(data) => data,
-                    Err(error) if error.kind() == ErrorKind::Corruption => continue,
-                    Err(error) => return Err(error),
-                };
-                let block = match Block::from_vec(data) {
+                let (separator, raw, _) = leaf.decode_restart_entry(idx)?;
+                let entry = decode_index_entry(raw)?;
+                let (_, first_seq, _) = decode_internal_key(entry.first_key)?;
+                max_seq = max_seq.max(first_seq);
+                let (_, last_seq, kind) = decode_internal_key(separator)?;
+                if kind != ValueType::RangeDeletion {
+                    max_seq = max_seq.max(last_seq);
+                }
+                let block = match Self::read_block_data(&self.file, &entry.handle)
+                    .and_then(Block::from_vec)
+                {
                     Ok(block) => block,
                     Err(error) if error.kind() == ErrorKind::Corruption => continue,
                     Err(error) => return Err(error),
                 };
-                let mut iter = block.iter();
-                for (key, _) in &mut iter {
-                    let (_, seq, _) = decode_internal_key(&key)?;
-                    max_seq = max_seq.max(seq);
-                }
-                if let Some(error) = iter.error() {
-                    if error.kind() == ErrorKind::Corruption {
-                        continue;
-                    }
-                    return Err(error.clone()).ctx();
-                }
+                max_seq = max_seq.max(block.max_readable_point_sequence());
             }
         }
         self.visit_ranges(None, None, false, |_begin, _end, seqs| {
-            for seq in seqs {
-                max_seq = max_seq.max(u64::from_le_bytes(*seq));
-            }
+            // Range validation requires at least one stripe in ascending order.
+            max_seq = max_seq.max(u64::from_le_bytes(*seqs.last().unwrap()));
         })?;
         Ok(max_seq)
     }
