@@ -227,6 +227,31 @@ impl VersionSet {
         Ok(manifest_number)
     }
 
+    /// Open and validate job outputs before taking DB::inner. The returned
+    /// readers stay live through install even if the table cache evicts them.
+    pub(crate) fn prepare_tables<'a>(
+        db_path: &Path,
+        cache: Option<&TableCache>,
+        files: impl IntoIterator<Item = &'a FileMetaData>,
+    ) -> Result<Vec<TableFile>> {
+        let mut tables: Vec<TableFile> = Vec::new();
+        for meta in files {
+            match Self::open_table(db_path, cache, meta) {
+                Ok(table) => tables.push(table),
+                Err(error) => {
+                    if let Some(cache) = cache {
+                        cache.evict(meta.number);
+                        for table in tables {
+                            cache.evict(table.meta.number);
+                        }
+                    }
+                    return Err(error).ctx();
+                }
+            }
+        }
+        Ok(tables)
+    }
+
     fn open_table(
         db_path: &Path,
         cache: Option<&TableCache>,
@@ -809,7 +834,16 @@ impl VersionSet {
 
     /// Publish an edit after syncing its new SST directory entries. On error the
     /// edit was rejected before publication, so its newly built SSTs can be removed.
-    pub fn log_and_apply_synced(&mut self, edit: VersionEdit, _synced: DirSynced) -> Result<()> {
+    pub fn log_and_apply_synced(&mut self, edit: VersionEdit, synced: DirSynced) -> Result<()> {
+        self.apply_with_tables(edit, synced, None)
+    }
+
+    pub(crate) fn apply_with_tables(
+        &mut self,
+        edit: VersionEdit,
+        _synced: DirSynced,
+        tables: Option<Vec<TableFile>>,
+    ) -> Result<()> {
         if self.manifest_writer.lock().is_none() {
             return Err(Error::read_only());
         }
@@ -859,6 +893,15 @@ impl VersionSet {
         let mut added_overflow: Option<HashSet<u64, FastBuildHasher>> = (edit.new_files.len() > 16)
             .then(|| HashSet::with_capacity_and_hasher(edit.new_files.len(), FastBuildHasher));
 
+        let mut prepared = tables.map(Vec::into_iter);
+        if prepared
+            .as_ref()
+            .is_some_and(|tables| tables.len() != edit.new_files.len())
+        {
+            return Err(Error::corruption(
+                "prepared SST count disagrees with VersionEdit",
+            ));
+        }
         for (level, meta) in &edit.new_files {
             let level = *level as usize;
             // An out-of-range level is an internal logic bug. Silently skipping
@@ -892,7 +935,15 @@ impl VersionSet {
                     meta.number, level
                 )));
             }
-            let file = Self::open_table(&self.db_path, self.table_cache.as_deref(), meta).ctx()?;
+            let file = match &mut prepared {
+                Some(tables) => tables
+                    .next()
+                    .filter(|table| table.meta == *meta)
+                    .ok_or_else(|| {
+                        Error::corruption("prepared SST metadata disagrees with VersionEdit")
+                    })?,
+                None => Self::open_table(&self.db_path, self.table_cache.as_deref(), meta).ctx()?,
+            };
             let files = Arc::make_mut(&mut new_version.files[level]);
             let index = if level == 0 {
                 0

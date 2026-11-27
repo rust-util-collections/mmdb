@@ -80,7 +80,7 @@ thread_local! {
     pub(crate) static PREPARE_FIRST_BLOCK_PIN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     /// Fires once on this thread right after a block's raw bytes are read.
-    static AFTER_BLOCK_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    pub(crate) static AFTER_BLOCK_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     /// Readahead hints issued on this thread.
     pub(crate) static WILLNEED_HINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

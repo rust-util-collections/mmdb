@@ -238,9 +238,9 @@ flowchart TD
 ```mermaid
 flowchart TD
     F1["mmdb-flush pops oldest FrozenMemtable"] --> F2["Unlocked write_memtable_ssts (split at user-key boundaries if meta >= 32 MiB)"]
-    F2 --> F3["Track outputs in PendingSsts; TableCache::prewarm; prepare L0 first-block pins"]
-    F3 --> F4["sync_new_sst_parent_dir -> DirSynced token"]
-    F4 --> F5["Lock DB::inner: log_and_apply_synced(new L0 SSTs, log_number = new_wal)"]
+    F2 --> F3["Track outputs in PendingSsts and sync the SST directory"]
+    F3 --> F4["Prepare validated table readers and L0 first-block pins"]
+    F4 --> F5["Lock DB::inner and install prepared L0 SSTs with log_number = new_wal"]
     F5 --> F6["PendingSsts::keep(); publish L0 cache pins; acquire CompactionClaim on new L0s"]
     F6 --> F7["Unlock DB::inner; confirm_manifest_durable (MANIFEST sync_all)"]
     F7 -- "Error" --> FFAIL["Poison MANIFEST, set bg_error + has_bg_error (Release), fail FlushQueue & exit"]
@@ -303,9 +303,9 @@ flowchart TD
     SUB --> C8
     SER --> C8["MVCC dedupe + LazyDelete/CompactionFilter + bottommost GC + clip_at SST cuts + sync_all + DirSynced"]
 
-    C8 --> C9["Prewarm TableCache; lock DB::inner: revalidate live inputs, target overlap, & snapshot/epoch races"]
+    C8 --> C9["Carry validated readers into DB::inner and recheck inputs, overlap and snapshots"]
     C9 -- "Stale or raced" --> CDISC["Discard & unlink newly built outputs (never live trivial-move inputs)"]
-    C9 -- "Valid" --> C10["log_and_apply_synced; evict/unpin replaced SSTs from caches; refresh SuperVersion"]
+    C9 -- "Valid" --> C10["Apply prepared tables, evict replaced SSTs and refresh SuperVersion"]
     C10 --> C11["Unlock DB::inner; confirm_manifest_durable"]
     C11 --> C12["Unlink superseded input SSTs; drop CompactionClaim & wake claim waiters"]
 ```
@@ -598,7 +598,7 @@ flowchart LR
   and ordered memtable insertion run under `DB::inner` (serialization measurements
   showed overlapping WAL and memtable apply projected `< 0.2%` p99 gain while a
   cheaper handoff regressed small-put p99). All heavy SST I/O (`write_memtable_ssts`,
-  `execute_compaction_io`, `ingest_sorted` table builds), `TableCache::prewarm`,
+  `execute_compaction_io`, `ingest_sorted` table builds), `VersionSet::prepare_tables`,
   WAL sealing (`old_wal.sync_data()`), directory syncs (`sync_new_sst_parent_dir`),
   and MANIFEST `fsync`s (`confirm_manifest_durable`) execute **outside**
   `DB::inner`.

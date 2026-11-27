@@ -56,6 +56,7 @@ pub struct CompactionHint {
 /// Shared context for compaction operations, reducing argument count.
 pub(crate) struct CompactionContext<'a> {
     pub db_path: &'a Path,
+    pub table_cache: Option<&'a TableCache>,
     pub dir_sync: &'a Mutex<Option<File>>,
     pub manifest_poisoned: &'a AtomicBool,
     pub options: &'a DbOptions,
@@ -90,6 +91,7 @@ type OutputTombstones = HashMap<u64, Vec<(Vec<u8>, Vec<u8>)>>;
 /// Result of the I/O phase of compaction (no lock needed to produce this).
 pub struct CompactionOutput {
     dir_synced: DirSynced,
+    tables: Vec<TableFile>,
     /// The version edit with new files added and old files deleted.
     pub edit: VersionEdit,
     /// Exact input files and levels the output was built from.
@@ -1408,6 +1410,7 @@ impl LeveledCompaction {
             edit.add_file(target_level as u32, tf.meta.clone());
             return Ok(CompactionOutput {
                 dir_synced,
+                tables: vec![tf.clone()],
                 edit,
                 input_files: vec![(task.level as u32, tf.meta.clone())],
                 // Empty, NOT `{tf.meta.number}`: a trivial move relabels the
@@ -1604,9 +1607,15 @@ impl LeveledCompaction {
         }
 
         let dir_synced = sync_new_sst_parent_dir(ctx.dir_sync, ctx.manifest_poisoned)?;
+        let tables = VersionSet::prepare_tables(
+            ctx.db_path,
+            ctx.table_cache,
+            edit.new_files.iter().map(|(_, meta)| meta),
+        )?;
         pending.keep();
         Ok(CompactionOutput {
             dir_synced,
+            tables,
             edit,
             input_files,
             input_file_numbers,
@@ -1687,7 +1696,9 @@ impl LeveledCompaction {
         output
             .edit
             .set_next_file_number(versions.next_file_number());
-        if let Err(e) = versions.log_and_apply_synced(output.edit, output.dir_synced) {
+        if let Err(e) =
+            versions.apply_with_tables(output.edit, output.dir_synced, Some(output.tables))
+        {
             // Delete only the freshly-written SSTs (otherwise they would be
             // orphaned on disk) — `created_files` excludes a trivial move's
             // still-live input file.
@@ -2039,6 +2050,7 @@ mod tests {
         edit.delete_file(1, meta1.number);
         edit.add_file(2, meta1.clone());
         let output = CompactionOutput {
+            tables: vec![versions.current().level_files(1)[0].clone()],
             dir_synced: super::sync_new_sst_parent_dir(
                 &versions.dir_sync_handle(),
                 &versions.poison_flag(),
@@ -2643,6 +2655,7 @@ mod tests {
             dir_sync: &dir_sync,
             manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
+            table_cache: None,
             options: &options,
             builds: &super::SstBuilds::default(),
             rate_limiter: None,
@@ -2926,6 +2939,7 @@ mod tests {
             dir_sync: &dir_sync,
             manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
+            table_cache: None,
             options: &options,
             builds: &super::SstBuilds::default(),
             rate_limiter: None,
@@ -3117,6 +3131,7 @@ mod tests {
                 dir_sync: &dir_sync,
                 manifest_poisoned: &super::AtomicBool::new(false),
                 db_path: dir.path(),
+                table_cache: None,
                 options: &options,
                 builds: &super::SstBuilds::default(),
                 rate_limiter: None,
@@ -3361,6 +3376,7 @@ mod tests {
             dir_sync: &dir_sync,
             manifest_poisoned: &super::AtomicBool::new(false),
             db_path: dir.path(),
+            table_cache: None,
             options: &options,
             builds: &super::SstBuilds::default(),
             rate_limiter: None,
@@ -3698,6 +3714,7 @@ mod tests {
                 dir_sync: &dir_sync,
                 manifest_poisoned: &super::AtomicBool::new(false),
                 db_path: dir.path(),
+                table_cache: None,
                 options: &options,
                 builds: &super::SstBuilds::default(),
                 rate_limiter: None,

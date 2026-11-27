@@ -520,8 +520,7 @@ impl LevelRewrite<'_> {
                 ..*ctx
             };
             let output = LeveledCompaction::execute_compaction_io(&ctx, &task, &numbers, bottom)?;
-            self.table_cache
-                .prewarm(output.edit.new_files.iter().map(|(_, m)| m.number));
+
             let (cleanup, manifest) = {
                 let mut inner = self.inner.lock();
                 if level == 0 && task.target_level == 0 && epoch != inner.l0_install_epoch {
@@ -1650,6 +1649,7 @@ impl DB {
                                             // Phase 2: I/O (no lock held)
                                             let ctx = CompactionContext {
                                                 db_path: &bg_path,
+                                                table_cache: Some(&bg_table_cache),
                                                 dir_sync: &bg_dir_sync,
                                                 manifest_poisoned: &bg_manifest_poisoned,
                                                 options: &bg_options,
@@ -1665,14 +1665,6 @@ impl DB {
                                                 is_bottom,
                                             )
                                             .map_err(|e| format!("compaction error: {}", e))?;
-
-                                            bg_table_cache.prewarm(
-                                                output
-                                                    .edit
-                                                    .new_files
-                                                    .iter()
-                                                    .map(|(_, meta)| meta.number),
-                                            );
 
                                             // Phase 3: validate and install the directory-synced outputs.
                                             let cleanup = {
@@ -1803,6 +1795,7 @@ impl DB {
                                                     };
                                                     let ctx = CompactionContext {
                                                         db_path: &bg_path,
+                                                        table_cache: Some(&bg_table_cache),
                                                         dir_sync: &bg_dir_sync,
                                                         manifest_poisoned: &bg_manifest_poisoned,
                                                         options: &bg_options,
@@ -1821,14 +1814,6 @@ impl DB {
                                                         .map_err(|e| {
                                                             format!("hint compaction error: {}", e)
                                                         })?;
-
-                                                    bg_table_cache.prewarm(
-                                                        output
-                                                            .edit
-                                                            .new_files
-                                                            .iter()
-                                                            .map(|(_, meta)| meta.number),
-                                                    );
 
                                                     let cleanup = {
                                                         let mut inner = bg_inner.lock();
@@ -1908,6 +1893,7 @@ impl DB {
                                             blocked_by_snapshot |= !bg_snapshot_list.is_empty();
                                             let ctx = CompactionContext {
                                                 db_path: &bg_path,
+                                                table_cache: Some(&bg_table_cache),
                                                 dir_sync: &bg_dir_sync,
                                                 manifest_poisoned: &bg_manifest_poisoned,
                                                 options: &bg_options,
@@ -2619,6 +2605,7 @@ impl DB {
 
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
+                table_cache: Some(&self.table_cache),
                 dir_sync: &self.dir_sync,
                 manifest_poisoned: &self.read.manifest_poisoned,
                 options: &self.options,
@@ -2643,11 +2630,6 @@ impl DB {
                     return Err(e).ctx();
                 }
             };
-
-            // Pre-warm the table cache for the new output files while
-            // unlocked (see the background compaction loop for rationale).
-            self.table_cache
-                .prewarm(output.edit.new_files.iter().map(|(_, meta)| meta.number));
 
             let rewritten_bottom_outputs: Vec<u64> = if is_bottom
                 && task.target_level == self.options.num_levels - 1
@@ -4012,6 +3994,7 @@ impl DB {
             // Phase 2: I/O (no lock held)
             let ctx = CompactionContext {
                 db_path: &self.storage_path,
+                table_cache: Some(&self.table_cache),
                 dir_sync: &self.dir_sync,
                 manifest_poisoned: &self.read.manifest_poisoned,
                 options: &force_opts,
@@ -4034,11 +4017,6 @@ impl DB {
                     return Err(e).ctx();
                 }
             };
-
-            // Pre-warm the table cache for the new output files while
-            // unlocked (see the background compaction loop for rationale).
-            self.table_cache
-                .prewarm(output.edit.new_files.iter().map(|(_, meta)| meta.number));
 
             // Phase 3: install (short lock)
             let cleanup = {
@@ -4133,6 +4111,7 @@ impl DB {
         }
         let ctx = CompactionContext {
             db_path: &self.storage_path,
+            table_cache: Some(&self.table_cache),
             dir_sync: &self.dir_sync,
             manifest_poisoned: &self.read.manifest_poisoned,
             options: &self.options,
@@ -5497,6 +5476,32 @@ mod tests {
     }
 
     #[test]
+    fn flush_installs_prepared_readers_without_reopening_evicted_tables() {
+        use crate::sst::table_reader::{AFTER_BLOCK_READ, PREPARE_FIRST_BLOCK_PIN_HOOK};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default().with_max_open_files(0), dir.path()).unwrap();
+        let pin_read = Arc::new(AtomicBool::new(false));
+        let seen = pin_read.clone();
+        db.flush_queue.on_next_build(move || {
+            PREPARE_FIRST_BLOCK_PIN_HOOK.set(Some(Box::new(move || {
+                AFTER_BLOCK_READ.set(Some(Box::new(move || {
+                    seen.store(true, Ordering::Release);
+                    AFTER_BLOCK_READ
+                        .set(Some(Box::new(|| panic!("SST read after pin preparation"))));
+                })));
+            })));
+        });
+        db.put(b"key", b"value").unwrap();
+        db.flush().unwrap();
+        assert!(pin_read.load(Ordering::Acquire));
+        assert_eq!(
+            db.get(b"key").unwrap().as_deref(),
+            Some(b"value".as_slice())
+        );
+    }
+
+    #[test]
     fn disabled_cache_skips_first_block_pin_io() {
         use crate::sst::table_reader::PREPARE_FIRST_BLOCK_PIN_HOOK;
         let probe_flush_pin_io = |options: DbOptions| -> bool {
@@ -5954,6 +5959,7 @@ mod tests {
             let snapshots = Vec::new();
             let ctx = CompactionContext {
                 db_path: &db.storage_path,
+                table_cache: Some(&db.table_cache),
                 dir_sync: &db.dir_sync,
                 manifest_poisoned: &db.read.manifest_poisoned,
                 options: &db.options,

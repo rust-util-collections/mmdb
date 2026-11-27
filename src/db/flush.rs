@@ -317,17 +317,6 @@ impl FlushContext {
         .ctx()?;
         let pending = PendingSsts::new(&self.storage_path, &frozen.file_numbers);
         pending.track(outputs.iter().map(|(n, _)| *n));
-        self.table_cache.prewarm(outputs.iter().map(|(n, _)| *n));
-        let pins: Vec<_> = outputs
-            .iter()
-            .filter_map(|(n, _)| {
-                if !self.options.pin_l0_first_block_and_warm_index {
-                    return None;
-                }
-                let reader = self.table_cache.get_reader(*n).ok()?;
-                Some((*n, reader.prepare_first_block_pin()?))
-            })
-            .collect();
         let mut edit = VersionEdit::new();
         edit.set_log_number(frozen.new_wal_number);
         edit.set_last_sequence(frozen.last_sequence);
@@ -335,11 +324,29 @@ impl FlushContext {
             edit.add_file(0, file_metadata(output));
         }
         let synced = sync_new_sst_parent_dir(&self.dir_sync, &self.manifest_poisoned)?;
+        let tables = VersionSet::prepare_tables(
+            &self.storage_path,
+            Some(&self.table_cache),
+            edit.new_files.iter().map(|(_, meta)| meta),
+        )?;
+        let pins: Vec<_> = if self.options.pin_l0_first_block_and_warm_index {
+            tables
+                .iter()
+                .filter_map(|table| {
+                    Some((table.meta.number, table.reader.prepare_first_block_pin()?))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let output_numbers: Vec<_> = edit.new_files.iter().map(|(_, m)| m.number).collect();
         let (claim, manifest) = {
             let mut inner = self.inner.lock();
             edit.set_next_file_number(inner.versions.next_file_number());
-            inner.versions.log_and_apply_synced(edit, synced).ctx()?;
+            inner
+                .versions
+                .apply_with_tables(edit, synced, Some(tables))
+                .ctx()?;
             pending.keep();
             let version = inner.versions.current();
             #[cfg(feature = "bench-metrics")]
@@ -910,6 +917,7 @@ mod tests {
             let rewrite = scope.spawn(|| {
                 let ctx = CompactionContext {
                     db_path: &db.storage_path,
+                    table_cache: Some(&db.table_cache),
                     dir_sync: &db.dir_sync,
                     manifest_poisoned: &db.read.manifest_poisoned,
                     options: &db.options,

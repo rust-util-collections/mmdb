@@ -235,7 +235,8 @@ impl DB {
 
         let synced = sync_new_sst_parent_dir(&self.dir_sync, &self.read.manifest_poisoned)
             .inspect_err(|e| self.fail_stop_if_manifest_poisoned("ingest_sorted", e))?;
-        self.table_cache.prewarm(outputs.iter().map(|m| m.number));
+        let tables =
+            VersionSet::prepare_tables(&self.storage_path, Some(&self.table_cache), &outputs)?;
 
         let (manifest_handle, claim) = {
             let mut inner = self.inner.lock();
@@ -259,7 +260,7 @@ impl DB {
             for meta in &outputs {
                 edit.add_file(target_level as u32, meta.clone());
             }
-            if let Err(e) = inner.versions.log_and_apply_synced(edit, synced) {
+            if let Err(e) = inner.versions.apply_with_tables(edit, synced, Some(tables)) {
                 drop(inner);
                 for m in &outputs {
                     self.table_cache.evict(m.number);
