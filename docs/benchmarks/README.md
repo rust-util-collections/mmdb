@@ -1,85 +1,75 @@
 # MMDB benchmarks and VSDB v18 results
 
-The four-host tuning study runs the same v5 engine on Apple M5/macOS and
-three physical Linux systems, covering APFS, ext4, ZFS and single- and
-dual-device Btrfs. Its independent controls cover grouped reads, shard
-buffer geometries, SST compression, durable WAL writes and application
-cache capacity. The 5.0.1 follow-up compares binaries directly and includes
-the cost of bringing the shard sets to a common compaction endpoint.
-[5.0.1 findings and historical baseline](four-host/README.md) ·
-[Retest protocol](four-host/retest.md)
+The published measurements below were collected on MMDB v5 revisions.
+Each report identifies its fixture, binary or source revision, controls, and
+raw observations. To measure the code in this checkout, use the commands
+under [Run a benchmark](#run-a-benchmark). For the current API guarantees,
+see the [usage guide](../usage.md).
+
+## Four-host tuning study
+
+The study ran on Apple M5/macOS and three physical Linux hosts across APFS,
+ext4, ZFS, and single- and dual-device Btrfs. The 5.0.1 follow-up compared
+binaries directly and counted compaction through a common endpoint.
+
+| Question | Evidence |
+|---|---|
+| How did grouped reads, shard buffers, SST compression, and durable WAL writes vary by host and volume? | [5.0.1 findings](four-host/README.md#follow-up-on-mmdb-501) · [Earlier v5 results](four-host/README.md#historical-campaign-at-828e47a) |
+| How much memory did a larger decoded block cache consume when the SST files were already in the OS page cache? | [Measured latency and RSS](four-host/README.md#paying-for-an-application-resident-working-set) · [Capacity driver and controls](cache-capacity/README.md) |
+| How do I verify the archived results or repeat the comparisons? | [Reproduction instructions](four-host/reproduce.md) · [5.0.1 retest protocol](four-host/retest.md) · [Original protocol](four-host/protocol.md) |
 
 ## Engine workloads
 
-| Workload | Result on the x86_64 fixture |
+| Question on the x86_64 Linux fixture | Report |
 |---|---|
-| [Grouped point reads](grouped-reads/README.md) | Grouping 32 clustered keys reduced request p99 on a warm SST and on verified storage reads. The scattered-key storage result fell within control variation. |
-| [Foreground puts during bulk writes](engine-profile/README.md#small-foreground-writes-during-bulk-updates) | Moving bulk writes to a second DB improved small-put p99 beyond control variation in the repeated-byte asynchronous trial. |
-| [Writer handoff](engine-profile/README.md#writer-handoff-and-overlap) | The shorter handoff missed its latency target. Replaying the warmed two-issuer trace also showed little opportunity to overlap WAL and memtable work. |
-| [Memory across 16 shards](engine-profile/README.md#sixteen-shards-under-a-1-gib-process-budget) | Two immutable slots improved saturation throughput at equal buffer allowance, but exceeded the hot-shard p99 budget. The reference keeps four slots. |
-| [Reopen with a residual WAL](engine-profile/README.md#reopen-from-a-known-residual-wal) | Writable and read-only opens recovered every row. Read-only open retained the replayed rows in memory. |
-| [L0 compaction and WAL fences](l0-profile/README.md) | Two-range compaction cut foreground stalls, but the experiment could not establish whether read p99 stayed within budget. An extra prefix cut increased cold-row rewrites. MMDB retains serial L0 compaction and the ordinary flush layout. |
-| [MMDB, RocksDB, and Pebble](point-ops/README.md) | MMDB had lower eight-writer put throughput than RocksDB and higher single-reader warm-hit throughput in both fill layouts. The report gives WAL acknowledgement policies for each engine. |
+| When can grouped keys reuse index and data blocks? | [Grouped reads, storage-read coverage, and pin lifetimes](grouped-reads/README.md) |
+| How do concurrent bulk writes affect a foreground put? | [Shared and separate DBs](engine-profile/README.md#small-foreground-writes-during-bulk-updates) · [Writer handoff](engine-profile/README.md#writer-handoff-and-overlap) · [Writer-stage replay](engine-profile/writer-trace/README.md) |
+| What changes with a fixed memory allowance or a residual WAL? | [16-shard memory trial](engine-profile/README.md#sixteen-shards-under-a-1-gib-process-budget) · [Writable and read-only reopen](engine-profile/README.md#reopen-from-a-known-residual-wal) |
+| How do WAL fences, L0 parallelism, and prefix cuts affect stalls and rewrites? | [L0 trials and controls](l0-profile/README.md) |
+| How did scalar reads and writes compare across MMDB, RocksDB, and Pebble? | [Point operations and WAL policies](point-ops/README.md) |
 
-At revision `90b220e`, the 21 engine checks in the validation excerpt passed
-on native x86_64 Linux and in an AArch64 Linux full-system virtual machine.
-Each target passed 579 default engine runtime cases and two doctests, plus 429
-overlapping feature-enabled library tests. The arena pin test also passed
-under Miri.
-[Validation receipt](engine-profile/validation.json)
+The validation receipt for revision `90b220e` identifies the tests run on
+native x86_64 Linux and in an AArch64 Linux full-system VM. [Validation receipt](engine-profile/validation.json)
 
 ### Physical ARM64 on macOS
 
-On Apple M5, 32 clustered keys had 25.30% lower request p99 with grouped
-reads on a warm SST and 66.64% lower p99 with verified device reads. The
-scattered device gain was 5.48%, above this host's 2.01% control spread.
-At an equal 30 MiB write-buffer allowance per shard, two immutable slots
-and a 10 MiB buffer improved hot-shard foreground p99 by 10.89% and
-saturation throughput by 35.06% relative to four slots and a 6 MiB buffer.
-Two-range L0 compaction exceeded the read p99 regression ceiling on this
-host. Debug and release each passed 577 runtime cases and two doctests.
-[M5 measurements, controls and native test receipt](apple-m5/README.md)
+The Apple M5 reports cover native APFS runs of the grouped-read, mixed-writer,
+shard-memory, recovery, and compaction workloads. Use each report's within-host
+controls when comparing methods. [Grouped reads and native tests](apple-m5/README.md) ·
+[Engine measurements and replay](apple-m5/engine.md)
 
 ## VSDB application results
 
-One VSDB namespace owns a pool and one or more MMDB shards. VSDB v18
-uses seven levels and eight-byte prefixes. Its ordinary VecDex search uses
-scalar pinned decoding. DagMap publishes parent and
-child records in a single checked, co-located batch. VerMap dependent
-edits publish one changed working root. [VSDB v18](https://github.com/rust-util-collections/vsdb/blob/master/docs/v18.md) · [VSDB storage](https://github.com/rust-util-collections/vsdb/blob/master/docs/storage.md)
+These trials measured complete VSDB v18 operations on MMDB v5 on x86_64
+Linux. A namespace owned a pool and one or more MMDB shards with seven
+levels and eight-byte prefixes. VecDex used scalar pinned decoding, DagMap
+published parent and child records in a single co-located batch, and VerMap
+dependent edits published one changed working root.
+[VSDB v18](https://github.com/rust-util-collections/vsdb/blob/master/docs/v18.md) · [VSDB storage](https://github.com/rust-util-collections/vsdb/blob/master/docs/storage.md)
 
-The VSDB v18 experiments measured complete caller operations on MMDB v5
-on x86_64 Linux.
-
-- Atomic registration reduced engine writes per DagMap child
-  from two to one. [Publication trials](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-publication/README.md)
-- The selected 2 GiB namespace profile
-  uses four immutable slots, a 16 MiB per-shard buffer and 256 MiB for
-  each of the two evictable stores. The measured RSS applies to the stated
-  workloads. [Adapter and resource trials](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-adapter/README.md)
+- Atomic registration reduced engine writes per DagMap child from two to
+  one. [Publication trials](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-publication/README.md)
+- The selected 2 GiB namespace profile used four immutable slots, a 16 MiB
+  per-shard buffer, and 256 MiB for each of the two evictable stores. The
+  measured RSS applies to those workloads. [Adapter and resource trials](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-adapter/README.md)
 - On a warm 8,192-node VecDex graph, median query p99 was 253.38 µs.
-  Grouping vectors did not meet the full-query adoption criterion.
-  [VecDex queries](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-vecdex-v5/README.md) · [B+ tree measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-tree-v5/stock/README.md)
+  Grouping vectors missed the adoption criterion for a complete query.
+  [VecDex measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-vecdex-v5/README.md) ·
+  [B+ tree measurements](https://github.com/rust-util-collections/vsdb/blob/master/docs/evaluations/v18-tree-v5/stock/README.md)
 
 ## Performance criteria
 
-The MMDB candidate comparisons used matched work, durability and resource
-budgets. Each primary comparison used at least five fresh-process pairs.
-P99 was computed within each run. A qualifying paired median gain had to
-exceed both the workload target and its control-to-control variation,
-with four of five pairs in the same direction. The targets were 10% lower
-p99 per clustered 32-key request, 15% lower foreground small-put
-arrival-to-ack p99, or 20% less L0 stall time per admitted GiB. A 5%
-guard applied to protected latency, throughput or SST write amplification
-where relevant. The 16-shard profile used a 1 GiB measured engine RSS
-ceiling, at least 95% of reference saturation throughput and at most 105%
-of reference foreground p99. These criteria apply to their respective
-fixtures. [Engine workloads](engine-profile/README.md) · [Grouped-read workload](grouped-reads/README.md)
+Each study defines its workload, resource budget, and acceptance thresholds.
+The paired studies compute p99 within a single run, compare control and
+candidate runs with matched work (A/B), and measure variation using two
+independent control runs (A/A). The four-host protocol also defines what
+qualifies as a physical storage read. [Four-host decision rules](four-host/protocol.md#analysis-rules-fixed-before-timing) ·
+[Engine settings and controls](engine-profile/README.md#workloads) ·
+[Grouped-read evidence](grouped-reads/README.md#verified-storage-reads-and-pins)
 
 ## Run a benchmark
 
-From the repository root, run the Criterion warm-cache suite, the concurrent
-reader/writer profile, or the engine mixed workload with stable Rust.
+Run these commands from the repository root with stable Rust.
 
 ```sh
 cargo +stable bench --bench benchmarks -- warm
@@ -87,8 +77,11 @@ cargo +stable bench --bench read_write_profile
 cargo +stable bench --bench engine_profile -- mixed
 ```
 
-Both the warm-cache and small-block-cache Criterion workloads can read from
-the OS page cache. The concurrent reader/writer profile defaults to two immutable
-memtables. Use `MMDB_PROFILE_IMMUTABLES` to compare queue limits across runs. The engine
-profile records diagnostic stage timings in a separate `bench-metrics` build.
-[Criterion driver](../../benches/benchmarks.rs) · [Concurrent reader/writer profile](../../benches/read_write_profile.rs) · [Engine profile settings](engine-profile/README.md#workloads)
+The first command selects Criterion's warm workloads. Its small-block-cache
+workloads can also hit the OS page cache. The concurrent reader/writer
+profile defaults to two immutable memtables and accepts
+`MMDB_PROFILE_IMMUTABLES` to change the limit. The engine profile records
+stage timings in a separate `bench-metrics` build. Use the report's pinned
+revision and settings to reproduce a historical result.
+[Criterion driver](../../benches/benchmarks.rs) · [Concurrent reader/writer profile](../../benches/read_write_profile.rs) ·
+[Engine profile settings](engine-profile/README.md#workloads)

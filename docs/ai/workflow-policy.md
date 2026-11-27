@@ -17,6 +17,14 @@ not implicitly invoke a commit or version workflow. These instructions define
 workflow scope; they do not alter the runtime's tool-approval controls. Pushing
 requires a separate explicit user request and is never performed automatically.
 
+Read invocation arguments from the user's prompt. Run repository commands
+from the Git root and resolve Markdown links relative to the page. For all
+four workflows, use the review evidence rules and check existing guarantees
+before recording a defect. Apply the design checks to cross-subsystem or
+design changes. Workflows that create commits also use the commit protocol.
+[Review core](review-core.md) · [False-positive guide](false-positive-guide.md) ·
+[Design checks](design-patterns.md) · [Commit protocol](commit-protocol.md)
+
 ## Scope
 
 `$x-review` and `$x-overhaul` take one optional scope and nothing else. Read
@@ -57,11 +65,8 @@ in-memory offset narrowed to `u32` can overflow on a 64-bit target.
 
 ## Storage-engine specification and reporting
 
-MMDB is an in-process embedded Rust LSM key-value library (`vsdb` backend)
-operating solely on caller-owned local database files (`CURRENT`, `MANIFEST-*`,
-`*.wal`, `*.sst`, `LOCK`). It opens no network sockets, runs no daemon or RPC
-endpoint, and defines no cross-user privilege boundary. Cargo dependency
-downloads and Git commands are separate developer-tooling operations.
+Use the local database operations and process boundary defined in the
+[project guide](../../AGENTS.md#what-is-this-project).
 
 For each candidate, finding, test, progress update, and commit message,
 name the local operation and input, the invariant, and the expected and

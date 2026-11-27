@@ -2,14 +2,8 @@
 
 **Files:** `block_cache.rs`, `table_cache.rs`, `mod.rs`; tests: `shared_cache.rs`.
 
-A `BlockCachePool` shares two weighted moka stores across its members.
-The segmented store and the unsegmented overflow store each use the configured
-capacity. Blocks heavier than a segment share and no heavier than the configured
-capacity go to overflow. A 16-shard reverse index tracks entries by member and
-file for invalidation. Member-local L0 pins live in `ArcSwap<PinnedBlocks>`.
-Table readers retain their partition directories and Bloom filters. Index and
-range-deletion leaves go through the block cache with the caller's `fill_cache`
-policy. `TableCache` coalesces opens through `try_get_with`.
+For store capacities, reader lifetimes, and pin ownership, see
+[SST layout and cache ownership](../../architecture/sst-and-cache.md).
 
 ## Invariants
 
@@ -24,7 +18,7 @@ Keys always carry `member_id`; IDs are monotonic and never reused after `detach(
 
 **CA5 Detach** — idempotent (`SeqCst` swap); own member only; clears `PinnedBlocks` under `pin_updates` (re-checked on `insert_pinned`); batches unpinned invalidations before one `run_pending_tasks()`. Afterwards the view is a permanent uncached pass-through.
 
-**CA6 TableReader & TableCache life** — eviction or `TableCache::close()` (`inner.store(None)` → `ErrorKind::DbClosed` on new misses) must not invalidate `Version` or iterator `Arc<TableReader>`s. `prewarm` runs unlocked before `log_and_apply_synced`; authoritative open errors happen inside `VersionSet::open_table`.
+**CA6 TableReader and TableCache lifetimes** — A live version or iterator keeps its `Arc<TableReader>` across eviction or `TableCache::close()`. After close, `get_reader` returns `ErrorKind::DbClosed`. Trace newly built SSTs through `VersionSet::prepare_tables` outside `DB::inner` and `apply_with_tables` at install. Eviction between these steps must preserve the validated reader held by the job. [Install and eviction test](../../../src/db.rs)
 
 **CA7 Memory gauges** — count `BlockCachePool::usage()` once per shared pool, keeping both stores' capacities and weighted charges separate. Each store charges `capacity().max(1)` per admitted buffer. Test weighted charges after quiescent maintenance. `DB::memory_usage()` samples active and immutable memtables from one published view and the member's L0 pin-map payload independently. The string property `block-cache-usage` reports an entry count. After close the DB gauges reach zero even when a caller still owns an old pin. [Gauge implementation](../../../src/db/memory.rs) · [Shared-pool tests](../../../tests/shared_cache.rs)
 

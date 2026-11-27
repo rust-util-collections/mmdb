@@ -5,30 +5,15 @@ description: Explicitly invoke $x-review to inspect an MMDB scope and update doc
 
 # MMDB Storage-Engine Reliability Review
 
-MMDB is an in-process embedded Rust LSM key-value library operating on
-caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
-Review data-structure, MVCC, persistence, and concurrency invariants.
-
-Resolve repository paths from the Git root; Markdown links are relative to
-this file. Read invocation arguments from the user prompt.
-
-High-signal review. Source code is read-only; update only `docs/audit.md`.
-Never commit, push, bump, or tag. Fixes belong to `$x-fix` or `$x-overhaul`.
+Review data-structure, MVCC, persistence, and concurrency invariants in the
+requested scope. The sole writable output is `docs/audit.md`. Fixes belong
+to `$x-fix` or `$x-overhaul`. This workflow creates no commits or tags.
 
 ## Preflight
 
-Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-review or edits. Record the staged, unstaged, and untracked baseline, branch,
-and starting `HEAD` for `workflow-policy.md` §1 and the invocation ledger.
-
-## Setup
-
-Read first:
-[workflow-policy.md](../../../docs/ai/workflow-policy.md),
-[review-core.md](../../../docs/ai/review-core.md),
-[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
-Design-shaped or multi-subsystem → also
-[design-patterns.md](../../../docs/ai/design-patterns.md).
+Run `git status --short --branch` and `git rev-parse HEAD` before reviewing.
+Record the branch, starting commit, and staged, unstaged, and untracked paths
+under the [shared workflow policy](../../../docs/ai/workflow-policy.md#1-preflight).
 
 ## Input
 

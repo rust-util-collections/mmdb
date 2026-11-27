@@ -2,7 +2,8 @@
 
 **Files:** `writer.rs`, `reader.rs`, `record.rs`, `src/db.rs` (`write_batch_group`, `freeze_memtable`, `open_impl`), `src/db/flush.rs`.
 
-**Arch:** 32 KiB (`BLOCK_SIZE`) blocks with 7-byte (`HEADER_SIZE`) `Full`/`First`/`Middle`/`Last` fragment headers (`crc32(type || payload)`); vectored `WalWriter::add_record_parts` (`PartsCursor`) streams `[wal_header(first_seq), batch.payload]` without intermediate concatenation; group commit supports `DurabilityMode::{WalAsync, WalSync, DisableWal}` plus `DB::sync_wal()` (`WalFence`); leader rotates WALs outside `DB::inner` while `mmdb-flush` unlinks `old_wal` only after durable MANIFEST install.
+Use the [WAL format and recovery rules](../../architecture/recovery.md) and
+the [write and flush sequence](../../architecture/writes.md) when tracing these invariants.
 
 ## Invariants
 

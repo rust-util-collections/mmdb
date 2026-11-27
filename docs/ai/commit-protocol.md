@@ -83,9 +83,8 @@ Never amend an earlier commit; `clippy` runs in the Final repository gate.
 
 ## Final repository gate
 
-Select the installed official stable Rust toolchain via `cargo +stable` under
-`AGENTS.md`; do not run `rustup update stable` automatically unless the user
-requested a toolchain update, and do not add MSRV pins or compatibility shims.
+Use the installed official stable Rust toolchain via `cargo +stable` under the
+[project toolchain rules](../../AGENTS.md#build--test).
 
 Validation targets follow the [architecture support policy](workflow-policy.md#supported-architectures):
 64-bit ARM (`aarch64`) and 64-bit x86 (`x86_64`). Report the architecture
@@ -168,8 +167,8 @@ git diff --name-only "$base" HEAD -- 'src/*.rs' 'src/**/*.rs' ':(exclude)src/tes
 For a root `Cargo.toml` hit, inspect the diff and confirm the changed lines are
 shipped dependency or feature entries; pure `package.version` or manifest
 metadata edits do not owe a bump. Work outside the whitelist — documentation and
-other non-source content, the audit registry, tests, benches, examples, the
-separate `tools/` crates, CI configuration, and repository meta files — never
+other non-source content, the audit registry, tests, benches, examples,
+standalone benchmark crates under `docs/benchmarks/`, CI configuration, and repository meta files — never
 triggers a version change, including when those paths contain `.rs` files.
 
 Scope eligibility:

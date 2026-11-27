@@ -32,16 +32,16 @@ A defect that also affects a supported target follows normal review and fix tria
 
 ```bash
 make all          # fmt + lint + test
-make test         # debug/release suites and optional profile-counter tests
+make test         # debug/release suites, then library tests with bench-metrics
 make ci           # fmt check + clippy + the CI test set (no release, no scale_profile)
 make lint         # default and bench-metrics clippy, rustdoc
 make bench        # cargo bench with default features
-cargo test --test integration   # integration tests only
-cargo test --test crash_recovery
-cargo test --test e2e_scenarios
-cargo test --test proptest_db
-cargo test --test grouped_reads    # bounded pinned reads and snapshot visibility
-cargo test --lib --features bench-metrics  # include opt-in diagnostic counters
+cargo +stable test --test integration
+cargo +stable test --test crash_recovery
+cargo +stable test --test e2e_scenarios
+cargo +stable test --test proptest_db
+cargo +stable test --test grouped_reads    # bounded pinned reads and snapshot visibility
+cargo +stable test --lib --features bench-metrics  # include opt-in diagnostic counters
 ```
 
 Agents use the cargo commands in [commit-protocol.md](docs/ai/commit-protocol.md) for their own checks. Run a `make` target only when the user asks for it. That includes `make fmt`, which formats the whole repository; agents format only their owned Rust files with `rustfmt +stable --edition 2024 --config skip_children=true <paths>`. Passing paths after `cargo fmt --` still formats discovered crate targets and does not isolate ownership.
@@ -53,13 +53,21 @@ for a toolchain update. Define no compatible Rust version range or minimum
 compiler; do not add `rust-version`, numeric toolchain pins, minimum-version CI
 jobs, or older-compiler compatibility shims.
 
+The `make test` and `make ci` targets run tests through
+`tools/with-test-fds.sh`. Where the shell supports soft and hard descriptor
+limits, the wrapper tries to raise a low soft limit to 4,096 (or the hard
+limit if lower). If it stays below 4,096, the wrapper defaults to one test
+thread, preserving an explicit `RUST_TEST_THREADS` setting. For a focused
+run, use `sh tools/with-test-fds.sh cargo +stable test --lib`.
+
 ## Architecture
 
-Follow a write, read, compaction, or reopen in the [storage architecture](docs/architecture.md).
-The [subsystem map](docs/ai/review-core.md#subsystem-map) pairs each source area
-with its review checklist. The [storage contract checks](docs/ai/review-core.md#storage-contract-checks)
-connect admission, WAL fences, grouped reads, memory accounting and reopen
-to their implementing paths and tests. See the [usage guide](docs/usage.md) for public behavior.
+Use the documentation index to find the caller contract and its implementation
+chapter. For a review, the subsystem map pairs each source area with its
+checklist. The storage contract checks link write admission, WAL fences,
+grouped reads, memory accounting, and reopen to the implementing paths and
+tests. [Documentation index](docs/README.md) · [Storage architecture](docs/architecture.md) ·
+[Subsystem map](docs/ai/review-core.md#subsystem-map) · [Storage contract checks](docs/ai/review-core.md#storage-contract-checks)
 
 ## Skills
 

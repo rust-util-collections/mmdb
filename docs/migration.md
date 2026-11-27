@@ -1,21 +1,42 @@
 # Upgrading to MMDB v6
 
-The supported data upgrade path is **v4 → v5 → v6**. Complete the first
-step with the [v5 release's migration guide](https://github.com/rust-util-collections/mmdb/blob/e0e490dce4eb53f03ed7e56d036779e906dfb3c1/docs/migration.md).
+| Database on disk | How to open it with v6 |
+|---|---|
+| MMDB v5 | Reopen the same directory in place with the original writable geometry. |
+| MMDB v4 | Use the converter from the v5 maintenance release to create a **new v5 directory**, then open that destination with v6. |
+
+MMDB v6 reads MANIFEST format 5, SST v2 files, and v5 WAL records.
 
 ## Reopen a v5 database
 
-MMDB v6 uses the same MANIFEST header (format 5), SST v2 tables and WAL
-records as v5. Existing v5 data can be upgraded in place.
+1. Stop the v5 writer and close its handles. Keep the whole store together,
+   including `CURRENT`, its MANIFEST, live SSTs, and residual WALs. A recent
+   acknowledged row may exist only in a WAL.
+2. Update the application's dependency to `mmdb = "6"`. Call `DB::open` on
+   the existing path with the original `num_levels` and `prefix_len`.
+   Use `with_create_if_missing(false)` so a mistaken path fails. A geometry
+   mismatch returns `ErrorKind::InvalidArgument`. An unsupported MANIFEST
+   header returns `ErrorKind::Corruption`.
+3. Verify expected keys, including recent updates and deletes, before
+   resuming writes. For an ordered scan, `step_next()?` propagates a read
+   failure. If you consume the owned `Iterator`, check `error()` after the scan.
 
-1. Stop the v5 writer and close its database handles. Keep the complete
-   database directory together, including any residual WALs.
-2. Update the application's Cargo dependency to `mmdb = "6"`. Open the
-   same path with `DB::open`, using the original `num_levels` and
-   `prefix_len`. Opening replays eligible WAL records as usual.
-3. Check the expected keys or scan the database before resuming writes.
-   An owned iterator exposes errors through `error()` after the scan.
+For example, the checked-in v5.0.1 fixture uses three levels and a two-byte
+prefix. Its compatibility test reads SST and WAL rows in read-only mode,
+reopens the same files writable with those settings, writes another key,
+flushes and compacts, and checks the rows again after reopen.
+[v5.0.1 fixture](../tests/fixtures/v5.0.1/) · [Compatibility test](../tests/integration.rs)
 
-For read-only inspection, `DB::open_read_only` adopts the geometry from
-the MANIFEST and replays valid residual WAL records in memory.
-[Open and read options](usage.md) · [Database files and recovery](architecture.md#database-files-and-recovery)
+To inspect before switching writers, `DB::open_read_only` adopts the stored
+geometry and replays WALs in memory. Close it before the writable reopen in
+step 2, which checks the application's geometry. [Read-only usage](usage.md#read-only-databases) ·
+[Reopen cost for legacy SSTs](architecture/recovery.md#validate-the-manifest-and-live-ssts)
+
+## Convert a v4 database
+
+Follow the v5 converter's instructions for a stable source and a separate
+destination. Supply the **source** level count and fixed prefix length. The
+converter copies the visible key/value rows and assigns fresh sequence
+history. Use the resulting v5 store's geometry when following the v6 reopen
+steps above. The v5 guide also covers the application-level migration path
+for a VSDB universe. [v4 conversion and verification](https://github.com/rust-util-collections/mmdb/blob/e0e490dce4eb53f03ed7e56d036779e906dfb3c1/docs/migration.md#convert-a-v4-directory)

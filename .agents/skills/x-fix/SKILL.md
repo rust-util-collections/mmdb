@@ -5,31 +5,17 @@ description: Explicitly invoke $x-fix to resolve Open MMDB audit findings sequen
 
 # Resolve MMDB Reliability Findings
 
-MMDB is an in-process embedded Rust LSM key-value library operating on
-caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
-
-Resolve repository paths from the Git root; Markdown links are relative to
-this file. Read invocation arguments from the user prompt.
-
-Clear actionable `docs/audit.md` `Open` entries sequentially, self-review, and
-create atomic local commits. Never push, bump, or tag. New commits only.
+Resolve actionable `Open` findings in `docs/audit.md` sequentially and
+create a validated local commit per root cause. This workflow never pushes,
+bumps the version, or tags.
 
 ## Preflight
 
-Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-review or edits. Record the staged, unstaged, and untracked baseline, branch,
-and starting `HEAD` for `workflow-policy.md` §1 and the invocation ledger.
-
-## Setup
-
-Read first:
-[workflow-policy.md](../../../docs/ai/workflow-policy.md),
-[commit-protocol.md](../../../docs/ai/commit-protocol.md),
-[review-core.md](../../../docs/ai/review-core.md),
-[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
-
-Preflight and freeze owned paths before editing. Empty `Open` → report
-"nothing to fix" and stop.
+Run `git status --short --branch` and `git rev-parse HEAD` before editing.
+Follow the shared workflow policy and freeze the owned paths in the ledger.
+If `Open` is empty, report “nothing to fix” and stop.
+[Preflight](../../../docs/ai/workflow-policy.md#1-preflight) ·
+[Invocation ledger](../../../docs/ai/commit-protocol.md#invocation-ledger)
 
 ## Protocol
 

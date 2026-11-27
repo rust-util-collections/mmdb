@@ -2,7 +2,8 @@
 
 **Files:** `table_builder.rs`, `table_reader/{mod.rs,iterator.rs}`, `block.rs`, `block_builder.rs`, `filter.rs`, `format.rs`, `range.rs`, `mod.rs`.
 
-**Arch:** SST v2 (`TABLE_MAGIC_V2`) stores prefix-compressed data blocks, 64-byte-aligned XXH3-64 blocked Bloom filters (`filter.format = 2`), ~64 KiB (`PARTITION_BYTES`) point-index leaves (`BlockBuilder::new(1)`) and pre-fragmented `rangedel` leaves, backward-chained partition directory pages targeting 32 MiB (`META_BLOCK_SPLIT_THRESHOLD`), a non-empty `metaindex` block, and a 48-byte footer. Every block carries `[payload][compression_type: u8][crc32: u32 LE]` capped at `MAX_DECOMPRESSED_BLOCK_SIZE` (`64 MiB`; meta hard limit `META_BLOCK_HARD_LIMIT = 64 MiB - 4 KiB`).
+See [SST v2 physical layout](../../architecture/sst-and-cache.md#sst-v2-physical-layout)
+for block encoding and directory traversal.
 
 ## Invariants
 

@@ -5,31 +5,15 @@ description: Explicitly invoke $x-commit to review intended MMDB worktree change
 
 # Self-Reviewing Commit for MMDB
 
-MMDB is an in-process embedded Rust LSM key-value library operating on
-caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
-
-Resolve repository paths from the Git root; Markdown links are relative to
-this file. Read invocation arguments from the user prompt.
-
-Review owned worktree changes, fix confirmed defects, validate, and create
-atomic local commits. Never push, bump, or tag. New commits only.
+Review the intended worktree changes, fix confirmed defects, validate, and
+create new atomic local commits. Never push, bump, or tag.
 
 ## Preflight
 
-Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-review or edits. Record the staged, unstaged, and untracked baseline, branch,
-and starting `HEAD` for `workflow-policy.md` §1 and the invocation ledger.
-
-## Setup
-
-Read first:
-[workflow-policy.md](../../../docs/ai/workflow-policy.md),
-[commit-protocol.md](../../../docs/ai/commit-protocol.md),
-[review-core.md](../../../docs/ai/review-core.md) (evidence rules),
-[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
-Design-shaped → also [design-patterns.md](../../../docs/ai/design-patterns.md).
-
-Preflight, then freeze owned paths before editing.
+Run `git status --short --branch` and `git rev-parse HEAD` before editing.
+Apply the shared workflow policy and freeze the owned paths and commit units
+in the ledger. [Preflight](../../../docs/ai/workflow-policy.md#1-preflight) ·
+[Invocation ledger](../../../docs/ai/commit-protocol.md#invocation-ledger)
 
 ## Protocol
 

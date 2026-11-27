@@ -17,10 +17,9 @@ The earlier AArch64 validation executed tests in a full-system Linux VM.
 The build record identifies the native executables, source overlays, patch
 digests, features and dependency locks. [Build provenance](build-provenance.json)
 
-The writer, L0 compaction, 16-shard memory and WAL recovery measurements
-have a separate set of paired traces. Further experiments measured
-prefix-aligned flush cuts and replayed the warmed two-issuer write trace.
-[Engine workloads](engine.md) · [Flush cuts and writer replay](secondary.md)
+For the paired writer, compaction, memory, and recovery trials, including
+the historical prefix-cut and writer-replay experiments, see the
+[engine workloads](engine.md).
 
 ## Test process file limits
 

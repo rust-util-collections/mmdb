@@ -25,13 +25,15 @@ to unsupported architectures under `Won't Fix`.
 
 | When checking | Compare against |
 |---------------|-----------------|
-| Public operations, errors, defaults | [Usage guide](../usage.md), public rustdoc on the items re-exported by `src/lib.rs`, and the corresponding API tests |
-| Read, write, recovery, format, or resource behavior | [Storage architecture](../architecture.md), the subsystem implementation and its tests |
+| Public operations, errors, defaults | [Usage guide](../usage.md), public rustdoc on the items re-exported by [the crate root](../../src/lib.rs), and the corresponding API tests |
+| Read, write, compaction, or resource behavior | The relevant chapter in the [architecture subsystem map](../architecture.md#subsystem-map), its implementation, and its tests |
+| Persistence and version compatibility | [Database files and recovery](../architecture/recovery.md), [upgrade guide](../migration.md), and the [native v5 fixture](../../tests/fixtures/v5.0.1/) |
 | Engine performance, diagnostics, or historical comparisons | [Benchmark reports](../benchmarks/README.md) and [performance priorities](#performance-priorities). Match the revision, feature flags, workload and counter scope to the claim. |
 | Skill scope, outputs, and validation | [Project guide](../../AGENTS.md#skills), the four skill entry points and their `agents/openai.yaml`, [workflow policy](workflow-policy.md) and [commit protocol](commit-protocol.md) |
 
-The [README](../../README.md#documentation) is the reader index. Update the
-page that explains a changed contract and check links to moved sections.
+The [documentation index](../README.md) connects the user guides, architecture
+chapters, benchmark reports, and contributor workflows. Update the page that
+explains a changed contract and check links to moved sections.
 For documentation drift, cite the discrepant claim and the API declaration,
 operation, test, or Cargo target that establishes the correction.
 

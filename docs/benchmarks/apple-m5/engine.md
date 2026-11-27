@@ -1,9 +1,10 @@
 # Engine workloads on Apple M5
 
 Each arm ran as a fresh release-build process on the local APFS volume,
-under the native scheduler. The production control used `d5569da`. The
-ordinary and instrumented drivers share the same Darwin process counters.
-Each paired comparison uses five seeds. At each seed, two processes repeat
+under the native scheduler. The main production control used `d5569da`.
+The prefix-cut and writer-replay sections identify their earlier source
+revisions. The ordinary and instrumented drivers share Darwin process
+counters. The main paired comparisons use five seeds. At each seed, two processes repeat
 the control (A/A) and two other processes run the control and candidate
 (A/B). Process order alternates with the seed. Tables report the median
 within-pair change and the largest absolute A/A change. A positive gain
@@ -68,6 +69,18 @@ deliberately high offer used to create L0 pressure.
 [Raw parallel trials](engine/l0-parallel-1-5.jsonl.gz) ·
 [Paired compaction and latency counters](engine/l0-parallel-1-5.csv)
 
+### Prefix cuts during flush
+
+At `5528950`, adding one SST cut at an eight-byte prefix boundary doubled
+the installed file count from 40 to 80 across 40 flushes in each A/B pair.
+Both variants still selected all 18 original cold-only L1 files
+(1,717,902 bytes). The candidate emitted 75.0% more cold logical bytes and
+increased foreground stall time per GiB by 201.0%. Each process verified the
+snapshot, current rows, and rows after writable reopen. The paired output,
+latency, and control ranges are in the recorded summary.
+[M5 runs](secondary/prefix.csv) · [Paired metrics](secondary/summary.json) ·
+[Original fixture and Linux results](../l0-profile/README.md#bounded-prefix-cuts-during-flush)
+
 ## Foreground writes during bulk updates
 
 The mixed workload runs a 128-byte foreground put, a pinned get, and fresh
@@ -92,6 +105,18 @@ prototype. The predeclared gain target was 15% and A/A varied by 12.38%.
 The existing serial group commit remains the production choice.
 [Raw handoff trials](engine/handoff-async-1-5.jsonl.gz) ·
 [Paired handoff metrics](engine/handoff-async-1-5.csv)
+
+### Writer-stage replay
+
+At `7b46443`, two issuers submitted 10,000 scalar puts and 79 batches of
+4,096 entries per run. Five warmed traces alternated with tracing-disabled
+controls. Serial replay reproduced every acknowledgement. The model allowed
+one group's WAL work to overlap the previous group's memtable insertion
+while preserving queue order and WAL-generation boundaries. With zero extra
+handoff cost, the median modeled reduction in small-put p99 was 0.00%
+(range 0.00–2.00%), below the 15% threshold in every trace.
+[Trace measurements](secondary/writer/summary.jsonl) · [Per-trace replay results](secondary/summary.json) ·
+[Model and Linux measurements](../engine-profile/writer-trace/README.md)
 
 ## Sixteen shards under a 1 GiB budget
 
@@ -179,3 +204,25 @@ high-water resident bytes, converted to KiB. Linux uses
 in-process RSS observer reads Linux procfs and omits its RSS fields on
 this Mac. Its file-length, compaction, stall and latency counters are
 available on both systems. Use within-host comparisons for these trials.
+
+### Reproduce the prefix-cut and writer-replay trials
+
+Run from the repository root on macOS with Python 3.12 or later. The
+driver restores the two original revisions, applies the patches, and builds
+each arm with the shared native benchmark lock and `bench-metrics`. The
+prefix candidate runs both boundary tests before timing. [Build and host record](secondary/metadata.json) ·
+[Benchmark lock](bench.Cargo.lock.gz) · [Driver](secondary/reproduce.py)
+
+```sh
+area=target/native-m5-secondary
+driver=docs/benchmarks/apple-m5/secondary/reproduce.py
+python3 -B "$driver" prepare "$area"
+python3 -B "$driver" build "$area"
+python3 -B "$driver" run "$area"
+python3 -B docs/benchmarks/apple-m5/secondary/analyze.py "$area/results"
+```
+
+To verify the archived measurements directly, run
+`python3 -B docs/benchmarks/apple-m5/secondary/analyze.py docs/benchmarks/apple-m5/secondary`
+from the repository root. This checks workload sizes, trace hashes,
+scheduled arrivals, and reconstructed acknowledgements. [Analysis script](secondary/analyze.py)

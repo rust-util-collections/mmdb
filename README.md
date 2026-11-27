@@ -1,28 +1,23 @@
 # MMDB
 
-**The Storage Engine Behind [vsdb](https://github.com/rust-util-collections/vsdb).**
-
 [![CI](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml/badge.svg)](https://github.com/rust-util-collections/mmdb/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/mmdb.svg)](https://crates.io/crates/mmdb)
 [![Docs.rs](https://docs.rs/mmdb/badge.svg)](https://docs.rs/mmdb)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 
-MMDB is an embedded Rust LSM-tree for vsdb's prefix-partitioned keys, bulk
-copy-on-write mutations, and compaction-driven garbage collection. Each
-database is a local directory. The caller reads and writes byte strings through
-the Rust API. Optimization work targets the vsdb workload. A writable handle runs flush and compaction workers in-process.
-
-MMDB 6 opens v5 databases in place. For a v4 database, first run the
-converter from the [v5 maintenance branch](https://github.com/rust-util-collections/mmdb/tree/v5).
-
-## Supported architectures
-
-MMDB guarantees correct behavior on 64-bit ARM (AArch64, `aarch64`) and
-64-bit x86 (`x86_64`), using a 64-bit ABI. Other architectures are outside
-the project’s tested correctness guarantee.
+MMDB is the embedded Rust key-value engine behind vsdb. Each database is a
+local directory. Applications read and write byte strings, group mutations in
+atomic batches, and scan ranges or prefixes at a snapshot. In vsdb these
+operations support prefix-partitioned keys and bulk copy-on-write updates.
+A writable handle runs its flush and compaction workers inside the caller's process.
+[vsdb](https://github.com/rust-util-collections/vsdb)
 
 ## Getting started
+
+Add `mmdb = "6"` to your application's `[dependencies]`. This example writes
+two keys in one batch, makes the batch durable, and reads it through a
+snapshot after deleting one of the keys.
 
 ```rust
 use mmdb::{DB, DbOptions, WriteBatch};
@@ -44,26 +39,26 @@ fn main() -> mmdb::Result<()> {
 }
 ```
 
-The default write mode flushes WAL bytes to the OS before acknowledging a
-batch. The example calls `sync_wal()` to make the two puts durable together.
-Run `cargo +stable run --example basic` for a temporary-directory example
-with prefix scans, bounded iteration, and typed errors. [Example source](examples/basic.rs)
+By default, `write` makes the batch visible and flushes the write-ahead log
+(WAL) to the OS. `sync_wal` confirms durability for preceding WAL-enabled
+writes. For a runnable example that uses a temporary directory and also scans
+keys, run `cargo +stable run --example basic`. [Example source](examples/basic.rs)
 
 ## Documentation
 
-| Task | Start here |
-|------|------------|
-| Choose durability, configure a store, read a snapshot, or scan a range | [Using MMDB v6](docs/usage.md) |
-| Inspect a stable copy without writing to it | [Read-only databases](docs/usage.md#read-only-databases) |
-| Upgrade a database to v6 | [Upgrade guide](docs/migration.md), [changelog](CHANGELOG.md) |
-| Trace a write through the WAL, flush, recovery, and compaction, or follow a point lookup | [Storage architecture](docs/architecture.md) |
-| Find public methods, options, defaults, and error types | [Crate API](https://docs.rs/mmdb), [exports in this checkout](src/lib.rs) |
-| Compare engines or reproduce a benchmark | [Benchmark reports and workloads](docs/benchmarks/README.md), [VSDB v18 application results](docs/benchmarks/README.md#vsdb-application-results) |
-| Contribute or run the project's review and fix workflows | [Contributor and skill guide](AGENTS.md), [audit registry](docs/audit.md) |
+Find the usage and upgrade guides, storage architecture, benchmark reports,
+and contributor workflows in the [documentation index](docs/README.md).
+For method signatures and option types, see the [Rust API reference](https://docs.rs/mmdb).
+
+## Supported architectures
+
+MMDB guarantees correct behavior on 64-bit ARM (`aarch64`) and 64-bit x86
+(`x86_64`), both with a 64-bit ABI. Other targets are outside the tested
+correctness guarantee.
 
 ## Build and test
 
-Use the stable Rust toolchain (edition 2024). From this checkout:
+From the repository root, use the stable Rust toolchain (edition 2024).
 
 ```sh
 cargo +stable build
@@ -71,11 +66,8 @@ cargo +stable test --test integration
 cargo +stable doc --no-deps --open
 ```
 
-When the shell supports `ulimit -Sn` and `ulimit -Hn`, `make test` and
-`make ci` raise a low soft file descriptor limit to 4,096 when possible.
-If the limit stays lower, they default to one test thread. Other shells
-launch the tests with their inherited settings. For a focused run, use
-`sh tools/with-test-fds.sh cargo +stable test --lib`.
+The contributor guide lists the full suites and how to run tests with a low
+file descriptor limit. [Build and test commands](AGENTS.md#build--test)
 
 ## License
 

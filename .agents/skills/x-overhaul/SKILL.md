@@ -5,45 +5,28 @@ description: Review scoped MMDB changes, prove each defect with a failing regres
 
 # MMDB Scoped Review, Proven Fix, and Local Commit
 
-MMDB is an in-process embedded Rust LSM key-value library operating on
-caller-owned local files (`vsdb` backend; no network, daemon, or IPC service).
-This workflow checks data-structure, MVCC, persistence, and concurrency
-invariants, proves each confirmed defect with a test that fails before the fix,
-fixes it together with its sibling variants as sequential atomic local commits,
-and finalizes at most one eligible patch version bump with a local version tag.
-
-Resolve repository paths from the Git root; Markdown links below are relative
-to this file. Read invocation arguments from user prompt text. Never create a
-branch, push, open a PR, publish, or rewrite history.
+Review the requested scope, prove each confirmed defect with a test that
+fails before the fix, and fix its sibling variants in atomic local commits.
+Finalize at most one eligible patch bump and tag its version commit locally.
+Work on the current branch. Never create a branch, push, open a PR, publish,
+or rewrite history.
 
 ## Preflight
 
-Run `git status --short --branch` and `git rev-parse HEAD` explicitly before
-reviewing or editing. Record the branch, starting `HEAD`, package version in
-`Cargo.toml` (at `HEAD` and in the worktree), and the staged, unstaged, and
-untracked baseline for the invocation ledger in
-[commit-protocol.md](../../../docs/ai/commit-protocol.md#invocation-ledger).
+Run `git status --short --branch` and `git rev-parse HEAD` before review or
+edits. Follow the shared policy and record the branch, starting `HEAD`,
+staged, unstaged and untracked baseline, and `Cargo.toml` package version
+at `HEAD` and in the worktree. [Preflight](../../../docs/ai/workflow-policy.md#1-preflight) ·
+[Invocation ledger](../../../docs/ai/commit-protocol.md#invocation-ledger)
 
-## Setup
-
-Read first:
-[workflow-policy.md](../../../docs/ai/workflow-policy.md),
-[commit-protocol.md](../../../docs/ai/commit-protocol.md),
-[review-core.md](../../../docs/ai/review-core.md),
-[false-positive-guide.md](../../../docs/ai/false-positive-guide.md).
-Multi-subsystem or design-shaped scope → also
-[design-patterns.md](../../../docs/ai/design-patterns.md).
-
-Compose the cited sections of `x-review`, `x-commit`, and `x-fix` under this
-single invocation ledger; do not launch them as nested standalone workflows or
-apply their standalone read-only, final-gate, or no-version rules.
+Compose the cited steps from `x-review`, `x-commit`, and `x-fix` under one
+invocation ledger. Do not launch nested workflows or apply their standalone
+read-only, final-gate, or no-version rules.
 
 ## Input
 
-Parse one optional scope with the table in
-[workflow-policy.md](../../../docs/ai/workflow-policy.md#scope) (`empty` =
-latest commit; `N`; `staged`; `worktree`; `all` = full repository; `<rev>`;
-`<rev1>..<rev2>`). Reject `--fix`, multiple scopes, and unknown tokens.
+Resolve the optional scope using the [scope table](../../../docs/ai/workflow-policy.md#scope).
+An empty argument selects the latest commit. `all` selects the full repository.
 
 ## Protocol
 

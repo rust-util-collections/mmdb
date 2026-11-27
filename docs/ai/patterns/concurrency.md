@@ -2,14 +2,8 @@
 
 ## Model
 
-```
-Writers → group-commit leader → admit_range_stripes + admit_same_key_runs → vectored WAL + MemTable → Release committed_sequence
-Freeze → leader seals old WAL + uses standby or creates WAL outside inner → push_front immutable_memtables → FlushQueue
-Flush worker (mmdb-flush) → FIFO SST build + DirSynced + log_and_apply_synced + confirm_manifest_durable → pop_back + unlink old WAL
-Readers → pin ArcSwap<SuperVersion> BEFORE Acquire committed_sequence → MemTable and SST v2 lookups
-Compaction / LevelRewrite → claim inputs under inner → unlocked SST I/O (SstBuilds guard) → revalidate + install under inner
-Close → MaintenanceState drain → write_queue drain → final flush → worker join → cache/LOCK teardown
-```
+Start with the [read view and worker lifecycle](../../architecture.md) and
+the [write and flush stages](../../architecture/writes.md).
 
 ## Lock & Synchronization Hierarchy
 

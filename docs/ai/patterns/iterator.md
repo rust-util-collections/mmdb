@@ -2,7 +2,8 @@
 
 **Files:** `db_iter.rs`, `bidi_iter.rs`, `level_iter.rs`, `merge.rs`, `range_del.rs`, `source.rs`, `mod.rs`.
 
-**Arch:** `DBIterator` = MVCC cutoff + same-key dedupe + point/range tombstones + `BlockPropertyFilter` row filter + `[lower, upper)` / prefix bounds + lending `step_next`/`step_prev`. `MergingIterator` = binary heap (+ single-source fast path). `IterSource` = peeked `MemTableCursorIter` / `TableIterator` / `LevelIterator` (`Boxed` is `#[cfg(test)]`-only). `BidiIterator::lazy` = O(1)-memory bidirectional wrapper narrowing `IterConfig` bounds monotonically across direction switches. `FragmentedRangeTombstoneList` = pre-loaded interval list with per-level sequence checks.
+For the merge sources, visibility order, and the remaining bidirectional
+window, see [range and prefix scans](../../architecture/reads.md#range-and-prefix-scans).
 
 ## Invariants
 

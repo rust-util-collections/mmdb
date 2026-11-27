@@ -1,5 +1,11 @@
 # MMDB v5 on four physical hosts
 
+For the direct binary comparison and results after compaction, start with
+the [5.0.1 follow-up](#follow-up-on-mmdb-501). For the original workload
+tables by host and volume, use the [baseline at `828e47a`](#historical-campaign-at-828e47a).
+To rebuild the drivers or verify results from either archive, see the
+[reproduction instructions](reproduce.md).
+
 Both archives preserve the v5 performance observations byte for byte. This
 checkout carries engine-only excerpts of the accompanying build and test
 receipts. The campaign manifests identify the source commit, original
