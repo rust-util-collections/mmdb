@@ -5398,10 +5398,12 @@ mod tests {
         use crate::BlockPropertyCollector;
         use std::sync::mpsc;
 
+        type GateStep = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
         struct GatedFailingProperty {
             armed: Arc<AtomicBool>,
             builds_started: Arc<AtomicUsize>,
-            gate: Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>,
+            gate: Arc<Mutex<Option<GateStep>>>,
         }
         impl BlockPropertyCollector for GatedFailingProperty {
             fn name(&self) -> &str {
