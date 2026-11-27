@@ -4,8 +4,9 @@
 
 ## v6
 
-| Crate version | Storage and API changes |
+| Crate version | Changes |
 |---|---|
+| 6.0.5 | The crate archive ships the library, runnable examples, README, and license alongside Cargo metadata. Benchmark archives and integration-test fixtures stay in the repository. |
 | 6.0.4 | New SSTs record their maximum sequence to speed reopen. File bounds use the range fragments actually emitted. Fatal worker and write-stall compactions publish the error before releasing claimed inputs. [Reopen checks](docs/architecture/recovery.md#validate-the-manifest-and-live-ssts) · [Compaction installation](docs/architecture/compaction.md#install-and-retire-files) |
 | 6.0.3 | Reopen checks the MANIFEST against interior SST sequences and rejects an incorrect smallest file key. A point-block checksum failure can surface when the block is read. [SST validation](docs/architecture/recovery.md#validate-the-manifest-and-live-ssts) |
 | 6.0.2 | Open validates SST bounds, including range-deletion keys, and reports `Corruption` for a missing referenced MANIFEST. Shutdown wakes flush waiters and interrupts rate-limiter sleeps. Lazy-delete sweeps can resume after snapshot release. [Recovery](docs/architecture/recovery.md) · [Shutdown](docs/architecture.md#fail-stop-error-latching-and-shutdown) |
