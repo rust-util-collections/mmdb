@@ -97,6 +97,12 @@ impl Default for TableBuildOptions {
 
 type RangeExtents = Vec<(Vec<u8>, Vec<u8>)>;
 
+struct WrittenRangeDel {
+    handle: BlockHandle,
+    extents: RangeExtents,
+    bounds: Option<(Vec<u8>, Vec<u8>)>,
+}
+
 const PARTITION_BYTES: usize = 64 * 1024;
 fn range_partition_value(handle: BlockHandle, begin: &[u8]) -> Vec<u8> {
     let mut value = Vec::with_capacity(16 + begin.len());
@@ -266,10 +272,12 @@ pub struct TableBuilder {
 
     // Current file offset
     offset: u64,
-    // Last key added (for ordering check)
+    // Last key passed to `add` (for ordering check)
+    last_added_key: Vec<u8>,
+    // Last point key added to `data_block` (largest point key at finish)
     last_key: Vec<u8>,
 
-    // Smallest key in the table; last_key supplies the largest at finish.
+    // Smallest point key in the table; range bounds fold in at finish.
     smallest_key: Option<Vec<u8>>,
     max_sequence: SequenceNumber,
 
@@ -319,6 +327,7 @@ impl TableBuilder {
             filter_key_hashes: Vec::new(),
             bloom_user_key: None,
             offset: 0,
+            last_added_key: Vec::new(),
             last_key: Vec::new(),
             smallest_key: None,
             max_sequence: 0,
@@ -436,19 +445,10 @@ impl TableBuilder {
         assert!(!self.finished);
         let (user_key_for_bloom, seq, vt) = decode_internal_key(key).ctx()?;
         assert!(
-            self.last_key.is_empty() || compare_internal_key(key, &self.last_key).is_gt(),
+            self.last_added_key.is_empty()
+                || compare_internal_key(key, &self.last_added_key).is_gt(),
             "keys must be added in order"
         );
-
-        if self.smallest_key.is_none()
-            || (self.last_key.is_empty()
-                && self
-                    .smallest_key
-                    .as_deref()
-                    .is_some_and(|s| compare_internal_key(key, s).is_lt()))
-        {
-            self.smallest_key = Some(key.to_vec());
-        }
 
         // A single entry (plus block framing) must fit within the reader's maximum
         // decompressed block size; otherwise the SST written here would be rejected
@@ -474,8 +474,8 @@ impl TableBuilder {
                 value,
                 Arc::from([seq]),
             ));
-            self.last_key.clear();
-            self.last_key.extend_from_slice(key);
+            self.last_added_key.clear();
+            self.last_added_key.extend_from_slice(key);
             return Ok(());
         }
 
@@ -530,8 +530,13 @@ impl TableBuilder {
 
         self.data_block.add(key, value);
         self.max_sequence = self.max_sequence.max(seq);
+        if self.smallest_key.is_none() {
+            self.smallest_key = Some(key.to_vec());
+        }
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
+        self.last_added_key.clear();
+        self.last_added_key.extend_from_slice(key);
 
         for collector in &mut self.block_property_collectors {
             collector.add(user_key_for_bloom);
@@ -553,41 +558,27 @@ impl TableBuilder {
         // Write prefix filter block
         let prefix_filter_handle = self.write_prefix_filter_block().ctx()?;
 
-        // Compaction buffers packed ranges separately from point rows. Fold in
-        // their extreme keys once, irrespective of how many stripes they carry.
-        let by_first = |a: &&RangeFragment, b: &&RangeFragment| {
-            a.begin
-                .cmp(&b.begin)
-                .then_with(|| b.sequences().last().cmp(&a.sequences().last()))
-        };
-        let by_last = |a: &&RangeFragment, b: &&RangeFragment| {
-            a.begin
-                .cmp(&b.begin)
-                .then_with(|| b.sequences()[0].cmp(&a.sequences()[0]))
-        };
-        if let Some(first) = self.range_del_entries.iter().min_by(by_first) {
-            let key = InternalKey::new(
-                &first.begin,
-                *first.sequences().last().unwrap(),
-                ValueType::RangeDeletion,
-            );
+        // Fold the exact emitted range-leaf extremes (after interval splitting
+        // and snapshot-stripe pruning) into the point-key bounds so manifest
+        // metadata matches `TableReader::range_leaf_extremes` byte-for-byte.
+        let WrittenRangeDel {
+            handle: range_del_handle,
+            extents: range_tombstones,
+            bounds: range_bounds,
+        } = self.write_range_del_block().ctx()?;
+        if let Some((range_min, range_max)) = range_bounds {
             if self
                 .smallest_key
                 .as_deref()
-                .is_none_or(|k| compare_internal_key(key.as_bytes(), k).is_lt())
+                .is_none_or(|k| compare_internal_key(&range_min, k).is_lt())
             {
-                self.smallest_key = Some(key.into_bytes());
+                self.smallest_key = Some(range_min);
+            }
+            if self.last_key.is_empty() || compare_internal_key(&range_max, &self.last_key).is_gt()
+            {
+                self.last_key = range_max;
             }
         }
-        if let Some(last) = self.range_del_entries.iter().max_by(by_last) {
-            let key = InternalKey::new(&last.begin, last.sequences()[0], ValueType::RangeDeletion);
-            if self.last_key.is_empty()
-                || compare_internal_key(key.as_bytes(), &self.last_key).is_gt()
-            {
-                self.last_key = key.into_bytes();
-            }
-        }
-        let (range_del_handle, range_tombstones) = self.write_range_del_block().ctx()?;
 
         // Write meta index block
         let metaindex_handle = self
@@ -807,10 +798,14 @@ impl TableBuilder {
         self.range_del_entries.push(range);
     }
 
-    fn write_range_del_block(&mut self) -> Result<(BlockHandle, RangeExtents)> {
+    fn write_range_del_block(&mut self) -> Result<WrittenRangeDel> {
         let mut extents = Vec::new();
         if self.range_del_entries.is_empty() {
-            return Ok((BlockHandle::default(), extents));
+            return Ok(WrittenRangeDel {
+                handle: BlockHandle::default(),
+                extents,
+                bounds: None,
+            });
         }
         let ranges = std::mem::take(&mut self.range_del_entries);
         let mut events = Vec::with_capacity(ranges.len() * 2);
@@ -823,6 +818,8 @@ impl TableBuilder {
         let mut root = DirectoryWriter::new();
         let mut leaf = BlockBuilder::new(16);
         let mut first_begin = None;
+        let mut range_min = None;
+        let mut last_range = None;
         let mut prev = events[0].0;
         let mut leaf_end = prev;
         let mut payload = Vec::new();
@@ -833,6 +830,8 @@ impl TableBuilder {
                 payload.clear();
                 payload.extend_from_slice(&(prev.len() as u32).to_le_bytes());
                 payload.extend_from_slice(prev);
+                let mut oldest_stripe = None;
+                let mut newest_stripe = 0;
                 if let Some(snapshots) = &self.snapshot_stripes {
                     let mut last = None;
                     for upper in snapshots
@@ -843,15 +842,26 @@ impl TableBuilder {
                         if let Some((&seq, _)) = live.range(..=upper).next_back()
                             && last != Some(seq)
                         {
+                            oldest_stripe.get_or_insert(seq);
+                            newest_stripe = seq;
                             payload.extend_from_slice(&seq.to_le_bytes());
                             last = Some(seq);
                         }
                     }
                 } else {
-                    for seq in live.keys() {
+                    for &seq in live.keys() {
+                        oldest_stripe.get_or_insert(seq);
+                        newest_stripe = seq;
                         payload.extend_from_slice(&seq.to_le_bytes());
                     }
                 }
+                if range_min.is_none() {
+                    range_min = Some(
+                        InternalKey::new(prev, newest_stripe, ValueType::RangeDeletion)
+                            .into_bytes(),
+                    );
+                }
+                last_range = Some((prev, oldest_stripe.expect("live range has a stripe")));
                 if !leaf.is_empty()
                     && leaf
                         .estimated_size()
@@ -895,7 +905,14 @@ impl TableBuilder {
                 self.write_raw_block(d)
             })?;
         }
-        Ok((root.finish(&mut |d| self.write_raw_block(d))?, extents))
+        let bounds = range_min.zip(last_range.map(|(begin, seq)| {
+            InternalKey::new(begin, seq, ValueType::RangeDeletion).into_bytes()
+        }));
+        Ok(WrittenRangeDel {
+            handle: root.finish(&mut |d| self.write_raw_block(d))?,
+            extents,
+            bounds,
+        })
     }
 
     fn write_metaindex_block(
@@ -1693,5 +1710,56 @@ mod tests {
                 .unwrap();
             assert_eq!(got, Some((Some(vec![0x5au8; 4096]), 1)));
         }
+    }
+
+    #[test]
+    fn fragmented_and_pruned_range_deletions_match_manifest_bounds_across_flush_and_compact() {
+        use crate::{DB, DbOptions};
+
+        // 1. Overlapping range tombstones create a trailing elementary interval
+        // `[c, d)` whose begin key exceeds every input tombstone's begin key.
+        let overlapping = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), overlapping.path()).unwrap();
+        db.put(b"a", b"va").unwrap();
+        db.put(b"c", b"vc").unwrap();
+        db.put(b"d", b"vd").unwrap();
+        db.flush().unwrap();
+        db.delete_range(b"a", b"c").unwrap();
+        db.delete_range(b"b", b"d").unwrap();
+        db.flush().unwrap();
+        db.compact().unwrap();
+        assert_eq!(db.get(b"a").unwrap(), None);
+        assert_eq!(db.get(b"c").unwrap(), None);
+        assert_eq!(db.get(b"d").unwrap().as_deref(), Some(b"vd".as_slice()));
+        db.close().unwrap();
+        let ro = DB::open_read_only(overlapping.path()).unwrap();
+        assert_eq!(ro.get(b"c").unwrap(), None);
+        assert_eq!(ro.get(b"d").unwrap().as_deref(), Some(b"vd".as_slice()));
+
+        // 2. Duplicate range tombstones with no intervening snapshot prune the
+        // older stripe in `write_range_del_block`.
+        let pruned = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), pruned.path()).unwrap();
+        db.delete_range(b"a", b"z").unwrap();
+        db.delete_range(b"a", b"z").unwrap();
+        db.flush().unwrap();
+        db.compact().unwrap();
+        db.close().unwrap();
+        let ro = DB::open_read_only(pruned.path()).unwrap();
+        assert_eq!(ro.get(b"m").unwrap(), None);
+
+        // 3. Mixed point + overlapping range tombstones where the fragmented
+        // tail interval `[c, d)` advances past the largest point key `b`.
+        let mixed = tempfile::tempdir().unwrap();
+        let db = DB::open(DbOptions::default(), mixed.path()).unwrap();
+        db.put(b"b", b"vb").unwrap();
+        db.delete_range(b"a", b"c").unwrap();
+        db.delete_range(b"b", b"d").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.get(b"b").unwrap(), None);
+        db.put(b"b", b"live").unwrap();
+        db.compact().unwrap();
+        assert_eq!(db.get(b"b").unwrap().as_deref(), Some(b"live".as_slice()));
+        db.close().unwrap();
     }
 }
