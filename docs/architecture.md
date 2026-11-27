@@ -623,10 +623,12 @@ flowchart LR
      `(check_poison, fsync, store_poison)` under their respective file locks so
      a later clean `fsync` can never mask an earlier failed durability claim or
      allow premature WAL/SST unlinking.
-- **Failed L0 write stall.** A failed inline drain publishes the background error
-  before releasing its input claims. Workers check for this error at wakeup and
-  the MANIFEST writer rechecks it before appending an edit. A retryable manual
-  compaction wakes pending work after releasing its claims.
+- **Failed background or write-stall compaction.** A failed background worker or
+  inline L0 write-stall drain publishes `has_bg_error` under `DB::inner` before
+  releasing its input claims. Workers, claim-waiting foreground drains, and the
+  MANIFEST writer check for this error before picking or appending an edit,
+  preserving the first root-cause failure message. A retryable manual compaction
+  wakes pending work after releasing its claims.
 - **Explicit `DB::close()` vs `Drop`.** Calling `DB::close()` acquires
   `lock_file`, atomically marks `closed = true`, drains active `MaintenanceState`
   operations (`flush`, `compact*`, `ingest_sorted`), waits for any active

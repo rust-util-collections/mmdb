@@ -413,6 +413,16 @@ fn l0_build_opts(options: &DbOptions) -> TableBuildOptions {
     }
 }
 
+enum RewriteMode<'a> {
+    Foreground(&'a ReadState),
+    Background {
+        shutdown: &'a AtomicBool,
+        has_bg_error: &'a AtomicBool,
+        manifest_poisoned: &'a AtomicBool,
+        on_error: &'a dyn Fn(&Error),
+    },
+}
+
 /// State shared by explicit full-level rewrites and the background sweep.
 struct LevelRewrite<'a> {
     inner: &'a Mutex<DBInner>,
@@ -422,6 +432,7 @@ struct LevelRewrite<'a> {
     block_cache: &'a Arc<BlockCache>,
     super_version: &'a ArcSwap<SuperVersion>,
     l0_count: &'a AtomicUsize,
+    mode: RewriteMode<'a>,
 }
 
 struct LevelRewriteOutcome {
@@ -430,6 +441,12 @@ struct LevelRewriteOutcome {
 }
 
 impl LevelRewrite<'_> {
+    fn latch_error(&self, error: &Error) {
+        if let RewriteMode::Background { on_error, .. } = self.mode {
+            on_error(error);
+        }
+    }
+
     fn run(
         &self,
         level: usize,
@@ -441,6 +458,31 @@ impl LevelRewrite<'_> {
         loop {
             let (task, numbers, snapshots, bottom, epoch, claim) = {
                 let inner = self.inner.lock();
+                match self.mode {
+                    RewriteMode::Foreground(read) => {
+                        if let Some(fatal) = read.fail_stop_error() {
+                            return Err(fatal);
+                        }
+                    }
+                    RewriteMode::Background {
+                        shutdown,
+                        has_bg_error,
+                        manifest_poisoned,
+                        ..
+                    } => {
+                        if has_bg_error.load(Ordering::Acquire)
+                            || manifest_poisoned.load(Ordering::Acquire)
+                        {
+                            return Err(Error::background("database stopped"));
+                        }
+                        if shutdown.load(Ordering::Acquire) {
+                            return Ok(LevelRewriteOutcome {
+                                swept: false,
+                                blocked_by_snapshot: true,
+                            });
+                        }
+                    }
+                }
                 let version = inner.versions.current();
                 if level == 0 && !inner.immutable_memtables.is_empty() && !move_l0 {
                     return Ok(LevelRewriteOutcome {
@@ -519,7 +561,8 @@ impl LevelRewrite<'_> {
                 active_snapshots: &snapshots,
                 ..*ctx
             };
-            let output = LeveledCompaction::execute_compaction_io(&ctx, &task, &numbers, bottom)?;
+            let output = LeveledCompaction::execute_compaction_io(&ctx, &task, &numbers, bottom)
+                .inspect_err(|e| self.latch_error(e))?;
 
             let (cleanup, manifest) = {
                 let mut inner = self.inner.lock();
@@ -538,7 +581,7 @@ impl LevelRewrite<'_> {
                 }
                 let live_snapshots = !self.snapshots.is_empty();
                 blocked_by_snapshot |= live_snapshots;
-                let cleanup = LeveledCompaction::install_compaction(
+                let cleanup = match LeveledCompaction::install_compaction(
                     output,
                     &mut inner.versions,
                     Some(self.table_cache),
@@ -546,7 +589,14 @@ impl LevelRewrite<'_> {
                     ctx.db_path,
                     ctx.stats,
                     live_snapshots,
-                )?;
+                ) {
+                    Ok(cleanup) => cleanup,
+                    Err(e) => {
+                        drop(inner);
+                        self.latch_error(&e);
+                        return Err(e);
+                    }
+                };
                 if cleanup.installed && level == 0 {
                     for tf in &task.input_files_level {
                         self.block_cache.unpin_file(tf.meta.number);
@@ -560,7 +610,8 @@ impl LevelRewrite<'_> {
             if !cleanup.installed {
                 continue;
             }
-            confirm_manifest_durable(&manifest, ctx.manifest_poisoned)?;
+            confirm_manifest_durable(&manifest, ctx.manifest_poisoned)
+                .inspect_err(|e| self.latch_error(e))?;
             LeveledCompaction::run_post_compaction_cleanup(&cleanup, ctx.db_path);
             // Retry the sweep after the outstanding generation publishes its
             // L0 files. This move may also have introduced work at L1.
@@ -713,6 +764,8 @@ enum L0Drain {
 struct CompactionClaims {
     files: Mutex<HashSet<u64>>,
     released: Condvar,
+    #[cfg(test)]
+    waiters: AtomicUsize,
 }
 
 impl CompactionClaims {
@@ -720,6 +773,8 @@ impl CompactionClaims {
         Self {
             files: Mutex::new(HashSet::new()),
             released: Condvar::new(),
+            #[cfg(test)]
+            waiters: AtomicUsize::new(0),
         }
     }
 
@@ -746,9 +801,13 @@ impl CompactionClaims {
     /// terminates once in-flight work settles.
     fn wait_until_empty(&self) {
         let mut files = self.files.lock();
+        #[cfg(test)]
+        self.waiters.fetch_add(1, Ordering::Release);
         while !files.is_empty() {
             self.released.wait(&mut files);
         }
+        #[cfg(test)]
+        self.waiters.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -1545,9 +1604,15 @@ impl DB {
                         // Helper: set background error and log it.
                         let set_error = |msg: String| {
                             tracing::error!("{}", msg);
-                            *bg_error_msg.lock() = Some(msg.clone());
+                            bg_error_msg.lock().get_or_insert(msg.clone());
                             bg_has_error.store(true, Ordering::Release);
                             bg_flush_queue.fail(Error::background(msg));
+                        };
+                        let latch_error = |msg: String| {
+                            let _inner = bg_inner.lock();
+                            if !bg_has_error.load(Ordering::Acquire) {
+                                set_error(msg);
+                            }
                         };
 
                         let should_stop = || {
@@ -1676,13 +1741,17 @@ impl DB {
                                                 &file_numbers,
                                                 is_bottom,
                                             )
-                                            .map_err(|e| format!("compaction error: {}", e))?;
+                                            .map_err(|e| {
+                                                let msg = format!("compaction error: {e}");
+                                                latch_error(msg.clone());
+                                                msg
+                                            })?;
 
                                             // Phase 3: validate and install the directory-synced outputs.
                                             let cleanup = {
                                                 let mut inner = bg_inner.lock();
                                                 let cleanup =
-                                                    LeveledCompaction::install_compaction(
+                                                    match LeveledCompaction::install_compaction(
                                                         output,
                                                         &mut inner.versions,
                                                         Some(&bg_table_cache),
@@ -1690,10 +1759,19 @@ impl DB {
                                                         &bg_path,
                                                         Some(&bg_stats),
                                                         !bg_snapshot_list.is_empty(),
-                                                    )
-                                                    .map_err(|e| {
-                                                        format!("compaction install error: {}", e)
-                                                    })?;
+                                                    ) {
+                                                        Ok(cleanup) => cleanup,
+                                                        Err(e) => {
+                                                            let msg = format!(
+                                                                "compaction install error: {e}"
+                                                            );
+                                                            if !bg_has_error.load(Ordering::Acquire)
+                                                            {
+                                                                set_error(msg.clone());
+                                                            }
+                                                            return Err(msg);
+                                                        }
+                                                    };
                                                 if !l0_inputs.is_empty() {
                                                     let current = inner.versions.current();
                                                     for num in &l0_inputs {
@@ -1722,7 +1800,9 @@ impl DB {
                                                     &bg_manifest_poisoned,
                                                 )
                                             } {
-                                                return Err(format!("manifest sync error: {}", e));
+                                                let msg = format!("manifest sync error: {e}");
+                                                latch_error(msg.clone());
+                                                return Err(msg);
                                             }
                                             LeveledCompaction::run_post_compaction_cleanup(
                                                 &cleanup, &bg_path,
@@ -1827,13 +1907,16 @@ impl DB {
                                                             is_bottom,
                                                         )
                                                         .map_err(|e| {
-                                                            format!("hint compaction error: {}", e)
+                                                            let msg = format!(
+                                                                "hint compaction error: {e}"
+                                                            );
+                                                            latch_error(msg.clone());
+                                                            msg
                                                         })?;
 
                                                     let cleanup = {
                                                         let mut inner = bg_inner.lock();
-                                                        let cleanup =
-                                                        LeveledCompaction::install_compaction(
+                                                        let cleanup = match LeveledCompaction::install_compaction(
                                                             output,
                                                             &mut inner.versions,
                                                             Some(&bg_table_cache),
@@ -1841,13 +1924,20 @@ impl DB {
                                                             &bg_path,
                                                             Some(&bg_stats),
                                                             !bg_snapshot_list.is_empty(),
-                                                        )
-                                                        .map_err(|e| {
-                                                            format!(
-                                                                "hint compaction install error: {}",
-                                                                e
-                                                            )
-                                                        })?;
+                                                        ) {
+                                                            Ok(cleanup) => cleanup,
+                                                            Err(e) => {
+                                                                let msg = format!(
+                                                                    "hint compaction install error: {e}"
+                                                                );
+                                                                if !bg_has_error
+                                                                    .load(Ordering::Acquire)
+                                                                {
+                                                                    set_error(msg.clone());
+                                                                }
+                                                                return Err(msg);
+                                                            }
+                                                        };
                                                         bg_l0_count.store(
                                                             inner
                                                                 .versions
@@ -1868,10 +1958,10 @@ impl DB {
                                                             &bg_manifest_poisoned,
                                                         )
                                                     } {
-                                                        return Err(format!(
-                                                            "manifest sync error: {}",
-                                                            e
-                                                        ));
+                                                        let msg =
+                                                            format!("manifest sync error: {e}");
+                                                        latch_error(msg.clone());
+                                                        return Err(msg);
                                                     }
                                                     hint_installed |= cleanup.installed;
                                                     LeveledCompaction::run_post_compaction_cleanup(
@@ -1917,6 +2007,11 @@ impl DB {
                                                 stats: Some(&bg_stats),
                                                 active_snapshots: &[],
                                             };
+                                            let on_sweep_error = |e: &Error| {
+                                                latch_error(format!(
+                                                    "dead-key sweep error at L{level}: {e}"
+                                                ));
+                                            };
                                             let rewrite = LevelRewrite {
                                                 inner: &bg_inner,
                                                 snapshots: &bg_snapshot_list,
@@ -1925,6 +2020,12 @@ impl DB {
                                                 block_cache: &bg_block_cache,
                                                 super_version: &bg_sv,
                                                 l0_count: &bg_l0_count,
+                                                mode: RewriteMode::Background {
+                                                    shutdown: &shutdown,
+                                                    has_bg_error: &bg_has_error,
+                                                    manifest_poisoned: &bg_manifest_poisoned,
+                                                    on_error: &on_sweep_error,
+                                                },
                                             };
                                             let outcome = rewrite
                                                 .run(level, &ctx, level == 0 && retry_l0)
@@ -2553,6 +2654,9 @@ impl DB {
         loop {
             let pick = {
                 let inner = self.inner.lock();
+                if let Some(fatal) = self.read.fail_stop_error() {
+                    return Err(fatal);
+                }
                 let version = inner.versions.current();
                 match LeveledCompaction::pick_compaction_for_range(
                     &version,
@@ -3178,10 +3282,10 @@ impl DB {
         refresh_super_version(&self.read.super_version, inner);
     }
 
-    /// Record a background error, setting the fast-path flag and the detailed message.
-    /// All subsequent `check_usable()` calls will return this error.
+    /// Record a background error, setting the fast-path flag and preserving the
+    /// first root-cause message. All subsequent `check_usable()` calls return it.
     fn set_bg_error(&self, msg: String) {
-        *self.read.bg_error.lock() = Some(msg.clone());
+        self.read.bg_error.lock().get_or_insert(msg.clone());
         self.read.has_bg_error.store(true, Ordering::Release);
         self.flush_queue.fail(Error::background(msg));
     }
@@ -3935,6 +4039,9 @@ impl DB {
             // levels are left to the background workers.
             let (pick, l0_blocked) = {
                 let inner = self.inner.lock();
+                if let Some(fatal) = self.read.fail_stop_error() {
+                    return Err(fatal);
+                }
                 let version = inner.versions.current();
                 let mut claimed = self.compacting_files.lock();
                 match LeveledCompaction::pick_l0_compaction(&version, &claimed) {
@@ -4101,6 +4208,7 @@ impl DB {
             block_cache: &self.block_cache,
             super_version: &self.read.super_version,
             l0_count: &self.l0_file_count,
+            mode: RewriteMode::Foreground(&self.read),
         }
     }
 
@@ -5275,6 +5383,120 @@ mod tests {
                 .number,
             l0
         );
+        assert!(dir.path().join(format!("{l0:06}.sst")).exists());
+        assert_eq!(db.close().unwrap_err().kind(), ErrorKind::Background);
+        let reopened = DB::open_read_only(dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(b"k").unwrap().as_deref(),
+            Some(b"new".as_slice())
+        );
+        assert!(reopened.get(b"other").unwrap().is_none());
+    }
+
+    #[test]
+    fn background_compaction_failure_keeps_claim_until_fail_stop_and_aborts_waiting_stall() {
+        use crate::BlockPropertyCollector;
+        use std::sync::mpsc;
+
+        struct GatedFailingProperty {
+            armed: Arc<AtomicBool>,
+            builds_started: Arc<AtomicUsize>,
+            gate: Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>,
+        }
+        impl BlockPropertyCollector for GatedFailingProperty {
+            fn name(&self) -> &str {
+                "gated_fail"
+            }
+            fn add(&mut self, _: &[u8]) {}
+            fn finish_block(&mut self) -> Vec<u8> {
+                if !self.armed.load(Ordering::Acquire) {
+                    return Vec::new();
+                }
+                self.builds_started.fetch_add(1, Ordering::AcqRel);
+                if let Some((entered_tx, release_rx)) = self.gate.lock().take() {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    vec![0; usize::from(u16::MAX) + 1]
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let armed = Arc::new(AtomicBool::new(false));
+        let builds_started = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gate = Arc::new(Mutex::new(Some((entered_tx, release_rx))));
+        let armed_for_factory = Arc::clone(&armed);
+        let builds_for_factory = Arc::clone(&builds_started);
+        let gate_for_factory = Arc::clone(&gate);
+        let options = DbOptions {
+            block_property_collectors: vec![Arc::new(move || {
+                Box::new(GatedFailingProperty {
+                    armed: Arc::clone(&armed_for_factory),
+                    builds_started: Arc::clone(&builds_for_factory),
+                    gate: Arc::clone(&gate_for_factory),
+                })
+            })],
+            ..DbOptions::default()
+        }
+        .with_num_levels(2)
+        .with_l0_compaction_trigger(1)
+        .with_l0_slowdown_trigger(1)
+        .with_l0_stop_trigger(1);
+
+        let db = Arc::new(DB::open(options, dir.path()).unwrap());
+        let passes = &db.dead_key_sweep.completed_passes;
+        wait_for_compaction_worker(|| passes.load(Ordering::Acquire) > 0);
+        db.ingest_sorted([(b"k", b"old")]).unwrap();
+        let l1 = db.inner.lock().versions.current().level_files(1)[0]
+            .meta
+            .number;
+        let prior = passes.load(Ordering::Acquire);
+        db.compacting_files.lock().insert(l1);
+        db.put(b"k", b"new").unwrap();
+        db.flush_generation().unwrap();
+        wait_for_compaction_worker(|| passes.load(Ordering::Acquire) > prior);
+        let l0 = db.inner.lock().versions.current().level_files(0)[0]
+            .meta
+            .number;
+
+        let claimed_at_failure = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&claimed_at_failure);
+        let claims = Arc::clone(&db.compacting_files);
+        db.flush_queue
+            .on_next_fail(move || observed.store(claims.lock().contains(&l0), Ordering::Release));
+
+        armed.store(true, Ordering::Release);
+        db.compacting_files.release(&[l1]);
+        db.read.signal_compaction();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background worker never entered compaction build");
+
+        let writer_db = Arc::clone(&db);
+        let writer = thread::spawn(move || writer_db.put(b"other", b"value"));
+        wait_for_compaction_worker(|| db.compacting_files.waiters.load(Ordering::Acquire) == 1);
+
+        release_tx.send(()).unwrap();
+        let err = writer.join().unwrap().unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Background);
+        assert!(
+            err.to_string().contains("compaction error:"),
+            "expected original background worker error, got: {err}"
+        );
+        assert!(
+            claimed_at_failure.load(Ordering::Acquire),
+            "background worker must publish fail-stop before releasing CompactionClaim"
+        );
+        assert_eq!(
+            builds_started.load(Ordering::Acquire),
+            1,
+            "waiting write-stall drain must abort on fail-stop without starting another build"
+        );
+        stop_background_workers(&db);
         assert!(dir.path().join(format!("{l0:06}.sst")).exists());
         assert_eq!(db.close().unwrap_err().kind(), ErrorKind::Background);
         let reopened = DB::open_read_only(dir.path()).unwrap();

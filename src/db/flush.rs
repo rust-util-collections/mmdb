@@ -216,7 +216,7 @@ impl FlushQueue {
                     let result = catch_unwind(AssertUnwindSafe(|| ctx.flush(&frozen)))
                         .unwrap_or_else(|_| Err(Error::background("flush worker panicked")));
                     if let Err(e) = result {
-                        *ctx.bg_error.lock() = Some(e.to_string());
+                        ctx.bg_error.lock().get_or_insert_with(|| e.to_string());
                         ctx.has_bg_error.store(true, Ordering::Release);
                         self.fail(e);
                         return;
