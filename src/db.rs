@@ -8301,10 +8301,11 @@ mod tests {
             .with_l0_compaction_trigger(2)
             .with_rate_limiter_bytes_per_sec(100);
         let db = DB::open(opts, dir.path()).unwrap();
+        // Leave the rate-limited L0 drain to the background worker.
         db.put(b"k", &[b'a'; 32 * 1024]).unwrap();
-        db.flush().unwrap();
+        db.flush_generation().unwrap();
         db.put(b"k", &[b'b'; 32 * 1024]).unwrap();
-        db.flush().unwrap();
+        db.flush_generation().unwrap();
 
         let enter_deadline = Instant::now() + Duration::from_secs(5);
         while !db.rate_limiter.has_inflight_debt() {
