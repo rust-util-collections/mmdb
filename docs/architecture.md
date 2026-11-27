@@ -454,9 +454,10 @@ Both open modes check that MANIFEST `last_sequence` covers each live SST
 before writable recovery repairs the MANIFEST tail. New SST v2 files store
 the highest point or range-deletion sequence as an eight-byte little-endian
 `table.max_sequence` entry in the checksummed metaindex. Older readers skip
-this optional entry. For older tables that lack it, recovery checks real index
-keys, readable point records and range stripes. An unreadable point block
-still reports corruption when a read visits it.
+this optional entry. For older tables that lack it, each open reads and scans
+their index keys, readable point data blocks, and range stripes until
+compaction rewrites them (and on every `DB::open_read_only`). An unreadable
+point block still reports corruption when a read visits it.
 
 ## SST v2 and cache memory
 
