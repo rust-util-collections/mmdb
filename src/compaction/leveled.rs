@@ -3876,10 +3876,12 @@ mod tests {
         use std::{error::Error as _, fs, io};
 
         let dir = tempfile::tempdir().unwrap();
+        // Keep the inputs below both background compaction triggers so a retry
+        // cannot create its own SSTs while we check the failed job's cleanup.
         let opts = DbOptions::default()
             .with_num_levels(3)
             .with_max_subcompactions(2)
-            .with_max_bytes_for_level_base(128)
+            .with_max_bytes_for_level_base(u64::MAX)
             .with_l0_compaction_trigger(usize::MAX);
         let db = DB::open(opts, dir.path()).unwrap();
 
@@ -3888,6 +3890,16 @@ mod tests {
         db.put(b"b0", &[b'x'; 256]).unwrap();
         db.put(b"y0", &[b'y'; 256]).unwrap();
         db.flush().unwrap();
+
+        let sst_paths = || {
+            fs::read_dir(dir.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "sst"))
+                .collect::<HashSet<_>>()
+        };
+        let input_ssts = sst_paths();
+        assert_eq!(input_ssts.len(), 3, "expected one L0 SST and two L2 SSTs");
 
         FAIL_SUB_COMPACTION_SPAWN_AT.with(|f| f.set(Some(1)));
         let err = db.compact_range(Some(b"a"), None).unwrap_err();
@@ -3900,24 +3912,9 @@ mod tests {
             .map(io::Error::kind);
         assert_eq!(io_kind, Some(io::ErrorKind::WouldBlock));
 
-        // Staged output SST from subcompaction #0 must be unlinked, while all
-        // live SSTs and rows remain intact and readable.
-        let disk_ssts: HashSet<u64> = fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| {
-                let name = e.ok()?.file_name().to_string_lossy().into_owned();
-                name.strip_suffix(".sst")?.parse::<u64>().ok()
-            })
-            .collect();
-        let total_live: usize = (0..3)
-            .map(|lvl| {
-                db.get_property(&format!("num-files-at-level{lvl}"))
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap()
-            })
-            .sum();
-        assert_eq!(disk_ssts.len(), total_live);
+        // The L0 to L1 trivial move keeps its SST. The failed L1 to L2 merge
+        // must unlink the first subcompaction's output and preserve every input.
+        assert_eq!(sst_paths(), input_ssts);
 
         for (k, expected) in [
             (b"a0".as_slice(), b"1".as_slice()),
@@ -3930,7 +3927,7 @@ mod tests {
             assert_eq!(db.get(k).unwrap().as_deref(), Some(expected));
         }
 
-        db.compact_range(None, None).unwrap();
+        db.compact_range(Some(b"a"), None).unwrap();
         assert_eq!(db.get(b"b0").unwrap().as_deref(), Some(&[b'x'; 256][..]));
         db.close().unwrap();
     }
