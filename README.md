@@ -6,12 +6,12 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024_edition-orange.svg)](https://www.rust-lang.org/)
 
-MMDB is the embedded Rust key-value engine behind vsdb. Each database is a
-local directory. Applications read and write byte strings, group mutations in
-atomic batches, and scan ranges or prefixes at a snapshot. In vsdb these
-operations support prefix-partitioned keys and bulk copy-on-write updates.
-A writable handle runs its flush and compaction workers inside the caller's process.
-[vsdb](https://github.com/rust-util-collections/vsdb)
+MMDB is the embedded Rust key-value engine behind
+[vsdb](https://github.com/rust-util-collections/vsdb). Each database is a local
+directory. Applications read and write byte strings, group mutations in atomic
+batches, and scan ranges or prefixes at a snapshot. In vsdb these operations
+support prefix-partitioned keys and bulk copy-on-write updates. A writable
+handle runs its flush and compaction workers inside the caller's process.
 
 ## Getting started
 
