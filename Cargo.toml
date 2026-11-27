@@ -10,7 +10,7 @@ documentation = "https://docs.rs/mmdb"
 keywords = ["rocksdb", "leveldb", "kv", "database", "db"]
 categories = ["database-implementations"]
 readme = "README.md"
-exclude = [".github/"]
+include = ["/src/**/*.rs", "/examples/**/*.rs", "/README.md", "/LICENSE"]
 
 [dependencies]
 smallvec = "1.16.6"

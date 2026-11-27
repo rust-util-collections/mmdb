@@ -47,7 +47,7 @@ keys, run `cargo +stable run --example basic`. [Example source](examples/basic.r
 ## Documentation
 
 Find the usage and upgrade guides, storage architecture, benchmark reports,
-and contributor workflows in the [documentation index](docs/README.md).
+and contributor workflows in the [repository documentation index](https://github.com/rust-util-collections/mmdb/blob/master/docs/README.md).
 For method signatures and option types, see the [Rust API reference](https://docs.rs/mmdb).
 
 ## Supported architectures
@@ -67,7 +67,7 @@ cargo +stable doc --no-deps --open
 ```
 
 The contributor guide lists the full suites and how to run tests with a low
-file descriptor limit. [Build and test commands](AGENTS.md#build--test)
+file descriptor limit. [Build and test commands](https://github.com/rust-util-collections/mmdb/blob/master/AGENTS.md#build--test)
 
 ## License
 
