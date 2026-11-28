@@ -1,8 +1,9 @@
 # MMDB benchmarks and VSDB v18 results
 
-The published measurements below were collected on MMDB v5 revisions.
-Each report identifies its fixture, binary or source revision, controls, and
-raw observations. To measure the code in this checkout, use the commands
+The durable write trial covers MMDB 6.0.5. Earlier measurements below
+were collected on MMDB v5 revisions. Each report identifies its fixture,
+binary or source revision, controls, and raw observations. To measure the
+code in this checkout, use the commands
 under [Run a benchmark](#run-a-benchmark). For the current API guarantees,
 see the [usage guide](../usage.md).
 
@@ -27,6 +28,11 @@ binaries directly and counted compaction through a common endpoint.
 | What changes with a fixed memory allowance or a residual WAL? | [16-shard memory trial](engine-profile/README.md#sixteen-shards-under-a-1-gib-process-budget) · [Writable and read-only reopen](engine-profile/README.md#reopen-from-a-known-residual-wal) |
 | How do WAL fences, L0 parallelism, and prefix cuts affect stalls and rewrites? | [L0 trials and controls](l0-profile/README.md) |
 | How did scalar reads and writes compare across MMDB, RocksDB, and Pebble? | [Point operations and WAL policies](point-ops/README.md) |
+
+On MMDB 6.0.5, reusing a write group's WAL sync at automatic rotation
+saved a syscall and missed the foreground p99 criterion in six paired
+rounds. [Durable write trial](engine-profile/durable-write/README.md) ·
+[Experiment plan](engine-profile/durable-write-plan.md)
 
 The validation receipt for revision `90b220e` identifies the tests run on
 native x86_64 Linux and in an AArch64 Linux full-system VM. [Validation receipt](engine-profile/validation.json)
