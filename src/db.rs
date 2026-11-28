@@ -1121,7 +1121,9 @@ impl DB {
             requested_path.clone()
         };
 
+        let existing_db = path.join("CURRENT").try_exists().ctx()?;
         if !read_only
+            && !(options.adopt_manifest_geometry && existing_db)
             && (!(2..=16).contains(&options.num_levels)
                 || u32::try_from(options.prefix_len).is_err())
         {
@@ -1297,14 +1299,28 @@ impl DB {
                     path.display()
                 )));
             }
-            VersionSet::recover_db_with_cache(
-                &path,
-                options.num_levels,
-                options.prefix_len,
-                Some(table_cache.clone()),
-            )
-            .ctx()?
+            if options.adopt_manifest_geometry {
+                VersionSet::recover_db_adopting_geometry_with_cache(
+                    &path,
+                    Some(table_cache.clone()),
+                )
+                .ctx()?
+            } else {
+                VersionSet::recover_db_with_cache(
+                    &path,
+                    options.num_levels,
+                    options.prefix_len,
+                    Some(table_cache.clone()),
+                )
+                .ctx()?
+            }
         } else if options.create_if_missing {
+            if !(2..=16).contains(&options.num_levels) || u32::try_from(options.prefix_len).is_err()
+            {
+                return Err(Error::invalid_argument(
+                    "num_levels must be in 2..=16 and prefix_len must fit u32",
+                ));
+            }
             VersionSet::create_db_with_cache(
                 &path,
                 options.num_levels,
@@ -2169,7 +2185,6 @@ impl DB {
                 compaction_notify,
                 super_version,
                 read_compaction_hints,
-                read_counter: AtomicU64::new(0),
             }),
             path: requested_path,
             storage_path: path,
@@ -2536,13 +2551,7 @@ impl DB {
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
-            "stats.bytes_read" => Some(
-                self.read
-                    .stats
-                    .bytes_read
-                    .load(Ordering::Relaxed)
-                    .to_string(),
-            ),
+            "stats.bytes_read" => Some(self.read.stats.bytes_read().to_string()),
             "stats.compactions_completed" => Some(
                 self.read
                     .stats
@@ -2564,23 +2573,11 @@ impl DB {
                     .load(Ordering::Relaxed)
                     .to_string(),
             ),
-            "stats.block_cache_hits" => Some(
-                self.read
-                    .stats
-                    .block_cache_hits
-                    .load(Ordering::Relaxed)
-                    .to_string(),
-            ),
-            "stats.block_cache_misses" => Some(
-                self.read
-                    .stats
-                    .block_cache_misses
-                    .load(Ordering::Relaxed)
-                    .to_string(),
-            ),
+            "stats.block_cache_hits" => Some(self.read.stats.block_cache_hits().to_string()),
+            "stats.block_cache_misses" => Some(self.read.stats.block_cache_misses().to_string()),
             "stats.cache_hit_rate" => {
-                let hits = self.read.stats.block_cache_hits.load(Ordering::Relaxed) as f64;
-                let misses = self.read.stats.block_cache_misses.load(Ordering::Relaxed) as f64;
+                let hits = self.read.stats.block_cache_hits() as f64;
+                let misses = self.read.stats.block_cache_misses() as f64;
                 let total = hits + misses;
                 if total > 0.0 {
                     Some(format!("{:.4}", hits / total))
@@ -4853,7 +4850,7 @@ mod tests {
         );
         assert_eq!(db.get(b"p:2").unwrap(), None);
 
-        let misses = db.read.stats.block_cache_misses.load(Ordering::Relaxed);
+        let misses = db.read.stats.block_cache_misses();
         for (prefix, lower, upper) in [
             (b"p:".as_slice(), b"z".as_slice(), b"zz".as_slice()),
             (b"p:", b"", b"a"),
@@ -4878,10 +4875,7 @@ mod tests {
             assert!(!iter.valid());
             assert!(iter.error().is_none());
         }
-        assert_eq!(
-            db.read.stats.block_cache_misses.load(Ordering::Relaxed),
-            misses
-        );
+        assert_eq!(db.read.stats.block_cache_misses(), misses);
     }
 
     #[test]

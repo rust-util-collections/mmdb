@@ -89,6 +89,194 @@ impl RestartSegmentEntry {
     }
 }
 
+/// Validate the restart table of a raw block buffer and return `(restart_offset, num_restarts)`.
+pub(crate) fn validate_block_restarts(data: &[u8]) -> Result<(usize, u32)> {
+    if data.len() < 4 {
+        return Err(Error::corruption("block too short"));
+    }
+    let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
+    let restarts_size = (num_restarts as usize)
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(4))
+        .ok_or_else(|| Error::corruption("restart count overflow"))?;
+    if num_restarts == 0 {
+        return Err(Error::corruption("bad restart count"));
+    }
+    if restarts_size > data.len() {
+        return Err(Error::corruption("bad restart count"));
+    }
+    let restart_offset = data.len() - restarts_size;
+    let mut prev_restart = 0usize;
+    for i in 0..num_restarts {
+        let offset = restart_offset + (i as usize) * 4;
+        let restart = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        // A restart must point at an entry. An empty segment (duplicate
+        // offset, or a restart at the entry-region end) makes reverse
+        // iteration a clean miss while a forward scan still yields keys.
+        // An empty block's first restart is the only offset that may
+        // equal the entry-region end.
+        let empty_block = restart_offset == 0 && i == 0 && restart == 0;
+        if (i == 0 && restart != 0)
+            || restart > restart_offset
+            || (restart == restart_offset && !empty_block)
+            || (i > 0 && restart <= prev_restart)
+        {
+            return Err(Error::corruption("bad restart offset"));
+        }
+        prev_restart = restart;
+    }
+
+    Ok((restart_offset, num_restarts))
+}
+
+#[inline]
+fn restart_point_in(data: &[u8], restart_offset: usize, i: u32) -> u32 {
+    let offset = restart_offset + (i as usize) * 4;
+    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+}
+
+/// Match returned by [`validate_point_block_bytes_and_locate`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ColdLocateMatch {
+    pub value_start: usize,
+    pub value_len: usize,
+    pub entry_seq: SequenceNumber,
+    pub value_type: ValueType,
+}
+
+/// Validate a point SST data block's entries, strict `compare_internal_key`
+/// monotonicity, and index `[first_key, sep]` bounds in a single linear pass
+/// while locating the first entry `>= seek_key` matching `user_key`.
+///
+/// Even after locating a match or passing `user_key`, validation continues to
+/// the end of the block so trailing corruption is still rejected and never
+/// cached.
+pub(crate) fn validate_point_block_bytes_and_locate(
+    data: &[u8],
+    restart_offset: usize,
+    num_restarts: u32,
+    first_key: &[u8],
+    sep: &[u8],
+    user_key: &[u8],
+    seek_key: &[u8],
+) -> Result<Option<ColdLocateMatch>> {
+    if restart_offset == 0 || num_restarts == 0 {
+        return Err(Error::corruption("empty SST data block"));
+    }
+    let mut key_buf = SmallVec::<[u8; 128]>::new();
+    let mut offset = 0usize;
+    let mut next_restart = 1u32;
+    let mut seg_end = if num_restarts > 1 {
+        restart_point_in(data, restart_offset, 1) as usize
+    } else {
+        restart_offset
+    };
+    let mut first = true;
+    let mut locate_done = false;
+    let mut matched = None;
+    let seek_has_expected_prefix =
+        seek_key.len() == user_key.len() + 8 && &seek_key[..user_key.len()] == user_key;
+    let seek_trailer = if seek_has_expected_prefix {
+        &seek_key[user_key.len()..]
+    } else {
+        &[]
+    };
+    let mut prev_uk_len = 0usize;
+    let mut lcp = 0usize;
+    while offset < restart_offset {
+        let mut at_restart = first;
+        if offset == seg_end {
+            at_restart = true;
+            let r = next_restart;
+            next_restart = r + 1;
+            seg_end = if r + 1 < num_restarts {
+                restart_point_in(data, restart_offset, r + 1) as usize
+            } else {
+                restart_offset
+            };
+        }
+        let (shared, value_start, value_len, next_off) = decode_point_entry_monotonic_with_shared(
+            &data[..seg_end],
+            offset,
+            !first,
+            at_restart,
+            &mut key_buf,
+        )?;
+        if first {
+            if key_buf.as_slice() != first_key {
+                return Err(Error::corruption(
+                    "SST data block disagrees with index bounds",
+                ));
+            }
+            first = false;
+        }
+        if !locate_done {
+            if seek_has_expected_prefix {
+                // `decode_point_entry_monotonic_with_shared` guarantees `key_buf.len() >= 8`.
+                let cur_uk_len = key_buf.len() - 8;
+                let shared_uk = shared.min(prev_uk_len).min(cur_uk_len);
+                if lcp < prev_uk_len && shared_uk > lcp {
+                    // Since `prev_key < seek_key` and `lcp < prev_uk_len`,
+                    // `prev_uk[lcp] < user_key[lcp]`. Because `shared_uk > lcp`,
+                    // `cur_uk[..=lcp] == prev_uk[..=lcp]`, so `cur_uk < user_key`
+                    // with unchanged `lcp` in O(1) time.
+                    prev_uk_len = cur_uk_len;
+                } else {
+                    let cur_uk = &key_buf[..cur_uk_len];
+                    let start = shared_uk.min(lcp);
+                    let extra = cur_uk[start..]
+                        .iter()
+                        .zip(&user_key[start..])
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    let new_lcp = start + extra;
+                    lcp = new_lcp;
+                    prev_uk_len = cur_uk_len;
+                    let ord = if new_lcp < cur_uk_len && new_lcp < user_key.len() {
+                        cur_uk[new_lcp].cmp(&user_key[new_lcp])
+                    } else {
+                        cur_uk_len.cmp(&user_key.len())
+                    };
+                    match ord {
+                        Ordering::Less => {}
+                        Ordering::Greater => {
+                            locate_done = true;
+                        }
+                        Ordering::Equal => {
+                            if &key_buf[cur_uk_len..] >= seek_trailer {
+                                locate_done = true;
+                                let (_, entry_seq, value_type) = decode_internal_key(&key_buf)?;
+                                matched = Some(ColdLocateMatch {
+                                    value_start,
+                                    value_len,
+                                    entry_seq,
+                                    value_type,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else if crate::types::compare_internal_key(&key_buf, seek_key) != Ordering::Less {
+                locate_done = true;
+                let (uk, entry_seq, value_type) = decode_internal_key(&key_buf)?;
+                if uk == user_key {
+                    matched = Some(ColdLocateMatch {
+                        value_start,
+                        value_len,
+                        entry_seq,
+                        value_type,
+                    });
+                }
+            }
+        }
+        offset = next_off;
+    }
+    if crate::types::compare_internal_key(&key_buf, sep).is_gt() {
+        return Err(Error::corruption("SST data block exceeds index separator"));
+    }
+    Ok(matched)
+}
+
 impl Block {
     /// Construct a `Block` whose restart table was already validated on cache admission.
     #[inline]
@@ -106,41 +294,7 @@ impl Block {
 
     /// Parse a data block from shared (Arc) raw bytes — zero-copy from block cache.
     pub fn new(data: Arc<Vec<u8>>) -> Result<Self> {
-        if data.len() < 4 {
-            return Err(Error::corruption("block too short"));
-        }
-        let num_restarts = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
-        let restarts_size = (num_restarts as usize)
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(4))
-            .ok_or_else(|| Error::corruption("restart count overflow"))?;
-        if num_restarts == 0 {
-            return Err(Error::corruption("bad restart count"));
-        }
-        if restarts_size > data.len() {
-            return Err(Error::corruption("bad restart count"));
-        }
-        let restart_offset = data.len() - restarts_size;
-        let mut prev_restart = 0usize;
-        for i in 0..num_restarts {
-            let offset = restart_offset + (i as usize) * 4;
-            let restart = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-            // A restart must point at an entry. An empty segment (duplicate
-            // offset, or a restart at the entry-region end) makes reverse
-            // iteration a clean miss while a forward scan still yields keys.
-            // An empty block's first restart is the only offset that may
-            // equal the entry-region end.
-            let empty_block = restart_offset == 0 && i == 0 && restart == 0;
-            if (i == 0 && restart != 0)
-                || restart > restart_offset
-                || (restart == restart_offset && !empty_block)
-                || (i > 0 && restart <= prev_restart)
-            {
-                return Err(Error::corruption("bad restart offset"));
-            }
-            prev_restart = restart;
-        }
-
+        let (restart_offset, num_restarts) = validate_block_restarts(&data)?;
         Ok(Self {
             data,
             restart_offset,
@@ -785,26 +939,48 @@ pub(crate) fn decode_point_entry_monotonic(
     at_restart: bool,
     key_buf: &mut impl KeyBuffer,
 ) -> Result<(usize, usize, usize)> {
+    let (_, value_start, value_len, next_off) =
+        decode_point_entry_monotonic_with_shared(data, offset, has_prev_key, at_restart, key_buf)?;
+    Ok((value_start, value_len, next_off))
+}
+
+#[inline]
+fn decode_point_entry_monotonic_with_shared(
+    data: &[u8],
+    offset: usize,
+    has_prev_key: bool,
+    at_restart: bool,
+    key_buf: &mut impl KeyBuffer,
+) -> Result<(usize, usize, usize, usize)> {
     if !at_restart
         && has_prev_key
-        && let Some(&[b0, b1, b2]) = offset.checked_add(3).and_then(|end| data.get(offset..end))
-        && (b0 | b1 | b2) & 0x80 == 0
+        && let Some(&[b0, b1, b2, ref rest @ ..]) = data.get(offset..)
+        && (b0 | b1) < 0x80
     {
-        let shared = b0 as usize;
-        let unshared = b1 as usize;
-        let vlen = b2 as usize;
-        let pos = offset + 3;
-        let key_end = pos + unshared;
-        let value_end = key_end + vlen;
-        let prev_len = key_buf.len();
-        if unshared > 8
-            && shared + 8 < prev_len
-            && value_end <= data.len()
-            && (!data[key_end - 1]) <= 1
-            && key_buf[shared] < data[pos]
+        let vlen_pos = if b2 < 0x80 {
+            Some((b2 as usize, offset + 3))
+        } else if let Some(&b3) = rest.first()
+            && b3 < 0x80
         {
-            key_buf.replace_suffix(shared, &data[pos..key_end]);
-            return Ok((key_end, vlen, value_end));
+            Some((((b2 & 0x7f) as usize) | ((b3 as usize) << 7), offset + 4))
+        } else {
+            None
+        };
+        if let Some((vlen, pos)) = vlen_pos {
+            let shared = b0 as usize;
+            let unshared = b1 as usize;
+            let key_end = pos + unshared;
+            let value_end = key_end + vlen;
+            let prev_len = key_buf.len();
+            if unshared > 8
+                && shared + 8 < prev_len
+                && value_end <= data.len()
+                && (!data[key_end - 1]) <= 1
+                && key_buf[shared] < data[pos]
+            {
+                key_buf.replace_suffix(shared, &data[pos..key_end]);
+                return Ok((shared, key_end, vlen, value_end));
+            }
         }
     }
     decode_point_entry_monotonic_general(data, offset, has_prev_key, at_restart, key_buf)
@@ -817,7 +993,7 @@ fn decode_point_entry_monotonic_general(
     has_prev_key: bool,
     at_restart: bool,
     key_buf: &mut impl KeyBuffer,
-) -> Result<(usize, usize, usize)> {
+) -> Result<(usize, usize, usize, usize)> {
     let (shared, unshared, vlen, pos, key_end) = decode_entry_header(data, offset)?;
     let value_end = key_end + vlen;
 
@@ -841,7 +1017,7 @@ fn decode_point_entry_monotonic_general(
             return Err(invalid_point_ikey_type(inv_vt));
         }
         key_buf.replace_suffix(0, &data[pos..key_end]);
-        return Ok((key_end, vlen, value_end));
+        return Ok((0, key_end, vlen, value_end));
     }
 
     let prev_len = key_buf.len();
@@ -886,7 +1062,7 @@ fn decode_point_entry_monotonic_general(
     }
 
     key_buf.replace_suffix(shared, &data[pos..key_end]);
-    Ok((key_end, vlen, value_end))
+    Ok((shared, key_end, vlen, value_end))
 }
 
 /// Iterator over entries in a block.
@@ -1357,5 +1533,308 @@ mod tests {
         assert!(siter.next().is_none());
         assert!(siter.error().is_some());
         assert!(straddle.seek_by(b"b", <[u8]>::cmp).is_err());
+    }
+
+    #[test]
+    fn decode_point_entry_monotonic_handles_2byte_and_3byte_vlen() {
+        use crate::types::InternalKey;
+
+        let mut builder = BlockBuilder::new(16);
+        let keys: Vec<Vec<u8>> = (0..6u64)
+            .map(|i| {
+                InternalKey::new(format!("row/{i:04}").as_bytes(), 10, ValueType::Value)
+                    .into_bytes()
+            })
+            .collect();
+        let values = [
+            vec![0x11u8; 0],     // 1-byte vlen (0)
+            vec![0x22u8; 127],   // max 1-byte vlen
+            vec![0x33u8; 280],   // 2-byte vlen (typical SQL row)
+            vec![0x44u8; 16383], // max 2-byte vlen
+            vec![0x55u8; 16384], // 3-byte vlen (fallback path)
+            vec![0x66u8; 300],   // 2-byte vlen again
+        ];
+        for (k, v) in keys.iter().zip(&values) {
+            builder.add(k, v);
+        }
+        let raw = builder.finish();
+        let (restart_offset, num_restarts) = validate_block_restarts(&raw).unwrap();
+        assert_eq!(num_restarts, 1);
+
+        for (i, expected_val) in values.iter().enumerate() {
+            let uk = format!("row/{i:04}");
+            let seek_key = InternalKey::new(uk.as_bytes(), 10, ValueType::Value).into_bytes();
+            let found = validate_point_block_bytes_and_locate(
+                &raw,
+                restart_offset,
+                num_restarts,
+                &keys[0],
+                keys.last().unwrap(),
+                uk.as_bytes(),
+                &seek_key,
+            )
+            .unwrap()
+            .expect("expected match");
+            assert_eq!(found.entry_seq, 10);
+            assert_eq!(found.value_type, ValueType::Value);
+            assert_eq!(
+                &raw[found.value_start..found.value_start + found.value_len],
+                expected_val.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_point_block_bytes_and_locate_covers_segments_versions_and_trailing_corruption() {
+        use crate::types::InternalKey;
+
+        let mut builder = BlockBuilder::new(3);
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (
+                InternalKey::new(b"k00", 20, ValueType::Value).into_bytes(),
+                vec![1; 280],
+            ),
+            (
+                InternalKey::new(b"k00", 10, ValueType::Value).into_bytes(),
+                vec![2; 280],
+            ),
+            (
+                InternalKey::new(b"k01", 15, ValueType::Deletion).into_bytes(),
+                vec![],
+            ),
+            (
+                InternalKey::new(b"k02", 12, ValueType::Value).into_bytes(),
+                vec![],
+            ),
+            (
+                InternalKey::new(b"k03", 12, ValueType::Value).into_bytes(),
+                vec![3; 300],
+            ),
+            (
+                InternalKey::new(b"k04", 12, ValueType::Value).into_bytes(),
+                vec![4; 300],
+            ),
+            (
+                InternalKey::new(b"k05", 12, ValueType::Value).into_bytes(),
+                vec![5; 300],
+            ),
+        ];
+        for (k, v) in &entries {
+            builder.add(k, v);
+        }
+        let raw = builder.finish();
+        let (restart_offset, num_restarts) = validate_block_restarts(&raw).unwrap();
+        assert!(num_restarts >= 3);
+        let first_key = &entries[0].0;
+        let last_key = &entries.last().unwrap().0;
+
+        // Snapshot at seq 15 skips k00@20 and returns k00@10.
+        let seek_k00_15 = InternalKey::new(b"k00", 15, ValueType::Value).into_bytes();
+        let m = validate_point_block_bytes_and_locate(
+            &raw,
+            restart_offset,
+            num_restarts,
+            first_key,
+            last_key,
+            b"k00",
+            &seek_k00_15,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m.entry_seq, 10);
+        assert_eq!(&raw[m.value_start..m.value_start + m.value_len], &[2; 280]);
+
+        // Snapshot at seq 5 misses k00 (older than all versions).
+        let seek_k00_5 = InternalKey::new(b"k00", 5, ValueType::Value).into_bytes();
+        assert!(
+            validate_point_block_bytes_and_locate(
+                &raw,
+                restart_offset,
+                num_restarts,
+                first_key,
+                last_key,
+                b"k00",
+                &seek_k00_5,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Deletion tombstone entry.
+        let seek_k01 = InternalKey::new(b"k01", 100, ValueType::Value).into_bytes();
+        let m = validate_point_block_bytes_and_locate(
+            &raw,
+            restart_offset,
+            num_restarts,
+            first_key,
+            last_key,
+            b"k01",
+            &seek_k01,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(m.value_type, ValueType::Deletion);
+        assert_eq!(m.entry_seq, 15);
+
+        // Empty value entry and last-segment hit.
+        for (uk, expected_len) in [(b"k02".as_slice(), 0usize), (b"k05".as_slice(), 300usize)] {
+            let seek = InternalKey::new(uk, 100, ValueType::Value).into_bytes();
+            let m = validate_point_block_bytes_and_locate(
+                &raw,
+                restart_offset,
+                num_restarts,
+                first_key,
+                last_key,
+                uk,
+                &seek,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(m.value_len, expected_len);
+        }
+
+        // Misses before, between, and past last key.
+        for missing in [b"a00".as_slice(), b"k02a", b"z99"] {
+            let seek = InternalKey::new(missing, 100, ValueType::Value).into_bytes();
+            assert!(
+                validate_point_block_bytes_and_locate(
+                    &raw,
+                    restart_offset,
+                    num_restarts,
+                    first_key,
+                    last_key,
+                    missing,
+                    &seek,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        // Trailing corruption AFTER the matched key must still be rejected.
+        let mut corrupt_builder = BlockBuilder::new(3);
+        corrupt_builder.add(&entries[0].0, &entries[0].1); // k00@20 (valid match)
+        corrupt_builder.add(&entries[4].0, &entries[4].1); // k03@12
+        corrupt_builder.add(&entries[3].0, &entries[3].1); // k02@12 (UNORDERED after k03!)
+        let corrupt_raw = corrupt_builder.finish();
+        let (cr_off, cr_n) = validate_block_restarts(&corrupt_raw).unwrap();
+        let seek_k00_20 = InternalKey::new(b"k00", 20, ValueType::Value).into_bytes();
+        let err = validate_point_block_bytes_and_locate(
+            &corrupt_raw,
+            cr_off,
+            cr_n,
+            &entries[0].0,
+            &entries[4].0,
+            b"k00",
+            &seek_k00_20,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Corruption);
+    }
+
+    #[test]
+    fn validate_point_block_bytes_and_locate_handles_long_shared_prefixes_and_boundaries() {
+        use crate::types::InternalKey;
+
+        let prefix = vec![b'p'; 1024];
+        let make_key = |suffix: &[u8], seq: u64| {
+            let mut uk = prefix.clone();
+            uk.extend_from_slice(suffix);
+            (
+                uk.clone(),
+                InternalKey::new(&uk, seq, ValueType::Value).into_bytes(),
+            )
+        };
+
+        // Include strict-prefix chains ("", "a", "aa", "ab"), multi-version keys,
+        // and multi-segment blocks with a 1 KiB common prefix.
+        let spec: &[(&[u8], u64, u8)] = &[
+            (b"", 10, 1),
+            (b"a", 20, 2),
+            (b"a", 10, 3),
+            (b"aa", 10, 4),
+            (b"aaa", 10, 5),
+            (b"ab", 10, 6),
+            (b"ab0", 10, 7),
+            (b"b", 10, 8),
+            (b"ba", 10, 9),
+            (b"bb", 10, 10),
+        ];
+        let mut builder = BlockBuilder::new(4);
+        let mut entries = Vec::new();
+        for &(suf, seq, tag) in spec {
+            let (uk, ik) = make_key(suf, seq);
+            let val = vec![tag; 16];
+            builder.add(&ik, &val);
+            entries.push((uk, ik, seq, tag));
+        }
+        let raw = builder.finish();
+        let (restart_offset, num_restarts) = validate_block_restarts(&raw).unwrap();
+        let first_key = &entries[0].1;
+        let last_key = &entries.last().unwrap().1;
+
+        for (uk, _, seq, tag) in &entries {
+            let seek = InternalKey::new(uk, *seq, ValueType::Value).into_bytes();
+            let m = validate_point_block_bytes_and_locate(
+                &raw,
+                restart_offset,
+                num_restarts,
+                first_key,
+                last_key,
+                uk,
+                &seek,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(m.entry_seq, *seq);
+            assert_eq!(
+                &raw[m.value_start..m.value_start + m.value_len],
+                &[*tag; 16]
+            );
+        }
+
+        // Lookup a strict-prefix miss and between-key misses.
+        for miss_suf in [b"a0".as_slice(), b"aab", b"ab1", b"z"] {
+            let (uk, seek) = make_key(miss_suf, 100);
+            assert!(
+                validate_point_block_bytes_and_locate(
+                    &raw,
+                    restart_offset,
+                    num_restarts,
+                    first_key,
+                    last_key,
+                    &uk,
+                    &seek,
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+
+        // Also test a valid block whose non-restart entries use non-maximal shared = 0.
+        let mut non_max = Vec::new();
+        for (_, ik, _, tag) in &entries[..4] {
+            encode_varint_vec(&mut non_max, 0);
+            encode_varint_vec(&mut non_max, ik.len() as u32);
+            encode_varint_vec(&mut non_max, 1);
+            non_max.extend_from_slice(ik);
+            non_max.push(*tag);
+        }
+        non_max.extend_from_slice(&0u32.to_le_bytes());
+        non_max.extend_from_slice(&1u32.to_le_bytes());
+        let (nm_off, nm_n) = validate_block_restarts(&non_max).unwrap();
+        let (target_uk, target_seek) = make_key(b"aa", 10);
+        let m = validate_point_block_bytes_and_locate(
+            &non_max,
+            nm_off,
+            nm_n,
+            &entries[0].1,
+            &entries[3].1,
+            &target_uk,
+            &target_seek,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(&non_max[m.value_start..m.value_start + m.value_len], &[4]);
     }
 }

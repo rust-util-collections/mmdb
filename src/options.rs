@@ -115,6 +115,16 @@ pub struct DbOptions {
     /// creates a private pool sized by [`Self::block_cache_capacity`]. With
     /// `Some(pool)`, the supplied pool controls cache sizing for all members.
     pub block_cache: Option<Arc<crate::cache::block_cache::BlockCachePool>>,
+    /// When opening an existing database writable (`CURRENT` is present), adopt
+    /// the persisted [`Self::num_levels`] and [`Self::prefix_len`] from the
+    /// MANIFEST header instead of returning
+    /// [`ErrorKind::InvalidArgument`](crate::ErrorKind::InvalidArgument) on
+    /// mismatch.
+    ///
+    /// Ignored when creating a new database (the configured `num_levels` and
+    /// `prefix_len` are persisted as usual) and on read-only opens (which
+    /// always adopt persisted geometry). Default: `false`.
+    pub adopt_manifest_geometry: bool,
 }
 
 impl Default for DbOptions {
@@ -149,6 +159,7 @@ impl Default for DbOptions {
             block_property_collectors: Vec::new(),
             lazy_delete_compaction_threshold: 0,
             block_cache: None,
+            adopt_manifest_geometry: false,
         }
     }
 }
@@ -206,6 +217,7 @@ impl fmt::Debug for DbOptions {
                 &self.lazy_delete_compaction_threshold,
             )
             .field("block_cache", &self.block_cache.as_ref().map(|_| ".."))
+            .field("adopt_manifest_geometry", &self.adopt_manifest_geometry)
             .finish()
     }
 }
@@ -255,6 +267,13 @@ pub struct ReadOptions<'a> {
     /// one-shot blocks don't evict hot point-read blocks. Cache *hits* are
     /// still served from the cache either way. RocksDB equivalent: `fill_cache`.
     pub fill_cache: bool,
+    /// Whether an SST index-leaf cache miss inserts the index leaf into the
+    /// block cache. Default: `None` (inherits [`Self::fill_cache`]).
+    ///
+    /// Set to `Some(true)` alongside `fill_cache = false` when an application
+    /// maintains its own decoded row cache or performs cold scans and wants
+    /// SST index leaves to stay resident without caching cold data blocks.
+    pub fill_index_cache: Option<bool>,
     /// Optional callback checked during iteration. If it returns `true` for a
     /// user key, that key is skipped without being yielded.
     pub skip_point: Option<SkipPointFn>,
@@ -275,6 +294,7 @@ impl Default for ReadOptions<'_> {
         Self {
             snapshot: None,
             fill_cache: true,
+            fill_index_cache: None,
             skip_point: None,
             block_property_filters: Vec::new(),
             iterate_lower_bound: None,
@@ -288,6 +308,7 @@ impl fmt::Debug for ReadOptions<'_> {
         f.debug_struct("ReadOptions")
             .field("snapshot", &self.snapshot)
             .field("fill_cache", &self.fill_cache)
+            .field("fill_index_cache", &self.fill_index_cache)
             .field("skip_point", &self.skip_point.as_ref().map(|_| ".."))
             .field("block_property_filters", &self.block_property_filters.len())
             .field("iterate_lower_bound", &self.iterate_lower_bound)
@@ -525,6 +546,7 @@ impl DbOptions {
         block_cache,
         Option<Arc<crate::cache::block_cache::BlockCachePool>>
     );
+    option_builder!(with_adopt_manifest_geometry, adopt_manifest_geometry, bool);
 
     /// Compute the Monkey level-proportional point-filter `bits_per_key` for `level`.
     ///
@@ -572,6 +594,17 @@ impl<'a> ReadOptions<'a> {
         self
     }
     option_builder!(with_fill_cache, fill_cache, bool);
+    /// Set [`fill_index_cache`](Self::fill_index_cache).
+    #[must_use]
+    pub fn with_fill_index_cache(mut self, value: impl Into<Option<bool>>) -> Self {
+        self.fill_index_cache = value.into();
+        self
+    }
+
+    #[inline]
+    pub(crate) fn effective_fill_index_cache(&self) -> bool {
+        self.fill_index_cache.unwrap_or(self.fill_cache)
+    }
     option_builder!(with_skip_point, skip_point, Option<SkipPointFn>);
     option_builder!(
         with_block_property_filters,

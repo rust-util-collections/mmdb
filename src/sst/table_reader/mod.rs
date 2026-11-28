@@ -2,7 +2,7 @@
 mod iterator;
 pub use iterator::TableIterator;
 
-use std::{cmp::Ordering, fs::File, io, path::Path, sync::Arc};
+use std::{cmp::Ordering, fs::File, io, ops::Deref, path::Path, sync::Arc};
 
 #[cfg(not(unix))]
 use parking_lot::Mutex;
@@ -11,7 +11,10 @@ use smallvec::SmallVec;
 use crate::cache::block_cache::{BlockCache, ValidatedKind};
 use crate::error::{Error, ErrorKind, Result, ResultExt};
 use crate::pinned::{PinnedSlice, PointValue};
-use crate::sst::block::{Block, decode_entry_reuse};
+use crate::sst::block::{
+    Block, ColdLocateMatch, decode_entry_reuse, validate_block_restarts,
+    validate_point_block_bytes_and_locate,
+};
 use crate::sst::filter::AlignedBytes;
 use crate::sst::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FILTER_FORMAT_BLOCKED_64B,
@@ -87,6 +90,43 @@ thread_local! {
     /// `(offset, len)` byte spans passed to `advise_willneed` on this thread.
     pub(crate) static WILLNEED_RANGES: std::cell::RefCell<Vec<(u64, u64)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Maximum retained capacity for the thread-local cold-read scratch buffer.
+/// Oversized blocks are released immediately after use so a single large block
+/// cannot pin memory indefinitely in a worker thread.
+const COLD_SCRATCH_MAX_CAP: usize = 64 * 1024;
+
+thread_local! {
+    static COLD_BLOCK_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct ScratchCapGuard<'a>(&'a mut Vec<u8>);
+
+impl Drop for ScratchCapGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.capacity() > COLD_SCRATCH_MAX_CAP {
+            *self.0 = Vec::new();
+        }
+    }
+}
+
+enum ColdBlockBytes<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl Deref for ColdBlockBytes<'_> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
 }
 
 /// An open, immutable SST file. On unix, block reads are positional
@@ -762,7 +802,7 @@ impl TableReader {
         fill_cache: bool,
     ) -> Result<Option<(Option<V>, SequenceNumber)>> {
         let mut probe = PointProbe::new(user_key, sequence);
-        self.point_value_with_probe(&mut probe, 0, fill_cache)
+        self.point_value_with_probe(&mut probe, 0, fill_cache, fill_cache)
     }
 
     pub(crate) fn point_value_with_probe<V: PointValue>(
@@ -770,6 +810,7 @@ impl TableReader {
         probe: &mut PointProbe<'_>,
         covering_tombstone_seq: SequenceNumber,
         fill_cache: bool,
+        fill_index_cache: bool,
     ) -> Result<Option<(Option<V>, SequenceNumber)>> {
         #[cfg(feature = "test-utils")]
         POINT_TABLE_PROBES.with(|count| count.set(count.get() + 1));
@@ -813,7 +854,7 @@ impl TableReader {
             }
         }
 
-        let Some(index_block) = self.index_leaf_block(part, fill_cache).ctx()? else {
+        let Some(index_block) = self.index_leaf_block(part, fill_index_cache).ctx()? else {
             return Ok(None);
         };
         let idx = Self::partition_point_index_leaf(&index_block, seek_key);
@@ -829,6 +870,32 @@ impl TableReader {
             (user_key, seek_key, covering_tombstone_seq),
             fill_cache,
         )
+    }
+
+    #[inline]
+    fn project_cold_match<V: PointValue>(
+        data: &[u8],
+        matched: ColdLocateMatch,
+        covering_tombstone_seq: SequenceNumber,
+        pin: impl FnOnce() -> PinnedSlice,
+    ) -> Result<Option<(Option<V>, SequenceNumber)>> {
+        let value = &data[matched.value_start..matched.value_start + matched.value_len];
+        Ok(Some((
+            match matched.value_type {
+                ValueType::Value => {
+                    if covering_tombstone_seq > matched.entry_seq {
+                        None
+                    } else {
+                        Some(V::project(value, pin))
+                    }
+                }
+                ValueType::Deletion => None,
+                ValueType::RangeDeletion => {
+                    return Err(Error::corruption("range deletion in point data block"));
+                }
+            },
+            matched.entry_seq,
+        )))
     }
 
     #[inline]
@@ -848,25 +915,189 @@ impl TableReader {
             if cached_size != u64::MAX && cached_size != handle.size {
                 return Err(Error::corruption("SST data block size mismatch")).ctx();
             }
-            if let Some((block, ValidatedKind::DataOrdered)) = data_entry.validated_ref() {
-                if let Some(ref s) = self.stats {
-                    s.record_cache_hit();
+            if let Some(ref s) = self.stats {
+                s.record_cache_hit();
+            }
+            match data_entry.validated_ref() {
+                Some((block, ValidatedKind::DataOrdered)) => {
+                    let (k0, _, _) = block.decode_restart_entry(0).ctx()?;
+                    let (kl, _, _) = block.decode_restart_entry(block.num_restarts() - 1).ctx()?;
+                    if k0 != first_key || compare_internal_key(kl, sep).is_gt() {
+                        return Err(Error::corruption(
+                            "SST data block disagrees with index bounds",
+                        ))
+                        .ctx();
+                    }
+                    return Self::point_in_block(block, user_key, seek_key, covering_tombstone_seq);
                 }
-                let (k0, _, _) = block.decode_restart_entry(0).ctx()?;
-                let (kl, _, _) = block.decode_restart_entry(block.num_restarts() - 1).ctx()?;
-                if k0 != first_key || compare_internal_key(kl, sep).is_gt() {
-                    return Err(Error::corruption(
-                        "SST data block disagrees with index bounds",
-                    ))
-                    .ctx();
+                Some((block, ValidatedKind::Data)) => {
+                    let located = validate_point_block_bytes_and_locate(
+                        block.data(),
+                        block.data_end_offset(),
+                        block.num_restarts(),
+                        first_key,
+                        sep,
+                        user_key,
+                        seek_key,
+                    )
+                    .ctx()?;
+                    data_entry.mark_data_ordered();
+                    return match located {
+                        Some(m) => Self::project_cold_match(
+                            block.data(),
+                            m,
+                            covering_tombstone_seq,
+                            || {
+                                PinnedSlice::from_block(
+                                    block.data_arc().clone(),
+                                    m.value_start as u32,
+                                    m.value_len as u32,
+                                )
+                            },
+                        ),
+                        None => Ok(None),
+                    };
                 }
-                return Self::point_in_block(block, user_key, seek_key, covering_tombstone_seq);
+                Some((_, _)) => {
+                    return Err(Error::corruption("SST block role mismatch")).ctx();
+                }
+                None => {
+                    let block = Block::new(data_entry.raw_arc().clone()).ctx()?;
+                    let located = validate_point_block_bytes_and_locate(
+                        block.data(),
+                        block.data_end_offset(),
+                        block.num_restarts(),
+                        first_key,
+                        sep,
+                        user_key,
+                        seek_key,
+                    )
+                    .ctx()?;
+                    if fill_cache {
+                        cache.insert_validated_block(
+                            self.file_number,
+                            handle.offset,
+                            handle.size,
+                            &block,
+                            ValidatedKind::DataOrdered,
+                        );
+                    }
+                    return match located {
+                        Some(m) => Self::project_cold_match(
+                            block.data(),
+                            m,
+                            covering_tombstone_seq,
+                            || {
+                                PinnedSlice::from_block(
+                                    block.data_arc().clone(),
+                                    m.value_start as u32,
+                                    m.value_len as u32,
+                                )
+                            },
+                        ),
+                        None => Ok(None),
+                    };
+                }
             }
         }
-        let block = self
-            .read_data_block_ordered(handle, first_key, sep, fill_cache)
+
+        if let Some(ref s) = self.stats
+            && self.block_cache.is_some()
+        {
+            s.record_cache_miss();
+        }
+        let should_cache = fill_cache && self.block_cache.as_ref().is_some_and(|c| c.is_enabled());
+        if should_cache {
+            let data = Self::read_block_data(&self.file, handle).ctx()?;
+            let block = Block::from_vec(data).ctx()?;
+            let located = validate_point_block_bytes_and_locate(
+                block.data(),
+                block.data_end_offset(),
+                block.num_restarts(),
+                first_key,
+                sep,
+                user_key,
+                seek_key,
+            )
             .ctx()?;
-        Self::point_in_block(&block, user_key, seek_key, covering_tombstone_seq)
+            if let Some(ref cache) = self.block_cache {
+                cache.insert_validated_block(
+                    self.file_number,
+                    handle.offset,
+                    handle.size,
+                    &block,
+                    ValidatedKind::DataOrdered,
+                );
+            }
+            return match located {
+                Some(m) => {
+                    Self::project_cold_match(block.data(), m, covering_tombstone_seq, || {
+                        PinnedSlice::from_block(
+                            block.data_arc().clone(),
+                            m.value_start as u32,
+                            m.value_len as u32,
+                        )
+                    })
+                }
+                None => Ok(None),
+            };
+        }
+
+        self.point_in_uncached_data_block(
+            handle,
+            first_key,
+            sep,
+            user_key,
+            seek_key,
+            covering_tombstone_seq,
+        )
+    }
+
+    fn point_in_uncached_data_block<V: PointValue>(
+        &self,
+        handle: &BlockHandle,
+        first_key: &[u8],
+        sep: &[u8],
+        user_key: &[u8],
+        seek_key: &[u8],
+        covering_tombstone_seq: SequenceNumber,
+    ) -> Result<Option<(Option<V>, SequenceNumber)>> {
+        let run = |raw_buf: &mut Vec<u8>| -> Result<Option<(Option<V>, SequenceNumber)>> {
+            let _cap_guard = ScratchCapGuard(raw_buf);
+            let bytes = Self::read_block_data_into(&self.file, handle, _cap_guard.0).ctx()?;
+            let (restart_offset, num_restarts) = validate_block_restarts(&bytes).ctx()?;
+            let located = validate_point_block_bytes_and_locate(
+                &bytes,
+                restart_offset,
+                num_restarts,
+                first_key,
+                sep,
+                user_key,
+                seek_key,
+            )
+            .ctx()?;
+            match located {
+                Some(m) => Self::project_cold_match(&bytes, m, covering_tombstone_seq, || {
+                    PinnedSlice::from_inline(
+                        bytes[m.value_start..m.value_start + m.value_len].to_vec(),
+                    )
+                }),
+                None => Ok(None),
+            }
+        };
+
+        COLD_BLOCK_SCRATCH
+            .try_with(|cell| match cell.try_borrow_mut() {
+                Ok(mut scratch) => run(&mut scratch),
+                Err(_) => {
+                    let mut fallback = Vec::new();
+                    run(&mut fallback)
+                }
+            })
+            .unwrap_or_else(|_| {
+                let mut fallback = Vec::new();
+                run(&mut fallback)
+            })
     }
 
     pub(crate) fn grouped_point_value(
@@ -875,6 +1106,7 @@ impl TableReader {
         probe: &mut PointProbe<'_>,
         covering_tombstone_seq: SequenceNumber,
         fill_cache: bool,
+        fill_index_cache: bool,
         blocks: &mut GroupedPointBlocks,
     ) -> Result<Option<(Option<PinnedSlice>, SequenceNumber)>> {
         #[cfg(feature = "test-utils")]
@@ -892,7 +1124,7 @@ impl TableReader {
         }
         let blocks = blocks.for_file(file_number);
         if !matches!(blocks.leaf, Some((index, _)) if index == part) {
-            let Some(leaf) = self.index_leaf_block(part, fill_cache)? else {
+            let Some(leaf) = self.index_leaf_block(part, fill_index_cache)? else {
                 return Ok(None);
             };
             blocks.leaf = Some((part, leaf));
@@ -1422,7 +1654,11 @@ impl TableReader {
         Ok(result)
     }
 
-    fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
+    fn read_block_raw_and_verify(
+        file: &SstFile,
+        handle: &BlockHandle,
+        raw_buf: &mut Vec<u8>,
+    ) -> Result<CompressionType> {
         const MAX_COMPRESSED_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
         let file_size = file.size;
         let end = handle
@@ -1445,10 +1681,11 @@ impl TableReader {
         }
         // Read the block and its trailer in one positional read.
         let size = handle.size as usize;
-        let mut data = vec![0u8; size + BLOCK_TRAILER_SIZE];
-        file.read_exact_at(&mut data, handle.offset).ctx()?;
-        let trailer: [u8; BLOCK_TRAILER_SIZE] = data[size..].try_into().unwrap();
-        data.truncate(size);
+        raw_buf.clear();
+        raw_buf.resize(size + BLOCK_TRAILER_SIZE, 0);
+        file.read_exact_at(raw_buf, handle.offset).ctx()?;
+        let trailer: [u8; BLOCK_TRAILER_SIZE] = raw_buf[size..].try_into().unwrap();
+        raw_buf.truncate(size);
         #[cfg(test)]
         if let Some(hook) = AFTER_BLOCK_READ.with(|hook| hook.borrow_mut().take()) {
             hook();
@@ -1460,7 +1697,7 @@ impl TableReader {
 
         let stored_crc = u32::from_le_bytes(trailer[1..5].try_into().unwrap());
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&data);
+        hasher.update(raw_buf);
         hasher.update(&[trailer[0]]);
         let computed_crc = hasher.finalize();
 
@@ -1471,8 +1708,11 @@ impl TableReader {
             )));
         }
 
-        // Decompress if needed, enforcing MAX_DECOMPRESSED_BLOCK_SIZE.
-        let data = match compression_type {
+        Ok(compression_type)
+    }
+
+    fn decompress_block_slice(compression_type: CompressionType, data: &[u8]) -> Result<Vec<u8>> {
+        match compression_type {
             CompressionType::Lz4 => {
                 if data.len() < 4 {
                     return Err(Error::corruption(
@@ -1487,9 +1727,9 @@ impl TableReader {
                         uncompressed_size, MAX_DECOMPRESSED_BLOCK_SIZE
                     )));
                 }
-                lz4_flex::decompress_size_prepended(&data)
+                lz4_flex::decompress_size_prepended(data)
                     .map_err(|e| Error::corruption(format!("LZ4 decompression error: {}", e)))
-                    .ctx()?
+                    .ctx()
             }
             CompressionType::Zstd => {
                 // zstd::bulk::compress() embeds the frame's uncompressed content
@@ -1503,7 +1743,7 @@ impl TableReader {
                 // MAX_DECOMPRESSED_BLOCK_SIZE before use, exactly like the LZ4
                 // path above, since a damaged frame header could otherwise
                 // report an oversized length.
-                let capacity = match zstd::zstd_safe::get_frame_content_size(&data) {
+                let capacity = match zstd::zstd_safe::get_frame_content_size(data) {
                     Ok(Some(size)) => {
                         if size > MAX_DECOMPRESSED_BLOCK_SIZE as u64 {
                             return Err(Error::corruption(format!(
@@ -1520,14 +1760,33 @@ impl TableReader {
                         return Err(Error::corruption("malformed Zstd frame header"));
                     }
                 };
-                zstd::bulk::decompress(data.as_slice(), capacity)
+                zstd::bulk::decompress(data, capacity)
                     .map_err(|e| Error::corruption(format!("Zstd decompression error: {}", e)))
-                    .ctx()?
+                    .ctx()
             }
-            CompressionType::None => data,
-        };
+            CompressionType::None => Ok(data.to_vec()),
+        }
+    }
 
-        Ok(data)
+    fn read_block_data_into<'a>(
+        file: &SstFile,
+        handle: &BlockHandle,
+        raw_buf: &'a mut Vec<u8>,
+    ) -> Result<ColdBlockBytes<'a>> {
+        let compression_type = Self::read_block_raw_and_verify(file, handle, raw_buf)?;
+        match compression_type {
+            CompressionType::None => Ok(ColdBlockBytes::Borrowed(raw_buf.as_slice())),
+            _ => Self::decompress_block_slice(compression_type, raw_buf).map(ColdBlockBytes::Owned),
+        }
+    }
+
+    fn read_block_data(file: &SstFile, handle: &BlockHandle) -> Result<Vec<u8>> {
+        let mut data = Vec::new();
+        let compression_type = Self::read_block_raw_and_verify(file, handle, &mut data)?;
+        match compression_type {
+            CompressionType::None => Ok(data),
+            _ => Self::decompress_block_slice(compression_type, &data),
+        }
     }
 
     fn read_metaindex(file: &SstFile, metaindex_handle: &BlockHandle) -> Result<MetaIndexData> {
@@ -2100,7 +2359,7 @@ mod tests {
         use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
         use crate::stats::DbStats;
         use crate::types::{InternalKey, ValueType};
-        use std::sync::{Arc, atomic::Ordering};
+        use std::sync::Arc;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ranges.sst");
@@ -2136,12 +2395,12 @@ mod tests {
             (b"k080", 0, 0),
             (b"z", 1000, 0),
         ] {
-            let before = stats.block_cache_misses.load(Ordering::Relaxed);
+            let before = stats.block_cache_misses();
             assert_eq!(
                 reader.max_covering_tombstone_seq(key, snapshot).unwrap(),
                 expected
             );
-            assert!(stats.block_cache_misses.load(Ordering::Relaxed) - before <= 1);
+            assert!(stats.block_cache_misses() - before <= 1);
         }
         let triples = reader.get_range_tombstones().unwrap();
         let at_k080: Vec<_> = triples
@@ -2257,7 +2516,7 @@ mod tests {
                     let mut probe = super::PointProbe::new(user_key, seq);
                     assert_eq!(
                         reader
-                            .grouped_point_value(1, &mut probe, 0, false, &mut grouped)
+                            .grouped_point_value(1, &mut probe, 0, false, false, &mut grouped)
                             .unwrap()
                             .map(|(v, seq)| (v.map(crate::PinnedSlice::into_vec), seq)),
                         expected
@@ -2766,6 +3025,226 @@ mod tests {
                 iter.iter_error().map(|e| e.kind()),
                 Some(ErrorKind::Corruption)
             );
+        }
+    }
+
+    #[test]
+    fn cold_point_read_rejects_trailing_corruption_after_match_and_does_not_cache() {
+        use crate::ErrorKind;
+        use crate::cache::block_cache::BlockCache;
+        use crate::sst::block_builder::BlockBuilder;
+        use crate::sst::format::{
+            BlockHandle, CompressionType, encode_footer, encode_index_value_with_props,
+        };
+        use crate::types::{InternalKey, ValueType};
+        use std::fs;
+        use std::sync::Arc;
+
+        let rechecksum = |raw: &[u8]| -> Vec<u8> {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(raw);
+            hasher.update(&[CompressionType::None as u8]);
+            let crc = hasher.finalize();
+            let mut out = raw.to_vec();
+            out.push(CompressionType::None as u8);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing_corrupt.sst");
+
+        let k0 = InternalKey::new(b"a_first", 10, ValueType::Value);
+        let k1 = InternalKey::new(b"z_middle", 10, ValueType::Value);
+        let k2_unordered = InternalKey::new(b"m_unordered", 10, ValueType::Value);
+        let mut data_b = BlockBuilder::new(16);
+        data_b.add(k0.as_bytes(), &[0xAB; 280]);
+        data_b.add(k1.as_bytes(), &[0xCD; 280]);
+        data_b.add(k2_unordered.as_bytes(), &[0xEF; 280]);
+        let raw_data = data_b.finish();
+        let framed_data = rechecksum(&raw_data);
+
+        let mut idx_leaf = BlockBuilder::new(1);
+        let data_h = BlockHandle::new(0, raw_data.len() as u64);
+        let idx_val = encode_index_value_with_props(&data_h, k0.as_bytes(), &[]).unwrap();
+        idx_leaf.add(k1.as_bytes(), &idx_val);
+        let raw_leaf = idx_leaf.finish();
+        let framed_leaf = rechecksum(&raw_leaf);
+
+        let mut meta_b = BlockBuilder::new(1);
+        meta_b.add(b"props.none", b"");
+        let raw_meta = meta_b.finish();
+        let framed_meta = rechecksum(&raw_meta);
+
+        let mut dir_b = BlockBuilder::new(1);
+        let leaf_h = BlockHandle::new(framed_data.len() as u64, raw_leaf.len() as u64);
+        dir_b.add(k1.as_bytes(), &leaf_h.encode());
+        let mut raw_dir = dir_b.finish();
+        raw_dir.extend_from_slice(&BlockHandle::default().encode());
+        let framed_dir = rechecksum(&raw_dir);
+
+        let meta_h = BlockHandle::new(
+            (framed_data.len() + framed_leaf.len()) as u64,
+            raw_meta.len() as u64,
+        );
+        let dir_h = BlockHandle::new(
+            (framed_data.len() + framed_leaf.len() + framed_meta.len()) as u64,
+            raw_dir.len() as u64,
+        );
+        let mut image = Vec::new();
+        image.extend_from_slice(&framed_data);
+        image.extend_from_slice(&framed_leaf);
+        image.extend_from_slice(&framed_meta);
+        image.extend_from_slice(&framed_dir);
+        image.extend_from_slice(&encode_footer(&meta_h, &dir_h));
+        fs::write(&path, &image).unwrap();
+
+        let cache = Arc::new(BlockCache::new(4 << 20));
+        let reader = TableReader::open_with_all(&path, 1, Some(Arc::clone(&cache)), None).unwrap();
+
+        // Reading the valid FIRST key must still detect trailing corruption
+        // on both uncached (scratch) and cached paths, and must never admit the
+        // corrupt data block into the block cache.
+        for fill_cache in [false, true] {
+            let err = reader
+                .get_internal_with_seq(b"a_first", 10, fill_cache)
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Corruption);
+            assert!(
+                cache.get_cached_entry(1, data_h.offset).is_none(),
+                "corrupt block must not be cached"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_uncached_scalar_point_read_handles_compression_large_cap_and_data_upgrade() {
+        use crate::PinnedSlice;
+        use crate::cache::block_cache::BlockCache;
+        use crate::sst::format::CompressionType;
+        use crate::sst::table_builder::{TableBuildOptions, TableBuilder};
+        use crate::types::{InternalKey, ValueType};
+        use std::sync::Arc;
+
+        for compression in [
+            CompressionType::None,
+            CompressionType::Lz4,
+            CompressionType::Zstd,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cold.sst");
+            let mut builder = TableBuilder::new(
+                &path,
+                TableBuildOptions {
+                    block_size: 4096,
+                    compression,
+                    bloom_bits_per_key: 0,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let v_small = vec![0x11u8; 280];
+            let v_huge = vec![0x77u8; 96 * 1024]; // > COLD_SCRATCH_MAX_CAP (64 KiB)
+            builder
+                .add(
+                    InternalKey::new(b"k_empty", 5, ValueType::Value).as_bytes(),
+                    b"",
+                )
+                .unwrap();
+            builder
+                .add(
+                    InternalKey::new(b"k_huge", 5, ValueType::Value).as_bytes(),
+                    &v_huge,
+                )
+                .unwrap();
+            builder
+                .add(
+                    InternalKey::new(b"k_small", 5, ValueType::Value).as_bytes(),
+                    &v_small,
+                )
+                .unwrap();
+            builder.finish().unwrap();
+
+            let cache = Arc::new(BlockCache::new(4 << 20));
+            let reader =
+                TableReader::open_with_all(&path, 7, Some(Arc::clone(&cache)), None).unwrap();
+
+            // Uncached reads exercise the thread-local scratch path.
+            let got_empty = reader
+                .point_value::<PinnedSlice>(b"k_empty", 5, false)
+                .unwrap()
+                .unwrap()
+                .0
+                .unwrap();
+            assert!(got_empty.is_empty());
+
+            let got_small = reader
+                .point_value::<PinnedSlice>(b"k_small", 5, false)
+                .unwrap()
+                .unwrap()
+                .0
+                .unwrap();
+            assert_eq!(got_small.as_ref(), v_small.as_slice());
+
+            let got_huge = reader
+                .point_value::<PinnedSlice>(b"k_huge", 5, false)
+                .unwrap()
+                .unwrap()
+                .0
+                .unwrap();
+            assert_eq!(got_huge.as_ref(), v_huge.as_slice());
+
+            // Oversized block must have been released from the thread-local scratch buffer.
+            super::COLD_BLOCK_SCRATCH.with(|cell| {
+                assert!(
+                    cell.borrow().capacity() <= super::COLD_SCRATCH_MAX_CAP,
+                    "scratch buffer retained capacity above cap"
+                );
+            });
+
+            // Cached read after an unbounded block load populates ValidatedKind::Data
+            // exercises fused Data -> DataOrdered upgrade in point_in_data_block.
+            let reader2 =
+                TableReader::open_with_all(&path, 8, Some(Arc::clone(&cache)), None).unwrap();
+            let (leaf, _) = reader2
+                .read_block_cached_block(&reader2.partitions[0].1, None, false)
+                .unwrap();
+            let (_, idx_val, _) = leaf.decode_restart_entry(0).unwrap();
+            let data_h0 = super::BlockHandle::decode(idx_val).unwrap();
+            let _ = reader2
+                .read_block_cached_block(&data_h0, None, true)
+                .unwrap();
+            let before = cache
+                .get_cached_entry(8, data_h0.offset)
+                .expect("unbounded read must have cached block 0");
+            assert_eq!(
+                before.validated_ref().map(|(_, k)| k),
+                Some(crate::cache::block_cache::ValidatedKind::Data),
+                "unbounded read must populate ValidatedKind::Data before point upgrade"
+            );
+            drop(before);
+            let upgraded = reader2
+                .point_value::<PinnedSlice>(b"k_empty", 5, true)
+                .unwrap()
+                .unwrap()
+                .0
+                .unwrap();
+            assert!(upgraded.is_empty());
+            let after = cache
+                .get_cached_entry(8, data_h0.offset)
+                .expect("block 0 must remain cached after upgrade");
+            assert_eq!(
+                after.validated_ref().map(|(_, k)| k),
+                Some(crate::cache::block_cache::ValidatedKind::DataOrdered),
+                "point read must upgrade ValidatedKind::Data to DataOrdered in place"
+            );
+            let upgraded_small = reader2
+                .point_value::<PinnedSlice>(b"k_small", 5, true)
+                .unwrap()
+                .unwrap()
+                .0
+                .unwrap();
+            assert_eq!(upgraded_small.as_ref(), v_small.as_slice());
         }
     }
 }

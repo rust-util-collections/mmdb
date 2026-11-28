@@ -515,6 +515,7 @@ impl VersionSet {
         Self::recover_with_cache_mode(
             db_path,
             Some(DBHeader::new(num_levels, prefix_len)?),
+            true,
             table_cache,
             false,
         )
@@ -530,9 +531,19 @@ impl VersionSet {
         Self::recover_with_cache_mode(
             db_path,
             Some(DBHeader::new(num_levels, prefix_len)?),
+            true,
             table_cache,
             true,
         )
+    }
+
+    /// Recover a writable database store's VersionSet adopting the persisted
+    /// MANIFEST geometry (`num_levels`, `prefix_len`).
+    pub fn recover_db_adopting_geometry_with_cache(
+        db_path: &Path,
+        table_cache: Option<Arc<TableCache>>,
+    ) -> Result<Self> {
+        Self::recover_with_cache_mode(db_path, None, true, table_cache, true)
     }
 
     /// Recover an existing VersionSet without opening or repairing its
@@ -542,7 +553,7 @@ impl VersionSet {
         db_path: &Path,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
-        Self::recover_with_cache_mode(db_path, None, table_cache, false)
+        Self::recover_with_cache_mode(db_path, None, false, table_cache, false)
     }
 
     /// Recover an existing database store's VersionSet read-only, enforcing DB-level WAL floor invariants.
@@ -550,12 +561,13 @@ impl VersionSet {
         db_path: &Path,
         table_cache: Option<Arc<TableCache>>,
     ) -> Result<Self> {
-        Self::recover_with_cache_mode(db_path, None, table_cache, true)
+        Self::recover_with_cache_mode(db_path, None, false, table_cache, true)
     }
 
     fn recover_with_cache_mode(
         db_path: &Path,
         requested: Option<DBHeader>,
+        writable: bool,
         table_cache: Option<Arc<TableCache>>,
         enforce_db_wal_floor: bool,
     ) -> Result<Self> {
@@ -785,7 +797,7 @@ impl VersionSet {
 
         // Writable recovery repairs a torn tail and reopens the MANIFEST for
         // append. Read-only recovery must leave the file byte-for-byte intact.
-        let (manifest_writer, parent_dir) = if requested.is_none() {
+        let (manifest_writer, parent_dir) = if !writable {
             (None, None)
         } else {
             let valid_offset = reader.last_valid_offset();
