@@ -70,8 +70,10 @@ pub struct LevelIterator {
     /// set, iteration and subsequent seeks stay halted instead of silently
     /// clearing the failure or advancing past the errored file.
     error: Option<Error>,
-    /// Whether cache misses populate the block cache (default: true).
+    /// Whether data-block cache misses populate the block cache (default: true).
     fill_cache: bool,
+    /// Whether index-leaf cache misses populate the block cache (default: true).
+    fill_index_cache: bool,
 }
 
 impl LevelIterator {
@@ -94,6 +96,7 @@ impl LevelIterator {
             config: IterConfig::empty(),
             error: None,
             fill_cache: true,
+            fill_index_cache: true,
         }
     }
 
@@ -101,6 +104,14 @@ impl LevelIterator {
     /// Forwarded to every `TableIterator` this level iterator opens.
     pub fn with_fill_cache(mut self, fill_cache: bool) -> Self {
         self.fill_cache = fill_cache;
+        self.fill_index_cache = fill_cache;
+        self
+    }
+
+    /// Set whether index-leaf cache misses populate the block cache.
+    /// Forwarded to every `TableIterator` this level iterator opens.
+    pub fn with_fill_index_cache(mut self, fill_index_cache: bool) -> Self {
+        self.fill_index_cache = fill_index_cache;
         self
     }
 
@@ -225,8 +236,9 @@ impl LevelIterator {
                     continue;
                 }
             }
-            let mut table_iter =
-                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
+            let mut table_iter = TableIterator::new(tf.reader.clone())
+                .with_fill_cache(self.fill_cache)
+                .with_fill_index_cache(self.fill_index_cache);
             table_iter.set_config(self.config.clone());
             if let Some(t) = target {
                 table_iter.seek(t);
@@ -339,8 +351,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 }
                 FileFilter::Skip | FileFilter::AfterRange => continue,
             }
-            let mut table_iter =
-                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
+            let mut table_iter = TableIterator::new(tf.reader.clone())
+                .with_fill_cache(self.fill_cache)
+                .with_fill_index_cache(self.fill_index_cache);
             table_iter.set_config(self.config.clone());
             table_iter.seek_to_last();
             if let Some(e) = table_iter.iter_error() {
@@ -393,8 +406,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 FileFilter::BeforeRange => break,
                 FileFilter::Skip | FileFilter::AfterRange => continue,
             }
-            let mut table_iter =
-                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
+            let mut table_iter = TableIterator::new(tf.reader.clone())
+                .with_fill_cache(self.fill_cache)
+                .with_fill_index_cache(self.fill_index_cache);
             table_iter.set_config(self.config.clone());
             table_iter.seek_for_prev(target);
             if let Some(e) = table_iter.iter_error() {
@@ -444,8 +458,9 @@ impl super::merge::SeekableIterator for LevelIterator {
                 FileFilter::BeforeRange => break,
                 FileFilter::Skip | FileFilter::AfterRange => continue,
             }
-            let mut table_iter =
-                TableIterator::new(tf.reader.clone()).with_fill_cache(self.fill_cache);
+            let mut table_iter = TableIterator::new(tf.reader.clone())
+                .with_fill_cache(self.fill_cache)
+                .with_fill_index_cache(self.fill_index_cache);
             table_iter.set_config(self.config.clone());
             table_iter.seek_to_last();
             if let Some(e) = table_iter.iter_error() {

@@ -6,10 +6,12 @@ use std::{ops::Deref, sync::Arc};
 /// Immutable bytes returned by [`crate::DB::get_pinned`] or by an occupied
 /// result slot in [`crate::DB::get_many_pinned`].
 ///
-/// A nonempty pin keeps its entire SST block (up to 64 MiB) or memtable arena alive,
-/// including after eviction, compaction, and database close. Those retained
-/// bytes are outside the cache and write-buffer budgets. Use [`Self::into_vec`]
-/// to retain just the value.
+/// A nonempty pin normally keeps its entire SST block (up to 64 MiB) or
+/// memtable arena alive, including after eviction, compaction, and database
+/// close. Uncached scalar SST point reads may instead return an inline copy of
+/// the value bytes rather than retaining the full block. Those retained bytes
+/// are outside the cache and write-buffer budgets. Use [`Self::into_vec`] to
+/// retain just the value.
 pub struct PinnedSlice(LazyValue);
 
 /// Projection at a visible point entry. Existence and owned-byte reads avoid
@@ -61,6 +63,10 @@ impl PinnedSlice {
         Self(LazyValue::BlockRef { data, offset, len })
     }
 
+    pub(crate) fn from_inline(data: Vec<u8>) -> Self {
+        Self(LazyValue::Inline(data))
+    }
+
     pub(crate) fn from_memtable(pin: MemTablePin) -> Self {
         Self(LazyValue::MemTable(pin))
     }
@@ -76,6 +82,9 @@ impl PinnedSlice {
     pub fn sst_backing_charge(&self) -> Option<(usize, usize)> {
         match &self.0 {
             LazyValue::BlockRef { data, .. } => Some((Arc::as_ptr(data) as usize, data.capacity())),
+            LazyValue::Inline(data) if !data.is_empty() => {
+                Some((data.as_ptr() as usize, data.capacity()))
+            }
             _ => None,
         }
     }

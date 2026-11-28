@@ -36,8 +36,6 @@ pub(super) struct ReadState {
     /// Read-triggered compaction hints accumulated from the get path, with
     /// at most one pending hint per sampled level while workers are busy.
     pub(super) read_compaction_hints: Arc<Mutex<Vec<CompactionHint>>>,
-    /// Counter for periodic read-compaction checks.
-    pub(super) read_counter: AtomicU64,
 }
 
 impl ReadState {
@@ -50,11 +48,16 @@ impl ReadState {
         let sv = self.get_super_version();
         self.check_usable().ctx()?;
         let sequence = self.resolve_read_sequence(&sv, options.snapshot)?;
+        let fill_index_cache = options.effective_fill_index_cache();
         let mut probe = PointProbe::new(key, sequence);
         let value: Option<V> =
             self.point_lookup_in_view(&sv, options, key, sequence, |file, tomb_seq| {
-                file.reader
-                    .point_value_with_probe(&mut probe, tomb_seq, options.fill_cache)
+                file.reader.point_value_with_probe(
+                    &mut probe,
+                    tomb_seq,
+                    options.fill_cache,
+                    fill_index_cache,
+                )
             })?;
         if let Some(v) = &value {
             self.stats.record_read((key.len() + v.byte_len()) as u64);
@@ -78,6 +81,7 @@ impl ReadState {
             )));
         }
         let sequence = self.resolve_read_sequence(&view, options.snapshot)?;
+        let fill_index_cache = options.effective_fill_index_cache();
         let mut slots: SmallVec<[usize; MAX_GROUPED_READ_KEYS]> = (0..keys.len()).collect();
         slots.sort_unstable_by_key(|&slot| keys[slot]);
         let mut blocks = GroupedPointBlocks::default();
@@ -94,6 +98,7 @@ impl ReadState {
                         &mut probe,
                         tomb_seq,
                         options.fill_cache,
+                        fill_index_cache,
                         &mut blocks,
                     )
                 })?;
@@ -169,9 +174,8 @@ impl ReadState {
                     continue;
                 }
                 if let Some((value, _seq)) = probe(file, tomb_seq).ctx()? {
-                    if level >= 2 {
-                        self.stats.maybe_sample_read_level(level);
-                        self.maybe_check_read_compaction();
+                    if level >= 2 && self.stats.record_l2_read_sample(level) && !self.read_only {
+                        self.check_read_compaction();
                     }
                     return Ok(value);
                 }
@@ -265,13 +269,15 @@ impl ReadState {
                     {
                         continue;
                     }
-                    let iter =
-                        TableIterator::new(file.reader.clone()).with_fill_cache(options.fill_cache);
+                    let iter = TableIterator::new(file.reader.clone())
+                        .with_fill_cache(options.fill_cache)
+                        .with_fill_index_cache(options.effective_fill_index_cache());
                     sources.push(IterSource::from_table_iter(iter).with_level(0));
                 }
             } else {
                 let iter = LevelIterator::for_level(version.clone(), level)
-                    .with_fill_cache(options.fill_cache);
+                    .with_fill_cache(options.fill_cache)
+                    .with_fill_index_cache(options.effective_fill_index_cache());
                 sources.push(IterSource::from_level_iter(iter).with_level(level));
             }
         }
@@ -357,19 +363,6 @@ impl ReadState {
             ));
         }
         None
-    }
-
-    /// Periodically check read-level samples and generate compaction hints.
-    /// Called every 1024 reads from get_with_options.
-    fn maybe_check_read_compaction(&self) {
-        if self.read_only {
-            return;
-        }
-        let count = self.read_counter.fetch_add(1, Ordering::Relaxed);
-        if !count.is_multiple_of(1024) {
-            return;
-        }
-        self.check_read_compaction();
     }
 
     /// Take read-level samples and convert them into compaction hints.

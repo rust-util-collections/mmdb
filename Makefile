@@ -41,6 +41,7 @@ ci:
 	$(CARGO_TEST) --test shared_cache
 	$(CARGO_TEST) --test grouped_reads
 	$(CARGO_TEST) --test read_only
+	$(CARGO_TEST) --test cold_read_and_options
 
 bench:
 	cargo bench

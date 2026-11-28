@@ -108,9 +108,11 @@ pub struct TableIterator {
     config: Arc<IterConfig>,
 
     // --- Cache policy ---
-    /// Whether cache misses populate the block cache. False for scans that
-    /// must not evict hot blocks (compaction, `ReadOptions::fill_cache=false`).
+    /// Whether data-block cache misses populate the block cache. False for scans
+    /// that must not evict hot blocks (compaction, `ReadOptions::fill_cache=false`).
     fill_cache: bool,
+    /// Whether index-leaf cache misses populate the block cache.
+    fill_index_cache: bool,
 }
 
 impl TableIterator {
@@ -146,12 +148,22 @@ impl TableIterator {
             err: None,
             config: IterConfig::empty(),
             fill_cache: true,
+            fill_index_cache: true,
         }
     }
 
     /// Set whether cache misses populate the block cache (default: true).
+    /// Also updates the index-leaf cache policy unless overridden afterwards
+    /// with [`Self::with_fill_index_cache`].
     pub fn with_fill_cache(mut self, fill_cache: bool) -> Self {
         self.fill_cache = fill_cache;
+        self.fill_index_cache = fill_cache;
+        self
+    }
+
+    /// Set whether index-leaf cache misses populate the block cache.
+    pub fn with_fill_index_cache(mut self, fill_index_cache: bool) -> Self {
+        self.fill_index_cache = fill_index_cache;
         self
     }
 
@@ -193,7 +205,7 @@ impl TableIterator {
             self.index_loaded = true;
             match self
                 .reader
-                .index_leaf_block(self.partition as usize, self.fill_cache)
+                .index_leaf_block(self.partition as usize, self.fill_index_cache)
             {
                 Ok(block) => self.index_block = block,
                 Err(e) => {
